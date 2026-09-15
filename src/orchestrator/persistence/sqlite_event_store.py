@@ -13,7 +13,7 @@ from typing import Any
 
 from orchestrator.identifiers import new_id
 
-from .events import EventDraft, StoredEvent
+from .events import EventDraft, StoredEvent, _validate_sha256_hex
 
 
 class StaleStream(RuntimeError):
@@ -127,6 +127,18 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (stream_type, stream_id)
                 REFERENCES stream_versions (stream_type, stream_id)
         );
+
+        CREATE TRIGGER IF NOT EXISTS events_immutable_update
+        BEFORE UPDATE ON events
+        BEGIN
+            SELECT RAISE(ABORT, 'event rows are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_immutable_delete
+        BEFORE DELETE ON events
+        BEGIN
+            SELECT RAISE(ABORT, 'event rows are immutable');
+        END;
         """
     )
 
@@ -376,10 +388,13 @@ class SQLiteEventStore:
             raise EventIntegrityError(
                 f"event {row['event_id']!r} contains an invalid payload"
             ) from exc
-        stored_hash = row["payload_hash"]
-        if not isinstance(stored_hash, str) or not hmac.compare_digest(
-            computed_hash, stored_hash
-        ):
+        try:
+            stored_hash = _validate_sha256_hex(row["payload_hash"])
+        except ValueError as exc:
+            raise EventIntegrityError(
+                f"event {row['event_id']!r} has a malformed payload_hash"
+            ) from exc
+        if not hmac.compare_digest(computed_hash, stored_hash):
             raise EventIntegrityError(
                 f"event {row['event_id']!r} payload_hash does not match payload"
             )

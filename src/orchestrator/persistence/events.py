@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import copy
 from datetime import datetime
 import math
+import re
 from typing import Any
 
 from pydantic import (
@@ -53,6 +55,15 @@ def _validate_non_blank(value: Any, field_name: str) -> Any:
     return value
 
 
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}", re.ASCII)
+
+
+def _validate_sha256_hex(value: Any, field_name: str = "payload_hash") -> str:
+    if not isinstance(value, str) or _SHA256_HEX.fullmatch(value) is None:
+        raise ValueError(f"{field_name} must be 64 lowercase ASCII hex characters")
+    return value
+
+
 class _FrozenDict(dict[str, Any]):
     """A dict-compatible JSON object that rejects all mutation methods."""
 
@@ -68,6 +79,23 @@ class _FrozenDict(dict[str, Any]):
     setdefault = _immutable
     update = _immutable
     __ior__ = _immutable
+
+    def __copy__(self) -> "_FrozenDict":
+        return type(self)(self.items())
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_FrozenDict":
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+        copied = type(self)()
+        memo[id(self)] = copied
+        for key, value in self.items():
+            dict.__setitem__(
+                copied,
+                copy.deepcopy(key, memo),
+                copy.deepcopy(value, memo),
+            )
+        return copied
 
 
 class _FrozenList(list[Any]):
@@ -89,6 +117,19 @@ class _FrozenList(list[Any]):
     remove = _immutable
     reverse = _immutable
     sort = _immutable
+
+    def __copy__(self) -> "_FrozenList":
+        return type(self)(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_FrozenList":
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+        copied = type(self)()
+        memo[id(self)] = copied
+        for item in self:
+            list.append(copied, copy.deepcopy(item, memo))
+        return copied
 
 
 def _freeze_json_value(value: Any) -> Any:
@@ -147,7 +188,7 @@ class StoredEvent(BaseModel):
     schema_version: StrictInt = Field(gt=0)
     occurred_at: datetime
     payload: dict[str, Any]
-    payload_hash: StrictStr = Field(min_length=1)
+    payload_hash: StrictStr = Field(min_length=64, max_length=64)
     idempotency_key: StrictStr = Field(min_length=1)
     correlation_id: StrictStr | None = None
     causation_id: StrictStr | None = None
@@ -161,6 +202,11 @@ class StoredEvent(BaseModel):
     @classmethod
     def validate_event_type(cls, value: Any) -> Any:
         return _validate_non_blank(value, "event_type")
+
+    @field_validator("payload_hash", mode="before")
+    @classmethod
+    def validate_payload_hash(cls, value: Any) -> Any:
+        return _validate_sha256_hex(value)
 
     @field_validator("payload", mode="before")
     @classmethod

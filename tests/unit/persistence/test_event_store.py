@@ -188,12 +188,15 @@ def test_read_stream_rejects_a_tampered_payload_hash(tmp_path):
     store = SQLiteEventStore(database)
     event = store.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "key")[0]
 
+    store.close()
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER IF EXISTS events_immutable_update")
         connection.execute(
             "UPDATE events SET payload_hash = ? WHERE event_id = ?",
             ("0" * 64, event.event_id),
         )
 
+    store = SQLiteEventStore(database)
     with pytest.raises(EventIntegrityError, match="payload_hash"):
         store.read_stream("run", "run-1")
 
@@ -205,14 +208,34 @@ def test_read_stream_rejects_a_tampered_payload(tmp_path):
         "run", "run-1", 0, [EventDraft("RunCreated", {"value": "original"})], "key"
     )[0]
 
+    store.close()
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER IF EXISTS events_immutable_update")
         connection.execute(
             "UPDATE events SET payload_json = ? WHERE event_id = ?",
             ('{"value":"tampered"}', event.event_id),
         )
 
+    store = SQLiteEventStore(database)
     with pytest.raises(EventIntegrityError, match="payload_hash"):
         store.read_stream("run", "run-1")
+
+
+def test_event_rows_reject_direct_sql_update_and_delete(tmp_path):
+    database = tmp_path / "events.db"
+    store = SQLiteEventStore(database)
+    event = store.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "key")[0]
+
+    with sqlite3.connect(database) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE events SET payload_hash = ? WHERE event_id = ?",
+                ("0" * 64, event.event_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute("DELETE FROM events WHERE event_id = ?", (event.event_id,))
+
+    assert store.read_stream("run", "run-1") == [event]
 
 
 def test_store_connection_is_thread_affine(tmp_path):
@@ -232,6 +255,49 @@ def test_store_connection_is_thread_affine(tmp_path):
     assert len(errors) == 1
     assert isinstance(errors[0], sqlite3.ProgrammingError)
     assert "thread" in (SQLiteEventStore.__doc__ or "").lower()
+
+
+def test_copies_of_frozen_payloads_remain_immutable(tmp_path):
+    import copy
+
+    store = SQLiteEventStore(tmp_path / "events.db")
+    event = store.append(
+        "run",
+        "run-1",
+        0,
+        [EventDraft("RunCreated", {"nested": {"items": [1]}})],
+        "key",
+    )[0]
+
+    copied_payloads = [
+        copy.copy(event.payload),
+        copy.deepcopy(event.payload),
+        event.model_copy(deep=True).payload,
+    ]
+    for payload in copied_payloads:
+        with pytest.raises(TypeError):
+            payload["new"] = "not allowed"
+        with pytest.raises(TypeError):
+            payload["nested"]["items"].append(2)
+        assert payload == event.payload
+
+
+def test_read_stream_rejects_a_malformed_non_ascii_payload_hash(tmp_path):
+    database = tmp_path / "events.db"
+    store = SQLiteEventStore(database)
+    event = store.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "key")[0]
+
+    store.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER IF EXISTS events_immutable_update")
+        connection.execute(
+            "UPDATE events SET payload_hash = ? WHERE event_id = ?",
+            ("é" * 64, event.event_id),
+        )
+
+    store = SQLiteEventStore(database)
+    with pytest.raises(EventIntegrityError, match="payload_hash"):
+        store.read_stream("run", "run-1")
 
 
 def test_identifier_and_event_payload_surrogates_are_rejected_with_field_context(tmp_path):
