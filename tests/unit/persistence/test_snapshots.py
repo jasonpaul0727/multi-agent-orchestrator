@@ -1,0 +1,134 @@
+import json
+import sqlite3
+
+from orchestrator.persistence.events import EventDraft
+from orchestrator.persistence.snapshots import SnapshotStore
+from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
+
+
+def test_snapshot_round_trip_persists_source_and_canonical_state_hash(tmp_path):
+    database = tmp_path / "snapshots.db"
+    events = SQLiteEventStore(database)
+    source = events.append(
+        "run", "run-1", 0, [EventDraft("RunCreated", {"run_id": "run-1"})], "create"
+    )[0]
+    snapshots = SnapshotStore(database)
+
+    saved = snapshots.save_snapshot(
+        "run",
+        "run-1",
+        event_version=source.stream_version,
+        state={"status": "Created", "nested": {"b": 2, "a": 1}},
+        schema_version=1,
+        source_event_id=source.event_id,
+    )
+
+    loaded = snapshots.load_valid(
+        "run",
+        "run-1",
+        expected_schema_version=1,
+        expected_source_version=source.stream_version,
+        expected_source_event_id=source.event_id,
+    )
+
+    assert loaded == saved
+    assert loaded.state == {"status": "Created", "nested": {"b": 2, "a": 1}}
+    assert len(loaded.state_hash) == 64
+    assert loaded.event_version == source.stream_version
+    assert loaded.source_event_id == source.event_id
+
+
+def test_load_valid_returns_none_for_tampered_state_hash(tmp_path):
+    database = tmp_path / "snapshots.db"
+    events = SQLiteEventStore(database)
+    source = events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")[0]
+    snapshots = SnapshotStore(database)
+    snapshots.save_snapshot("run", "run-1", 1, {"status": "Created"}, 1, source.event_id)
+    snapshots.close()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE snapshots SET state_hash = ? WHERE aggregate_id = ?",
+            ("0" * 64, "run-1"),
+        )
+
+    snapshots = SnapshotStore(database)
+    assert snapshots.load_valid("run", "run-1", expected_schema_version=1) is None
+
+
+def test_load_valid_returns_none_for_malformed_schema_and_source_version(tmp_path):
+    database = tmp_path / "snapshots.db"
+    events = SQLiteEventStore(database)
+    source = events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")[0]
+    snapshots = SnapshotStore(database)
+    snapshots.save_snapshot("run", "run-1", 1, {"status": "Created"}, 1, source.event_id)
+    snapshots.close()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE snapshots SET schema_version = ? WHERE aggregate_id = ?",
+            (0, "run-1"),
+        )
+
+    snapshots = SnapshotStore(database)
+    assert snapshots.load_valid("run", "run-1", expected_schema_version=1) is None
+
+    snapshots.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE snapshots SET event_version = ? WHERE aggregate_id = ?",
+            (2, "run-1"),
+        )
+
+    snapshots = SnapshotStore(database)
+    assert (
+        snapshots.load_valid(
+            "run",
+            "run-1",
+            expected_schema_version=1,
+            expected_source_version=1,
+        )
+        is None
+    )
+
+
+def test_load_valid_returns_none_for_tampered_state_payload(tmp_path):
+    database = tmp_path / "snapshots.db"
+    events = SQLiteEventStore(database)
+    source = events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")[0]
+    snapshots = SnapshotStore(database)
+    snapshots.save_snapshot("run", "run-1", 1, {"status": "Created"}, 1, source.event_id)
+    snapshots.close()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE snapshots SET state_json = ? WHERE aggregate_id = ?",
+            (json.dumps({"status": "Tampered"}), "run-1"),
+        )
+
+    snapshots = SnapshotStore(database)
+    assert snapshots.load_valid("run", "run-1", expected_schema_version=1) is None
+
+
+def test_event_payload_tampering_is_detected_before_recovery_can_use_it(tmp_path):
+    database = tmp_path / "events.db"
+    events = SQLiteEventStore(database)
+    source = events.append(
+        "run", "run-1", 0, [EventDraft("RunCreated", {"status": "Created"})], "create"
+    )[0]
+    events.close()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER events_immutable_update")
+        connection.execute(
+            "UPDATE events SET payload_json = ? WHERE event_id = ?",
+            (json.dumps({"status": "Tampered"}), source.event_id),
+        )
+
+    reopened = SQLiteEventStore(database)
+    try:
+        reopened.read_stream("run", "run-1")
+    except Exception as exc:
+        assert type(exc).__name__ == "EventIntegrityError"
+    else:
+        raise AssertionError("tampered event payload was accepted")

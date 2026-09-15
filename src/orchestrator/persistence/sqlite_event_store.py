@@ -88,15 +88,26 @@ def _open_connection(path: str | Path) -> sqlite3.Connection:
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
-    connection.executescript(
+    # ``executescript`` implicitly commits around DDL when autocommit is on,
+    # leaving partial schemas behind after a migration failure.  Keep every
+    # schema change (including the snapshot table added later) in one explicit
+    # transaction.
+    statements = (
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
         """
         CREATE TABLE IF NOT EXISTS stream_versions (
             stream_type TEXT NOT NULL,
             stream_id TEXT NOT NULL,
             current_version INTEGER NOT NULL CHECK (current_version >= 0),
             PRIMARY KEY (stream_type, stream_id)
-        );
-
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS events (
             event_id TEXT NOT NULL UNIQUE,
             stream_type TEXT NOT NULL,
@@ -114,8 +125,9 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             UNIQUE (stream_type, stream_id, stream_version),
             FOREIGN KEY (stream_type, stream_id)
                 REFERENCES stream_versions (stream_type, stream_id)
-        );
-
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS idempotency_records (
             stream_id TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
@@ -126,21 +138,45 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             PRIMARY KEY (stream_id, idempotency_key),
             FOREIGN KEY (stream_type, stream_id)
                 REFERENCES stream_versions (stream_type, stream_id)
-        );
-
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS snapshots (
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            event_version INTEGER NOT NULL,
+            state_json TEXT NOT NULL,
+            state_hash TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            source_event_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (aggregate_type, aggregate_id)
+        )
+        """,
+        """
         CREATE TRIGGER IF NOT EXISTS events_immutable_update
         BEFORE UPDATE ON events
         BEGIN
             SELECT RAISE(ABORT, 'event rows are immutable');
-        END;
-
+        END
+        """,
+        """
         CREATE TRIGGER IF NOT EXISTS events_immutable_delete
         BEFORE DELETE ON events
         BEGIN
             SELECT RAISE(ABORT, 'event rows are immutable');
-        END;
-        """
+        END
+        """,
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)",
     )
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in statements:
+            connection.execute(statement)
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
 
 
 def _draft_request_hash(stream_type: str, stream_id: str, drafts: list[EventDraft]) -> str:
