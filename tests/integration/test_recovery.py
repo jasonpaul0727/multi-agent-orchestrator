@@ -169,3 +169,152 @@ def test_recovery_raises_typed_event_chain_failure_for_a_gap(tmp_path):
         )
 
     assert failure.value.category == "event_chain"
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "UnknownEffect",
+        "EffectUnknown",
+        "UnknownEffectDetected",
+        "EffectOutcomeUnknown",
+        "OutcomeCannotBeDetermined",
+        "OutcomeUnknown",
+    ],
+)
+def test_recovery_routes_unknown_effect_outcome_events_to_findings_and_hook(
+    tmp_path, event_type
+):
+    database = tmp_path / "recovery.db"
+    events = SQLiteEventStore(database)
+    events.append(
+        "run",
+        "run-1",
+        0,
+        [
+            EventDraft("RunCreated", {}),
+            EventDraft(event_type, {"effect_id": "effect-1"}),
+        ],
+        "events-run-1",
+    )
+    hook_calls = []
+
+    result = RecoveryBootstrap(events).recover(
+        "run",
+        "run-1",
+        reducers={"RunCreated": lambda state, event: "Created"},
+        effect_hook=lambda state: hook_calls.append(state),
+    )
+
+    assert result.state == "Created"
+    assert result.unknown_effects == ("effect-1",)
+    assert hook_calls == ["Created"]
+
+
+def test_unknown_effect_outcome_is_never_sent_to_a_generic_reducer(tmp_path):
+    database = tmp_path / "recovery.db"
+    events = SQLiteEventStore(database)
+    events.append(
+        "run",
+        "run-1",
+        0,
+        [EventDraft("RunCreated", {}), EventDraft("OutcomeUnknown", {})],
+        "events-run-1",
+    )
+    reduced_event_types = []
+
+    def reducer(state, event):
+        reduced_event_types.append(event.event_type)
+        return state
+
+    result = RecoveryBootstrap(events).recover("run", "run-1", reducers=reducer)
+
+    assert reduced_event_types == ["RunCreated"]
+    assert result.unknown_effects
+
+
+def test_effect_hook_receives_canonical_unknown_outcome_events(tmp_path):
+    database = tmp_path / "recovery.db"
+    events = SQLiteEventStore(database)
+    events.append(
+        "run",
+        "run-1",
+        0,
+        [EventDraft("RunCreated", {}), EventDraft("OutcomeUnknown", {})],
+        "events-run-1",
+    )
+    seen_event_types = []
+
+    def effect_hook(events):
+        seen_event_types.extend(event.event_type for event in events)
+
+    RecoveryBootstrap(events).recover(
+        "run",
+        "run-1",
+        reducers={"RunCreated": lambda state, event: "Created"},
+        effect_hook=effect_hook,
+    )
+
+    assert seen_event_types == ["OutcomeUnknown"]
+
+
+def test_unknown_event_hook_failure_is_wrapped_without_leaking_its_message(tmp_path):
+    database = tmp_path / "recovery.db"
+    events = SQLiteEventStore(database)
+    events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+
+    def unknown_event_hook(state, event):
+        raise ValueError("secret-payload-should-not-escape")
+
+    with pytest.raises(EventChainFailure) as failure:
+        RecoveryBootstrap(events).recover(
+            "run",
+            "run-1",
+            reducers={},
+            unknown_event_hook=unknown_event_hook,
+        )
+
+    assert isinstance(failure.value.__cause__, ValueError)
+    assert "secret-payload" not in str(failure.value)
+
+
+def test_recovery_uses_an_atomic_event_stream_snapshot_reader(tmp_path):
+    database = tmp_path / "recovery.db"
+    source_store = SQLiteEventStore(database)
+    source_events = source_store.append(
+        "run", "run-1", 0, [EventDraft("RunCreated", {})], "create"
+    )
+
+    class AtomicReader:
+        def read_stream_snapshot(self, aggregate_type, aggregate_id):
+            return source_events, 1
+
+        def read_stream(self, aggregate_type, aggregate_id, after_version=0):
+            raise AssertionError("recovery used non-atomic stream reads")
+
+        def current_version(self, aggregate_type, aggregate_id):
+            raise AssertionError("recovery used a second version read")
+
+    result = RecoveryBootstrap(AtomicReader()).recover(
+        "run",
+        "run-1",
+        reducers={"RunCreated": lambda state, event: "Created"},
+    )
+
+    assert result.state == "Created"
+
+
+def test_lease_hook_failure_is_wrapped_as_event_chain_failure(tmp_path):
+    database = tmp_path / "recovery.db"
+    events = SQLiteEventStore(database)
+    events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+
+    with pytest.raises(EventChainFailure) as failure:
+        RecoveryBootstrap(events).recover(
+            "run",
+            "run-1",
+            reducers={"RunCreated": lambda state, event: "Created"},
+            lease_hook=lambda state: (_ for _ in ()).throw(ValueError("secret")),
+        )
+
+    assert isinstance(failure.value.__cause__, ValueError)

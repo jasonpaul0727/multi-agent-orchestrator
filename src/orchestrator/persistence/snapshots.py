@@ -11,13 +11,21 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator, model_validator
 
-from .events import _validate_json_value, _validate_non_blank, _validate_sha256_hex
+from .events import (
+    _freeze_json_value,
+    _validate_json_value,
+    _validate_non_blank,
+    _validate_sha256_hex,
+)
 from .sqlite_event_store import (
     _open_connection,
     _sha256_json,
     _validate_version,
     initialize_schema,
 )
+
+
+_MISSING = object()
 
 
 class Snapshot(BaseModel):
@@ -31,8 +39,9 @@ class Snapshot(BaseModel):
     state: Any
     state_hash: StrictStr = Field(min_length=64, max_length=64)
     schema_version: StrictInt = Field(gt=0)
-    source_event_id: StrictStr = Field(min_length=1)
+    source_event_id: StrictStr | None = None
     created_at: datetime
+    metadata_hash: StrictStr | None = None
 
     @property
     def version(self) -> int:
@@ -46,21 +55,35 @@ class Snapshot(BaseModel):
     def source_version(self) -> int:
         return self.event_version
 
-    @field_validator("aggregate_type", "aggregate_id", "source_event_id", mode="before")
+    @field_validator("aggregate_type", "aggregate_id", mode="before")
     @classmethod
     def validate_identifiers(cls, value: Any, info: Any) -> Any:
         return _validate_non_blank(value, info.field_name)
+
+    @field_validator("source_event_id", mode="before")
+    @classmethod
+    def validate_source_event_id(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        return _validate_non_blank(value, "source_event_id")
 
     @field_validator("state", mode="before")
     @classmethod
     def validate_state(cls, value: Any) -> Any:
         _validate_json_value(value, path="state")
-        return value
+        return _freeze_json_value(value)
 
     @field_validator("state_hash", mode="before")
     @classmethod
     def validate_state_hash(cls, value: Any) -> Any:
         return _validate_sha256_hex(value, "state_hash")
+
+    @field_validator("metadata_hash", mode="before")
+    @classmethod
+    def validate_metadata_hash(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        return _validate_sha256_hex(value, "metadata_hash")
 
     @model_validator(mode="after")
     def validate_hash(self) -> "Snapshot":
@@ -70,6 +93,16 @@ class Snapshot(BaseModel):
             raise ValueError("state is not canonically serializable") from exc
         if not hmac.compare_digest(computed, self.state_hash):
             raise ValueError("state_hash does not match state")
+        if self.metadata_hash is not None:
+            expected_metadata_hash = _metadata_hash(
+                self.aggregate_type,
+                self.aggregate_id,
+                self.event_version,
+                self.schema_version,
+                self.source_event_id,
+            )
+            if not hmac.compare_digest(expected_metadata_hash, self.metadata_hash):
+                raise ValueError("metadata_hash does not match snapshot metadata")
         return self
 
 
@@ -98,6 +131,11 @@ class SnapshotStore:
             self._owns_connection = False
         else:
             self._connection = _open_connection(database)
+        # Raw sqlite3.connect() uses tuple rows by default.  Use named rows
+        # when possible; _row_value below still accepts tuple rows from
+        # caller-managed connections and older adapters.
+        if self._connection.row_factory is None:
+            self._connection.row_factory = sqlite3.Row
         initialize_schema(self._connection)
 
     def save_snapshot(
@@ -116,9 +154,8 @@ class SnapshotStore:
         aggregate_id = _validate_non_blank(aggregate_id, "aggregate_id")
         event_version = _validate_positive_version(event_version, "event_version")
         schema_version = _validate_positive_version(schema_version, "schema_version")
-        if source_event_id is None:
-            raise ValueError("source_event_id must be a non-blank string")
-        source_event_id = _validate_non_blank(source_event_id, "source_event_id")
+        if source_event_id is not None:
+            source_event_id = _validate_non_blank(source_event_id, "source_event_id")
 
         state_json = _canonical_state_json(state)
         computed_hash = _sha256_json(state)
@@ -129,6 +166,13 @@ class SnapshotStore:
         else:
             state_hash = computed_hash
         created_at = datetime.now(timezone.utc)
+        metadata_hash = _metadata_hash(
+            aggregate_type,
+            aggregate_id,
+            event_version,
+            schema_version,
+            source_event_id,
+        )
         snapshot = Snapshot(
             aggregate_type=aggregate_type,
             aggregate_id=aggregate_id,
@@ -138,17 +182,25 @@ class SnapshotStore:
             schema_version=schema_version,
             source_event_id=source_event_id,
             created_at=created_at,
+            metadata_hash=metadata_hash,
         )
 
         connection = self._connection
-        connection.execute("BEGIN IMMEDIATE")
+        started_transaction = not connection.in_transaction
+        savepoint: str | None = None
+        if started_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        else:
+            savepoint = "orchestrator_snapshot_write"
+            connection.execute(f"SAVEPOINT {savepoint}")
         try:
             connection.execute(
                 """
                 INSERT INTO snapshots (
                     aggregate_type, aggregate_id, event_version, state_json,
-                    state_hash, schema_version, source_event_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    state_hash, schema_version, source_event_id, created_at,
+                    metadata_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (aggregate_type, aggregate_id) DO UPDATE SET
                     event_version = excluded.event_version,
                     state_json = excluded.state_json,
@@ -166,16 +218,92 @@ class SnapshotStore:
                     snapshot.schema_version,
                     snapshot.source_event_id,
                     snapshot.created_at.isoformat(),
+                    snapshot.metadata_hash,
                 ),
             )
-            connection.commit()
+            if started_transaction:
+                connection.commit()
+            else:
+                connection.execute(f"RELEASE SAVEPOINT {savepoint}")
         except BaseException:
-            connection.rollback()
+            if started_transaction:
+                connection.rollback()
+            elif savepoint is not None:
+                try:
+                    connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                finally:
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
         return snapshot
 
-    # Concise alias for clients that use ``save`` as their persistence verb.
-    save = save_snapshot
+    def save(
+        self,
+        aggregate_type: str,
+        aggregate_id: str,
+        *args: Any,
+        state: Any = _MISSING,
+        version: int | None = None,
+        event_version: int | None = None,
+        schema_version: int = 1,
+        source_event_id: str | None = None,
+        state_hash: str | None = None,
+    ) -> Snapshot:
+        """Persist a snapshot using the documented ``version=`` spelling.
+
+        The legacy positional order ``(event_version, state, schema_version,
+        source_event_id)`` is accepted as well as ``(state, version)``.
+        """
+
+        if args:
+            if isinstance(args[0], int) and not isinstance(args[0], bool):
+                if event_version is not None:
+                    raise TypeError("event version was provided twice")
+                event_version = args[0]
+                if len(args) > 1:
+                    if state is not _MISSING:
+                        raise TypeError("state was provided twice")
+                    state = args[1]
+                if len(args) > 2:
+                    schema_version = args[2]
+                if len(args) > 3:
+                    source_event_id = args[3]
+                if len(args) > 4:
+                    state_hash = args[4]
+                if len(args) > 5:
+                    raise TypeError("save accepts at most five positional values")
+            else:
+                if state is not _MISSING:
+                    raise TypeError("state was provided twice")
+                state = args[0]
+                if len(args) > 1:
+                    if version is not None:
+                        raise TypeError("version was provided twice")
+                    version = args[1]
+                if len(args) > 2:
+                    schema_version = args[2]
+                if len(args) > 3:
+                    source_event_id = args[3]
+                if len(args) > 4:
+                    state_hash = args[4]
+                if len(args) > 5:
+                    raise TypeError("save accepts at most five positional values")
+        if event_version is None:
+            event_version = version
+        elif version is not None and event_version != version:
+            raise TypeError("version and event_version disagree")
+        if event_version is None:
+            raise TypeError("save requires version or event_version")
+        if state is _MISSING:
+            raise TypeError("save requires state")
+        return self.save_snapshot(
+            aggregate_type,
+            aggregate_id,
+            event_version,
+            state,
+            schema_version,
+            source_event_id,
+            state_hash,
+        )
 
     def load_valid(
         self,
@@ -189,6 +317,8 @@ class SnapshotStore:
         schema_version: int | None = None,
         source_version: int | None = None,
         source_event_id: str | None = None,
+        expected_version: int | None = None,
+        version: int | None = None,
     ) -> Snapshot | None:
         """Load a snapshot only when all persisted and expected facts agree.
 
@@ -214,6 +344,14 @@ class SnapshotStore:
             ):
                 return None
             expected_source_event_id = source_event_id
+        if version is not None:
+            if expected_version is not None and expected_version != version:
+                return None
+            expected_version = version
+        if expected_version is not None:
+            if expected_event_version is not None and expected_event_version != expected_version:
+                return None
+            expected_event_version = expected_version
         for value, name in (
             (expected_schema_version, "expected_schema_version"),
             (expected_source_version, "expected_source_version"),
@@ -229,7 +367,8 @@ class SnapshotStore:
         row = self._connection.execute(
             """
             SELECT aggregate_type, aggregate_id, event_version, state_json,
-                   state_hash, schema_version, source_event_id, created_at
+                   state_hash, schema_version, source_event_id, created_at,
+                   metadata_hash
             FROM snapshots
             WHERE aggregate_type = ? AND aggregate_id = ?
             """,
@@ -262,21 +401,42 @@ class SnapshotStore:
     @staticmethod
     def _row_to_snapshot(row: sqlite3.Row) -> Snapshot | None:
         try:
-            state = _decode_state(row["state_json"])
+            state = _decode_state(_row_value(row, "state_json", 3))
             # Validate the stored hash before constructing the model.  This
             # ensures malformed rows never expose their payload to callers.
-            stored_hash = _validate_sha256_hex(row["state_hash"], "state_hash")
+            stored_hash = _validate_sha256_hex(
+                _row_value(row, "state_hash", 4), "state_hash"
+            )
             if not hmac.compare_digest(_sha256_json(state), stored_hash):
                 return None
+            metadata_hash = _row_value(row, "metadata_hash", 8, default=None)
+            if metadata_hash is None:
+                return None
+            metadata_hash = _validate_sha256_hex(metadata_hash, "metadata_hash")
+            aggregate_type = _row_value(row, "aggregate_type", 0)
+            aggregate_id = _row_value(row, "aggregate_id", 1)
+            event_version = _row_value(row, "event_version", 2)
+            schema_version = _row_value(row, "schema_version", 5)
+            source_event_id = _row_value(row, "source_event_id", 6)
+            expected_metadata_hash = _metadata_hash(
+                aggregate_type,
+                aggregate_id,
+                event_version,
+                schema_version,
+                source_event_id,
+            )
+            if not hmac.compare_digest(expected_metadata_hash, metadata_hash):
+                return None
             return Snapshot(
-                aggregate_type=row["aggregate_type"],
-                aggregate_id=row["aggregate_id"],
-                event_version=row["event_version"],
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+                event_version=event_version,
                 state=state,
                 state_hash=stored_hash,
-                schema_version=row["schema_version"],
-                source_event_id=row["source_event_id"],
-                created_at=datetime.fromisoformat(row["created_at"]),
+                schema_version=schema_version,
+                source_event_id=source_event_id,
+                created_at=datetime.fromisoformat(_row_value(row, "created_at", 7)),
+                metadata_hash=metadata_hash,
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -321,6 +481,42 @@ def _decode_state(value: Any) -> Any:
     if not isinstance(value, str):
         raise ValueError("state_json must be text")
     return json.loads(value)
+
+
+def _metadata_hash(
+    aggregate_type: str,
+    aggregate_id: str,
+    event_version: int,
+    schema_version: int,
+    source_event_id: str | None,
+) -> str:
+    return _sha256_json(
+        {
+            "aggregate_id": aggregate_id,
+            "aggregate_type": aggregate_type,
+            "event_version": event_version,
+            "schema_version": schema_version,
+            "source_event_id": source_event_id,
+        }
+    )
+
+
+def _row_value(
+    row: sqlite3.Row | tuple[Any, ...],
+    name: str,
+    index: int,
+    *,
+    default: Any = _MISSING,
+) -> Any:
+    try:
+        return row[name]  # type: ignore[index]
+    except (IndexError, KeyError, TypeError):
+        try:
+            return row[index]
+        except (IndexError, TypeError):
+            if default is not _MISSING:
+                return default
+            raise
 
 
 __all__ = ["Snapshot", "SnapshotRecord", "SnapshotStore"]

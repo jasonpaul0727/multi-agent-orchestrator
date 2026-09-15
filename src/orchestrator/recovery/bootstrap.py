@@ -19,6 +19,16 @@ Reducer: TypeAlias = Callable[[Any, StoredEvent], Any]
 ProjectionReducer: TypeAlias = Callable[[Any, StoredEvent], Any]
 Hook: TypeAlias = Callable[..., Any]
 
+_LEASE_EVENT_TYPES = {"LeaseExpired", "LeaseExpiryDetected", "ExpiredLease"}
+_UNKNOWN_EFFECT_EVENT_TYPES = {
+    "UnknownEffect",
+    "EffectUnknown",
+    "UnknownEffectDetected",
+    "EffectOutcomeUnknown",
+    "OutcomeCannotBeDetermined",
+    "OutcomeUnknown",
+}
+
 
 class RecoveryFailure(RuntimeError):
     """Base error for a recovery invariant that prevents safe bootstrap."""
@@ -185,12 +195,12 @@ class RecoveryBootstrap:
         )
         expired_leases = _event_findings(
             all_events,
-            {"LeaseExpired", "LeaseExpiryDetected", "ExpiredLease"},
+            _LEASE_EVENT_TYPES,
             "lease_id",
         )
         unknown_effects = _event_findings(
             all_events,
-            {"UnknownEffect", "EffectUnknown", "UnknownEffectDetected"},
+            _UNKNOWN_EFFECT_EVENT_TYPES,
             "effect_id",
         )
         expired_leases = _merge_hook_findings(
@@ -198,18 +208,20 @@ class RecoveryBootstrap:
             lease_hook,
             state,
             all_events,
+            [event for event in all_events if event.event_type in _LEASE_EVENT_TYPES],
             aggregate_type,
             aggregate_id,
-            invariant="security",
+            invariant="event_chain",
         )
         unknown_effects = _merge_hook_findings(
             unknown_effects,
             effect_hook,
             state,
             all_events,
+            [event for event in all_events if event.event_type in _UNKNOWN_EFFECT_EVENT_TYPES],
             aggregate_type,
             aggregate_id,
-            invariant="security",
+            invariant="event_chain",
         )
 
         return RecoveryResult(
@@ -229,8 +241,16 @@ class RecoveryBootstrap:
         self, aggregate_type: str, aggregate_id: str
     ) -> list[StoredEvent]:
         try:
-            events = self.event_store.read_stream(aggregate_type, aggregate_id)
-            current_version = self.event_store.current_version(aggregate_type, aggregate_id)
+            atomic_reader = getattr(self.event_store, "read_stream_snapshot", None)
+            if atomic_reader is None:
+                atomic_reader = getattr(self.event_store, "read_stream_with_version", None)
+            if atomic_reader is not None:
+                events, current_version = atomic_reader(aggregate_type, aggregate_id)
+            else:
+                # Compatibility fallback for lightweight adapters.  The
+                # SQLiteEventStore always supplies the atomic reader above.
+                events = self.event_store.read_stream(aggregate_type, aggregate_id)
+                current_version = self.event_store.current_version(aggregate_type, aggregate_id)
         except (EventIntegrityError, ValueError, TypeError) as exc:
             raise EventChainFailure(
                 "event stream integrity validation failed",
@@ -301,26 +321,31 @@ class RecoveryBootstrap:
         aggregate_type: str,
         aggregate_id: str,
     ) -> Any:
+        # An unresolved effect outcome is a terminal diagnostic, never a
+        # lifecycle transition.  Do not pass it to wildcard/callable
+        # reducers where it could accidentally schedule the effect again.
+        if event.event_type in _UNKNOWN_EFFECT_EVENT_TYPES:
+            return state
         if callable(reducers):
             reducer = reducers
         else:
             reducer = reducers.get(event.event_type) or reducers.get("*")
         if reducer is None:
-            if event.event_type in {
-                "LeaseExpired",
-                "LeaseExpiryDetected",
-                "ExpiredLease",
-                "UnknownEffect",
-                "EffectUnknown",
-                "UnknownEffectDetected",
-            }:
+            if event.event_type in _LEASE_EVENT_TYPES | _UNKNOWN_EFFECT_EVENT_TYPES:
                 return state
             if unknown_event_hook is not None:
-                reducer_result = _invoke_hook(
-                    unknown_event_hook,
-                    (state, event),
-                    (event,),
-                )
+                try:
+                    reducer_result = _invoke_hook(
+                        unknown_event_hook,
+                        (state, event),
+                        (event,),
+                    )
+                except BaseException as exc:
+                    raise EventChainFailure(
+                        "unknown event hook failed during recovery",
+                        aggregate_type=aggregate_type,
+                        aggregate_id=aggregate_id,
+                    ) from exc
                 return state if reducer_result is None else reducer_result
             raise EventChainFailure(
                 "event stream contains an event without a reducer",
@@ -552,6 +577,7 @@ def _merge_hook_findings(
     hook: Hook | None,
     state: Any,
     events: list[StoredEvent],
+    focused_events: list[StoredEvent],
     aggregate_type: str,
     aggregate_id: str,
     *,
@@ -562,10 +588,14 @@ def _merge_hook_findings(
     try:
         found = _invoke_hook(
             hook,
-            (state,),
-            (state, events),
-            (aggregate_type, aggregate_id, state),
-            (aggregate_type, aggregate_id, state, events),
+            *_finding_hook_candidates(
+                hook,
+                state,
+                focused_events,
+                events,
+                aggregate_type,
+                aggregate_id,
+            ),
         )
     except BaseException as exc:
         failure_type = SecurityInvariantFailure if invariant == "security" else EventChainFailure
@@ -584,6 +614,44 @@ def _merge_hook_findings(
         except TypeError:
             additions = (found,)
     return existing + additions
+
+
+def _finding_hook_candidates(
+    hook: Hook,
+    state: Any,
+    focused_events: list[StoredEvent],
+    events: list[StoredEvent],
+    aggregate_type: str,
+    aggregate_id: str,
+) -> tuple[tuple[Any, ...], ...]:
+    """Prefer findings for explicitly event-oriented one-argument hooks."""
+
+    try:
+        parameters = list(inspect.signature(hook).parameters.values())
+    except (TypeError, ValueError):
+        parameters = []
+    first_name = parameters[0].name.lower() if parameters else ""
+    wants_findings = any(
+        marker in first_name
+        for marker in ("event", "effect", "lease", "finding", "outcome")
+    )
+    if wants_findings:
+        return (
+            (focused_events,),
+            (state, focused_events),
+            (state, events),
+            (aggregate_type, aggregate_id, state),
+            (aggregate_type, aggregate_id, state, events),
+            (state,),
+        )
+    return (
+        (state,),
+        (state, focused_events),
+        (state, events),
+        (aggregate_type, aggregate_id, state),
+        (aggregate_type, aggregate_id, state, events),
+        (focused_events,),
+    )
 
 
 __all__ = [

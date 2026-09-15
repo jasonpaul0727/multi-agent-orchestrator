@@ -148,8 +148,9 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             state_json TEXT NOT NULL,
             state_hash TEXT NOT NULL,
             schema_version INTEGER NOT NULL,
-            source_event_id TEXT NOT NULL,
+            source_event_id TEXT,
             created_at TEXT NOT NULL,
+            metadata_hash TEXT,
             PRIMARY KEY (aggregate_type, aggregate_id)
         )
         """,
@@ -167,16 +168,119 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             SELECT RAISE(ABORT, 'event rows are immutable');
         END
         """,
-        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)",
     )
+    if connection.in_transaction:
+        # SQLite has no nested BEGIN.  A savepoint keeps a caller-owned
+        # transaction open while making migration DDL atomic.
+        savepoint = "orchestrator_schema_migration"
+        connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            for statement in statements:
+                connection.execute(statement)
+            _migrate_snapshot_metadata(connection)
+            connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
+            connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except BaseException:
+            try:
+                connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        return
+
     connection.execute("BEGIN IMMEDIATE")
     try:
         for statement in statements:
             connection.execute(statement)
+        _migrate_snapshot_metadata(connection)
+        connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
+        connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
         connection.commit()
     except BaseException:
         connection.rollback()
         raise
+
+
+def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
+    """Add authenticated snapshot metadata to databases from Task 3."""
+
+    columns = connection.execute("PRAGMA table_info(snapshots)").fetchall()
+    names = {row[1] for row in columns}
+    source_is_required = any(row[1] == "source_event_id" and row[3] for row in columns)
+    if "metadata_hash" not in names or source_is_required:
+        connection.execute(
+            """
+            CREATE TABLE snapshots_migration (
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                event_version INTEGER NOT NULL,
+                state_json TEXT NOT NULL,
+                state_hash TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                source_event_id TEXT,
+                created_at TEXT NOT NULL,
+                metadata_hash TEXT,
+                PRIMARY KEY (aggregate_type, aggregate_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO snapshots_migration (
+                aggregate_type, aggregate_id, event_version, state_json,
+                state_hash, schema_version, source_event_id, created_at,
+                metadata_hash
+            )
+            SELECT aggregate_type, aggregate_id, event_version, state_json,
+                   state_hash, schema_version, source_event_id, created_at,
+                   NULL
+            FROM snapshots
+            """
+        )
+        connection.execute("DROP TABLE snapshots")
+        connection.execute("ALTER TABLE snapshots_migration RENAME TO snapshots")
+
+    rows = connection.execute(
+        """
+        SELECT aggregate_type, aggregate_id, event_version, schema_version,
+               source_event_id
+        FROM snapshots
+        WHERE metadata_hash IS NULL
+        """
+    ).fetchall()
+    for row in rows:
+        metadata_hash = _snapshot_metadata_hash(
+            row[0], row[1], row[2], row[3], row[4]
+        )
+        connection.execute(
+            """
+            UPDATE snapshots
+            SET metadata_hash = ?
+            WHERE aggregate_type = ? AND aggregate_id = ?
+            """,
+            (metadata_hash, row[0], row[1]),
+        )
+
+
+def _snapshot_metadata_hash(
+    aggregate_type: str,
+    aggregate_id: str,
+    event_version: int,
+    schema_version: int,
+    source_event_id: str | None,
+) -> str:
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "aggregate_id": aggregate_id,
+                "aggregate_type": aggregate_type,
+                "event_version": event_version,
+                "schema_version": schema_version,
+                "source_event_id": source_event_id,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _draft_request_hash(stream_type: str, stream_id: str, drafts: list[EventDraft]) -> str:
@@ -374,6 +478,70 @@ class SQLiteEventStore:
             (stream_type, stream_id, after_version),
         ).fetchall()
         return [self._row_to_event(row) for row in rows]
+
+    def read_stream_with_version(
+        self,
+        stream_type: str,
+        stream_id: str,
+        after_version: int = 0,
+    ) -> tuple[list[StoredEvent], int]:
+        """Read a stream and its version from one SQLite read transaction.
+
+        Keeping both reads in one transaction prevents recovery from seeing a
+        stream's rows before a concurrent append and its version afterwards.
+        """
+
+        stream_type = _validate_identifier(stream_type, "stream_type")
+        stream_id = _validate_identifier(stream_id, "stream_id")
+        after_version = _validate_version(after_version, "after_version")
+        connection = self._connection
+        savepoint: str | None = None
+        started_transaction = not connection.in_transaction
+        if started_transaction:
+            connection.execute("BEGIN")
+        else:
+            savepoint = "orchestrator_stream_read"
+            connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            rows = connection.execute(
+                """
+                SELECT event_id, stream_type, stream_id, stream_version,
+                       event_type, schema_version, occurred_at, payload_json,
+                       payload_hash, idempotency_key, correlation_id, causation_id
+                FROM events
+                WHERE stream_type = ? AND stream_id = ? AND stream_version > ?
+                ORDER BY stream_version ASC
+                """,
+                (stream_type, stream_id, after_version),
+            ).fetchall()
+            version_row = connection.execute(
+                """
+                SELECT current_version
+                FROM stream_versions
+                WHERE stream_type = ? AND stream_id = ?
+                """,
+                (stream_type, stream_id),
+            ).fetchone()
+            events = [self._row_to_event(row) for row in rows]
+            current_version = 0 if version_row is None else version_row["current_version"]
+            if started_transaction:
+                connection.commit()
+            else:
+                connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return events, current_version
+        except BaseException:
+            if started_transaction:
+                connection.rollback()
+            elif savepoint is not None:
+                try:
+                    connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                finally:
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+
+    # Name the operation after the consistent point-in-time view as well;
+    # both spellings are kept as public compatibility aliases.
+    read_stream_snapshot = read_stream_with_version
 
     def current_version(self, stream_type: str, stream_id: str) -> int:
         stream_type = _validate_identifier(stream_type, "stream_type")
