@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 from pathlib import Path
 import sqlite3
@@ -30,6 +31,10 @@ class IdempotencyConflict(ValueError):
     """Raised when an idempotency key is reused for a different append."""
 
 
+class EventIntegrityError(RuntimeError):
+    """Raised when a persisted event fails payload or boundary validation."""
+
+
 def canonical_json(value: Any) -> str:
     """Encode JSON with stable key ordering and no insignificant whitespace."""
 
@@ -46,12 +51,19 @@ def canonical_json(value: Any) -> str:
 
 
 def _sha256_json(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+    encoded = canonical_json(value)
+    try:
+        encoded_bytes = encoded.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("value must not contain lone surrogate characters") from exc
+    return hashlib.sha256(encoded_bytes).hexdigest()
 
 
 def _validate_identifier(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-blank string")
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise ValueError(f"{field_name} must not contain lone surrogate characters")
     return value
 
 
@@ -66,6 +78,7 @@ def _open_connection(path: str | Path) -> sqlite3.Connection:
         str(path),
         timeout=5.0,
         isolation_level=None,
+        check_same_thread=True,
     )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -132,7 +145,12 @@ def _draft_request_hash(stream_type: str, stream_id: str, drafts: list[EventDraf
 
 
 class SQLiteEventStore:
-    """Append-only event storage with stream-version CAS and idempotency."""
+    """Append-only event storage with stream-version CAS and idempotency.
+
+    A store instance is thread-affine: SQLite's ``check_same_thread=True``
+    contract is enforced, so callers must create one store per worker thread.
+    Separate instances may safely point at the same database path.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self._connection = _open_connection(path)
@@ -346,20 +364,44 @@ class SQLiteEventStore:
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> StoredEvent:
-        return StoredEvent(
-            event_id=row["event_id"],
-            stream_type=row["stream_type"],
-            stream_id=row["stream_id"],
-            stream_version=row["stream_version"],
-            event_type=row["event_type"],
-            schema_version=row["schema_version"],
-            occurred_at=datetime.fromisoformat(row["occurred_at"]),
-            payload=json.loads(row["payload_json"]),
-            payload_hash=row["payload_hash"],
-            idempotency_key=row["idempotency_key"],
-            correlation_id=row["correlation_id"],
-            causation_id=row["causation_id"],
-        )
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EventIntegrityError(
+                f"event {row['event_id']!r} contains invalid payload JSON"
+            ) from exc
+        try:
+            computed_hash = _sha256_json(payload)
+        except ValueError as exc:
+            raise EventIntegrityError(
+                f"event {row['event_id']!r} contains an invalid payload"
+            ) from exc
+        stored_hash = row["payload_hash"]
+        if not isinstance(stored_hash, str) or not hmac.compare_digest(
+            computed_hash, stored_hash
+        ):
+            raise EventIntegrityError(
+                f"event {row['event_id']!r} payload_hash does not match payload"
+            )
+        try:
+            return StoredEvent(
+                event_id=row["event_id"],
+                stream_type=row["stream_type"],
+                stream_id=row["stream_id"],
+                stream_version=row["stream_version"],
+                event_type=row["event_type"],
+                schema_version=row["schema_version"],
+                occurred_at=datetime.fromisoformat(row["occurred_at"]),
+                payload=payload,
+                payload_hash=row["payload_hash"],
+                idempotency_key=row["idempotency_key"],
+                correlation_id=row["correlation_id"],
+                causation_id=row["causation_id"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise EventIntegrityError(
+                f"event {row['event_id']!r} fails persisted field validation"
+            ) from exc
 
     def close(self) -> None:
         self._connection.close()

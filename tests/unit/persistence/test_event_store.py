@@ -1,10 +1,13 @@
 from datetime import datetime
+import sqlite3
+import threading
 
 import pytest
 from pydantic import ValidationError
 
 from orchestrator.persistence.events import EventDraft
 from orchestrator.persistence.sqlite_event_store import (
+    EventIntegrityError,
     IdempotencyConflict,
     SQLiteEventStore,
     StaleStream,
@@ -156,3 +159,89 @@ def test_stored_event_has_frozen_and_typed_boundary_fields(tmp_path):
     assert isinstance(event.occurred_at, datetime)
     with pytest.raises(ValidationError):
         event.stream_version = 2
+
+
+def test_stored_event_payload_is_deeply_immutable_and_hash_consistent(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    source_payload = {"nested": {"value": 1}, "items": ["original"]}
+    event = store.append(
+        "run", "run-1", 0, [EventDraft("RunCreated", source_payload)], "key"
+    )[0]
+
+    source_payload["nested"]["value"] = 99
+    source_payload["items"].append("source-only")
+
+    with pytest.raises(TypeError):
+        event.payload["new"] = "not allowed"
+    with pytest.raises(TypeError):
+        event.payload["nested"]["value"] = 2
+    with pytest.raises(TypeError):
+        event.payload["items"].append("not allowed")
+
+    reread = store.read_stream("run", "run-1")[0]
+    assert reread.payload == {"nested": {"value": 1}, "items": ["original"]}
+    assert reread.payload_hash == event.payload_hash
+
+
+def test_read_stream_rejects_a_tampered_payload_hash(tmp_path):
+    database = tmp_path / "events.db"
+    store = SQLiteEventStore(database)
+    event = store.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "key")[0]
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE events SET payload_hash = ? WHERE event_id = ?",
+            ("0" * 64, event.event_id),
+        )
+
+    with pytest.raises(EventIntegrityError, match="payload_hash"):
+        store.read_stream("run", "run-1")
+
+
+def test_read_stream_rejects_a_tampered_payload(tmp_path):
+    database = tmp_path / "events.db"
+    store = SQLiteEventStore(database)
+    event = store.append(
+        "run", "run-1", 0, [EventDraft("RunCreated", {"value": "original"})], "key"
+    )[0]
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE events SET payload_json = ? WHERE event_id = ?",
+            ('{"value":"tampered"}', event.event_id),
+        )
+
+    with pytest.raises(EventIntegrityError, match="payload_hash"):
+        store.read_stream("run", "run-1")
+
+
+def test_store_connection_is_thread_affine(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    errors = []
+
+    def read_from_another_thread():
+        try:
+            store.current_version("run", "run-1")
+        except BaseException as exc:  # sqlite3 raises ProgrammingError here.
+            errors.append(exc)
+
+    thread = threading.Thread(target=read_from_another_thread)
+    thread.start()
+    thread.join()
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], sqlite3.ProgrammingError)
+    assert "thread" in (SQLiteEventStore.__doc__ or "").lower()
+
+
+def test_identifier_and_event_payload_surrogates_are_rejected_with_field_context(tmp_path):
+    with pytest.raises(ValidationError, match="event_type"):
+        EventDraft("bad\ud800", {})
+    with pytest.raises(ValidationError, match="payload"):
+        EventDraft("RunCreated", {"text": "bad\ud800"})
+
+    store = SQLiteEventStore(tmp_path / "events.db")
+    with pytest.raises(ValueError, match="stream_id"):
+        store.append("run", "bad\ud800", 0, [EventDraft("RunCreated", {})], "key")
+    with pytest.raises(ValueError, match="idempotency_key"):
+        store.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "bad\ud800")
