@@ -1,0 +1,371 @@
+"""SQLite implementation of the append-only event store."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+from typing import Any
+
+from orchestrator.identifiers import new_id
+
+from .events import EventDraft, StoredEvent
+
+
+class StaleStream(RuntimeError):
+    """Raised when a compare-and-swap stream version is no longer current."""
+
+    def __init__(self, expected_version: int, current_version: int) -> None:
+        self.expected_version = expected_version
+        self.current_version = current_version
+        super().__init__(
+            f"expected stream version {expected_version}, current version is {current_version}"
+        )
+
+
+class IdempotencyConflict(ValueError):
+    """Raised when an idempotency key is reused for a different append."""
+
+
+def canonical_json(value: Any) -> str:
+    """Encode JSON with stable key ordering and no insignificant whitespace."""
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("value must be JSON serializable") from exc
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _validate_identifier(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-blank string")
+    return value
+
+
+def _validate_version(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _open_connection(path: str | Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        str(path),
+        timeout=5.0,
+        isolation_level=None,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    return connection
+
+
+def initialize_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS stream_versions (
+            stream_type TEXT NOT NULL,
+            stream_id TEXT NOT NULL,
+            current_version INTEGER NOT NULL CHECK (current_version >= 0),
+            PRIMARY KEY (stream_type, stream_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS events (
+            event_id TEXT NOT NULL UNIQUE,
+            stream_type TEXT NOT NULL,
+            stream_id TEXT NOT NULL,
+            stream_version INTEGER NOT NULL CHECK (stream_version > 0),
+            event_type TEXT NOT NULL,
+            schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+            occurred_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            correlation_id TEXT,
+            causation_id TEXT,
+            PRIMARY KEY (event_id),
+            UNIQUE (stream_type, stream_id, stream_version),
+            FOREIGN KEY (stream_type, stream_id)
+                REFERENCES stream_versions (stream_type, stream_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS idempotency_records (
+            stream_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            stream_type TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            first_version INTEGER NOT NULL CHECK (first_version > 0),
+            last_version INTEGER NOT NULL CHECK (last_version >= first_version),
+            PRIMARY KEY (stream_id, idempotency_key),
+            FOREIGN KEY (stream_type, stream_id)
+                REFERENCES stream_versions (stream_type, stream_id)
+        );
+        """
+    )
+
+
+def _draft_request_hash(stream_type: str, stream_id: str, drafts: list[EventDraft]) -> str:
+    return _sha256_json(
+        {
+            "stream_type": stream_type,
+            "stream_id": stream_id,
+            "events": [
+                {"event_type": draft.event_type, "payload": draft.payload}
+                for draft in drafts
+            ],
+        }
+    )
+
+
+class SQLiteEventStore:
+    """Append-only event storage with stream-version CAS and idempotency."""
+
+    def __init__(self, path: str | Path) -> None:
+        self._connection = _open_connection(path)
+        initialize_schema(self._connection)
+
+    def append(
+        self,
+        stream_type: str,
+        stream_id: str,
+        expected_version: int,
+        events: Iterable[EventDraft],
+        idempotency_key: str,
+    ) -> list[StoredEvent]:
+        stream_type = _validate_identifier(stream_type, "stream_type")
+        stream_id = _validate_identifier(stream_id, "stream_id")
+        expected_version = _validate_version(expected_version, "expected_version")
+        idempotency_key = _validate_identifier(idempotency_key, "idempotency_key")
+
+        try:
+            drafts = list(events)
+        except TypeError as exc:
+            raise ValueError("events must be an iterable of EventDraft objects") from exc
+        if not drafts:
+            raise ValueError("events must contain at least one EventDraft")
+        if not all(isinstance(draft, EventDraft) for draft in drafts):
+            raise ValueError("events must contain only EventDraft objects")
+
+        request_hash = _draft_request_hash(stream_type, stream_id, drafts)
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            idempotency_row = connection.execute(
+                """
+                SELECT stream_type, request_hash, first_version, last_version
+                FROM idempotency_records
+                WHERE stream_id = ? AND idempotency_key = ?
+                """,
+                (stream_id, idempotency_key),
+            ).fetchone()
+            if idempotency_row is not None:
+                if (
+                    idempotency_row["stream_type"] != stream_type
+                    or idempotency_row["request_hash"] != request_hash
+                ):
+                    raise IdempotencyConflict(
+                        f"idempotency key {idempotency_key!r} was already used for a different append"
+                    )
+                original_events = self._read_rows(
+                    stream_type,
+                    stream_id,
+                    first_version=idempotency_row["first_version"],
+                    last_version=idempotency_row["last_version"],
+                )
+                if len(original_events) != (
+                    idempotency_row["last_version"] - idempotency_row["first_version"] + 1
+                ):
+                    raise RuntimeError("idempotency record points to missing events")
+                connection.commit()
+                return original_events
+
+            version_row = connection.execute(
+                """
+                SELECT current_version
+                FROM stream_versions
+                WHERE stream_type = ? AND stream_id = ?
+                """,
+                (stream_type, stream_id),
+            ).fetchone()
+            current_version = 0 if version_row is None else version_row["current_version"]
+            if current_version != expected_version:
+                raise StaleStream(expected_version, current_version)
+
+            first_version = current_version + 1
+            last_version = current_version + len(drafts)
+            if version_row is None:
+                connection.execute(
+                    """
+                    INSERT INTO stream_versions (stream_type, stream_id, current_version)
+                    VALUES (?, ?, ?)
+                    """,
+                    (stream_type, stream_id, last_version),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE stream_versions
+                    SET current_version = ?
+                    WHERE stream_type = ? AND stream_id = ?
+                    """,
+                    (last_version, stream_type, stream_id),
+                )
+
+            stored_events: list[StoredEvent] = []
+            for offset, draft in enumerate(drafts):
+                occurred_at = datetime.now(timezone.utc)
+                stored_event = StoredEvent(
+                    event_id=new_id(),
+                    stream_type=stream_type,
+                    stream_id=stream_id,
+                    stream_version=first_version + offset,
+                    event_type=draft.event_type,
+                    schema_version=1,
+                    occurred_at=occurred_at,
+                    payload=draft.payload,
+                    payload_hash=_sha256_json(draft.payload),
+                    idempotency_key=idempotency_key,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO events (
+                        event_id, stream_type, stream_id, stream_version,
+                        event_type, schema_version, occurred_at, payload_json,
+                        payload_hash, idempotency_key, correlation_id, causation_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        stored_event.event_id,
+                        stored_event.stream_type,
+                        stored_event.stream_id,
+                        stored_event.stream_version,
+                        stored_event.event_type,
+                        stored_event.schema_version,
+                        stored_event.occurred_at.isoformat(),
+                        canonical_json(stored_event.payload),
+                        stored_event.payload_hash,
+                        stored_event.idempotency_key,
+                        stored_event.correlation_id,
+                        stored_event.causation_id,
+                    ),
+                )
+                stored_events.append(stored_event)
+
+            connection.execute(
+                """
+                INSERT INTO idempotency_records (
+                    stream_id, idempotency_key, stream_type, request_hash,
+                    first_version, last_version
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    stream_id,
+                    idempotency_key,
+                    stream_type,
+                    request_hash,
+                    first_version,
+                    last_version,
+                ),
+            )
+            connection.commit()
+            return stored_events
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def read_stream(
+        self,
+        stream_type: str,
+        stream_id: str,
+        after_version: int = 0,
+    ) -> list[StoredEvent]:
+        stream_type = _validate_identifier(stream_type, "stream_type")
+        stream_id = _validate_identifier(stream_id, "stream_id")
+        after_version = _validate_version(after_version, "after_version")
+        rows = self._connection.execute(
+            """
+            SELECT event_id, stream_type, stream_id, stream_version,
+                   event_type, schema_version, occurred_at, payload_json,
+                   payload_hash, idempotency_key, correlation_id, causation_id
+            FROM events
+            WHERE stream_type = ? AND stream_id = ? AND stream_version > ?
+            ORDER BY stream_version ASC
+            """,
+            (stream_type, stream_id, after_version),
+        ).fetchall()
+        return [self._row_to_event(row) for row in rows]
+
+    def current_version(self, stream_type: str, stream_id: str) -> int:
+        stream_type = _validate_identifier(stream_type, "stream_type")
+        stream_id = _validate_identifier(stream_id, "stream_id")
+        row = self._connection.execute(
+            """
+            SELECT current_version
+            FROM stream_versions
+            WHERE stream_type = ? AND stream_id = ?
+            """,
+            (stream_type, stream_id),
+        ).fetchone()
+        return 0 if row is None else row["current_version"]
+
+    def _read_rows(
+        self,
+        stream_type: str,
+        stream_id: str,
+        *,
+        first_version: int,
+        last_version: int,
+    ) -> list[StoredEvent]:
+        rows = self._connection.execute(
+            """
+            SELECT event_id, stream_type, stream_id, stream_version,
+                   event_type, schema_version, occurred_at, payload_json,
+                   payload_hash, idempotency_key, correlation_id, causation_id
+            FROM events
+            WHERE stream_type = ? AND stream_id = ?
+              AND stream_version BETWEEN ? AND ?
+            ORDER BY stream_version ASC
+            """,
+            (stream_type, stream_id, first_version, last_version),
+        ).fetchall()
+        return [self._row_to_event(row) for row in rows]
+
+    @staticmethod
+    def _row_to_event(row: sqlite3.Row) -> StoredEvent:
+        return StoredEvent(
+            event_id=row["event_id"],
+            stream_type=row["stream_type"],
+            stream_id=row["stream_id"],
+            stream_version=row["stream_version"],
+            event_type=row["event_type"],
+            schema_version=row["schema_version"],
+            occurred_at=datetime.fromisoformat(row["occurred_at"]),
+            payload=json.loads(row["payload_json"]),
+            payload_hash=row["payload_hash"],
+            idempotency_key=row["idempotency_key"],
+            correlation_id=row["correlation_id"],
+            causation_id=row["causation_id"],
+        )
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def __enter__(self) -> "SQLiteEventStore":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
