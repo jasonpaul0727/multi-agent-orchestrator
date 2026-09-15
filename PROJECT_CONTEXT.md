@@ -36,15 +36,17 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 
 权限、安全、隔离与审批设计已逐节获得用户确认；正式规格位于 `docs/superpowers/specs/2026-09-13-permissions-security-isolation-approval-design.md`，当前等待用户审阅书面规格。
 
-持久化、成本统计、可观测性和测试方案的 SQLite 本地优先方向已于 2026-09-14 获用户确认；正式规格位于 `docs/superpowers/specs/2026-09-14-persistence-cost-observability-testing-design.md`，当前等待用户审阅书面规格。
+持久化、成本统计、可观测性和测试方案的 SQLite 本地优先方向已于 2026-09-14 获用户确认；正式规格位于 `docs/superpowers/specs/2026-09-14-persistence-cost-observability-testing-design.md`，已完成书面审阅。
+
+持久化、成本统计、可观测性和测试方案书面规格已获用户审阅确认；对应实施计划位于 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md`，尚未开始编码。
 
 ## 待确认的设计部分
 
-权限、安全、隔离与审批，以及持久化、成本统计、可观测性和测试方案的书面规格仍待用户审阅。实施层面的 SQLite schema、Python 接口、迁移、观测导出和测试夹具尚未开始。
+权限、安全、隔离与审批书面规格仍待最终审阅。持久化、成本统计、可观测性和测试方案已完成书面审阅，但实施层面的 SQLite schema、Python 接口、迁移、观测导出和测试夹具尚未开始。
 
 ## 后续设计顺序
 
 1. 用户审阅并批准权限、安全、隔离与审批书面规格。
-2. 用户审阅并批准持久化、成本统计、可观测性和测试书面规格。
-3. 汇总并审阅完整产品设计文档。
-4. 用户批准完整设计文档后，编写实施计划，再开始编码。
+2. 汇总并审阅完整产品设计文档和各模块实施边界。
+3. 为生命周期、模型路由、权限安全、CLI/MCP 等模块编写实施计划。
+4. 用户批准完整实施计划后，按计划开始编码。
