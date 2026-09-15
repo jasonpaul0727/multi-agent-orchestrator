@@ -175,6 +175,37 @@ def test_load_valid_without_expected_metadata_rejects_tampered_version(tmp_path)
     assert SnapshotStore(database).load_valid("run", "run-1") is None
 
 
+def test_current_snapshot_with_missing_metadata_is_not_repaired_on_reopen(tmp_path):
+    database = tmp_path / "snapshots.db"
+    snapshots = SnapshotStore(database)
+    snapshots.save("run", "run-1", state={"status": "Created"}, version=1)
+    snapshots.close()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE snapshots SET metadata_hash = NULL WHERE aggregate_id = ?",
+            ("run-1",),
+        )
+
+    reopened = SnapshotStore(database)
+    assert reopened.load_valid("run", "run-1") is None
+
+
+def test_snapshot_timestamp_is_authenticated_metadata(tmp_path):
+    database = tmp_path / "snapshots.db"
+    snapshots = SnapshotStore(database)
+    snapshots.save("run", "run-1", state={"status": "Created"}, version=1)
+    snapshots.close()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE snapshots SET created_at = ? WHERE aggregate_id = ?",
+            ("2099-01-01T00:00:00+00:00", "run-1"),
+        )
+
+    assert SnapshotStore(database).load_valid("run", "run-1") is None
+
+
 def test_snapshot_store_accepts_a_raw_connection_with_an_active_transaction(tmp_path):
     connection = sqlite3.connect(tmp_path / "snapshots.db")
     connection.execute("BEGIN")
@@ -183,3 +214,19 @@ def test_snapshot_store_accepts_a_raw_connection_with_an_active_transaction(tmp_
     saved = snapshots.save("run", "run-1", state={"status": "Created"}, version=1)
 
     assert snapshots.load_valid("run", "run-1") == saved
+
+
+def test_save_accepts_integer_state_when_version_is_explicit(tmp_path):
+    snapshots = SnapshotStore(tmp_path / "snapshots.db")
+
+    saved = snapshots.save("counter", "counter-1", 7, version=1)
+
+    assert saved.state == 7
+    assert saved.event_version == 1
+
+
+def test_save_rejects_ambiguous_legacy_positional_order(tmp_path):
+    snapshots = SnapshotStore(tmp_path / "snapshots.db")
+
+    with pytest.raises(TypeError, match="state first"):
+        snapshots.save("run", "run-1", 1, {"status": "Created"})

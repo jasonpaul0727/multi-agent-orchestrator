@@ -307,7 +307,10 @@ class RecoveryBootstrap:
         if snapshot.event_version > len(events):
             return None
         source = events[snapshot.event_version - 1]
-        if source.event_id != snapshot.source_event_id:
+        # Source-less snapshots are valid for generic checkpointing.  The
+        # stream version is the anchor and supplies the source event at
+        # recovery time; snapshots that provide an ID must still match it.
+        if snapshot.source_event_id is not None and source.event_id != snapshot.source_event_id:
             return None
         return snapshot
 
@@ -321,15 +324,16 @@ class RecoveryBootstrap:
         aggregate_type: str,
         aggregate_id: str,
     ) -> Any:
-        # An unresolved effect outcome is a terminal diagnostic, never a
-        # lifecycle transition.  Do not pass it to wildcard/callable
-        # reducers where it could accidentally schedule the effect again.
-        if event.event_type in _UNKNOWN_EFFECT_EVENT_TYPES:
-            return state
         if callable(reducers):
+            # Generic callable reducers cannot distinguish an unresolved
+            # effect from a normal lifecycle event safely.
+            if event.event_type in _UNKNOWN_EFFECT_EVENT_TYPES:
+                return state
             reducer = reducers
         else:
-            reducer = reducers.get(event.event_type) or reducers.get("*")
+            reducer = reducers.get(event.event_type)
+            if reducer is None and event.event_type not in _UNKNOWN_EFFECT_EVENT_TYPES:
+                reducer = reducers.get("*")
         if reducer is None:
             if event.event_type in _LEASE_EVENT_TYPES | _UNKNOWN_EFFECT_EVENT_TYPES:
                 return state

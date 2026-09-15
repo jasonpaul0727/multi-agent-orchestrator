@@ -241,26 +241,29 @@ def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
         connection.execute("DROP TABLE snapshots")
         connection.execute("ALTER TABLE snapshots_migration RENAME TO snapshots")
 
-    rows = connection.execute(
-        """
-        SELECT aggregate_type, aggregate_id, event_version, schema_version,
-               source_event_id
-        FROM snapshots
-        WHERE metadata_hash IS NULL
-        """
-    ).fetchall()
-    for row in rows:
-        metadata_hash = _snapshot_metadata_hash(
-            row[0], row[1], row[2], row[3], row[4]
-        )
-        connection.execute(
+        # Only rows copied out of the pre-v2 table are missing authenticated
+        # metadata.  Current-schema NULLs are tampering/corruption and must
+        # remain unusable rather than being silently repaired at open time.
+        rows = connection.execute(
             """
-            UPDATE snapshots
-            SET metadata_hash = ?
-            WHERE aggregate_type = ? AND aggregate_id = ?
-            """,
-            (metadata_hash, row[0], row[1]),
-        )
+            SELECT aggregate_type, aggregate_id, event_version, schema_version,
+                   source_event_id, created_at
+            FROM snapshots
+            WHERE metadata_hash IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            metadata_hash = _snapshot_metadata_hash(
+                row[0], row[1], row[2], row[3], row[4], row[5]
+            )
+            connection.execute(
+                """
+                UPDATE snapshots
+                SET metadata_hash = ?
+                WHERE aggregate_type = ? AND aggregate_id = ?
+                """,
+                (metadata_hash, row[0], row[1]),
+            )
 
 
 def _snapshot_metadata_hash(
@@ -269,6 +272,7 @@ def _snapshot_metadata_hash(
     event_version: int,
     schema_version: int,
     source_event_id: str | None,
+    created_at: str,
 ) -> str:
     return hashlib.sha256(
         canonical_json(
@@ -278,6 +282,7 @@ def _snapshot_metadata_hash(
                 "event_version": event_version,
                 "schema_version": schema_version,
                 "source_event_id": source_event_id,
+                "created_at": created_at,
             }
         ).encode("utf-8")
     ).hexdigest()

@@ -100,6 +100,7 @@ class Snapshot(BaseModel):
                 self.event_version,
                 self.schema_version,
                 self.source_event_id,
+                self.created_at.isoformat(),
             )
             if not hmac.compare_digest(expected_metadata_hash, self.metadata_hash):
                 raise ValueError("metadata_hash does not match snapshot metadata")
@@ -172,6 +173,7 @@ class SnapshotStore:
             event_version,
             schema_version,
             source_event_id,
+            created_at.isoformat(),
         )
         snapshot = Snapshot(
             aggregate_type=aggregate_type,
@@ -240,61 +242,35 @@ class SnapshotStore:
         self,
         aggregate_type: str,
         aggregate_id: str,
-        *args: Any,
         state: Any = _MISSING,
         version: int | None = None,
+        *,
         event_version: int | None = None,
         schema_version: int = 1,
         source_event_id: str | None = None,
         state_hash: str | None = None,
     ) -> Snapshot:
-        """Persist a snapshot using the documented ``version=`` spelling.
+        """Persist ``state`` at ``version`` using a deterministic signature.
 
-        The legacy positional order ``(event_version, state, schema_version,
-        source_event_id)`` is accepted as well as ``(state, version)``.
+        ``save_snapshot`` remains the lower-level API with event-version-first
+        arguments.  ``save`` intentionally accepts state-first arguments only
+        so an integer state cannot be confused with an event version.
         """
 
-        if args:
-            if isinstance(args[0], int) and not isinstance(args[0], bool):
-                if event_version is not None:
-                    raise TypeError("event version was provided twice")
-                event_version = args[0]
-                if len(args) > 1:
-                    if state is not _MISSING:
-                        raise TypeError("state was provided twice")
-                    state = args[1]
-                if len(args) > 2:
-                    schema_version = args[2]
-                if len(args) > 3:
-                    source_event_id = args[3]
-                if len(args) > 4:
-                    state_hash = args[4]
-                if len(args) > 5:
-                    raise TypeError("save accepts at most five positional values")
-            else:
-                if state is not _MISSING:
-                    raise TypeError("state was provided twice")
-                state = args[0]
-                if len(args) > 1:
-                    if version is not None:
-                        raise TypeError("version was provided twice")
-                    version = args[1]
-                if len(args) > 2:
-                    schema_version = args[2]
-                if len(args) > 3:
-                    source_event_id = args[3]
-                if len(args) > 4:
-                    state_hash = args[4]
-                if len(args) > 5:
-                    raise TypeError("save accepts at most five positional values")
+        if state is _MISSING:
+            raise TypeError("save requires state as its third argument")
+        if version is not None and (
+            isinstance(version, bool) or not isinstance(version, int)
+        ):
+            raise TypeError(
+                "save expects state first and an integer version; use save_snapshot for legacy order"
+            )
         if event_version is None:
             event_version = version
         elif version is not None and event_version != version:
             raise TypeError("version and event_version disagree")
         if event_version is None:
             raise TypeError("save requires version or event_version")
-        if state is _MISSING:
-            raise TypeError("save requires state")
         return self.save_snapshot(
             aggregate_type,
             aggregate_id,
@@ -418,12 +394,14 @@ class SnapshotStore:
             event_version = _row_value(row, "event_version", 2)
             schema_version = _row_value(row, "schema_version", 5)
             source_event_id = _row_value(row, "source_event_id", 6)
+            created_at = datetime.fromisoformat(_row_value(row, "created_at", 7))
             expected_metadata_hash = _metadata_hash(
                 aggregate_type,
                 aggregate_id,
                 event_version,
                 schema_version,
                 source_event_id,
+                created_at.isoformat(),
             )
             if not hmac.compare_digest(expected_metadata_hash, metadata_hash):
                 return None
@@ -435,7 +413,7 @@ class SnapshotStore:
                 state_hash=stored_hash,
                 schema_version=schema_version,
                 source_event_id=source_event_id,
-                created_at=datetime.fromisoformat(_row_value(row, "created_at", 7)),
+                created_at=created_at,
                 metadata_hash=metadata_hash,
             )
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -489,6 +467,7 @@ def _metadata_hash(
     event_version: int,
     schema_version: int,
     source_event_id: str | None,
+    created_at: str,
 ) -> str:
     return _sha256_json(
         {
@@ -497,6 +476,7 @@ def _metadata_hash(
             "event_version": event_version,
             "schema_version": schema_version,
             "source_event_id": source_event_id,
+            "created_at": created_at,
         }
     )
 

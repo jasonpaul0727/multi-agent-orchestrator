@@ -233,6 +233,29 @@ def test_unknown_effect_outcome_is_never_sent_to_a_generic_reducer(tmp_path):
     assert result.unknown_effects
 
 
+def test_explicit_unknown_effect_reducer_can_transition_to_reconciliation(tmp_path):
+    database = tmp_path / "recovery.db"
+    events = SQLiteEventStore(database)
+    events.append(
+        "run",
+        "run-1",
+        0,
+        [EventDraft("RunCreated", {}), EventDraft("OutcomeUnknown", {})],
+        "events-run-1",
+    )
+
+    result = RecoveryBootstrap(events).recover(
+        "run",
+        "run-1",
+        reducers={
+            "RunCreated": lambda state, event: "Running",
+            "OutcomeUnknown": lambda state, event: "AwaitingReconciliation",
+        },
+    )
+
+    assert result.state == "AwaitingReconciliation"
+
+
 def test_effect_hook_receives_canonical_unknown_outcome_events(tmp_path):
     database = tmp_path / "recovery.db"
     events = SQLiteEventStore(database)
@@ -318,3 +341,23 @@ def test_lease_hook_failure_is_wrapped_as_event_chain_failure(tmp_path):
         )
 
     assert isinstance(failure.value.__cause__, ValueError)
+
+
+def test_source_less_snapshot_is_anchored_by_version_for_tail_replay(tmp_path):
+    database = tmp_path / "recovery.db"
+    events = SQLiteEventStore(database)
+    events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+    snapshots = SnapshotStore(database)
+    snapshots.save("run", "run-1", state="Created", version=1)
+    events.append("run", "run-1", 1, [EventDraft("InputAccepted", {})], "input")
+
+    result = RecoveryBootstrap(events, snapshots).recover(
+        "run",
+        "run-1",
+        reducers={"InputAccepted": lambda state, event: "Planning"},
+    )
+
+    assert result.snapshot_used is True
+    assert result.replayed_from_version == 1
+    assert result.replayed_event_count == 1
+    assert result.state == "Planning"
