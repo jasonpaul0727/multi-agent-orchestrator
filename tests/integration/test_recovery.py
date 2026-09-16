@@ -343,6 +343,49 @@ def test_lease_hook_failure_is_wrapped_as_event_chain_failure(tmp_path):
     assert isinstance(failure.value.__cause__, ValueError)
 
 
+def test_hook_return_iterable_failure_is_wrapped_as_event_chain_failure(tmp_path):
+    database = tmp_path / "recovery.db"
+    events = SQLiteEventStore(database)
+    events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+
+    def lease_hook(state):
+        def findings():
+            yield "lease-1"
+            raise ValueError("secret")
+
+        return findings()
+
+    with pytest.raises(EventChainFailure) as failure:
+        RecoveryBootstrap(events).recover(
+            "run",
+            "run-1",
+            reducers={"RunCreated": lambda state, event: "Created"},
+            lease_hook=lease_hook,
+        )
+
+    assert isinstance(failure.value.__cause__, ValueError)
+
+
+def test_hook_iterator_creation_failure_is_wrapped_as_event_chain_failure(tmp_path):
+    database = tmp_path / "recovery.db"
+    events = SQLiteEventStore(database)
+    events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+
+    class BrokenIterable:
+        def __iter__(self):
+            raise ValueError("secret")
+
+    with pytest.raises(EventChainFailure) as failure:
+        RecoveryBootstrap(events).recover(
+            "run",
+            "run-1",
+            reducers={"RunCreated": lambda state, event: "Created"},
+            lease_hook=lambda state: BrokenIterable(),
+        )
+
+    assert isinstance(failure.value.__cause__, ValueError)
+
+
 def test_source_less_snapshot_is_anchored_by_version_for_tail_replay(tmp_path):
     database = tmp_path / "recovery.db"
     events = SQLiteEventStore(database)

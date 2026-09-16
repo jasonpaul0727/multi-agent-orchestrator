@@ -134,7 +134,13 @@ class RecoveryBootstrap:
         effect_resolver: Hook | None = None,
         unknown_event_hook: Hook | None = None,
     ) -> RecoveryResult:
-        """Validate, checkpoint, and replay an aggregate deterministically."""
+        """Validate, checkpoint, and replay an aggregate deterministically.
+
+        A snapshot without ``source_event_id`` is trusted only after its
+        authenticated metadata and event version validate; that version is
+        the stream anchor used for tail replay.  Snapshots that name a source
+        event must also match the event at that anchor.
+        """
 
         aggregate_type, aggregate_id = _validate_aggregate_identity(
             aggregate_type, aggregate_id
@@ -614,9 +620,50 @@ def _merge_hook_findings(
         additions = (found,)
     else:
         try:
-            additions = tuple(found)
-        except TypeError:
+            iterator = iter(found)
+        except TypeError as exc:
+            # A plain scalar is a valid single finding, but an object that
+            # advertises iteration and fails from its iterator is a hook
+            # failure, not a scalar result.
+            if getattr(type(found), "__iter__", None) is not None or getattr(
+                type(found), "__getitem__", None
+            ) is not None:
+                failure_type = (
+                    SecurityInvariantFailure
+                    if invariant == "security"
+                    else EventChainFailure
+                )
+                raise failure_type(
+                    "recovery invariant hook failed",
+                    aggregate_type=aggregate_type,
+                    aggregate_id=aggregate_id,
+                ) from exc
             additions = (found,)
+        except BaseException as exc:
+            failure_type = (
+                SecurityInvariantFailure
+                if invariant == "security"
+                else EventChainFailure
+            )
+            raise failure_type(
+                "recovery invariant hook failed",
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+            ) from exc
+        else:
+            try:
+                additions = tuple(iterator)
+            except BaseException as exc:
+                failure_type = (
+                    SecurityInvariantFailure
+                    if invariant == "security"
+                    else EventChainFailure
+                )
+                raise failure_type(
+                    "recovery invariant hook failed",
+                    aggregate_type=aggregate_type,
+                    aggregate_id=aggregate_id,
+                ) from exc
     return existing + additions
 
 

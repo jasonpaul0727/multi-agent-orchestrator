@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Any
+import warnings
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator, model_validator
 
@@ -26,6 +27,18 @@ from .sqlite_event_store import (
 
 
 _MISSING = object()
+
+
+class StaleSnapshot(RuntimeError):
+    """Raised when a checkpoint would move an aggregate back in time."""
+
+    def __init__(self, attempted_version: int, current_version: int) -> None:
+        self.attempted_version = attempted_version
+        self.current_version = current_version
+        super().__init__(
+            "snapshot version is stale: "
+            f"attempted {attempted_version}, current {current_version}"
+        )
 
 
 class Snapshot(BaseModel):
@@ -118,6 +131,11 @@ class SnapshotStore:
     Snapshots are intentionally replaceable: a newer checkpoint supersedes an
     older checkpoint for the same aggregate.  Event rows remain protected by
     the append-only triggers owned by :class:`SQLiteEventStore`.
+
+    ``source_event_id`` is optional for generic checkpointing.  Recovery treats
+    a source-less snapshot as anchored at its validated stream version and
+    replays the event tail from that anchor; callers that need an explicit
+    identity can persist the source event ID and have it checked as well.
     """
 
     def __init__(self, database: str | Path | sqlite3.Connection | Any) -> None:
@@ -196,6 +214,18 @@ class SnapshotStore:
             savepoint = "orchestrator_snapshot_write"
             connection.execute(f"SAVEPOINT {savepoint}")
         try:
+            current = connection.execute(
+                """
+                SELECT event_version
+                FROM snapshots
+                WHERE aggregate_type = ? AND aggregate_id = ?
+                """,
+                (snapshot.aggregate_type, snapshot.aggregate_id),
+            ).fetchone()
+            if current is not None:
+                current_version = _row_value(current, "event_version", 0)
+                if current_version > snapshot.event_version:
+                    raise StaleSnapshot(snapshot.event_version, current_version)
             connection.execute(
                 """
                 INSERT INTO snapshots (
@@ -209,7 +239,9 @@ class SnapshotStore:
                     state_hash = excluded.state_hash,
                     schema_version = excluded.schema_version,
                     source_event_id = excluded.source_event_id,
-                    created_at = excluded.created_at
+                    created_at = excluded.created_at,
+                    metadata_hash = excluded.metadata_hash
+                WHERE snapshots.event_version <= excluded.event_version
                 """,
                 (
                     snapshot.aggregate_type,
@@ -223,6 +255,18 @@ class SnapshotStore:
                     snapshot.metadata_hash,
                 ),
             )
+            current_after = connection.execute(
+                """
+                SELECT event_version
+                FROM snapshots
+                WHERE aggregate_type = ? AND aggregate_id = ?
+                """,
+                (snapshot.aggregate_type, snapshot.aggregate_id),
+            ).fetchone()
+            if current_after is not None:
+                current_after_version = _row_value(current_after, "event_version", 0)
+                if current_after_version > snapshot.event_version:
+                    raise StaleSnapshot(snapshot.event_version, current_after_version)
             if started_transaction:
                 connection.commit()
             else:
@@ -243,8 +287,8 @@ class SnapshotStore:
         aggregate_type: str,
         aggregate_id: str,
         state: Any = _MISSING,
-        version: int | None = None,
-        *,
+        version: Any = None,
+        *legacy_args: Any,
         event_version: int | None = None,
         schema_version: int = 1,
         source_event_id: str | None = None,
@@ -253,12 +297,75 @@ class SnapshotStore:
         """Persist ``state`` at ``version`` using a deterministic signature.
 
         ``save_snapshot`` remains the lower-level API with event-version-first
-        arguments.  ``save`` intentionally accepts state-first arguments only
-        so an integer state cannot be confused with an event version.
+        arguments.  The historical positional form with trailing metadata
+        arguments remains supported with a deprecation warning; its
+        four-position prefix is intentionally rejected as ambiguous.  New
+        callers should use the deterministic state-first form, while legacy
+        callers can use :meth:`save_legacy` or ``save_snapshot`` explicitly.
         """
 
         if state is _MISSING:
             raise TypeError("save requires state as its third argument")
+        if legacy_args:
+            if isinstance(version, int) and not isinstance(version, bool):
+                # Unambiguous state-first positional metadata, retained for
+                # callers of the original convenience wrapper.
+                if isinstance(state, int) and not isinstance(state, bool):
+                    raise TypeError(
+                        "save cannot disambiguate integer state and legacy "
+                        "event-version order; use keyword version or save_snapshot"
+                    )
+                if event_version is not None:
+                    raise TypeError("version and event_version disagree")
+                if len(legacy_args) > 3:
+                    raise TypeError(
+                        "state-first save accepts at most three trailing arguments"
+                    )
+                schema_version = legacy_args[0] if len(legacy_args) >= 1 else schema_version
+                source_event_id = (
+                    legacy_args[1] if len(legacy_args) >= 2 else source_event_id
+                )
+                state_hash = legacy_args[2] if len(legacy_args) >= 3 else state_hash
+                event_version = version
+                return self.save_snapshot(
+                    aggregate_type,
+                    aggregate_id,
+                    event_version,
+                    state,
+                    schema_version,
+                    source_event_id,
+                    state_hash,
+                )
+            if (
+                isinstance(state, bool)
+                or not isinstance(state, int)
+                or isinstance(version, (type(None), int, bool))
+            ):
+                raise TypeError(
+                    "save expects state first and an integer version; use "
+                    "save_snapshot for legacy order"
+                )
+            if event_version is not None:
+                raise TypeError("legacy positional save cannot combine event_version")
+            if len(legacy_args) > 3:
+                raise TypeError("legacy positional save accepts at most three trailing arguments")
+            warnings.warn(
+                "legacy positional save is deprecated; use save_snapshot",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            legacy_schema_version = legacy_args[0] if len(legacy_args) >= 1 else 1
+            legacy_source_event_id = legacy_args[1] if len(legacy_args) >= 2 else None
+            legacy_state_hash = legacy_args[2] if len(legacy_args) >= 3 else None
+            return self.save_snapshot(
+                aggregate_type,
+                aggregate_id,
+                state,
+                version,
+                legacy_schema_version,
+                legacy_source_event_id,
+                legacy_state_hash,
+            )
         if version is not None and (
             isinstance(version, bool) or not isinstance(version, int)
         ):
@@ -271,6 +378,38 @@ class SnapshotStore:
             raise TypeError("version and event_version disagree")
         if event_version is None:
             raise TypeError("save requires version or event_version")
+        return self.save_snapshot(
+            aggregate_type,
+            aggregate_id,
+            event_version,
+            state,
+            schema_version,
+            source_event_id,
+            state_hash,
+        )
+
+    def save_legacy(
+        self,
+        aggregate_type: str,
+        aggregate_id: str,
+        event_version: int,
+        state: Any,
+        schema_version: int = 1,
+        source_event_id: str | None = None,
+        state_hash: str | None = None,
+    ) -> Snapshot:
+        """Explicit compatibility entry point for event-version-first callers.
+
+        The four-position form cannot be distinguished from an invalid
+        state-first call, so callers using the historical order should use
+        this named, deprecated entry point (or :meth:`save_snapshot`).
+        """
+
+        warnings.warn(
+            "save_legacy is deprecated; use save_snapshot or state-first save",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.save_snapshot(
             aggregate_type,
             aggregate_id,
@@ -499,4 +638,4 @@ def _row_value(
             raise
 
 
-__all__ = ["Snapshot", "SnapshotRecord", "SnapshotStore"]
+__all__ = ["Snapshot", "SnapshotRecord", "SnapshotStore", "StaleSnapshot"]

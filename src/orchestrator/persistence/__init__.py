@@ -1,7 +1,7 @@
 """Durable persistence primitives for orchestration facts."""
 
 from .events import EventDraft, StoredEvent
-from .snapshots import Snapshot, SnapshotRecord, SnapshotStore
+from .snapshots import Snapshot, SnapshotRecord, SnapshotStore, StaleSnapshot
 from .sqlite_event_store import (
     EventIntegrityError,
     IdempotencyConflict,
@@ -17,6 +17,7 @@ __all__ = [
     "Snapshot",
     "SnapshotRecord",
     "SnapshotStore",
+    "StaleSnapshot",
     "StaleStream",
     "StoredEvent",
 ]

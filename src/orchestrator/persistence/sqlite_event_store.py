@@ -180,6 +180,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             _migrate_snapshot_metadata(connection)
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
+            connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
             connection.execute(f"RELEASE SAVEPOINT {savepoint}")
         except BaseException:
             try:
@@ -196,6 +197,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         _migrate_snapshot_metadata(connection)
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
+        connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -205,6 +207,12 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
 def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
     """Add authenticated snapshot metadata to databases from Task 3."""
 
+    migration_versions = {
+        row[0]
+        for row in connection.execute(
+            "SELECT version FROM schema_migrations"
+        ).fetchall()
+    }
     columns = connection.execute("PRAGMA table_info(snapshots)").fetchall()
     names = {row[1] for row in columns}
     source_is_required = any(row[1] == "source_event_id" and row[3] for row in columns)
@@ -264,6 +272,64 @@ def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
                 """,
                 (metadata_hash, row[0], row[1]),
             )
+        return
+
+    # Version 3 authenticates ``created_at`` as part of the snapshot
+    # metadata.  Databases written by the preceding Task 3 implementation
+    # have versions 1 and 2 but no version 3; rehash their existing,
+    # self-contained metadata exactly once.  NULL hashes are deliberately not
+    # repaired: on a current schema they indicate corruption or tampering.
+    if 2 in migration_versions and 3 not in migration_versions:
+        rows = connection.execute(
+            """
+            SELECT aggregate_type, aggregate_id, event_version, schema_version,
+                   source_event_id, created_at, metadata_hash
+            FROM snapshots
+            WHERE metadata_hash IS NOT NULL
+            """
+        ).fetchall()
+        for row in rows:
+            legacy_hash = row[6]
+            expected_legacy_hash = _legacy_snapshot_metadata_hash(
+                row[0], row[1], row[2], row[3], row[4]
+            )
+            if not isinstance(legacy_hash, str) or not hmac.compare_digest(
+                legacy_hash, expected_legacy_hash
+            ):
+                continue
+            metadata_hash = _snapshot_metadata_hash(
+                row[0], row[1], row[2], row[3], row[4], row[5]
+            )
+            connection.execute(
+                """
+                UPDATE snapshots
+                SET metadata_hash = ?
+                WHERE aggregate_type = ? AND aggregate_id = ?
+                """,
+                (metadata_hash, row[0], row[1]),
+            )
+
+
+def _legacy_snapshot_metadata_hash(
+    aggregate_type: str,
+    aggregate_id: str,
+    event_version: int,
+    schema_version: int,
+    source_event_id: str | None,
+) -> str:
+    """Hash format emitted before migration 3 authenticated ``created_at``."""
+
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "aggregate_id": aggregate_id,
+                "aggregate_type": aggregate_type,
+                "event_version": event_version,
+                "schema_version": schema_version,
+                "source_event_id": source_event_id,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _snapshot_metadata_hash(
