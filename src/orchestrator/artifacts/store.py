@@ -8,9 +8,11 @@ atomically installed in the artifact directory.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import inspect
 import os
 from pathlib import Path
 import re
@@ -106,7 +108,9 @@ def _validate_digest(value: Any) -> str:
     return value
 
 
-def _validate_text(value: Any, field_name: str) -> str:
+def _validate_text(value: Any, field_name: str, *, normalize_whitespace: bool = False) -> str:
+    if normalize_whitespace and isinstance(value, str):
+        value = value.strip()
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-blank string")
     if value != value.strip():
@@ -118,16 +122,24 @@ def _validate_text(value: Any, field_name: str) -> str:
     return value
 
 
-def _normalize_source(value: Mapping[str, Any] | None) -> dict[str, str | None]:
+def _normalize_source(
+    value: Mapping[str, Any] | None,
+    *,
+    normalize_whitespace: bool = False,
+) -> dict[str, str | None]:
     if value is None:
         return {}
     if not isinstance(value, Mapping):
         raise TypeError("source must be a mapping")
     normalized: dict[str, str | None] = {}
     for key, item in value.items():
-        key = _validate_text(key, "source key")
+        key = _validate_text(key, "source key", normalize_whitespace=normalize_whitespace)
         if item is not None:
-            item = _validate_text(item, f"source[{key!r}]")
+            item = _validate_text(
+                item,
+                f"source[{key!r}]",
+                normalize_whitespace=normalize_whitespace,
+            )
         normalized[key] = item
     return normalized
 
@@ -138,6 +150,7 @@ def _normalize_labels(
     *,
     none_is_wildcard: bool,
     require_nonempty: bool = False,
+    normalize_whitespace: bool = False,
 ) -> tuple[str, ...]:
     if value is None:
         values: tuple[Any, ...] = ("*",) if none_is_wildcard else ()
@@ -148,13 +161,25 @@ def _normalize_labels(
         # callers; both ``run-1`` and ``run_id:run-1`` match.
         values_list: list[str] = []
         for key, item in value.items():
-            key = _validate_text(key, f"{field_name} key")
+            key = _validate_text(
+                key,
+                f"{field_name} key",
+                normalize_whitespace=normalize_whitespace,
+            )
             if isinstance(item, str):
-                item = _validate_text(item, f"{field_name}[{key!r}]")
+                item = _validate_text(
+                    item,
+                    f"{field_name}[{key!r}]",
+                    normalize_whitespace=normalize_whitespace,
+                )
                 values_list.extend((item, f"{key}:{item}"))
             elif isinstance(item, Iterable) and not isinstance(item, (bytes, bytearray)):
                 for nested in item:
-                    nested = _validate_text(nested, f"{field_name}[{key!r}]")
+                    nested = _validate_text(
+                        nested,
+                        f"{field_name}[{key!r}]",
+                        normalize_whitespace=normalize_whitespace,
+                    )
                     values_list.extend((nested, f"{key}:{nested}"))
             else:
                 raise TypeError(f"{field_name} values must be strings or iterables of strings")
@@ -166,7 +191,10 @@ def _normalize_labels(
             values = tuple(value)
         except TypeError as exc:
             raise TypeError(f"{field_name} must be a string or iterable of strings") from exc
-    normalized = tuple(_validate_text(item, field_name) for item in values)
+    normalized = tuple(
+        _validate_text(item, field_name, normalize_whitespace=normalize_whitespace)
+        for item in values
+    )
     if require_nonempty and not normalized:
         raise ValueError(f"{field_name} must contain at least one scope")
     return normalized
@@ -332,24 +360,69 @@ class ArtifactRecord(BaseModel):
         lifecycle_state: str,
         created_at: datetime | None = None,
         publication_id: str | None = None,
+        normalize_whitespace: bool = False,
+        allow_empty_scope: bool = False,
     ) -> "ArtifactRecord":
         try:
             kwargs: dict[str, Any] = {
                 "digest": _validate_digest(digest),
-                "artifact_type": _validate_text(artifact_type, "artifact_type"),
+                "artifact_type": _validate_text(
+                    artifact_type,
+                    "artifact_type",
+                    normalize_whitespace=normalize_whitespace,
+                ),
                 "size": size,
-                "media_type": _validate_text(media_type, "media_type"),
-                "source": _normalize_source(source),
+                "media_type": _validate_text(
+                    media_type,
+                    "media_type",
+                    normalize_whitespace=normalize_whitespace,
+                ),
+                "source": _normalize_source(
+                    source,
+                    normalize_whitespace=normalize_whitespace,
+                ),
                 "schema_version": schema_version,
-                "redaction_state": _validate_text(redaction_state, "redaction_state"),
-                "readable_scope": _validate_scope_labels(readable_scope),
-                "references": _validate_references(references),
-                "lifecycle_state": _validate_text(lifecycle_state, "lifecycle_state"),
+                "redaction_state": _validate_text(
+                    redaction_state,
+                    "redaction_state",
+                    normalize_whitespace=normalize_whitespace,
+                ),
+                "readable_scope": _normalize_labels(
+                    readable_scope,
+                    "readable_scope",
+                    none_is_wildcard=True,
+                    require_nonempty=not allow_empty_scope,
+                    normalize_whitespace=normalize_whitespace,
+                ),
+                "references": _normalize_labels(
+                    references,
+                    "references",
+                    none_is_wildcard=False,
+                    normalize_whitespace=normalize_whitespace,
+                ),
+                "lifecycle_state": _validate_text(
+                    lifecycle_state,
+                    "lifecycle_state",
+                    normalize_whitespace=normalize_whitespace,
+                ),
                 "created_at": created_at or datetime.now(timezone.utc),
             }
             if publication_id is not None:
-                kwargs["publication_id"] = publication_id
-            return cls(**kwargs)
+                kwargs["publication_id"] = _validate_text(
+                    publication_id,
+                    "publication_id",
+                    normalize_whitespace=normalize_whitespace,
+                )
+            legacy_empty_scope = allow_empty_scope and not kwargs["readable_scope"]
+            if legacy_empty_scope:
+                # New records reject an empty scope.  A prior valid event may
+                # have used [] to mean "no readers"; validate through the
+                # normal model first, then restore that legacy representation.
+                kwargs["readable_scope"] = ("__legacy_empty_scope__",)
+            record = cls(**kwargs)
+            if legacy_empty_scope:
+                object.__setattr__(record, "readable_scope", ())
+            return record
         except (TypeError, ValueError, ValidationError) as exc:
             raise ValueError(f"invalid artifact metadata: {exc}") from exc
 
@@ -445,10 +518,23 @@ class ArtifactStore:
         if event_store is None:
             metadata_db = self._root / ".metadata.db"
             try:
+                try:
+                    metadata_stat = metadata_db.lstat()
+                except FileNotFoundError:
+                    metadata_stat = None
+                if metadata_stat is not None and (
+                    stat.S_ISLNK(metadata_stat.st_mode)
+                    or not stat.S_ISREG(metadata_stat.st_mode)
+                ):
+                    raise ArtifactMetadataError(
+                        "artifact metadata database must be a regular file"
+                    )
                 self._event_store: _EventStore = SQLiteEventStore(metadata_db)
                 os.chmod(metadata_db, 0o600)
-            except OSError as exc:
-                raise ArtifactFilesystemError("unable to initialize artifact metadata store") from exc
+            except ArtifactMetadataError:
+                raise
+            except Exception as exc:
+                raise ArtifactMetadataError("unable to initialize artifact metadata store") from exc
         else:
             self._event_store = event_store
         self._records: dict[str, list[ArtifactRecord]] = {}
@@ -572,7 +658,7 @@ class ArtifactStore:
 
             assert digest is not None
             final_path = self._path_for_digest(digest)
-            with _PUBLICATION_LOCK:
+            with self._digest_lock(digest):
                 try:
                     if final_path.exists() or final_path.is_symlink():
                         self._verify_file(final_path, digest)
@@ -582,23 +668,48 @@ class ArtifactStore:
                         try:
                             staged_stat = temp_path.stat()
                             installed_identity = (staged_stat.st_dev, staged_stat.st_ino)
-                            os.replace(temp_path, final_path)
+                            # Hard-link creation is atomic and has
+                            # create-if-absent semantics across processes.
+                            os.link(temp_path, final_path)
+                        except FileExistsError:
+                            # A publisher in another process won the race.
+                            # Its object is authoritative and must remain
+                            # owned by that process.
+                            self._verify_file(final_path, digest)
+                            temp_path.unlink(missing_ok=True)
+                            temp_path = None
+                            installed_identity = None
                         except OSError as exc:
+                            # A platform/filesystem error may be reported
+                            # after the directory entry was installed.  Keep
+                            # ownership tracking accurate so cleanup can only
+                            # remove our inode, never a competing publisher.
+                            installed_new = self._has_identity(
+                                final_path,
+                                installed_identity,
+                            )
                             raise ArtifactFilesystemError("unable to atomically publish artifact") from exc
-                        temp_path = None
-                        installed_new = True
-                        self._fsync_directory()
+                        else:
+                            installed_new = True
+                            try:
+                                temp_path.unlink()
+                            except OSError as exc:
+                                raise ArtifactFilesystemError(
+                                    "unable to finalize artifact publication"
+                                ) from exc
+                            temp_path = None
+                            self._fsync_directory()
                     return self._record_metadata(candidate)
                 except ArtifactError:
-                    if installed_new:
+                    if installed_new and not self._publication_committed(candidate):
                         self._remove_new_object(final_path, digest, installed_identity)
                     raise
                 except OSError as exc:
-                    if installed_new:
+                    if installed_new and not self._publication_committed(candidate):
                         self._remove_new_object(final_path, digest, installed_identity)
                     raise ArtifactFilesystemError("artifact publication filesystem failure") from exc
                 except Exception as exc:
-                    if installed_new:
+                    if installed_new and not self._publication_committed(candidate):
                         self._remove_new_object(final_path, digest, installed_identity)
                     raise ArtifactMetadataError("unable to record artifact publication") from exc
         finally:
@@ -622,15 +733,8 @@ class ArtifactStore:
         digest = _validate_digest(digest)
         if caller_scope is not None or scope is not None:
             raise TypeError("caller_scope/scope are deprecated; use an authenticated grant")
-        if grant is not None and access_grant is not None:
-            raise TypeError("grant and access_grant are mutually exclusive")
-        if grant is None:
-            grant = access_grant
-        path = self._path_for_digest(digest)
-        if path.is_symlink():
-            raise ArtifactIntegrityError(digest, "artifact path must not be a symlink")
-        if not path.exists():
-            raise ArtifactNotFound(digest)
+        grant = self._resolve_grant(grant, access_grant)
+        path = self._require_artifact_path(digest)
         publications = self._load_records(digest)
         if not publications:
             raise ArtifactNotFound(digest)
@@ -640,62 +744,65 @@ class ArtifactStore:
             raise ArtifactIntegrityError(digest, "artifact metadata size mismatch")
         return content
 
-    def get_record(self, digest: str) -> ArtifactRecord:
-        """Return the latest publication only after re-hashing its bytes."""
+    def get_record(
+        self,
+        digest: str,
+        grant: ArtifactAccessGrant | None = None,
+        *,
+        access_grant: ArtifactAccessGrant | None = None,
+    ) -> ArtifactRecord:
+        """Return metadata only after a verified digest-bound grant."""
 
         digest = _validate_digest(digest)
-        path = self._path_for_digest(digest)
-        if path.is_symlink():
-            raise ArtifactIntegrityError(digest, "artifact path must not be a symlink")
-        if not path.exists():
-            raise ArtifactNotFound(digest)
+        grant = self._resolve_grant(grant, access_grant)
+        path = self._require_artifact_path(digest)
         publications = self._load_records(digest)
         if not publications:
             raise ArtifactNotFound(digest)
+        authorized = self._authorize(digest, grant, publications)
         content = self._read_and_verify(path, digest)
-        latest = publications[-1]
+        latest = authorized[-1]
         if any(len(content) != record.size for record in publications):
             raise ArtifactIntegrityError(digest, "artifact metadata size mismatch")
         return latest
 
-    def list_publications(self, digest: str) -> list[ArtifactRecord]:
-        """List all authenticated provenance publications for one digest."""
+    def list_publications(
+        self,
+        digest: str,
+        grant: ArtifactAccessGrant | None = None,
+        *,
+        access_grant: ArtifactAccessGrant | None = None,
+    ) -> list[ArtifactRecord]:
+        """List provenance only after a verified digest-bound grant."""
 
         digest = _validate_digest(digest)
-        path = self._path_for_digest(digest)
-        if path.is_symlink():
-            raise ArtifactIntegrityError(digest, "artifact path must not be a symlink")
-        if not path.exists():
-            raise ArtifactNotFound(digest)
+        grant = self._resolve_grant(grant, access_grant)
+        path = self._require_artifact_path(digest)
         publications = self._load_records(digest)
         if not publications:
             raise ArtifactNotFound(digest)
+        authorized = self._authorize(digest, grant, publications)
         content = self._read_and_verify(path, digest)
         if any(len(content) != record.size for record in publications):
             raise ArtifactIntegrityError(digest, "artifact metadata size mismatch")
-        return publications
+        return authorized
 
-    def get_records(self, digest: str | None = None) -> list[ArtifactRecord]:
-        """Return publications for one digest, or all discoverable artifacts."""
+    def get_records(
+        self,
+        digest: str | None = None,
+        grant: ArtifactAccessGrant | None = None,
+        *,
+        access_grant: ArtifactAccessGrant | None = None,
+    ) -> list[ArtifactRecord]:
+        """Return publications for one digest after grant authorization.
 
-        if digest is not None:
-            return self.list_publications(digest)
-        try:
-            children = list(self._root.iterdir())
-        except OSError as exc:
-            raise ArtifactFilesystemError("unable to enumerate artifact directory") from exc
-        records: list[ArtifactRecord] = []
-        for child in children:
-            if child.name.startswith(".") or not child.is_file():
-                continue
-            candidate = f"sha256:{child.name}"
-            if _DIGEST_RE.fullmatch(candidate) is None:
-                continue
-            try:
-                records.extend(self.list_publications(candidate))
-            except ArtifactNotFound:
-                continue
-        return records
+        An all-artifacts query is intentionally unavailable: a grant is
+        digest-bound, and an unbounded query would disclose provenance.
+        """
+
+        if digest is None:
+            raise ArtifactAccessDenied("metadata")
+        return self.list_publications(digest, grant, access_grant=access_grant)
 
     def _record_metadata(self, record: ArtifactRecord) -> ArtifactRecord:
         """Append a unique provenance event; never use digest as idempotency key."""
@@ -727,19 +834,53 @@ class ArtifactStore:
         except Exception as exc:
             raise ArtifactMetadataError("unable to record artifact publication") from exc
 
-    def _load_records(self, digest: str) -> list[ArtifactRecord]:
+    def _publication_committed(self, record: ArtifactRecord) -> bool:
+        """Conservatively detect an append that committed before reporting failure.
+
+        Event-store implementations normally roll back a failed append, but a
+        transport/database error can be reported after the transaction has
+        committed.  In that ambiguous case retaining the object is safer than
+        deleting bytes referenced by an already durable publication event.
+        """
+
+        read_stream = getattr(self._event_store, "read_stream", None)
+        if read_stream is None:
+            return False
         try:
-            events = self._event_store.read_stream("artifact", digest)
-        except AttributeError:
+            events = read_stream("artifact", record.digest)
+            for event in events:
+                payload = getattr(event, "payload", None)
+                if isinstance(payload, Mapping) and payload.get("publication_id") == record.publication_id:
+                    return True
+            return False
+        except Exception:
+            # An unreadable stream leaves commit state unknown.  Never delete
+            # an object in that state because it may already be referenced.
+            return True
+
+    def _load_records(self, digest: str) -> list[ArtifactRecord]:
+        read_stream = getattr(self._event_store, "read_stream", None)
+        if read_stream is None:
+            # Tiny test/in-process adapters may intentionally expose only
+            # append/current_version.  Once a read capability is present,
+            # however, every failure must be surfaced rather than falling
+            # back to a potentially stale cache.
             return list(self._records.get(digest, ()))
+        try:
+            events = read_stream("artifact", digest)
         except EventIntegrityError as exc:
             raise ArtifactIntegrityError(digest, "metadata event integrity failure") from exc
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ArtifactIntegrityError(digest, "metadata event could not be read") from exc
+        except Exception as exc:
+            raise ArtifactMetadataError("unable to read artifact publication metadata") from exc
         publications: list[ArtifactRecord] = []
-        for event in events:
-            if getattr(event, "event_type", None) == "ArtifactPublished":
-                publications.append(self._record_from_event(event, digest))
+        try:
+            for event in events:
+                if getattr(event, "event_type", None) == "ArtifactPublished":
+                    publications.append(self._record_from_event(event, digest))
+        except ArtifactError:
+            raise
+        except Exception as exc:
+            raise ArtifactMetadataError("unable to iterate artifact publication metadata") from exc
         if publications:
             self._records[digest] = publications
         return publications
@@ -753,7 +894,14 @@ class ArtifactStore:
             raise ArtifactIntegrityError(digest, "metadata event digest mismatch")
         try:
             created_at = datetime.fromisoformat(payload["created_at"])
-            publication_id = payload.get("publication_id") or getattr(event, "event_id", None)
+            if "publication_id" in payload:
+                # Presence is significant: blank, zero, and non-string values
+                # are malformed metadata and must not fall back to event_id.
+                publication_id = payload["publication_id"]
+            else:
+                publication_id = getattr(event, "event_id", None)
+                if not isinstance(publication_id, str) or not publication_id.strip():
+                    raise ValueError("legacy metadata has no valid publication id")
             return ArtifactRecord.from_metadata(
                 digest,
                 size=payload["size"],
@@ -767,6 +915,11 @@ class ArtifactStore:
                 lifecycle_state=payload["lifecycle_state"],
                 created_at=created_at,
                 publication_id=publication_id,
+                # Prior metadata accepted [] and surrounding whitespace.  The
+                # compatibility normalization is confined to this parser;
+                # new publish calls remain strict.
+                normalize_whitespace=True,
+                allow_empty_scope=True,
             )
         except (KeyError, TypeError, ValueError, ValidationError) as exc:
             raise ArtifactIntegrityError(digest, "metadata event fields are invalid") from exc
@@ -776,7 +929,7 @@ class ArtifactStore:
         digest: str,
         grant: ArtifactAccessGrant | None,
         publications: list[ArtifactRecord],
-    ) -> None:
+    ) -> list[ArtifactRecord]:
         if grant is None or not isinstance(grant, ArtifactAccessGrant):
             raise ArtifactAccessDenied(digest)
         if grant.digest != digest:
@@ -789,20 +942,128 @@ class ArtifactStore:
             if verifier is None:
                 verified = False
             elif callable(verifier):
-                verified = bool(verifier(grant))
+                verified = self._strict_verify_result(verifier(grant))
             else:
                 verify = getattr(verifier, "verify", None)
-                verified = bool(verify(grant)) if callable(verify) else False
+                if callable(verify):
+                    verified = self._strict_verify_result(verify(grant))
+                else:
+                    verified = False
         except Exception:
             verified = False
         if not verified:
             raise ArtifactAccessDenied(digest)
-        if not any(self._scope_allows(record.readable_scope, grant.scope) for record in publications):
+        authorized = [
+            record
+            for record in publications
+            if self._scope_allows(record.readable_scope, grant.scope)
+        ]
+        if not authorized:
             raise ArtifactAccessDenied(digest)
+        return authorized
+
+    @staticmethod
+    def _strict_verify_result(result: Any) -> bool:
+        """Accept only a literal bool from the synchronous trust boundary.
+
+        An async verifier cannot be safely driven from this synchronous API.
+        Closing native coroutine objects avoids an unawaited-coroutine warning
+        while still rejecting the result rather than treating it as truthy.
+        """
+
+        if inspect.isawaitable(result):
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
+            return False
+        return result if type(result) is bool else False
+
+    @staticmethod
+    def _resolve_grant(
+        grant: ArtifactAccessGrant | None,
+        access_grant: ArtifactAccessGrant | None,
+    ) -> ArtifactAccessGrant | None:
+        if grant is not None and access_grant is not None:
+            raise TypeError("grant and access_grant are mutually exclusive")
+        return grant if grant is not None else access_grant
 
     @staticmethod
     def _scope_allows(allowed: tuple[str, ...], requested: tuple[str, ...]) -> bool:
         return "*" in allowed or "*" in requested or bool(set(allowed).intersection(requested))
+
+    @contextmanager
+    def _digest_lock(self, digest: str):
+        """Serialize install/metadata cleanup across threads and processes."""
+
+        lock_path = self._root / f".{digest.removeprefix('sha256:')}.lock"
+        try:
+            flags = os.O_CREAT | os.O_RDWR
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            lock_fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise ArtifactFilesystemError("unable to open artifact publication lock") from exc
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError as exc:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            raise ArtifactFilesystemError("unable to secure artifact publication lock") from exc
+        locked = False
+        try:
+            if os.name == "nt":
+                # msvcrt.locking is the native advisory region-lock primitive.
+                import msvcrt
+
+                if os.fstat(lock_fd).st_size == 0:
+                    os.write(lock_fd, b"\0")
+                os.lseek(lock_fd, 0, os.SEEK_SET)
+                msvcrt.locking(lock_fd, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            locked = True
+            with _PUBLICATION_LOCK:
+                yield
+        except ArtifactError:
+            raise
+        except OSError as exc:
+            raise ArtifactFilesystemError("unable to acquire artifact publication lock") from exc
+        finally:
+            if locked:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        os.lseek(lock_fd, 0, os.SEEK_SET)
+                        msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    # The lock is advisory; always close the descriptor.  A
+                    # failed unlock cannot make an artifact path unsafe.
+                    pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+
+    def _require_artifact_path(self, digest: str) -> Path:
+        path = self._path_for_digest(digest)
+        try:
+            path_stat = path.lstat()
+        except FileNotFoundError as exc:
+            raise ArtifactNotFound(digest) from exc
+        except OSError as exc:
+            raise ArtifactFilesystemError("unable to inspect artifact path") from exc
+        if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+            raise ArtifactIntegrityError(digest, "artifact path is not a regular file")
+        return path
 
     def _path_for_digest(self, digest: str) -> Path:
         digest = _validate_digest(digest)
@@ -838,10 +1099,14 @@ class ArtifactStore:
         cls._read_and_verify(path, digest)
 
     def _fsync_directory(self) -> None:
+        if os.name == "nt":
+            # Windows has no portable directory-fsync equivalent.  The file
+            # itself is fsync'd before the atomic hard-link install; NTFS
+            # preserves that operation's atomicity and durability contract.
+            return
         try:
             flags = os.O_RDONLY
-            if hasattr(os, "O_DIRECTORY"):
-                flags |= os.O_DIRECTORY
+            flags |= getattr(os, "O_DIRECTORY", 0)
             directory_fd = os.open(self._root, flags)
         except OSError as exc:
             raise ArtifactFilesystemError("unable to open artifact directory for sync") from exc
@@ -851,7 +1116,10 @@ class ArtifactStore:
             except OSError as exc:
                 raise ArtifactFilesystemError("unable to fsync artifact directory") from exc
         finally:
-            os.close(directory_fd)
+            try:
+                os.close(directory_fd)
+            except OSError as exc:
+                raise ArtifactFilesystemError("unable to close artifact directory") from exc
 
     def _remove_new_object(
         self,
@@ -862,8 +1130,7 @@ class ArtifactStore:
         if identity is None:
             return
         try:
-            current = path.lstat()
-            if (current.st_dev, current.st_ino) != identity or not stat.S_ISREG(current.st_mode):
+            if not self._has_identity(path, identity):
                 return
             path.unlink()
             self._fsync_directory()
@@ -871,6 +1138,21 @@ class ArtifactStore:
             return
         except OSError as exc:
             raise ArtifactFilesystemError("unable to remove failed artifact publication") from exc
+
+    @staticmethod
+    def _has_identity(path: Path, identity: tuple[int, int] | None) -> bool:
+        if identity is None:
+            return False
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(current.st_mode)
+            and (current.st_dev, current.st_ino) == identity
+        )
 
     def close(self) -> None:
         if self._owned_event_store:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import multiprocessing
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -21,6 +23,23 @@ from orchestrator.artifacts import (
 )
 from orchestrator.artifacts import store as artifact_store_module
 from orchestrator.persistence import SQLiteEventStore
+from orchestrator.persistence import EventDraft
+
+
+def _publish_from_process(root, database, index, queue):
+    events = SQLiteEventStore(database)
+    artifacts = _store(root, events)
+    try:
+        record = artifacts.publish_bytes(
+            b"same-process-race",
+            source={"run_id": f"run-{index}"},
+            readable_scope=(f"run-{index}",),
+        )
+        queue.put(("ok", record.publication_id))
+    except BaseException as exc:  # pragma: no cover - assertion reports detail
+        queue.put(("error", type(exc).__name__, str(exc)))
+    finally:
+        events.close()
 
 
 def _grant(record, *, scope=("run-1",), expires_at=None, signature="valid"):
@@ -62,7 +81,7 @@ def test_publish_rejects_modified_content_after_hashing(tmp_path):
     with pytest.raises(ArtifactIntegrityError):
         artifacts.read_bytes(record.digest, grant=_grant(record))
     with pytest.raises(ArtifactIntegrityError):
-        artifacts.get_record(record.digest)
+        artifacts.get_record(record.digest, _grant(record))
 
 
 def test_read_enforces_scope(tmp_path):
@@ -112,6 +131,39 @@ def test_read_requires_verifier_and_authenticated_grant(tmp_path):
         )
 
 
+def test_metadata_reads_require_authenticated_grant_and_filter_provenance(tmp_path):
+    artifacts = _store(tmp_path / "artifacts")
+    first = artifacts.publish_bytes(
+        b"metadata-secret",
+        source={"run_id": "run-1"},
+        readable_scope=("run-1",),
+    )
+    second = artifacts.publish_bytes(
+        b"metadata-secret",
+        source={"run_id": "run-2"},
+        readable_scope=("run-2",),
+    )
+
+    for method in (
+        lambda: artifacts.get_record(first.digest),
+        lambda: artifacts.list_publications(first.digest),
+        lambda: artifacts.get_records(first.digest),
+    ):
+        with pytest.raises(ArtifactAccessDenied):
+            method()
+
+    assert artifacts.get_record(first.digest, _grant(first, scope=("run-2",))) == second
+    assert artifacts.list_publications(first.digest, _grant(first, scope=("run-2",))) == [second]
+
+    grant = _grant(first, scope=("run-1",))
+    assert artifacts.get_record(first.digest, grant) == first
+    assert artifacts.get_records(first.digest, grant) == [first]
+    assert artifacts.list_publications(first.digest, grant) == [first]
+    assert second.source_run_id not in {
+        publication.source_run_id for publication in artifacts.list_publications(first.digest, grant)
+    }
+
+
 @pytest.mark.parametrize("digest", ["../secret", "sha256:../" + "0" * 58, "sha256:" + "A" * 64])
 def test_read_rejects_malformed_digest_and_traversal(tmp_path, digest):
     artifacts = _store(tmp_path / "artifacts")
@@ -143,7 +195,7 @@ def test_duplicate_content_deduplicates_bytes_but_preserves_provenance(tmp_path)
 
     assert duplicate.digest == first.digest
     assert duplicate.publication_id != first.publication_id
-    assert artifacts.list_publications(first.digest) == [first, duplicate]
+    assert artifacts.list_publications(first.digest, _grant(first, scope=("run-1",))) == [first, duplicate]
     assert artifacts.read_bytes(first.digest, grant=_grant(first, scope=("run-1",))) == b"same"
     assert artifacts.read_bytes(first.digest, grant=_grant(duplicate, scope=("run-2",))) == b"same"
 
@@ -182,8 +234,43 @@ def test_concurrent_duplicate_publications_keep_both_provenances(tmp_path):
     assert len(records) == 2
     assert records[0].digest == records[1].digest
     reopened = _store(root, SQLiteEventStore(database))
-    publications = reopened.list_publications(records[0].digest)
-    assert {publication.source_run_id for publication in publications} == {"run-1", "run-2"}
+    publications = reopened.list_publications(records[0].digest, _grant(records[0], scope=("run-1",)))
+    assert {publication.source_run_id for publication in publications} == {"run-1"}
+    all_publications = reopened.list_publications(records[0].digest, _grant(records[0], scope=("*",)))
+    assert {publication.source_run_id for publication in all_publications} == {"run-1", "run-2"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="cross-process file-lock test uses POSIX process semantics")
+def test_cross_process_duplicate_publications_keep_committed_file(tmp_path):
+    database = tmp_path / "control.db"
+    root = tmp_path / "artifacts"
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    processes = [
+        context.Process(target=_publish_from_process, args=(str(root), str(database), index, queue))
+        for index in (1, 2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=20)
+    assert all(process.exitcode == 0 for process in processes)
+    outcomes = [queue.get(timeout=5) for _ in processes]
+    assert all(outcome[0] == "ok" for outcome in outcomes), outcomes
+
+    reopened = _store(root, SQLiteEventStore(database))
+    content_digest = "sha256:" + hashlib.sha256(b"same-process-race").hexdigest()
+    grant = ArtifactAccessGrant(
+        digest=content_digest,
+        scope=("*",),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        issuer="control-plane",
+        signature="valid",
+    )
+    publications = reopened.list_publications(content_digest, grant)
+    assert len(publications) == 2
+    assert reopened.read_bytes(content_digest, grant=grant) == b"same-process-race"
+    assert reopened._path_for_digest(content_digest).is_file()
 
 
 def test_metadata_is_recorded_after_durable_publication_and_survives_reopen(tmp_path):
@@ -220,7 +307,7 @@ def test_metadata_is_recorded_after_durable_publication_and_survives_reopen(tmp_
     reopened_events = SQLiteEventStore(database)
     reopened = _store(root, reopened_events)
     assert reopened.read_bytes(record.digest, grant=_grant(record)) == b"tool result"
-    assert reopened.get_record(record.digest) == record
+    assert reopened.get_record(record.digest, _grant(record)) == record
 
 
 def test_tampered_event_metadata_is_integrity_failure(tmp_path):
@@ -239,7 +326,7 @@ def test_tampered_event_metadata_is_integrity_failure(tmp_path):
 
     reopened = _store(tmp_path / "artifacts", SQLiteEventStore(database))
     with pytest.raises(ArtifactIntegrityError):
-        reopened.get_record(record.digest)
+        reopened.get_record(record.digest, _grant(record))
 
 
 @pytest.mark.parametrize("root", ["", ".", "..", "artifacts", "/", "/tmp", str(__file__)])
@@ -327,10 +414,10 @@ def test_append_failure_cleans_new_object_but_not_existing_dedup(tmp_path):
 def test_filesystem_failures_are_typed_and_leave_no_staging(tmp_path, monkeypatch):
     artifacts = _store(tmp_path / "artifacts")
 
-    def fail_replace(*args, **kwargs):
-        raise OSError("replace unavailable")
+    def fail_link(*args, **kwargs):
+        raise OSError("link unavailable")
 
-    monkeypatch.setattr(artifact_store_module.os, "replace", fail_replace)
+    monkeypatch.setattr(artifact_store_module.os, "link", fail_link)
     with pytest.raises(ArtifactFilesystemError):
         artifacts.publish_bytes(b"result")
     assert not list((tmp_path / "artifacts").glob(".tmp-*"))
@@ -349,3 +436,246 @@ def test_filesystem_failures_are_typed_and_leave_no_staging(tmp_path, monkeypatc
     with pytest.raises(ArtifactFilesystemError):
         artifacts.publish_bytes(b"other")
     assert not list((tmp_path / "artifacts").glob(".tmp-*"))
+
+
+@pytest.mark.parametrize("metadata_path_kind", ["symlink", "directory"])
+def test_existing_metadata_database_must_be_regular_file(tmp_path, metadata_path_kind):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    metadata_path = root / ".metadata.db"
+    if metadata_path_kind == "symlink":
+        target = tmp_path / "metadata-target"
+        target.touch()
+        metadata_path.symlink_to(target)
+    else:
+        metadata_path.mkdir()
+
+    with pytest.raises(ArtifactMetadataError):
+        ArtifactStore(root, grant_verifier=lambda grant: True)
+
+
+def test_windows_directory_durability_path_is_supported(monkeypatch, tmp_path):
+    artifacts = _store(tmp_path / "artifacts")
+    monkeypatch.setattr(artifact_store_module.os, "name", "nt")
+    monkeypatch.delattr(artifact_store_module.os, "O_DIRECTORY", raising=False)
+    artifacts._fsync_directory()
+
+
+@pytest.mark.parametrize("result", [1, "true", object(), None])
+def test_verifier_must_return_bool(tmp_path, result):
+    artifacts = ArtifactStore(tmp_path / "artifacts", grant_verifier=lambda grant: result)
+    record = artifacts.publish_bytes(b"result", readable_scope=("run-1",))
+    with pytest.raises(ArtifactAccessDenied):
+        artifacts.get_record(record.digest, _grant(record))
+
+
+def test_async_verifier_is_rejected_without_unawaited_coroutine_warning(tmp_path, recwarn):
+    async def verify(grant):
+        return True
+
+    artifacts = ArtifactStore(tmp_path / "artifacts", grant_verifier=verify)
+    record = artifacts.publish_bytes(b"result", readable_scope=("run-1",))
+    with pytest.raises(ArtifactAccessDenied):
+        artifacts.get_record(record.digest, _grant(record))
+    assert not [warning for warning in recwarn if warning.category is RuntimeWarning]
+
+
+def test_legacy_metadata_normalizes_only_when_replaying(tmp_path):
+    database = tmp_path / "control.db"
+    root = tmp_path / "artifacts"
+    events = SQLiteEventStore(database)
+    artifacts = ArtifactStore(root, event_store=events)
+    content = b"legacy"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    path = artifacts._path_for_digest(digest)
+    path.write_bytes(content)
+    payload = {
+        "digest": digest,
+        "type": " legacy-output ",
+        "size": len(content),
+        "media_type": " text/plain ",
+        "source": {" run_id ": " run-legacy "},
+        "schema_version": 1,
+        "redaction_state": " unknown ",
+        "readable_scope": [" run-legacy "],
+        "references": [],
+        "lifecycle_state": " retained ",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        # Deliberately omit publication_id for the legacy event format.
+    }
+    events.append(
+        "artifact",
+        digest,
+        0,
+        [EventDraft("ArtifactPublished", payload)],
+        "legacy-publication",
+    )
+    events.close()
+
+    reopened_events = SQLiteEventStore(database)
+    reopened = _store(root, reopened_events)
+    record = reopened.get_record(
+        digest,
+        ArtifactAccessGrant(
+            digest=digest,
+            scope=("run-legacy",),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            issuer="control-plane",
+            signature="valid",
+        ),
+    )
+    assert record.artifact_type == "legacy-output"
+    assert record.source_run_id == "run-legacy"
+    assert record.readable_scope == ("run-legacy",)
+    assert reopened.read_bytes(digest, grant=_grant(record, scope=("run-legacy",))) == content
+
+    # A legacy empty scope remains readable as metadata by the parser but
+    # authorizes no grant, preserving its prior deny-all meaning.
+    empty_digest = "sha256:" + hashlib.sha256(b"legacy-empty").hexdigest()
+    empty_path = reopened._path_for_digest(empty_digest)
+    empty_path.write_bytes(b"legacy-empty")
+    empty_payload = dict(payload)
+    empty_payload.update(
+        {
+            "digest": empty_digest,
+            "size": len(b"legacy-empty"),
+            "readable_scope": [],
+        }
+    )
+    reopened_events.append(
+        "artifact",
+        empty_digest,
+        0,
+        [EventDraft("ArtifactPublished", empty_payload)],
+        "legacy-empty-publication",
+    )
+    assert reopened._load_records(empty_digest)[0].readable_scope == ()
+    with pytest.raises(ArtifactAccessDenied):
+        reopened.get_record(empty_digest, _grant(record, scope=("run-legacy",)))
+    reopened_events.close()
+
+
+class _BrokenReadStore:
+    def current_version(self, stream_type, stream_id):
+        return 0
+
+    def append(self, stream_type, stream_id, expected_version, events, idempotency_key):
+        return []
+
+    def read_stream(self, stream_type, stream_id):
+        raise RuntimeError("metadata read unavailable")
+
+
+class _BrokenIterationStore(_BrokenReadStore):
+    def read_stream(self, stream_type, stream_id):
+        class ExplodingIterable:
+            def __iter__(self):
+                raise RuntimeError("metadata iteration unavailable")
+
+        return ExplodingIterable()
+
+
+class _CommitThenFailStore:
+    def __init__(self, delegate):
+        self.delegate = delegate
+
+    def current_version(self, stream_type, stream_id):
+        return self.delegate.current_version(stream_type, stream_id)
+
+    def append(self, stream_type, stream_id, expected_version, events, idempotency_key):
+        result = self.delegate.append(
+            stream_type, stream_id, expected_version, events, idempotency_key
+        )
+        raise RuntimeError("append response lost after commit")
+
+    def read_stream(self, stream_type, stream_id):
+        return self.delegate.read_stream(stream_type, stream_id)
+
+
+@pytest.mark.parametrize("event_store", [_BrokenReadStore(), _BrokenIterationStore()])
+def test_event_store_read_and_iteration_failures_are_typed(tmp_path, event_store):
+    artifacts = _store(tmp_path / (type(event_store).__name__), event_store)
+    record = artifacts.publish_bytes(b"result", readable_scope=("run-1",))
+    with pytest.raises(ArtifactMetadataError):
+        artifacts.get_record(record.digest, _grant(record))
+
+
+def test_append_commit_then_error_never_deletes_referenced_object(tmp_path):
+    database = tmp_path / "control.db"
+    delegate = SQLiteEventStore(database)
+    events = _CommitThenFailStore(delegate)
+    artifacts = _store(tmp_path / "artifacts", events)
+    content = b"committed-before-error"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+
+    with pytest.raises(ArtifactMetadataError):
+        artifacts.publish_bytes(content, readable_scope=("run-1",))
+
+    assert artifacts._path_for_digest(digest).is_file()
+    reopened = _store(tmp_path / "artifacts", delegate)
+    grant = ArtifactAccessGrant(
+        digest=digest,
+        scope=("run-1",),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        issuer="control-plane",
+        signature="valid",
+    )
+    assert reopened.read_bytes(digest, grant=grant) == content
+    delegate.close()
+
+
+@pytest.mark.parametrize("path_kind", ["directory", "dangling_symlink"])
+def test_digest_named_nonfile_is_integrity_failure(tmp_path, path_kind):
+    artifacts = _store(tmp_path / "artifacts")
+    record = artifacts.publish_bytes(b"result", readable_scope=("run-1",))
+    path = artifacts._path_for_digest(record.digest)
+    path.unlink()
+    if path_kind == "directory":
+        path.mkdir()
+    else:
+        path.symlink_to(tmp_path / "does-not-exist")
+
+    with pytest.raises(ArtifactIntegrityError):
+        artifacts.get_record(record.digest, _grant(record))
+
+
+@pytest.mark.parametrize("publication_id", ["", 0, False, {"id": "bad"}])
+def test_explicit_malformed_publication_id_is_integrity_failure(tmp_path, publication_id):
+    database = tmp_path / "control.db"
+    root = tmp_path / "artifacts"
+    events = SQLiteEventStore(database)
+    artifacts = ArtifactStore(root, event_store=events)
+    content = b"bad-publication-id"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    artifacts._path_for_digest(digest).write_bytes(content)
+    payload = {
+        "publication_id": publication_id,
+        "digest": digest,
+        "type": "artifact",
+        "size": len(content),
+        "media_type": "application/octet-stream",
+        "source": {},
+        "schema_version": 1,
+        "redaction_state": "unknown",
+        "readable_scope": ["run-1"],
+        "references": [],
+        "lifecycle_state": "temporary",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    events.append(
+        "artifact",
+        digest,
+        0,
+        [EventDraft("ArtifactPublished", payload)],
+        "bad-publication-id",
+    )
+    grant = ArtifactAccessGrant(
+        digest=digest,
+        scope=("run-1",),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        issuer="control-plane",
+        signature="valid",
+    )
+    with pytest.raises(ArtifactIntegrityError):
+        artifacts.get_record(digest, grant)
+    events.close()
