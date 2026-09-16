@@ -414,6 +414,25 @@ def test_invalid_same_version_snapshot_can_be_replaced(tmp_path):
     assert SnapshotStore(database).load_valid("run", "run-1") == replacement
 
 
+def test_non_numeric_event_version_snapshot_can_be_replaced(tmp_path):
+    database = tmp_path / "snapshots.db"
+    snapshots = SnapshotStore(database)
+    snapshots.save("run", "run-1", state="Created", version=1)
+    snapshots.close()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE snapshots SET event_version = ? WHERE aggregate_id = ?",
+            ("not-a-version", "run-1"),
+        )
+
+    replacement = SnapshotStore(database).save(
+        "run", "run-1", state="Planning", version=1
+    )
+
+    assert SnapshotStore(database).load_valid("run", "run-1") == replacement
+
+
 def test_save_accepts_integer_state_when_version_is_explicit(tmp_path):
     snapshots = SnapshotStore(tmp_path / "snapshots.db")
 

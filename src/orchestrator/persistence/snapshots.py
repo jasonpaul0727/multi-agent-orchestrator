@@ -50,6 +50,13 @@ class SnapshotConflict(RuntimeError):
         super().__init__("snapshot conflicts with an existing same-version checkpoint")
 
 
+class SnapshotIntegrityError(RuntimeError):
+    """Raised when a persisted snapshot cannot be classified safely."""
+
+    def __init__(self) -> None:
+        super().__init__("persisted snapshot failed integrity validation")
+
+
 class Snapshot(BaseModel):
     """An immutable in-memory representation of a persisted snapshot."""
 
@@ -240,10 +247,20 @@ class SnapshotStore:
                 (snapshot.aggregate_type, snapshot.aggregate_id),
             ).fetchone()
             if current is not None:
-                current_version = _row_value(current, "event_version", 0)
-                if current_version > snapshot.event_version:
+                try:
+                    current_version = _validate_positive_version(
+                        _row_value(current, "event_version", 0), "event_version"
+                    )
+                except (TypeError, ValueError):
+                    # Malformed persisted rows are untrusted checkpoints, not
+                    # newer checkpoints.  They may be replaced at this
+                    # version by a newly validated write.
+                    current_version = None
+                if current_version is None:
+                    should_write = True
+                elif current_version > snapshot.event_version:
                     raise StaleSnapshot(snapshot.event_version, current_version)
-                if current_version == snapshot.event_version:
+                elif current_version == snapshot.event_version:
                     current_snapshot = self._row_to_snapshot(current)
                     same_checkpoint = (
                         current_snapshot is not None
@@ -264,10 +281,8 @@ class SnapshotStore:
                     else:
                         result_snapshot = current_snapshot
                         should_write = False
-                elif current_version < snapshot.event_version:
-                    should_write = True
                 else:
-                    should_write = False
+                    should_write = True
             if should_write:
                 connection.execute(
                     """
@@ -284,7 +299,8 @@ class SnapshotStore:
                         source_event_id = excluded.source_event_id,
                         created_at = excluded.created_at,
                         metadata_hash = excluded.metadata_hash
-                    WHERE snapshots.event_version <= excluded.event_version
+                    WHERE typeof(snapshots.event_version) != 'integer'
+                       OR snapshots.event_version <= excluded.event_version
                     """,
                     (
                         snapshot.aggregate_type,
@@ -307,7 +323,13 @@ class SnapshotStore:
                     (snapshot.aggregate_type, snapshot.aggregate_id),
                 ).fetchone()
                 if current_after is not None:
-                    current_after_version = _row_value(current_after, "event_version", 0)
+                    try:
+                        current_after_version = _validate_positive_version(
+                            _row_value(current_after, "event_version", 0),
+                            "event_version",
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise SnapshotIntegrityError() from exc
                     if current_after_version > snapshot.event_version:
                         raise StaleSnapshot(
                             snapshot.event_version, current_after_version
@@ -697,6 +719,7 @@ __all__ = [
     "Snapshot",
     "SnapshotConflict",
     "SnapshotRecord",
+    "SnapshotIntegrityError",
     "SnapshotStore",
     "StaleSnapshot",
 ]

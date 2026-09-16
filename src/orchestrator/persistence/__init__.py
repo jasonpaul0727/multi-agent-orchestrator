@@ -4,6 +4,7 @@ from .events import EventDraft, StoredEvent
 from .snapshots import (
     Snapshot,
     SnapshotConflict,
+    SnapshotIntegrityError,
     SnapshotRecord,
     SnapshotStore,
     StaleSnapshot,
@@ -22,6 +23,7 @@ __all__ = [
     "SQLiteEventStore",
     "Snapshot",
     "SnapshotConflict",
+    "SnapshotIntegrityError",
     "SnapshotRecord",
     "SnapshotStore",
     "StaleSnapshot",
