@@ -639,7 +639,7 @@ def test_digest_named_nonfile_is_integrity_failure(tmp_path, path_kind):
         artifacts.get_record(record.digest, _grant(record))
 
 
-@pytest.mark.parametrize("publication_id", ["", 0, False, {"id": "bad"}])
+@pytest.mark.parametrize("publication_id", [None, "", 0, False, {"id": "bad"}])
 def test_explicit_malformed_publication_id_is_integrity_failure(tmp_path, publication_id):
     database = tmp_path / "control.db"
     root = tmp_path / "artifacts"
@@ -679,3 +679,56 @@ def test_explicit_malformed_publication_id_is_integrity_failure(tmp_path, public
     with pytest.raises(ArtifactIntegrityError):
         artifacts.get_record(digest, grant)
     events.close()
+
+
+class _NoReadAppendFailureStore:
+    """An adapter whose append outcome is unknown and offers no stream reads."""
+
+    def current_version(self, stream_type, stream_id):
+        return 0
+
+    def append(self, stream_type, stream_id, expected_version, events, idempotency_key):
+        raise RuntimeError("append response lost")
+
+
+class _ReadFailureAfterAppendStore(_NoReadAppendFailureStore):
+    def __init__(self, error):
+        self.error = error
+
+    def read_stream(self, stream_type, stream_id):
+        raise self.error
+
+
+def test_append_failure_without_read_capability_retains_final_object(tmp_path):
+    artifacts = _store(tmp_path / "artifacts", _NoReadAppendFailureStore())
+    content = b"unknown-commit"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+
+    with pytest.raises(ArtifactMetadataError):
+        artifacts.publish_bytes(content, readable_scope=("run-1",))
+
+    assert artifacts._path_for_digest(digest).is_file()
+
+
+@pytest.mark.parametrize(
+    "read_error",
+    [
+        OSError("metadata unavailable"),
+        sqlite3.OperationalError("database unavailable"),
+        RuntimeError("metadata unavailable"),
+    ],
+)
+def test_append_failure_with_unreadable_stream_retains_final_object(
+    tmp_path, read_error
+):
+    artifacts = _store(
+        tmp_path / "artifacts",
+        _ReadFailureAfterAppendStore(read_error),
+    )
+    content = b"unknown-commit"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+
+    with pytest.raises(ArtifactMetadataError):
+        artifacts.publish_bytes(content, readable_scope=("run-1",))
+
+    assert artifacts._path_for_digest(digest).is_file()

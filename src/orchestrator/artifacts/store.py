@@ -845,7 +845,10 @@ class ArtifactStore:
 
         read_stream = getattr(self._event_store, "read_stream", None)
         if read_stream is None:
-            return False
+            # Without a read capability the append outcome is unknowable.  A
+            # failure may have been reported after metadata was committed,
+            # so retain the object rather than deleting a referenced inode.
+            return True
         try:
             events = read_stream("artifact", record.digest)
             for event in events:
@@ -897,7 +900,11 @@ class ArtifactStore:
             if "publication_id" in payload:
                 # Presence is significant: blank, zero, and non-string values
                 # are malformed metadata and must not fall back to event_id.
-                publication_id = payload["publication_id"]
+                publication_id = _validate_text(
+                    payload["publication_id"],
+                    "publication_id",
+                    normalize_whitespace=True,
+                )
             else:
                 publication_id = getattr(event, "event_id", None)
                 if not isinstance(publication_id, str) or not publication_id.strip():
