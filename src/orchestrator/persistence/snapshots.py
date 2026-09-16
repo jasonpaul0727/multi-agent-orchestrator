@@ -227,6 +227,7 @@ class SnapshotStore:
             savepoint = "orchestrator_snapshot_write"
             connection.execute(f"SAVEPOINT {savepoint}")
         result_snapshot = snapshot
+        should_write = True
         try:
             current = connection.execute(
                 """
@@ -253,10 +254,21 @@ class SnapshotStore:
                         and _row_value(current, "source_event_id", 6)
                         == snapshot.source_event_id
                     )
-                    if not same_checkpoint:
+                    if current_snapshot is None:
+                        # An invalid or legacy checkpoint cannot be trusted as
+                        # a same-version conflict and may be replaced by a
+                        # newly authenticated write.
+                        should_write = True
+                    elif not same_checkpoint:
                         raise SnapshotConflict(snapshot.event_version)
-                    result_snapshot = current_snapshot
-            if current is None or current_version < snapshot.event_version:
+                    else:
+                        result_snapshot = current_snapshot
+                        should_write = False
+                elif current_version < snapshot.event_version:
+                    should_write = True
+                else:
+                    should_write = False
+            if should_write:
                 connection.execute(
                     """
                     INSERT INTO snapshots (
@@ -341,26 +353,60 @@ class SnapshotStore:
         if len(args) > 5:
             raise TypeError("save accepts at most five positional values after aggregate id")
         if args:
-            if state is not _MISSING:
-                raise TypeError("state was provided twice")
-            first = args[0]
-            if isinstance(first, int) and not isinstance(first, bool):
-                if len(args) == 1:
-                    if version is None and event_version is None:
-                        raise TypeError("save requires state and version")
-                    # An explicit keyword version disambiguates an integer
-                    # state from the old event-version-first order.
-                    state = first
-                elif isinstance(args[1], int) and not isinstance(args[1], bool):
-                    raise TypeError(
-                        "save cannot disambiguate integer state and legacy "
-                        "event-version order; use keyword version or save_snapshot"
-                    )
-                else:
-                    if version is not None or event_version is not None:
-                        raise TypeError("event version was provided twice")
+            if state is not _MISSING and len(args) == 1:
+                first = args[0]
+                if (
+                    isinstance(first, int)
+                    and not isinstance(first, bool)
+                    and version is None
+                    and event_version is None
+                ):
+                    # Compatibility form: the legacy event_version remains
+                    # positional while state and metadata use keywords.
                     event_version = first
-                    state = args[1]
+                    args = ()
+                else:
+                    raise TypeError("state was provided twice")
+            if not args:
+                warnings.warn(
+                    "positional save is deprecated; use keyword arguments or save_snapshot",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            else:
+                if state is not _MISSING:
+                    raise TypeError("state was provided twice")
+                first = args[0]
+                if isinstance(first, int) and not isinstance(first, bool):
+                    if len(args) == 1:
+                        if version is None and event_version is None:
+                            raise TypeError("save requires state and version")
+                        # An explicit keyword version disambiguates an integer
+                        # state from the old event-version-first order.
+                        state = first
+                    elif isinstance(args[1], int) and not isinstance(args[1], bool):
+                        raise TypeError(
+                            "save cannot disambiguate integer state and legacy "
+                            "event-version order; use keyword version or save_snapshot"
+                        )
+                    else:
+                        if version is not None or event_version is not None:
+                            raise TypeError("event version was provided twice")
+                        event_version = first
+                        state = args[1]
+                        metadata_args = args[2:]
+                        if metadata_args:
+                            schema_version = metadata_args[0]
+                        if len(metadata_args) >= 2:
+                            source_event_id = metadata_args[1]
+                        if len(metadata_args) >= 3:
+                            state_hash = metadata_args[2]
+                else:
+                    state = first
+                    if len(args) >= 2:
+                        if version is not None:
+                            raise TypeError("version was provided twice")
+                        version = args[1]
                     metadata_args = args[2:]
                     if metadata_args:
                         schema_version = metadata_args[0]
@@ -368,24 +414,11 @@ class SnapshotStore:
                         source_event_id = metadata_args[1]
                     if len(metadata_args) >= 3:
                         state_hash = metadata_args[2]
-            else:
-                state = first
-                if len(args) >= 2:
-                    if version is not None:
-                        raise TypeError("version was provided twice")
-                    version = args[1]
-                metadata_args = args[2:]
-                if metadata_args:
-                    schema_version = metadata_args[0]
-                if len(metadata_args) >= 2:
-                    source_event_id = metadata_args[1]
-                if len(metadata_args) >= 3:
-                    state_hash = metadata_args[2]
-            warnings.warn(
-                "positional save is deprecated; use keyword arguments or save_snapshot",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+                warnings.warn(
+                    "positional save is deprecated; use keyword arguments or save_snapshot",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
         if state is _MISSING:
             raise TypeError("save requires state as its third argument")
         if version is not None and (

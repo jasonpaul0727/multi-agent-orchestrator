@@ -319,6 +319,59 @@ def test_upgrade_rejects_legacy_snapshot_with_tampered_created_at(tmp_path):
     assert SnapshotStore(database).load_valid("run", "run-1") is None
 
 
+def test_pre_metadata_hash_snapshot_is_unusable_after_migration(tmp_path):
+    database = tmp_path / "snapshots.db"
+    state_json = canonical_json("Created")
+    state_hash = hashlib.sha256(state_json.encode("utf-8")).hexdigest()
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO schema_migrations (version) VALUES (1);
+            CREATE TABLE snapshots (
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                event_version INTEGER NOT NULL,
+                state_json TEXT NOT NULL,
+                state_hash TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                source_event_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (aggregate_type, aggregate_id)
+            );
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO snapshots (
+                aggregate_type, aggregate_id, event_version, state_json,
+                state_hash, schema_version, source_event_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "run",
+                "run-1",
+                99,
+                state_json,
+                state_hash,
+                1,
+                "tampered-source",
+                "2099-01-01T00:00:00+00:00",
+            ),
+        )
+
+    upgraded = SnapshotStore(database)
+    assert upgraded.load_valid("run", "run-1") is None
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT metadata_hash FROM snapshots WHERE aggregate_id = ?",
+            ("run-1",),
+        ).fetchone()[0] is None
+
+
 def test_same_version_conflicting_snapshot_is_rejected(tmp_path):
     snapshots = SnapshotStore(tmp_path / "snapshots.db")
     original = snapshots.save("run", "run-1", state="Created", version=1)
@@ -340,6 +393,25 @@ def test_same_version_exact_snapshot_write_is_idempotent(tmp_path):
     )
 
     assert duplicate == original
+
+
+def test_invalid_same_version_snapshot_can_be_replaced(tmp_path):
+    database = tmp_path / "snapshots.db"
+    snapshots = SnapshotStore(database)
+    snapshots.save("run", "run-1", state="Created", version=1)
+    snapshots.close()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE snapshots SET metadata_hash = NULL WHERE aggregate_id = ?",
+            ("run-1",),
+        )
+
+    replacement = SnapshotStore(database).save(
+        "run", "run-1", state="Planning", version=1
+    )
+
+    assert SnapshotStore(database).load_valid("run", "run-1") == replacement
 
 
 def test_save_accepts_integer_state_when_version_is_explicit(tmp_path):
@@ -375,6 +447,25 @@ def test_legacy_positional_save_is_supported_with_deprecation_warning(tmp_path):
     assert saved.event_version == 1
     assert saved.state == {"status": "Created"}
     assert saved.schema_version == 2
+
+
+def test_legacy_event_version_with_keyword_state_and_metadata_is_supported(tmp_path):
+    snapshots = SnapshotStore(tmp_path / "snapshots.db")
+
+    with pytest.warns(DeprecationWarning, match="save_snapshot"):
+        saved = snapshots.save(
+            "run",
+            "run-1",
+            1,
+            state={"status": "Created"},
+            schema_version=2,
+            source_event_id="event-1",
+        )
+
+    assert saved.event_version == 1
+    assert saved.state == {"status": "Created"}
+    assert saved.schema_version == 2
+    assert saved.source_event_id == "event-1"
 
 
 def test_state_first_positional_save_is_deprecated_but_deterministic(tmp_path):

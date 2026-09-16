@@ -249,29 +249,10 @@ def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
         connection.execute("DROP TABLE snapshots")
         connection.execute("ALTER TABLE snapshots_migration RENAME TO snapshots")
 
-        # Only rows copied out of the pre-v2 table are missing authenticated
-        # metadata.  Current-schema NULLs are tampering/corruption and must
-        # remain unusable rather than being silently repaired at open time.
-        rows = connection.execute(
-            """
-            SELECT aggregate_type, aggregate_id, event_version, schema_version,
-                   source_event_id, created_at
-            FROM snapshots
-            WHERE metadata_hash IS NULL
-            """
-        ).fetchall()
-        for row in rows:
-            metadata_hash = _snapshot_metadata_hash(
-                row[0], row[1], row[2], row[3], row[4], row[5]
-            )
-            connection.execute(
-                """
-                UPDATE snapshots
-                SET metadata_hash = ?
-                WHERE aggregate_type = ? AND aggregate_id = ?
-                """,
-                (metadata_hash, row[0], row[1]),
-            )
+        # The old table did not authenticate any metadata.  In particular,
+        # event_version, source_event_id, and created_at came from an
+        # untrusted snapshot row, so there is no safe v3 hash to synthesize.
+        # Leave metadata_hash NULL and force recovery to replay the stream.
         return
 
     # Version 3 authenticates ``created_at`` as part of the snapshot
