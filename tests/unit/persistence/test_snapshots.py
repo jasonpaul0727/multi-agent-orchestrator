@@ -5,7 +5,7 @@ import hashlib
 import pytest
 
 from orchestrator.persistence.events import EventDraft
-from orchestrator.persistence.snapshots import SnapshotStore, StaleSnapshot
+from orchestrator.persistence.snapshots import SnapshotConflict, SnapshotStore, StaleSnapshot
 from orchestrator.persistence.sqlite_event_store import SQLiteEventStore, canonical_json
 
 
@@ -263,22 +263,16 @@ def test_previous_metadata_hash_format_is_migrated_once_on_upgrade(tmp_path):
         connection.execute("DELETE FROM schema_migrations WHERE version = 3")
 
     upgraded = SnapshotStore(database)
-    assert upgraded.load_valid("run", "run-1") is not None
+    assert upgraded.load_valid("run", "run-1") is None
     with sqlite3.connect(database) as connection:
         migrated_hash = connection.execute(
             "SELECT metadata_hash FROM snapshots WHERE aggregate_id = ?",
             ("run-1",),
         ).fetchone()[0]
-        assert migrated_hash != old_hash
+        assert migrated_hash is None
         assert connection.execute(
             "SELECT 1 FROM schema_migrations WHERE version = 3"
         ).fetchone() == (1,)
-        connection.execute(
-            "UPDATE snapshots SET metadata_hash = ? WHERE aggregate_id = ?",
-            ("0" * 64, "run-1"),
-        )
-
-    assert SnapshotStore(database).load_valid("run", "run-1") is None
 
 
 def test_upgrade_does_not_repair_arbitrary_current_metadata_tampering(tmp_path):
@@ -298,27 +292,99 @@ def test_upgrade_does_not_repair_arbitrary_current_metadata_tampering(tmp_path):
     assert upgraded.load_valid("run", "run-1") is None
 
 
+def test_upgrade_rejects_legacy_snapshot_with_tampered_created_at(tmp_path):
+    database = tmp_path / "snapshots.db"
+    snapshots = SnapshotStore(database)
+    saved = snapshots.save("run", "run-1", state="Created", version=1)
+    snapshots.close()
+
+    old_hash = hashlib.sha256(
+        canonical_json(
+            {
+                "aggregate_id": saved.aggregate_id,
+                "aggregate_type": saved.aggregate_type,
+                "event_version": saved.event_version,
+                "schema_version": saved.schema_version,
+                "source_event_id": saved.source_event_id,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE snapshots SET created_at = ?, metadata_hash = ? WHERE aggregate_id = ?",
+            ("2099-01-01T00:00:00+00:00", old_hash, "run-1"),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+
+    assert SnapshotStore(database).load_valid("run", "run-1") is None
+
+
+def test_same_version_conflicting_snapshot_is_rejected(tmp_path):
+    snapshots = SnapshotStore(tmp_path / "snapshots.db")
+    original = snapshots.save("run", "run-1", state="Created", version=1)
+
+    with pytest.raises(SnapshotConflict):
+        snapshots.save("run", "run-1", state="Planning", version=1)
+
+    assert snapshots.load_valid("run", "run-1") == original
+
+
+def test_same_version_exact_snapshot_write_is_idempotent(tmp_path):
+    snapshots = SnapshotStore(tmp_path / "snapshots.db")
+    original = snapshots.save(
+        "run", "run-1", state="Created", version=1, source_event_id="event-1"
+    )
+
+    duplicate = snapshots.save(
+        "run", "run-1", state="Created", version=1, source_event_id="event-1"
+    )
+
+    assert duplicate == original
+
+
 def test_save_accepts_integer_state_when_version_is_explicit(tmp_path):
     snapshots = SnapshotStore(tmp_path / "snapshots.db")
 
-    saved = snapshots.save("counter", "counter-1", 7, version=1)
+    with pytest.warns(DeprecationWarning, match="save_snapshot"):
+        saved = snapshots.save("counter", "counter-1", 7, version=1)
 
     assert saved.state == 7
     assert saved.event_version == 1
 
 
-def test_save_rejects_ambiguous_legacy_positional_order(tmp_path):
+def test_save_rejects_ambiguous_integer_positional_order(tmp_path):
     snapshots = SnapshotStore(tmp_path / "snapshots.db")
 
-    with pytest.raises(TypeError, match="state first"):
-        snapshots.save("run", "run-1", 1, {"status": "Created"})
+    with pytest.raises(TypeError, match="integer"):
+        snapshots.save("counter", "counter-1", 7, 1)
 
 
 def test_legacy_positional_save_is_supported_with_deprecation_warning(tmp_path):
     snapshots = SnapshotStore(tmp_path / "snapshots.db")
 
     with pytest.warns(DeprecationWarning, match="save_snapshot"):
-        saved = snapshots.save("run", "run-1", 1, {"status": "Created"}, 1, "event-1")
+        saved = snapshots.save(
+            "run",
+            "run-1",
+            1,
+            {"status": "Created"},
+            source_event_id="event-1",
+            schema_version=2,
+        )
 
     assert saved.event_version == 1
     assert saved.state == {"status": "Created"}
+    assert saved.schema_version == 2
+
+
+def test_state_first_positional_save_is_deprecated_but_deterministic(tmp_path):
+    snapshots = SnapshotStore(tmp_path / "snapshots.db")
+
+    with pytest.warns(DeprecationWarning, match="save_snapshot"):
+        saved = snapshots.save(
+            "run", "run-1", {"status": "Created"}, 1, 2, "event-1"
+        )
+
+    assert saved.event_version == 1
+    assert saved.schema_version == 2
+    assert saved.source_event_id == "event-1"

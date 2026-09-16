@@ -41,6 +41,15 @@ class StaleSnapshot(RuntimeError):
         )
 
 
+class SnapshotConflict(RuntimeError):
+    """Raised when a different snapshot already exists at the same version."""
+
+    def __init__(self, version: int) -> None:
+        self.version = version
+        self.event_version = version
+        super().__init__("snapshot conflicts with an existing same-version checkpoint")
+
+
 class Snapshot(BaseModel):
     """An immutable in-memory representation of a persisted snapshot."""
 
@@ -132,6 +141,10 @@ class SnapshotStore:
     older checkpoint for the same aggregate.  Event rows remain protected by
     the append-only triggers owned by :class:`SQLiteEventStore`.
 
+    A lower-version write raises :class:`StaleSnapshot`; an exact duplicate at
+    the same version is idempotent, while a differing same-version write
+    raises :class:`SnapshotConflict`.
+
     ``source_event_id`` is optional for generic checkpointing.  Recovery treats
     a source-less snapshot as anchored at its validated stream version and
     replays the event tail from that anchor; callers that need an explicit
@@ -213,10 +226,13 @@ class SnapshotStore:
         else:
             savepoint = "orchestrator_snapshot_write"
             connection.execute(f"SAVEPOINT {savepoint}")
+        result_snapshot = snapshot
         try:
             current = connection.execute(
                 """
-                SELECT event_version
+                SELECT aggregate_type, aggregate_id, event_version, state_json,
+                       state_hash, schema_version, source_event_id, created_at,
+                       metadata_hash
                 FROM snapshots
                 WHERE aggregate_type = ? AND aggregate_id = ?
                 """,
@@ -226,47 +242,64 @@ class SnapshotStore:
                 current_version = _row_value(current, "event_version", 0)
                 if current_version > snapshot.event_version:
                     raise StaleSnapshot(snapshot.event_version, current_version)
-            connection.execute(
-                """
-                INSERT INTO snapshots (
-                    aggregate_type, aggregate_id, event_version, state_json,
-                    state_hash, schema_version, source_event_id, created_at,
-                    metadata_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (aggregate_type, aggregate_id) DO UPDATE SET
-                    event_version = excluded.event_version,
-                    state_json = excluded.state_json,
-                    state_hash = excluded.state_hash,
-                    schema_version = excluded.schema_version,
-                    source_event_id = excluded.source_event_id,
-                    created_at = excluded.created_at,
-                    metadata_hash = excluded.metadata_hash
-                WHERE snapshots.event_version <= excluded.event_version
-                """,
-                (
-                    snapshot.aggregate_type,
-                    snapshot.aggregate_id,
-                    snapshot.event_version,
-                    state_json,
-                    snapshot.state_hash,
-                    snapshot.schema_version,
-                    snapshot.source_event_id,
-                    snapshot.created_at.isoformat(),
-                    snapshot.metadata_hash,
-                ),
-            )
-            current_after = connection.execute(
-                """
-                SELECT event_version
-                FROM snapshots
-                WHERE aggregate_type = ? AND aggregate_id = ?
-                """,
-                (snapshot.aggregate_type, snapshot.aggregate_id),
-            ).fetchone()
-            if current_after is not None:
-                current_after_version = _row_value(current_after, "event_version", 0)
-                if current_after_version > snapshot.event_version:
-                    raise StaleSnapshot(snapshot.event_version, current_after_version)
+                if current_version == snapshot.event_version:
+                    current_snapshot = self._row_to_snapshot(current)
+                    same_checkpoint = (
+                        current_snapshot is not None
+                        and _row_value(current, "state_json", 3) == state_json
+                        and _row_value(current, "state_hash", 4) == snapshot.state_hash
+                        and _row_value(current, "schema_version", 5)
+                        == snapshot.schema_version
+                        and _row_value(current, "source_event_id", 6)
+                        == snapshot.source_event_id
+                    )
+                    if not same_checkpoint:
+                        raise SnapshotConflict(snapshot.event_version)
+                    result_snapshot = current_snapshot
+            if current is None or current_version < snapshot.event_version:
+                connection.execute(
+                    """
+                    INSERT INTO snapshots (
+                        aggregate_type, aggregate_id, event_version, state_json,
+                        state_hash, schema_version, source_event_id, created_at,
+                        metadata_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (aggregate_type, aggregate_id) DO UPDATE SET
+                        event_version = excluded.event_version,
+                        state_json = excluded.state_json,
+                        state_hash = excluded.state_hash,
+                        schema_version = excluded.schema_version,
+                        source_event_id = excluded.source_event_id,
+                        created_at = excluded.created_at,
+                        metadata_hash = excluded.metadata_hash
+                    WHERE snapshots.event_version <= excluded.event_version
+                    """,
+                    (
+                        snapshot.aggregate_type,
+                        snapshot.aggregate_id,
+                        snapshot.event_version,
+                        state_json,
+                        snapshot.state_hash,
+                        snapshot.schema_version,
+                        snapshot.source_event_id,
+                        snapshot.created_at.isoformat(),
+                        snapshot.metadata_hash,
+                    ),
+                )
+                current_after = connection.execute(
+                    """
+                    SELECT event_version
+                    FROM snapshots
+                    WHERE aggregate_type = ? AND aggregate_id = ?
+                    """,
+                    (snapshot.aggregate_type, snapshot.aggregate_id),
+                ).fetchone()
+                if current_after is not None:
+                    current_after_version = _row_value(current_after, "event_version", 0)
+                    if current_after_version > snapshot.event_version:
+                        raise StaleSnapshot(
+                            snapshot.event_version, current_after_version
+                        )
             if started_transaction:
                 connection.commit()
             else:
@@ -280,15 +313,15 @@ class SnapshotStore:
                 finally:
                     connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
-        return snapshot
+        return result_snapshot
 
     def save(
         self,
         aggregate_type: str,
         aggregate_id: str,
+        *args: Any,
         state: Any = _MISSING,
-        version: Any = None,
-        *legacy_args: Any,
+        version: int | None = None,
         event_version: int | None = None,
         schema_version: int = 1,
         source_event_id: str | None = None,
@@ -297,75 +330,64 @@ class SnapshotStore:
         """Persist ``state`` at ``version`` using a deterministic signature.
 
         ``save_snapshot`` remains the lower-level API with event-version-first
-        arguments.  The historical positional form with trailing metadata
-        arguments remains supported with a deprecation warning; its
-        four-position prefix is intentionally rejected as ambiguous.  New
-        callers should use the deterministic state-first form, while legacy
-        callers can use :meth:`save_legacy` or ``save_snapshot`` explicitly.
+        arguments.  Both historical event-version-first and state-first
+        positional forms remain supported with a deprecation warning.  When
+        the first two positional values are both integers, the call is
+        rejected because state-first and legacy order cannot be distinguished;
+        use keyword ``version`` for an integer state.  Keyword calls are the
+        non-deprecated deterministic form.
         """
 
-        if state is _MISSING:
-            raise TypeError("save requires state as its third argument")
-        if legacy_args:
-            if isinstance(version, int) and not isinstance(version, bool):
-                # Unambiguous state-first positional metadata, retained for
-                # callers of the original convenience wrapper.
-                if isinstance(state, int) and not isinstance(state, bool):
+        if len(args) > 5:
+            raise TypeError("save accepts at most five positional values after aggregate id")
+        if args:
+            if state is not _MISSING:
+                raise TypeError("state was provided twice")
+            first = args[0]
+            if isinstance(first, int) and not isinstance(first, bool):
+                if len(args) == 1:
+                    if version is None and event_version is None:
+                        raise TypeError("save requires state and version")
+                    # An explicit keyword version disambiguates an integer
+                    # state from the old event-version-first order.
+                    state = first
+                elif isinstance(args[1], int) and not isinstance(args[1], bool):
                     raise TypeError(
                         "save cannot disambiguate integer state and legacy "
                         "event-version order; use keyword version or save_snapshot"
                     )
-                if event_version is not None:
-                    raise TypeError("version and event_version disagree")
-                if len(legacy_args) > 3:
-                    raise TypeError(
-                        "state-first save accepts at most three trailing arguments"
-                    )
-                schema_version = legacy_args[0] if len(legacy_args) >= 1 else schema_version
-                source_event_id = (
-                    legacy_args[1] if len(legacy_args) >= 2 else source_event_id
-                )
-                state_hash = legacy_args[2] if len(legacy_args) >= 3 else state_hash
-                event_version = version
-                return self.save_snapshot(
-                    aggregate_type,
-                    aggregate_id,
-                    event_version,
-                    state,
-                    schema_version,
-                    source_event_id,
-                    state_hash,
-                )
-            if (
-                isinstance(state, bool)
-                or not isinstance(state, int)
-                or isinstance(version, (type(None), int, bool))
-            ):
-                raise TypeError(
-                    "save expects state first and an integer version; use "
-                    "save_snapshot for legacy order"
-                )
-            if event_version is not None:
-                raise TypeError("legacy positional save cannot combine event_version")
-            if len(legacy_args) > 3:
-                raise TypeError("legacy positional save accepts at most three trailing arguments")
+                else:
+                    if version is not None or event_version is not None:
+                        raise TypeError("event version was provided twice")
+                    event_version = first
+                    state = args[1]
+                    metadata_args = args[2:]
+                    if metadata_args:
+                        schema_version = metadata_args[0]
+                    if len(metadata_args) >= 2:
+                        source_event_id = metadata_args[1]
+                    if len(metadata_args) >= 3:
+                        state_hash = metadata_args[2]
+            else:
+                state = first
+                if len(args) >= 2:
+                    if version is not None:
+                        raise TypeError("version was provided twice")
+                    version = args[1]
+                metadata_args = args[2:]
+                if metadata_args:
+                    schema_version = metadata_args[0]
+                if len(metadata_args) >= 2:
+                    source_event_id = metadata_args[1]
+                if len(metadata_args) >= 3:
+                    state_hash = metadata_args[2]
             warnings.warn(
-                "legacy positional save is deprecated; use save_snapshot",
+                "positional save is deprecated; use keyword arguments or save_snapshot",
                 DeprecationWarning,
                 stacklevel=2,
             )
-            legacy_schema_version = legacy_args[0] if len(legacy_args) >= 1 else 1
-            legacy_source_event_id = legacy_args[1] if len(legacy_args) >= 2 else None
-            legacy_state_hash = legacy_args[2] if len(legacy_args) >= 3 else None
-            return self.save_snapshot(
-                aggregate_type,
-                aggregate_id,
-                state,
-                version,
-                legacy_schema_version,
-                legacy_source_event_id,
-                legacy_state_hash,
-            )
+        if state is _MISSING:
+            raise TypeError("save requires state as its third argument")
         if version is not None and (
             isinstance(version, bool) or not isinstance(version, int)
         ):
@@ -638,4 +660,10 @@ def _row_value(
             raise
 
 
-__all__ = ["Snapshot", "SnapshotRecord", "SnapshotStore", "StaleSnapshot"]
+__all__ = [
+    "Snapshot",
+    "SnapshotConflict",
+    "SnapshotRecord",
+    "SnapshotStore",
+    "StaleSnapshot",
+]

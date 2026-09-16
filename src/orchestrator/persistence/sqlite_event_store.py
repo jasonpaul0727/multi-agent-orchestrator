@@ -276,20 +276,23 @@ def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
 
     # Version 3 authenticates ``created_at`` as part of the snapshot
     # metadata.  Databases written by the preceding Task 3 implementation
-    # have versions 1 and 2 but no version 3; rehash their existing,
-    # self-contained metadata exactly once.  NULL hashes are deliberately not
-    # repaired: on a current schema they indicate corruption or tampering.
+    # have versions 1 and 2 but no version 3.  Their metadata hash did not
+    # authenticate ``created_at``, so there is no trusted value with which to
+    # produce a v3 hash.  Mark matching legacy rows unusable and require event
+    # replay instead of silently trusting or rehashing their metadata.  Rows
+    # that do not match the legacy format are left untouched; v3 validation
+    # will accept an already-v3 hash or reject arbitrary tampering.
     if 2 in migration_versions and 3 not in migration_versions:
         rows = connection.execute(
             """
             SELECT aggregate_type, aggregate_id, event_version, schema_version,
-                   source_event_id, created_at, metadata_hash
+                   source_event_id, metadata_hash
             FROM snapshots
             WHERE metadata_hash IS NOT NULL
             """
         ).fetchall()
         for row in rows:
-            legacy_hash = row[6]
+            legacy_hash = row[5]
             expected_legacy_hash = _legacy_snapshot_metadata_hash(
                 row[0], row[1], row[2], row[3], row[4]
             )
@@ -297,16 +300,13 @@ def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
                 legacy_hash, expected_legacy_hash
             ):
                 continue
-            metadata_hash = _snapshot_metadata_hash(
-                row[0], row[1], row[2], row[3], row[4], row[5]
-            )
             connection.execute(
                 """
                 UPDATE snapshots
                 SET metadata_hash = ?
                 WHERE aggregate_type = ? AND aggregate_id = ?
                 """,
-                (metadata_hash, row[0], row[1]),
+                (None, row[0], row[1]),
             )
 
 
