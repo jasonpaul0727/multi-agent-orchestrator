@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import pytest
+from concurrent.futures import ThreadPoolExecutor
 
 from orchestrator.budget import (
     BudgetExhausted,
     BudgetLedger,
+    BudgetLimitMismatch,
     BudgetReleasedError,
     CostEstimate,
     CurrencyMismatch,
+    IdempotencyConflict,
     RunLimit,
+    ReservationStateError,
+    UsageRecord,
 )
 from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
 
@@ -48,9 +53,14 @@ def test_cost_rounds_up_and_reservation_is_atomic(tmp_path):
         "cached_input_price_minor_per_million": 0,
         "cached_input_tokens": 0,
         "currency": "USD",
+        "estimator_snapshot_id": "unspecified",
         "input_price_minor_per_million": 1,
         "input_tokens": 101,
+        "max_cached_input_tokens": None,
         "max_cost_minor": 100,
+        "max_input_tokens": None,
+        "max_output_tokens": None,
+        "max_reasoning_tokens": None,
         "max_tokens": 200,
         "output_price_minor_per_million": 3,
         "output_tokens": 9,
@@ -61,6 +71,10 @@ def test_cost_rounds_up_and_reservation_is_atomic(tmp_path):
         "reservation_id": reservation.reservation_id,
         "reserved_minor": 1,
         "reserved_tokens": 200,
+        "reserved_cached_input_tokens": 0,
+        "reserved_input_tokens": 101,
+        "reserved_output_tokens": 9,
+        "reserved_reasoning_tokens": 0,
         "run_id": "run-1",
         "snapshot_id": "unspecified",
         "status": "reserved",
@@ -190,3 +204,262 @@ def test_unknown_cannot_be_released_implicitly(tmp_path):
 
     with pytest.raises(BudgetReleasedError):
         ledger.release(reservation.reservation_id)
+
+
+def test_unknown_cannot_commit_but_explicit_reconciliation_settles(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    reservation = ledger.reserve("run-1", estimate_with_worst_case(), token_limit=100)
+    ledger.mark_unknown(reservation.reservation_id)
+
+    with pytest.raises(ReservationStateError) as failure:
+        ledger.commit_usage(reservation.reservation_id, {"input": 1})
+    assert "reconcile_unknown" in str(failure.value)
+
+    reconciled = ledger.reconcile_unknown(
+        reservation.reservation_id,
+        {"input": 1, "cost_minor": 3},
+        "provider-reconciliation-1",
+    )
+    assert reconciled.status == "committed"
+    assert ledger.available("run-1").unknown_minor == 0
+    assert [event.event_type for event in ledger.read("run-1")][-4:] == [
+        "UsageObserved",
+        "CostCommitted",
+        "BudgetReleased",
+        "CostAdjusted",
+    ]
+
+
+def test_empty_keys_are_rejected_without_fallback(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=10, max_tokens=10)},
+    )
+    estimate = estimate_with_worst_case(1)
+    with pytest.raises(ValueError):
+        ledger.reserve("run-1", estimate, idempotency_key="")
+    reservation = ledger.reserve("run-1", estimate)
+    with pytest.raises(ValueError):
+        ledger.commit_usage(reservation.reservation_id, {}, settlement_key="")
+    ledger.mark_unknown(reservation.reservation_id)
+    with pytest.raises(ValueError):
+        ledger.reconcile_unknown(reservation.reservation_id, {}, "")
+
+
+def test_reservation_key_fingerprint_and_explicit_id_are_unique(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    first = ledger.reserve(
+        "run-1",
+        estimate_with_worst_case(5),
+        reservation_id="reservation-1",
+        idempotency_key="request-1",
+    )
+    assert ledger.reserve(
+        "run-1",
+        estimate_with_worst_case(5),
+        reservation_id="reservation-1",
+        idempotency_key="request-1",
+    ) == first
+    with pytest.raises(IdempotencyConflict):
+        ledger.reserve(
+            "run-1",
+            estimate_with_worst_case(6),
+            reservation_id="reservation-1",
+            idempotency_key="request-1",
+        )
+    with pytest.raises(IdempotencyConflict):
+        ledger.reserve(
+            "run-1",
+            estimate_with_worst_case(5),
+            reservation_id="reservation-1",
+            idempotency_key="request-2",
+        )
+
+
+def test_usage_record_identity_must_match_target(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    reservation = ledger.reserve("run-1", estimate_with_worst_case(5), token_limit=5)
+    with pytest.raises(ReservationStateError):
+        ledger.commit_usage(
+            reservation.reservation_id,
+            {"reservation_id": "other", "input": 1},
+        )
+    with pytest.raises(ReservationStateError):
+        ledger.commit_usage(
+            reservation.reservation_id,
+            {"run_id": "other", "input": 1},
+        )
+    with pytest.raises(ReservationStateError):
+        ledger.commit_usage(
+            reservation.reservation_id,
+            UsageRecord(
+                reservation_id=reservation.reservation_id,
+                run_id="run-1",
+                settlement_key="other-key",
+                currency="USD",
+            ),
+        )
+
+
+def test_settlement_key_reuse_on_another_reservation_conflicts(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    first = ledger.reserve(
+        "run-1",
+        estimate_with_worst_case(5),
+        reservation_id="reservation-1",
+    )
+    second = ledger.reserve(
+        "run-1",
+        estimate_with_worst_case(5),
+        reservation_id="reservation-2",
+    )
+    ledger.commit_usage(first.reservation_id, {"input": 1}, settlement_key="same-key")
+    with pytest.raises(IdempotencyConflict):
+        ledger.commit_usage(second.reservation_id, {"input": 1}, settlement_key="same-key")
+
+
+def test_all_run_token_caps_and_max_total_tokens_alias_are_enforced(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={
+            "run-1": RunLimit(
+                max_total_tokens=10,
+                max_input_tokens=2,
+                max_output_tokens=2,
+                max_reasoning_tokens=2,
+                max_cached_input_tokens=2,
+            )
+        },
+    )
+    estimate = CostEstimate(
+        amount_minor=1,
+        currency="USD",
+        token_limit=4,
+        input_tokens=3,
+        output_tokens=1,
+        snapshot_id="test",
+    )
+    with pytest.raises(BudgetExhausted):
+        ledger.reserve("run-1", estimate)
+
+
+def test_reopen_derives_persisted_envelope_and_rejects_mismatch(tmp_path):
+    database = tmp_path / "events.db"
+    first_store = SQLiteEventStore(database)
+    first = BudgetLedger(
+        first_store,
+        run_limits={
+            "run-1": RunLimit(
+                max_cost_minor=10,
+                max_total_tokens=10,
+                max_input_tokens=4,
+                currency="USD",
+            )
+        },
+    )
+    first.reserve(
+        "run-1",
+        CostEstimate(amount_minor=1, currency="USD", token_limit=1, snapshot_id="test"),
+    )
+    first_store.close()
+    reopened_store = SQLiteEventStore(database)
+    reopened = BudgetLedger.reopen(reopened_store)
+    assert reopened.available("run-1").max_input_tokens == 4
+    with pytest.raises(BudgetLimitMismatch):
+        BudgetLedger(reopened_store, {"run-1": RunLimit(max_cost_minor=11, max_tokens=10)})
+
+
+def test_release_after_commit_returns_committed_without_extra_event(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    reservation = ledger.reserve("run-1", estimate_with_worst_case(5), token_limit=5)
+    ledger.commit_usage(reservation.reservation_id, {"input": 1}, settlement_key="s-1")
+    event_count = len(ledger.read("run-1"))
+    result = ledger.release(reservation.reservation_id)
+    assert result.status == "committed"
+    assert len(ledger.read("run-1")) == event_count
+
+
+def test_concurrent_reservations_never_cross_cost_envelope(tmp_path):
+    database = tmp_path / "events.db"
+    estimate = estimate_with_worst_case(1)
+
+    def attempt(index: int):
+        store = SQLiteEventStore(database)
+        try:
+            ledger = BudgetLedger(
+                store,
+                run_limits={"run-1": RunLimit(max_cost_minor=3, max_tokens=100)},
+            )
+            return ledger.reserve(
+                "run-1",
+                estimate,
+                reservation_id=f"r-{index}",
+                idempotency_key=f"reserve-{index}",
+            )
+        except Exception as exc:
+            return exc
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(attempt, range(8)))
+    assert sum(not isinstance(result, Exception) for result in results) == 3
+    check = SQLiteEventStore(database)
+    assert check.current_version("budget", "run-1") == 3
+
+
+def test_concurrent_settlements_cannot_cross_cost_envelope(tmp_path):
+    database = tmp_path / "events.db"
+    initial = SQLiteEventStore(database)
+    setup = BudgetLedger(
+        initial,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    reservations = [
+        setup.reserve(
+            "run-1",
+            CostEstimate(amount_minor=40, currency="USD", token_limit=1, snapshot_id="test"),
+            reservation_id=f"r-{index}",
+        )
+        for index in range(2)
+    ]
+    initial.close()
+
+    def settle(reservation):
+        store = SQLiteEventStore(database)
+        try:
+            return BudgetLedger(store).commit_usage(
+                reservation.reservation_id,
+                {"cost_minor": 60},
+                settlement_key=f"settle-{reservation.reservation_id}",
+            )
+        except Exception as exc:
+            return exc
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(settle, reservations))
+    assert sum(not isinstance(result, Exception) for result in results) == 1

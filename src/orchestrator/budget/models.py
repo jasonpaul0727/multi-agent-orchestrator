@@ -67,7 +67,11 @@ class RunLimit(_BudgetModel):
         validation_alias=AliasChoices("max_cost_minor", "max_amount_minor", "max_cost"),
     )
     max_tokens: StrictInt | None = Field(
-        default=None, ge=0, validation_alias=AliasChoices("max_tokens", "token_limit")
+        default=None,
+        ge=0,
+        validation_alias=AliasChoices(
+            "max_tokens", "max_total_tokens", "token_limit"
+        ),
     )
     currency: Currency = "USD"
     max_input_tokens: StrictInt | None = Field(default=None, ge=0)
@@ -85,6 +89,9 @@ class RunLimit(_BudgetModel):
     def max_amount_minor(self) -> int | None:
         return self.max_cost_minor
 
+    @property
+    def max_total_tokens(self) -> int | None:
+        return self.max_tokens
 
 class CostEstimate(_BudgetModel):
     """A worst-case or actual cost calculation at frozen prices."""
@@ -111,8 +118,15 @@ class CostEstimate(_BudgetModel):
     snapshot_id: StrictStr = "unspecified"
     tokenizer_snapshot_id: StrictStr = "unspecified"
     price_snapshot_id: StrictStr = "unspecified"
+    estimator_snapshot_id: StrictStr = "unspecified"
 
-    @field_validator("snapshot_id", "tokenizer_snapshot_id", "price_snapshot_id", mode="before")
+    @field_validator(
+        "snapshot_id",
+        "tokenizer_snapshot_id",
+        "price_snapshot_id",
+        "estimator_snapshot_id",
+        mode="before",
+    )
     @classmethod
     def validate_snapshots(cls, value: Any, info: Any) -> Any:
         return _snapshot_id(value, info.field_name)
@@ -157,12 +171,17 @@ class BudgetReservation(_BudgetModel):
     reserved_tokens: StrictInt = Field(
         validation_alias=AliasChoices("reserved_tokens", "token_limit"), ge=0
     )
+    reserved_input_tokens: StrictInt = Field(default=0, ge=0)
+    reserved_output_tokens: StrictInt = Field(default=0, ge=0)
+    reserved_reasoning_tokens: StrictInt = Field(default=0, ge=0)
+    reserved_cached_input_tokens: StrictInt = Field(default=0, ge=0)
     currency: Currency
     reservation_version: StrictInt = Field(default=1, gt=0)
     status: ReservationStatus = "reserved"
     snapshot_id: StrictStr = "unspecified"
     tokenizer_snapshot_id: StrictStr = "unspecified"
     price_snapshot_id: StrictStr = "unspecified"
+    estimator_snapshot_id: StrictStr = "unspecified"
 
     @field_validator("reservation_id", "run_id", mode="before")
     @classmethod
@@ -171,7 +190,13 @@ class BudgetReservation(_BudgetModel):
             raise ValueError(f"{info.field_name} must be a non-blank string")
         return value
 
-    @field_validator("snapshot_id", "tokenizer_snapshot_id", "price_snapshot_id", mode="before")
+    @field_validator(
+        "snapshot_id",
+        "tokenizer_snapshot_id",
+        "price_snapshot_id",
+        "estimator_snapshot_id",
+        mode="before",
+    )
     @classmethod
     def validate_snapshots(cls, value: Any, info: Any) -> Any:
         return _snapshot_id(value, info.field_name)
@@ -250,7 +275,15 @@ class BudgetBalance(_BudgetModel):
     run_id: StrictStr
     currency: Currency
     max_cost_minor: StrictInt | None = Field(default=None, ge=0)
-    max_tokens: StrictInt | None = Field(default=None, ge=0)
+    max_tokens: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        validation_alias=AliasChoices("max_tokens", "max_total_tokens"),
+    )
+    max_input_tokens: StrictInt | None = Field(default=None, ge=0)
+    max_output_tokens: StrictInt | None = Field(default=None, ge=0)
+    max_reasoning_tokens: StrictInt | None = Field(default=None, ge=0)
+    max_cached_input_tokens: StrictInt | None = Field(default=None, ge=0)
     reserved_minor: StrictInt = Field(default=0, ge=0)
     reserved_tokens: StrictInt = Field(default=0, ge=0)
     used_minor: StrictInt = Field(default=0, ge=0)
@@ -259,6 +292,18 @@ class BudgetBalance(_BudgetModel):
     released_tokens: StrictInt = Field(default=0, ge=0)
     unknown_minor: StrictInt = Field(default=0, ge=0)
     unknown_tokens: StrictInt = Field(default=0, ge=0)
+    reserved_input_tokens: StrictInt = Field(default=0, ge=0)
+    reserved_output_tokens: StrictInt = Field(default=0, ge=0)
+    reserved_reasoning_tokens: StrictInt = Field(default=0, ge=0)
+    reserved_cached_input_tokens: StrictInt = Field(default=0, ge=0)
+    used_input_tokens: StrictInt = Field(default=0, ge=0)
+    used_output_tokens: StrictInt = Field(default=0, ge=0)
+    used_reasoning_tokens: StrictInt = Field(default=0, ge=0)
+    used_cached_input_tokens: StrictInt = Field(default=0, ge=0)
+    unknown_input_tokens: StrictInt = Field(default=0, ge=0)
+    unknown_output_tokens: StrictInt = Field(default=0, ge=0)
+    unknown_reasoning_tokens: StrictInt = Field(default=0, ge=0)
+    unknown_cached_input_tokens: StrictInt = Field(default=0, ge=0)
     reservation_version: StrictInt = Field(default=0, ge=0)
     latest_event_id: StrictStr | None = None
 
@@ -276,6 +321,34 @@ class BudgetBalance(_BudgetModel):
     @property
     def held_tokens(self) -> int:
         return self.reserved_tokens + self.unknown_tokens
+
+    @property
+    def max_total_tokens(self) -> int | None:
+        return self.max_tokens
+
+    def _available_class(self, name: str, cap: int | None) -> int | None:
+        if cap is None:
+            return None
+        held = getattr(self, f"reserved_{name}") + getattr(self, f"unknown_{name}")
+        return max(0, cap - getattr(self, f"used_{name}") - held)
+
+    @property
+    def available_input_tokens(self) -> int | None:
+        return self._available_class("input_tokens", self.max_input_tokens)
+
+    @property
+    def available_output_tokens(self) -> int | None:
+        return self._available_class("output_tokens", self.max_output_tokens)
+
+    @property
+    def available_reasoning_tokens(self) -> int | None:
+        return self._available_class("reasoning_tokens", self.max_reasoning_tokens)
+
+    @property
+    def available_cached_input_tokens(self) -> int | None:
+        return self._available_class(
+            "cached_input_tokens", self.max_cached_input_tokens
+        )
 
     @property
     def available_minor(self) -> int | None:

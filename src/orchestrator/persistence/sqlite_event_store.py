@@ -9,7 +9,7 @@ import hmac
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any
+from typing import Any, Callable
 
 from orchestrator.identifiers import new_id
 
@@ -384,7 +384,13 @@ class SQLiteEventStore:
 
         request_hash = _draft_request_hash(stream_type, stream_id, drafts)
         connection = self._connection
-        connection.execute("BEGIN IMMEDIATE")
+        started_transaction = not connection.in_transaction
+        savepoint: str | None = None
+        if started_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        else:
+            savepoint = "orchestrator_append"
+            connection.execute(f"SAVEPOINT {savepoint}")
         try:
             idempotency_row = connection.execute(
                 """
@@ -412,7 +418,10 @@ class SQLiteEventStore:
                     idempotency_row["last_version"] - idempotency_row["first_version"] + 1
                 ):
                     raise RuntimeError("idempotency record points to missing events")
-                connection.commit()
+                if started_transaction:
+                    connection.commit()
+                else:
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
                 return original_events
 
             version_row = connection.execute(
@@ -503,8 +512,70 @@ class SQLiteEventStore:
                     last_version,
                 ),
             )
-            connection.commit()
+            if started_transaction:
+                connection.commit()
+            else:
+                connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             return stored_events
+        except BaseException:
+            if started_transaction:
+                connection.rollback()
+            elif savepoint is not None:
+                try:
+                    connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                finally:
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+
+    def append_checked(
+        self,
+        stream_type: str,
+        stream_id: str,
+        idempotency_key: str,
+        decide: Callable[[list[StoredEvent], int], Iterable[EventDraft] | None],
+    ) -> list[StoredEvent]:
+        """Run a locked read-modify-append operation atomically.
+
+        ``decide`` executes while ``BEGIN IMMEDIATE`` holds the database
+        write lock.  It receives the complete validated stream and its
+        current version, and returns the drafts to append.  Returning ``None``
+        is a no-op and is useful for an operation whose idempotency key was
+        already observed by the caller.  The regular append implementation is
+        savepoint-aware, so the actual append remains subject to its normal
+        CAS and idempotency checks while sharing this transaction.
+        """
+
+        stream_type = _validate_identifier(stream_type, "stream_type")
+        stream_id = _validate_identifier(stream_id, "stream_id")
+        idempotency_key = _validate_identifier(idempotency_key, "idempotency_key")
+        if not callable(decide):
+            raise TypeError("decide must be callable")
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            events = self._read_rows(
+                stream_type,
+                stream_id,
+                first_version=1,
+                last_version=self.current_version(stream_type, stream_id),
+            )
+            current_version = self.current_version(stream_type, stream_id)
+            drafts = decide(events, current_version)
+            if drafts is None:
+                existing = [
+                    event for event in events if event.idempotency_key == idempotency_key
+                ]
+                connection.commit()
+                return existing
+            appended = self.append(
+                stream_type,
+                stream_id,
+                current_version,
+                drafts,
+                idempotency_key,
+            )
+            connection.commit()
+            return appended
         except BaseException:
             connection.rollback()
             raise
@@ -607,6 +678,21 @@ class SQLiteEventStore:
             (stream_type, stream_id),
         ).fetchone()
         return 0 if row is None else row["current_version"]
+
+    def stream_ids(self, stream_type: str) -> list[str]:
+        """Return stream IDs for a type without exposing the SQLite handle."""
+
+        stream_type = _validate_identifier(stream_type, "stream_type")
+        rows = self._connection.execute(
+            """
+            SELECT stream_id
+            FROM stream_versions
+            WHERE stream_type = ?
+            ORDER BY stream_id ASC
+            """,
+            (stream_type,),
+        ).fetchall()
+        return [row["stream_id"] for row in rows]
 
     def _read_rows(
         self,
