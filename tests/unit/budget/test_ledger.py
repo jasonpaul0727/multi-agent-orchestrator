@@ -4,6 +4,7 @@ import pytest
 from concurrent.futures import ThreadPoolExecutor
 
 from orchestrator.budget import (
+    AmbiguousReservation,
     BudgetExhausted,
     BudgetLedger,
     BudgetLimitMismatch,
@@ -17,6 +18,7 @@ from orchestrator.budget import (
     ReservationStateError,
     UsageRecord,
 )
+from orchestrator.persistence.events import EventDraft
 from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
 from pydantic import ValidationError
 
@@ -473,6 +475,108 @@ def test_reopened_auto_id_lookup_uses_persisted_run_index_without_stream_ids(tmp
     reopened = BudgetLedger.reopen(_NoStreamIndexStore(SQLiteEventStore(database)))
     committed = reopened.commit_usage(reservation.reservation_id, {"input": 1})
     assert committed.run_id == "tenant::run"
+
+
+def test_omitted_run_id_rejects_ambiguous_indexed_reservation(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    limit = RunLimit(max_cost_minor=100, max_tokens=100)
+    estimate = estimate_with_worst_case(2)
+    reservation_id = "budget:cnVuLTE:same"
+    store.append(
+        "budget",
+        "run-1",
+        0,
+        [
+            EventDraft(
+                "BudgetReserved",
+                BudgetLedger._reservation_payload(
+                    "run-1", reservation_id, estimate, 2, limit
+                ),
+            )
+        ],
+        "fixture-run-1",
+    )
+    store.append(
+        "budget",
+        "run-2",
+        0,
+        [
+            EventDraft(
+                "BudgetReserved",
+                BudgetLedger._reservation_payload(
+                    "run-2", reservation_id, estimate, 2, limit
+                ),
+            )
+        ],
+        "fixture-run-2",
+    )
+
+    with pytest.raises(AmbiguousReservation):
+        BudgetLedger(store).get_reservation(reservation_id)
+
+
+def test_legacy_raw_reservation_key_reuses_event_without_duplicate(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    legacy_payload = {
+        "amount_minor": 3,
+        "cached_input_price_minor_per_million": 0,
+        "cached_input_tokens": 0,
+        "currency": "USD",
+        "input_price_minor_per_million": 0,
+        "input_tokens": 3,
+        "max_cost_minor": 100,
+        "max_tokens": 100,
+        "output_price_minor_per_million": 0,
+        "output_tokens": 0,
+        "price_snapshot_id": "unspecified",
+        "provider_fee_minor": 0,
+        "reasoning_price_minor_per_million": 0,
+        "reasoning_tokens": 0,
+        "reservation_id": "run-1::legacy-id",
+        "reserved_minor": 3,
+        "reserved_tokens": 3,
+        "run_id": "run-1",
+        "snapshot_id": "test",
+        "status": "reserved",
+        "tokenizer_snapshot_id": "unspecified",
+        "tool_fee_minor": 0,
+    }
+    store.append(
+        "budget",
+        "run-1",
+        0,
+        [EventDraft("BudgetReserved", legacy_payload)],
+        "legacy-request",
+    )
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+
+    estimate = CostEstimate(
+        amount_minor=3,
+        currency="USD",
+        token_limit=3,
+        input_tokens=3,
+        snapshot_id="test",
+    )
+    reservation = ledger.reserve(
+        "run-1", estimate, idempotency_key="legacy-request"
+    )
+    assert reservation.reservation_id == "run-1::legacy-id"
+    with pytest.raises(IdempotencyConflict):
+        ledger.reserve(
+            "run-1",
+            CostEstimate(
+                amount_minor=4,
+                currency="USD",
+                token_limit=3,
+                input_tokens=3,
+                snapshot_id="test",
+            ),
+            idempotency_key="legacy-request",
+        )
+    assert len(ledger.read("run-1")) == 1
 
 
 def test_unknown_cannot_commit_but_explicit_reconciliation_settles(tmp_path):

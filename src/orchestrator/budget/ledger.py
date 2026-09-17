@@ -42,6 +42,10 @@ class ReservationNotFound(BudgetError):
     """A reservation ID is not present in the durable budget stream."""
 
 
+class AmbiguousReservation(BudgetError):
+    """A reservation ID occurs in more than one Run stream."""
+
+
 class ReservationStateError(BudgetError):
     """An operation is not valid for the reservation's current state."""
 
@@ -301,6 +305,8 @@ class BudgetLedger:
             if reservation_id is not None
             else None
         )
+        explicit_reservation_id = reservation_id is not None
+        caller_key: str | None = None
         if idempotency_key is None:
             if reservation_id is None:
                 reservation_id = _indexed_reservation_id(run_id, new_id())
@@ -328,11 +334,17 @@ class BudgetLedger:
                 run_id, reservation_id, estimate, reserved_tokens, limit
             )
             same_key = [event for event in events if event.idempotency_key == append_key]
-            if same_key:
+            legacy_key = (
+                [event for event in events if event.idempotency_key == caller_key]
+                if caller_key is not None
+                else []
+            )
+            matching_key = same_key or legacy_key
+            if matching_key:
                 original_event = next(
                     (
                         event
-                        for event in same_key
+                        for event in matching_key
                         if event.event_type == "BudgetReserved"
                     ),
                     None,
@@ -341,7 +353,12 @@ class BudgetLedger:
                     raise IdempotencyConflict(
                         f"idempotency key {append_key!r} was already used for a different operation"
                     )
-                self._check_reservation_idempotency(same_key, payload)
+                self._check_reservation_idempotency(
+                    matching_key,
+                    payload,
+                    include_reservation_id=explicit_reservation_id or not legacy_key,
+                    legacy=bool(legacy_key and not same_key),
+                )
                 return None
             states = self._replay_states(run_id, events)
             existing_state = states.get(reservation_id)
@@ -359,6 +376,22 @@ class BudgetLedger:
             # conforming EventStore returns its original batch.  Retain a
             # defensive lookup for small third-party adapters.
             events = self._events_for_key(run_id, append_key)
+        if not events and caller_key is not None:
+            legacy_events = [
+                event for event in self.read(run_id) if event.idempotency_key == caller_key
+            ]
+            if legacy_events:
+                limit = self._limit_for(run_id, events=self.read(run_id))
+                payload = self._reservation_payload(
+                    run_id, reservation_id, estimate, reserved_tokens, limit
+                )
+                self._check_reservation_idempotency(
+                    legacy_events,
+                    payload,
+                    include_reservation_id=explicit_reservation_id,
+                    legacy=True,
+                )
+                events = legacy_events
         return self._reservation_from_event(
             next(event for event in events if event.event_type == "BudgetReserved")
         )
@@ -1009,6 +1042,25 @@ class BudgetLedger:
         )
 
     def _run_id_from_reservation(self, reservation_id: str) -> str:
+        stream_ids = getattr(self._event_store, "stream_ids", None)
+        candidates = (
+            stream_ids(_BUDGET_STREAM)
+            if callable(stream_ids)
+            else list(self._run_limits)
+        )
+        matches = []
+        for candidate in dict.fromkeys(candidates):
+            if reservation_id in {
+                state.reservation.reservation_id
+                for state in self._replay_states(candidate, self.read(candidate)).values()
+            }:
+                matches.append(candidate)
+        if len(matches) > 1:
+            raise AmbiguousReservation(
+                f"reservation {reservation_id!r} exists in multiple Run streams"
+            )
+        if len(matches) == 1:
+            return matches[0]
         indexed_run_id = _run_id_from_index(reservation_id)
         if indexed_run_id is not None:
             indexed_states = self._replay_states(
@@ -1017,23 +1069,6 @@ class BudgetLedger:
             indexed_state = indexed_states.get(reservation_id)
             if indexed_state is not None and indexed_state.reservation.run_id == indexed_run_id:
                 return indexed_run_id
-        stream_ids = getattr(self._event_store, "stream_ids", None)
-        candidates = (
-            stream_ids(_BUDGET_STREAM)
-            if callable(stream_ids)
-            else list(self._run_limits)
-        )
-        candidates = [
-            run_id
-            for run_id in candidates
-            if reservation_id
-            in {
-                state.reservation.reservation_id
-                for state in self._replay_states(run_id, self.read(run_id)).values()
-            }
-        ]
-        if len(candidates) == 1:
-            return candidates[0]
         raise ReservationNotFound(
             "run_id is required for custom reservation IDs that are not in the local limits"
         )
@@ -1104,18 +1139,41 @@ class BudgetLedger:
 
     @staticmethod
     def _check_reservation_idempotency(
-        events: list[StoredEvent], expected: Mapping[str, Any]
+        events: list[StoredEvent],
+        expected: Mapping[str, Any],
+        *,
+        include_reservation_id: bool = True,
+        legacy: bool = False,
     ) -> None:
         original = next(
             (event for event in events if event.event_type == "BudgetReserved"), None
         )
         if original is None:
             raise IdempotencyConflict("idempotency key was used for a different operation")
-        # Compare the complete request fingerprint, not just amount/currency.
-        # Missing fields from a legacy event are intentionally a conflict: a
-        # caller must not treat an incomplete historical reservation as the
-        # same request.
-        if dict(original.payload) != dict(expected):
+        actual = dict(original.payload)
+        target = dict(expected)
+        if not include_reservation_id:
+            actual.pop("reservation_id", None)
+            target.pop("reservation_id", None)
+        if legacy:
+            # Before the namespaced idempotency revision, reservation events
+            # did not carry the derived class breakdown or newer cap fields.
+            # Fill only fields whose old semantics are unambiguous, then keep
+            # the complete request fingerprint comparison below.
+            legacy_defaults = {
+                "estimator_snapshot_id": "unspecified",
+                "max_cached_input_tokens": None,
+                "max_input_tokens": None,
+                "max_output_tokens": None,
+                "max_reasoning_tokens": None,
+                "reserved_cached_input_tokens": actual.get("cached_input_tokens", 0),
+                "reserved_input_tokens": actual.get("input_tokens", 0),
+                "reserved_output_tokens": actual.get("output_tokens", 0),
+                "reserved_reasoning_tokens": actual.get("reasoning_tokens", 0),
+            }
+            for field_name, default in legacy_defaults.items():
+                actual.setdefault(field_name, default)
+        if actual != target:
             raise IdempotencyConflict(
                 "idempotency key was already used for a different reservation request"
             )
@@ -1430,6 +1488,7 @@ class BudgetLedger:
 
 
 __all__ = [
+    "AmbiguousReservation",
     "BudgetError",
     "BudgetExhausted",
     "BudgetLimitMismatch",

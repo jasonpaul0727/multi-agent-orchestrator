@@ -1,6 +1,7 @@
 """Durable token and cost accounting for orchestrator Runs."""
 
 from .ledger import (
+    AmbiguousReservation,
     BudgetError,
     BudgetExhausted,
     BudgetLimitMismatch,
@@ -15,6 +16,7 @@ from .ledger import (
 from .models import BudgetBalance, BudgetReservation, CostEstimate, RunLimit, UsageRecord
 
 __all__ = [
+    "AmbiguousReservation",
     "BudgetBalance",
     "BudgetError",
     "BudgetExhausted",
