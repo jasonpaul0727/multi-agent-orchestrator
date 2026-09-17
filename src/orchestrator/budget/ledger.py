@@ -353,11 +353,15 @@ class BudgetLedger:
                     raise IdempotencyConflict(
                         f"idempotency key {append_key!r} was already used for a different operation"
                     )
+                legacy_payload = self._is_legacy_reservation_payload(
+                    original_event.payload
+                )
                 self._check_reservation_idempotency(
                     matching_key,
                     payload,
-                    include_reservation_id=explicit_reservation_id or not legacy_key,
-                    legacy=bool(legacy_key and not same_key),
+                    include_reservation_id=explicit_reservation_id
+                    or not (legacy_key or legacy_payload),
+                    legacy=bool(legacy_key and not same_key) or legacy_payload,
                 )
                 return None
             states = self._replay_states(run_id, events)
@@ -385,11 +389,22 @@ class BudgetLedger:
                 payload = self._reservation_payload(
                     run_id, reservation_id, estimate, reserved_tokens, limit
                 )
+                original_event = next(
+                    (
+                        event
+                        for event in legacy_events
+                        if event.event_type == "BudgetReserved"
+                    ),
+                    None,
+                )
                 self._check_reservation_idempotency(
                     legacy_events,
                     payload,
                     include_reservation_id=explicit_reservation_id,
-                    legacy=True,
+                    legacy=bool(
+                        original_event is not None
+                        and self._is_legacy_reservation_payload(original_event.payload)
+                    ),
                 )
                 events = legacy_events
         return self._reservation_from_event(
@@ -1136,6 +1151,21 @@ class BudgetLedger:
             price_snapshot_id=payload.get("price_snapshot_id", "unspecified"),
             estimator_snapshot_id=payload.get("estimator_snapshot_id", "unspecified"),
         )
+
+    @staticmethod
+    def _is_legacy_reservation_payload(payload: Mapping[str, Any]) -> bool:
+        modern_fields = (
+            "estimator_snapshot_id",
+            "max_cached_input_tokens",
+            "max_input_tokens",
+            "max_output_tokens",
+            "max_reasoning_tokens",
+            "reserved_cached_input_tokens",
+            "reserved_input_tokens",
+            "reserved_output_tokens",
+            "reserved_reasoning_tokens",
+        )
+        return any(field_name not in payload for field_name in modern_fields)
 
     @staticmethod
     def _check_reservation_idempotency(

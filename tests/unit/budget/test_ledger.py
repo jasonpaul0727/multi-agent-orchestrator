@@ -579,6 +579,57 @@ def test_legacy_raw_reservation_key_reuses_event_without_duplicate(tmp_path):
     assert len(ledger.read("run-1")) == 1
 
 
+def test_legacy_default_reserve_key_reuses_explicit_reservation_id(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    limit = RunLimit(max_cost_minor=100, max_tokens=100)
+    estimate = estimate_with_worst_case(3)
+    reservation_id = "run-1::legacy-default"
+    legacy_payload = BudgetLedger._reservation_payload(
+        "run-1", reservation_id, estimate, 3, limit
+    )
+    for field_name in (
+        "estimator_snapshot_id",
+        "max_cached_input_tokens",
+        "max_input_tokens",
+        "max_output_tokens",
+        "max_reasoning_tokens",
+        "reserved_cached_input_tokens",
+        "reserved_input_tokens",
+        "reserved_output_tokens",
+        "reserved_reasoning_tokens",
+    ):
+        legacy_payload.pop(field_name)
+    store.append(
+        "budget",
+        "run-1",
+        0,
+        [EventDraft("BudgetReserved", legacy_payload)],
+        f"reserve:{reservation_id}",
+    )
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": limit},
+    )
+
+    reservation = ledger.reserve(
+        "run-1", estimate, reservation_id=reservation_id
+    )
+    assert reservation.reservation_id == reservation_id
+    with pytest.raises(IdempotencyConflict):
+        ledger.reserve(
+            "run-1",
+            CostEstimate(
+                amount_minor=3,
+                currency="USD",
+                token_limit=3,
+                estimator_snapshot_id="changed",
+                snapshot_id="test",
+            ),
+            reservation_id=reservation_id,
+        )
+    assert len(ledger.read("run-1")) == 1
+
+
 def test_unknown_cannot_commit_but_explicit_reconciliation_settles(tmp_path):
     store = SQLiteEventStore(tmp_path / "events.db")
     ledger = BudgetLedger(
