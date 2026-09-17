@@ -213,6 +213,20 @@ class BudgetReservation(_BudgetModel):
     def version(self) -> int:
         return self.reservation_version
 
+    @model_validator(mode="after")
+    def validate_token_breakdown(self) -> "BudgetReservation":
+        total = (
+            self.reserved_input_tokens
+            + self.reserved_output_tokens
+            + self.reserved_reasoning_tokens
+            + self.reserved_cached_input_tokens
+        )
+        if self.reserved_tokens < total:
+            raise ValueError(
+                "reserved_tokens cannot be lower than the reserved token breakdown"
+            )
+        return self
+
 
 class UsageRecord(_BudgetModel):
     """Exact usage observed from a model/tool provider."""

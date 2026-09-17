@@ -7,6 +7,7 @@ from orchestrator.budget import (
     BudgetExhausted,
     BudgetLedger,
     BudgetLimitMismatch,
+    BudgetReservation,
     BudgetReleasedError,
     CostEstimate,
     CurrencyMismatch,
@@ -16,6 +17,7 @@ from orchestrator.budget import (
     UsageRecord,
 )
 from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
+from pydantic import ValidationError
 
 
 def estimate_with_worst_case(tokens: int = 10) -> CostEstimate:
@@ -83,6 +85,100 @@ def test_cost_rounds_up_and_reservation_is_atomic(tmp_path):
     }
 
 
+def test_explicit_idempotency_retry_without_reservation_id_reuses_original(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    estimate = estimate_with_worst_case(7)
+    first = ledger.reserve("run-1", estimate, idempotency_key="request-1")
+    second = ledger.reserve("run-1", estimate, idempotency_key="request-1")
+    assert second == first
+    assert len(ledger.read("run-1")) == 1
+
+
+def test_reserved_token_breakdown_and_override_must_fit_total(tmp_path):
+    with pytest.raises(ValidationError):
+        BudgetReservation(
+            reservation_id="r",
+            run_id="run-1",
+            reserved_minor=1,
+            reserved_tokens=3,
+            reserved_input_tokens=2,
+            reserved_output_tokens=2,
+            currency="USD",
+        )
+    ledger = BudgetLedger(
+        SQLiteEventStore(tmp_path / "events.db"),
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    estimate = CostEstimate(
+        amount_minor=1,
+        currency="USD",
+        token_limit=4,
+        input_tokens=3,
+        output_tokens=1,
+        snapshot_id="test",
+    )
+    with pytest.raises(ValueError):
+        ledger.reserve("run-1", estimate, token_limit=3)
+
+
+def test_used_class_tokens_exhaust_cap_after_commit(tmp_path):
+    ledger = BudgetLedger(
+        SQLiteEventStore(tmp_path / "events.db"),
+        run_limits={
+            "run-1": RunLimit(
+                max_cost_minor=100,
+                max_tokens=100,
+                max_input_tokens=3,
+            )
+        },
+    )
+    reservation = ledger.reserve(
+        "run-1",
+        CostEstimate(
+            amount_minor=1,
+            currency="USD",
+            token_limit=3,
+            input_tokens=3,
+            snapshot_id="test",
+        ),
+    )
+    ledger.commit_usage(reservation.reservation_id, {"input": 3})
+    with pytest.raises(BudgetExhausted):
+        ledger.reserve(
+            "run-1",
+            CostEstimate(
+                amount_minor=1,
+                currency="USD",
+                token_limit=1,
+                input_tokens=1,
+                snapshot_id="test",
+            ),
+        )
+
+
+def test_reservation_run_id_with_separator_is_resolved_from_persisted_stream(tmp_path):
+    database = tmp_path / "events.db"
+    first_store = SQLiteEventStore(database)
+    first = BudgetLedger(
+        first_store,
+        run_limits={"tenant::run": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    reservation = first.reserve("tenant::run", estimate_with_worst_case(5))
+    first_store.close()
+    reopened_store = SQLiteEventStore(database)
+    reopened = BudgetLedger.reopen(reopened_store)
+    committed = reopened.commit_usage(
+        reservation.reservation_id,
+        {"input": 1},
+        settlement_key="provider-key",
+    )
+    assert committed.run_id == "tenant::run"
+
+
 def test_estimate_includes_token_classes_and_fixed_fees_with_one_final_ceiling():
     estimate = BudgetLedger.estimate(
         input_tokens=1,
@@ -115,6 +211,21 @@ def test_unknown_result_keeps_worst_case_reservation(tmp_path):
     assert ledger.available("run-1").unknown_minor == reservation.reserved_minor
     assert ledger.available("run-1").available_minor == 90
     assert ledger.read("run-1")[-1].event_type == "CostAdjusted"
+
+
+def test_reconcile_unknown_rejects_an_ordinarily_reserved_reservation(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    reservation = ledger.reserve("run-1", estimate_with_worst_case())
+    with pytest.raises(ReservationStateError):
+        ledger.reconcile_unknown(
+            reservation.reservation_id,
+            {"input": 1},
+            "provider-reconciliation-1",
+        )
 
 
 def test_settlement_is_idempotent_and_releases_remainder(tmp_path):
@@ -204,6 +315,40 @@ def test_unknown_cannot_be_released_implicitly(tmp_path):
 
     with pytest.raises(BudgetReleasedError):
         ledger.release(reservation.reservation_id)
+
+
+def test_unknown_retry_with_changed_reason_conflicts(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=10, max_tokens=10)},
+    )
+    reservation = ledger.reserve("run-1", estimate_with_worst_case(4))
+    ledger.mark_unknown(reservation.reservation_id, reason="provider-timeout")
+    # The same internal key is deliberately reused, but the reason is part
+    # of the CostAdjusted request fingerprint.
+    with pytest.raises(IdempotencyConflict):
+        ledger.mark_unknown(reservation.reservation_id, reason="worker-crash")
+
+
+def test_release_key_is_namespaced_away_from_caller_reservation_key(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=10, max_tokens=10)},
+    )
+    reservation = ledger.reserve(
+        "run-1",
+        estimate_with_worst_case(4),
+        reservation_id="reservation-1",
+        idempotency_key="release:reservation-1",
+    )
+    released = ledger.release(reservation.reservation_id)
+    assert released.status == "released"
+    assert [event.event_type for event in ledger.read("run-1")] == [
+        "BudgetReserved",
+        "BudgetReleased",
+    ]
 
 
 def test_unknown_cannot_commit_but_explicit_reconciliation_settles(tmp_path):

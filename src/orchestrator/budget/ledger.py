@@ -240,17 +240,22 @@ class BudgetLedger:
         if reserved_tokens is None:
             reserved_tokens = estimate.total_tokens
         reserved_tokens = _nonnegative_int(reserved_tokens, "token_limit")
+        if reserved_tokens < estimate.total_tokens:
+            raise ValueError("token_limit cannot be lower than the estimate token totals")
         reservation_id = (
             _identifier(reservation_id, "reservation_id")
             if reservation_id is not None
-            else f"{run_id}::{new_id()}"
+            else None
         )
-        append_key = (
-            f"reserve:{reservation_id}" if idempotency_key is None else idempotency_key
-        )
-        append_key = _identifier(append_key, "idempotency_key")
+        if idempotency_key is None:
+            if reservation_id is None:
+                reservation_id = f"{run_id}::{new_id()}"
+            append_key = f"reserve:{reservation_id}"
+        else:
+            append_key = _identifier(idempotency_key, "idempotency_key")
 
         def decide(events: list[StoredEvent], _version: int) -> Iterable[EventDraft] | None:
+            nonlocal reservation_id
             limit = self._limit_for(run_id, events=events)
             self._check_currency(limit.currency, estimate.currency)
             payload = self._reservation_payload(
@@ -258,8 +263,32 @@ class BudgetLedger:
             )
             same_key = [event for event in events if event.idempotency_key == append_key]
             if same_key:
+                original_event = next(
+                    (
+                        event
+                        for event in same_key
+                        if event.event_type == "BudgetReserved"
+                    ),
+                    None,
+                )
+                if original_event is None:
+                    raise IdempotencyConflict(
+                        f"idempotency key {append_key!r} was already used for a different operation"
+                    )
+                if reservation_id is None:
+                    reservation_id = _identifier(
+                        original_event.payload.get("reservation_id"), "reservation_id"
+                    )
+                    payload = self._reservation_payload(
+                        run_id, reservation_id, estimate, reserved_tokens, limit
+                    )
                 self._check_reservation_idempotency(same_key, payload)
                 return None
+            if reservation_id is None:
+                reservation_id = f"{run_id}::{new_id()}"
+                payload = self._reservation_payload(
+                    run_id, reservation_id, estimate, reserved_tokens, limit
+                )
             states = self._replay_states(run_id, events)
             existing_state = states.get(reservation_id)
             if existing_state is not None:
@@ -298,15 +327,6 @@ class BudgetLedger:
                 state = states[reservation_id]
             except KeyError as exc:
                 raise ReservationNotFound(f"unknown reservation {reservation_id!r}") from exc
-            same_key = [event for event in events if event.idempotency_key == append_key]
-            if same_key or state.reservation.status == "unknown":
-                if same_key and state.reservation.status != "unknown":
-                    raise ReservationStateError("unknown marker is not reflected in replay")
-                return None
-            if state.reservation.status != "reserved":
-                raise ReservationStateError(
-                    f"reservation {reservation_id!r} is already {state.reservation.status}"
-                )
             payload = {
                 "adjustment_minor": 0,
                 "adjustment_tokens": 0,
@@ -316,6 +336,25 @@ class BudgetLedger:
                 "run_id": run_id,
                 "status": "unknown",
             }
+            same_key = [event for event in events if event.idempotency_key == append_key]
+            if same_key:
+                marker = next(
+                    (event for event in same_key if event.event_type == "CostAdjusted"),
+                    None,
+                )
+                if marker is None or dict(marker.payload) != payload:
+                    raise IdempotencyConflict(
+                        f"unknown marker key {append_key!r} was already used differently"
+                    )
+                if state.reservation.status != "unknown":
+                    raise ReservationStateError("unknown marker is not reflected in replay")
+                return None
+            if state.reservation.status == "unknown":
+                return None
+            if state.reservation.status != "reserved":
+                raise ReservationStateError(
+                    f"reservation {reservation_id!r} is already {state.reservation.status}"
+                )
             return [EventDraft("CostAdjusted", payload)]
 
         self._transactional_append(run_id, append_key, decide)
@@ -414,6 +453,10 @@ class BudgetLedger:
                 record = self._build_usage(state, usage, settlement_key)
                 self._check_settlement_fingerprint(same_key, record)
                 return None
+            if allow_unknown and state.reservation.status != "unknown":
+                raise ReservationStateError(
+                    "reconcile_unknown requires a reservation with status unknown"
+                )
             if state.reservation.status == "unknown" and not allow_unknown:
                 raise ReservationStateError(
                     "unknown reservations require explicit reconcile_unknown"
@@ -490,7 +533,7 @@ class BudgetLedger:
         reservation_id = _identifier(reservation_id, "reservation_id")
         run_id = self._resolve_run_id(reservation_id, run_id)
         reason = _identifier(reason, "reason")
-        append_key = f"release:{reservation_id}"
+        append_key = f"__budget_release__:{run_id}:{reservation_id}"
 
         def decide(events: list[StoredEvent], _version: int) -> Iterable[EventDraft] | None:
             states = self._replay_states(run_id, events)
@@ -498,15 +541,6 @@ class BudgetLedger:
                 state = states[reservation_id]
             except KeyError as exc:
                 raise ReservationNotFound(f"unknown reservation {reservation_id!r}") from exc
-            same_key = [event for event in events if event.idempotency_key == append_key]
-            if same_key or state.reservation.status in {"released", "committed"}:
-                # If settlement won a release race, returning the committed
-                # state is deterministic and does not manufacture a release.
-                return None
-            if state.reservation.status == "unknown":
-                raise BudgetReleasedError(
-                    "unknown reservations remain held until explicit reconciliation"
-                )
             payload = {
                 "currency": state.reservation.currency,
                 "reason": reason,
@@ -516,6 +550,39 @@ class BudgetLedger:
                 "run_id": run_id,
                 "status": "released",
             }
+            same_key = [event for event in events if event.idempotency_key == append_key]
+            if same_key:
+                marker = next(
+                    (event for event in same_key if event.event_type == "BudgetReleased"),
+                    None,
+                )
+                if marker is None or dict(marker.payload) != payload:
+                    raise IdempotencyConflict(
+                        f"release key {append_key!r} was already used differently"
+                    )
+                return None
+            if state.reservation.status in {"released", "committed"}:
+                # If settlement won a release race, returning the committed
+                # state is deterministic and does not manufacture a release.
+                if state.reservation.status == "released":
+                    prior = next(
+                        (
+                            event
+                            for event in events
+                            if event.event_type == "BudgetReleased"
+                            and event.payload.get("reservation_id") == reservation_id
+                        ),
+                        None,
+                    )
+                    if prior is not None and dict(prior.payload) != payload:
+                        raise IdempotencyConflict(
+                            "release request differs from the persisted release"
+                        )
+                return None
+            if state.reservation.status == "unknown":
+                raise BudgetReleasedError(
+                    "unknown reservations remain held until explicit reconciliation"
+                )
             return [EventDraft("BudgetReleased", payload)]
 
         self._transactional_append(run_id, append_key, decide)
@@ -656,11 +723,17 @@ class BudgetLedger:
         if estimate is None:
             return
         held = {
-            "input_tokens": balance.reserved_input_tokens + balance.unknown_input_tokens,
-            "output_tokens": balance.reserved_output_tokens + balance.unknown_output_tokens,
+            "input_tokens": balance.used_input_tokens
+            + balance.reserved_input_tokens
+            + balance.unknown_input_tokens,
+            "output_tokens": balance.used_output_tokens
+            + balance.reserved_output_tokens
+            + balance.unknown_output_tokens,
             "reasoning_tokens": balance.reserved_reasoning_tokens
+            + balance.used_reasoning_tokens
             + balance.unknown_reasoning_tokens,
-            "cached_input_tokens": balance.reserved_cached_input_tokens
+            "cached_input_tokens": balance.used_cached_input_tokens
+            + balance.reserved_cached_input_tokens
             + balance.unknown_cached_input_tokens,
         }
         caps = {
@@ -794,9 +867,6 @@ class BudgetLedger:
         )
 
     def _run_id_from_reservation(self, reservation_id: str) -> str:
-        marker = "::"
-        if marker in reservation_id:
-            return reservation_id.split(marker, 1)[0]
         stream_ids = getattr(self._event_store, "stream_ids", None)
         candidates = (
             stream_ids(_BUDGET_STREAM)
