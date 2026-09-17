@@ -12,6 +12,7 @@ from orchestrator.budget import (
     CostEstimate,
     CurrencyMismatch,
     IdempotencyConflict,
+    ReservedKeyError,
     RunLimit,
     ReservationStateError,
     UsageRecord,
@@ -259,6 +260,27 @@ def test_settlement_is_idempotent_and_releases_remainder(tmp_path):
     ]
 
 
+def test_reconcile_unknown_rejects_prior_ordinary_settlement(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    reservation = ledger.reserve("run-1", estimate_with_worst_case())
+    ledger.commit_usage(
+        reservation.reservation_id,
+        {"input": 1},
+        settlement_key="provider-ordinary",
+    )
+
+    with pytest.raises(ReservationStateError):
+        ledger.reconcile_unknown(
+            reservation.reservation_id,
+            {"input": 1},
+            "provider-ordinary",
+        )
+
+
 def test_budget_exhaustion_is_rejected_without_events(tmp_path):
     store = SQLiteEventStore(tmp_path / "events.db")
     ledger = BudgetLedger(
@@ -337,11 +359,18 @@ def test_release_key_is_namespaced_away_from_caller_reservation_key(tmp_path):
         store,
         run_limits={"run-1": RunLimit(max_cost_minor=10, max_tokens=10)},
     )
+    with pytest.raises(ReservedKeyError):
+        ledger.reserve(
+            "run-1",
+            estimate_with_worst_case(4),
+            reservation_id="reservation-1",
+            idempotency_key="release:reservation-1",
+        )
     reservation = ledger.reserve(
         "run-1",
         estimate_with_worst_case(4),
         reservation_id="reservation-1",
-        idempotency_key="release:reservation-1",
+        idempotency_key="caller-reservation-1",
     )
     released = ledger.release(reservation.reservation_id)
     assert released.status == "released"
@@ -349,6 +378,101 @@ def test_release_key_is_namespaced_away_from_caller_reservation_key(tmp_path):
         "BudgetReserved",
         "BudgetReleased",
     ]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["reserve:", "unknown:", "settle:", "release:", "reconcile:"],
+)
+def test_caller_reservation_keys_cannot_enter_internal_namespaces(tmp_path, prefix):
+    ledger = BudgetLedger(
+        SQLiteEventStore(tmp_path / "events.db"),
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    with pytest.raises(ReservedKeyError):
+        ledger.reserve(
+            "run-1",
+            estimate_with_worst_case(1),
+            idempotency_key=f"{prefix}caller",
+        )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["reserve:", "unknown:", "settle:", "release:", "reconcile:"],
+)
+def test_caller_settlement_keys_cannot_enter_internal_namespaces(tmp_path, prefix):
+    ledger = BudgetLedger(
+        SQLiteEventStore(tmp_path / "events.db"),
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    reservation = ledger.reserve("run-1", estimate_with_worst_case(1))
+    with pytest.raises(ReservedKeyError):
+        ledger.commit_usage(
+            reservation.reservation_id,
+            {"input": 1},
+            settlement_key=f"{prefix}caller",
+        )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["reserve:", "unknown:", "settle:", "release:", "reconcile:"],
+)
+def test_caller_reconciliation_keys_cannot_enter_internal_namespaces(tmp_path, prefix):
+    ledger = BudgetLedger(
+        SQLiteEventStore(tmp_path / "events.db"),
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    reservation = ledger.reserve("run-1", estimate_with_worst_case(1))
+    ledger.mark_unknown(reservation.reservation_id)
+    with pytest.raises(ReservedKeyError):
+        ledger.reconcile_unknown(
+            reservation.reservation_id,
+            {"input": 1},
+            f"{prefix}caller",
+        )
+
+
+class _NoStreamIndexStore:
+    """A legacy EventStore adapter with no stream enumeration or transactions."""
+
+    def __init__(self, delegate, *, lose_append_response=False):
+        self.delegate = delegate
+        self.lose_append_response = lose_append_response
+
+    def append(self, stream_type, stream_id, expected_version, events, idempotency_key):
+        result = self.delegate.append(
+            stream_type, stream_id, expected_version, events, idempotency_key
+        )
+        return [] if self.lose_append_response else result
+
+    def read_stream(self, stream_type, stream_id, after_version=0):
+        return self.delegate.read_stream(stream_type, stream_id, after_version)
+
+    def current_version(self, stream_type, stream_id):
+        return self.delegate.current_version(stream_type, stream_id)
+
+
+def test_reopened_auto_id_lookup_uses_persisted_run_index_without_stream_ids(tmp_path):
+    database = tmp_path / "events.db"
+    first_store = SQLiteEventStore(database)
+    first = BudgetLedger(
+        _NoStreamIndexStore(first_store, lose_append_response=True),
+        run_limits={"tenant::run": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    reservation = first.reserve(
+        "tenant::run", estimate_with_worst_case(3), idempotency_key="caller-request"
+    )
+    assert first.reserve(
+        "tenant::run", estimate_with_worst_case(3), idempotency_key="caller-request"
+    ) == reservation
+    assert reservation.reservation_id.startswith("budget:")
+    first_store.close()
+
+    reopened = BudgetLedger.reopen(_NoStreamIndexStore(SQLiteEventStore(database)))
+    committed = reopened.commit_usage(reservation.reservation_id, {"input": 1})
+    assert committed.run_id == "tenant::run"
 
 
 def test_unknown_cannot_commit_but_explicit_reconciliation_settles(tmp_path):
@@ -369,7 +493,13 @@ def test_unknown_cannot_commit_but_explicit_reconciliation_settles(tmp_path):
         {"input": 1, "cost_minor": 3},
         "provider-reconciliation-1",
     )
+    retried = ledger.reconcile_unknown(
+        reservation.reservation_id,
+        {"input": 1, "cost_minor": 3},
+        "provider-reconciliation-1",
+    )
     assert reconciled.status == "committed"
+    assert retried == reconciled
     assert ledger.available("run-1").unknown_minor == 0
     assert [event.event_type for event in ledger.read("run-1")][-4:] == [
         "UsageObserved",

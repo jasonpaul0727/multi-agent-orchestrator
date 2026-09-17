@@ -8,6 +8,7 @@ from .ledger import (
     BudgetReleasedError,
     CurrencyMismatch,
     IdempotencyConflict,
+    ReservedKeyError,
     ReservationNotFound,
     ReservationStateError,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "CostEstimate",
     "CurrencyMismatch",
     "IdempotencyConflict",
+    "ReservedKeyError",
     "ReservationNotFound",
     "ReservationStateError",
     "RunLimit",

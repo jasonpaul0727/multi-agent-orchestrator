@@ -8,8 +8,11 @@ as a long-lived process.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import Any, Protocol
 
 from orchestrator.identifiers import new_id
@@ -56,6 +59,10 @@ class CurrencyMismatch(ValueError):
         super().__init__(f"currency mismatch: expected {expected}, got {actual}")
 
 
+class ReservedKeyError(ValueError):
+    """A caller key entered a namespace reserved for ledger operations."""
+
+
 class _EventStore(Protocol):
     def append(
         self,
@@ -83,6 +90,19 @@ class _EventStore(Protocol):
 
 _MILLION = 1_000_000
 _BUDGET_STREAM = "budget"
+_INTERNAL_KEY_PREFIXES = (
+    "reserve:",
+    "unknown:",
+    "settle:",
+    "release:",
+    "reconcile:",
+    # Kept reserved for databases written by an earlier hardening revision.
+    "__budget_release__:",
+    "__budget_reserve__:",
+    "__budget_unknown__:",
+    "__budget_settle__:",
+    "__budget_reconcile__:",
+)
 
 
 @dataclass
@@ -112,6 +132,40 @@ def _nonnegative_int(value: Any, field_name: str) -> int:
 
 def _ceil_million(numerator: int) -> int:
     return (numerator + _MILLION - 1) // _MILLION
+
+
+def _caller_key(value: Any, field_name: str) -> str:
+    value = _identifier(value, field_name)
+    if value.startswith(_INTERNAL_KEY_PREFIXES):
+        raise ReservedKeyError(
+            f"{field_name} uses a reserved ledger idempotency namespace"
+        )
+    return value
+
+
+def _digest_key(namespace: str, *parts: str) -> str:
+    encoded = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return f"{namespace}caller:{digest}"
+
+
+def _indexed_reservation_id(run_id: str, suffix: str) -> str:
+    encoded = base64.urlsafe_b64encode(run_id.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"budget:{encoded}:{suffix}"
+
+
+def _run_id_from_index(reservation_id: str) -> str | None:
+    if not reservation_id.startswith("budget:"):
+        return None
+    parts = reservation_id.split(":", 2)
+    if len(parts) != 3 or not parts[1]:
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        run_id = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, UnicodeEncodeError):
+        return None
+    return run_id or None
 
 
 class BudgetLedger:
@@ -249,13 +303,25 @@ class BudgetLedger:
         )
         if idempotency_key is None:
             if reservation_id is None:
-                reservation_id = f"{run_id}::{new_id()}"
+                reservation_id = _indexed_reservation_id(run_id, new_id())
             append_key = f"reserve:{reservation_id}"
         else:
-            append_key = _identifier(idempotency_key, "idempotency_key")
+            caller_key = _caller_key(idempotency_key, "idempotency_key")
+            append_key = _digest_key("reserve:", run_id, caller_key)
+            if reservation_id is None:
+                # The identity is stable before the CAS callback executes,
+                # so concurrent retries and legacy adapters converge on one
+                # reservation even when the first append response is lost.
+                identity = hashlib.sha256(
+                    json.dumps(
+                        (run_id, caller_key),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                reservation_id = _indexed_reservation_id(run_id, identity)
 
         def decide(events: list[StoredEvent], _version: int) -> Iterable[EventDraft] | None:
-            nonlocal reservation_id
             limit = self._limit_for(run_id, events=events)
             self._check_currency(limit.currency, estimate.currency)
             payload = self._reservation_payload(
@@ -275,20 +341,8 @@ class BudgetLedger:
                     raise IdempotencyConflict(
                         f"idempotency key {append_key!r} was already used for a different operation"
                     )
-                if reservation_id is None:
-                    reservation_id = _identifier(
-                        original_event.payload.get("reservation_id"), "reservation_id"
-                    )
-                    payload = self._reservation_payload(
-                        run_id, reservation_id, estimate, reserved_tokens, limit
-                    )
                 self._check_reservation_idempotency(same_key, payload)
                 return None
-            if reservation_id is None:
-                reservation_id = f"{run_id}::{new_id()}"
-                payload = self._reservation_payload(
-                    run_id, reservation_id, estimate, reserved_tokens, limit
-                )
             states = self._replay_states(run_id, events)
             existing_state = states.get(reservation_id)
             if existing_state is not None:
@@ -424,34 +478,56 @@ class BudgetLedger:
         run_id = self._resolve_run_id(reservation_id, run_id)
         if settlement_key is None:
             settlement_key = f"settle:{reservation_id}"
+            append_key = settlement_key
         else:
-            settlement_key = _identifier(settlement_key, "settlement_key")
+            settlement_key = _caller_key(settlement_key, "settlement_key")
+            append_key = _digest_key(
+                "reconcile:" if allow_unknown else "settle:",
+                run_id,
+                reservation_id,
+                settlement_key,
+            )
 
         def decide(events: list[StoredEvent], version: int) -> Iterable[EventDraft] | None:
-            # Settlement keys are scoped by this stream (run_id), while the
-            # reservation ID in the payload prevents reuse on another hold.
-            same_key = [event for event in events if event.idempotency_key == settlement_key]
-            for event in same_key:
-                event_reservation = event.payload.get("reservation_id")
-                if event_reservation != reservation_id:
-                    raise IdempotencyConflict(
-                        f"settlement key {settlement_key!r} was already used for another reservation"
-                    )
+            # User settlement keys are persisted in payloads while the
+            # operation-specific append key prevents collisions with reserve,
+            # unknown, release, and reconciliation operations.
+            same_key = [event for event in events if event.idempotency_key == append_key]
+            settlement_events = self._settlement_events(
+                events, reservation_id, settlement_key
+            )
             states = self._replay_states(run_id, events)
             try:
                 state = states[reservation_id]
             except KeyError as exc:
                 raise ReservationNotFound(f"unknown reservation {reservation_id!r}") from exc
-            if same_key:
+            if same_key or settlement_events:
                 committed = next(
-                    (event for event in same_key if event.event_type == "CostCommitted"), None
+                    (
+                        event
+                        for event in (same_key or settlement_events)
+                        if event.event_type == "CostCommitted"
+                    ),
+                    None,
                 )
                 if committed is None:
                     raise IdempotencyConflict(
                         f"settlement key {settlement_key!r} was already used for a different operation"
                     )
+                prior_events = same_key or settlement_events
                 record = self._build_usage(state, usage, settlement_key)
-                self._check_settlement_fingerprint(same_key, record)
+                self._check_settlement_fingerprint(prior_events, record)
+                marker = self._reconciliation_marker(prior_events, reservation_id, settlement_key)
+                if allow_unknown:
+                    if marker is None:
+                        raise ReservationStateError(
+                            "reconcile_unknown cannot reuse an ordinary settlement"
+                        )
+                    self._check_reconciliation_fingerprint(marker, state, record)
+                elif marker is not None:
+                    raise ReservationStateError(
+                        "ordinary commit cannot reuse a reconciliation settlement"
+                    )
                 return None
             if allow_unknown and state.reservation.status != "unknown":
                 raise ReservationStateError(
@@ -508,16 +584,21 @@ class BudgetLedger:
                 )
             return drafts
 
-        events = self._transactional_append(run_id, settlement_key, decide)
+        events = self._transactional_append(run_id, append_key, decide)
         committed = next(
             (event for event in events if event.event_type == "CostCommitted"), None
         )
         if committed is None:
             # ``append_checked`` returns original events for duplicate keys;
             # adapters that return an empty no-op batch can be replayed here.
-            current = self._events_for_key(run_id, settlement_key)
+            current = self.read(run_id)
             committed = next(
-                (event for event in current if event.event_type == "CostCommitted"), None
+                (
+                    event
+                    for event in self._settlement_events(current, reservation_id, settlement_key)
+                    if event.event_type == "CostCommitted"
+                ),
+                None,
             )
         if committed is None:
             raise ReservationStateError("settlement committed without a CostCommitted event")
@@ -533,7 +614,7 @@ class BudgetLedger:
         reservation_id = _identifier(reservation_id, "reservation_id")
         run_id = self._resolve_run_id(reservation_id, run_id)
         reason = _identifier(reason, "reason")
-        append_key = f"__budget_release__:{run_id}:{reservation_id}"
+        append_key = _digest_key("release:", run_id, reservation_id)
 
         def decide(events: list[StoredEvent], _version: int) -> Iterable[EventDraft] | None:
             states = self._replay_states(run_id, events)
@@ -830,15 +911,76 @@ class BudgetLedger:
             if drafts is None:
                 return self._events_for_key(run_id, idempotency_key)
             try:
-                return self._event_store.append(
+                appended = self._event_store.append(
                     _BUDGET_STREAM, run_id, version, drafts, idempotency_key
                 )
+                if appended:
+                    return appended
+                # Some legacy adapters commit successfully but lose the
+                # response.  Recover the winner by the same durable key;
+                # deterministic reservation IDs make this safe for retries.
+                persisted = self._events_for_key(run_id, idempotency_key)
+                if persisted:
+                    return persisted
+                return appended
             except StaleStream:
                 continue
         raise ReservationStateError("budget stream changed during transactional append")
 
     def _events_for_key(self, run_id: str, key: str) -> list[StoredEvent]:
         return [event for event in self.read(run_id) if event.idempotency_key == key]
+
+    @staticmethod
+    def _settlement_events(
+        events: list[StoredEvent], reservation_id: str, settlement_key: str
+    ) -> list[StoredEvent]:
+        matching = [
+            event
+            for event in events
+            if event.event_type in {"UsageObserved", "CostCommitted", "CostAdjusted"}
+            and event.payload.get("settlement_key") == settlement_key
+        ]
+        for event in matching:
+            if event.payload.get("reservation_id") != reservation_id:
+                raise IdempotencyConflict(
+                    f"settlement key {settlement_key!r} was already used for another reservation"
+                )
+        return matching
+
+    @staticmethod
+    def _reconciliation_marker(
+        events: list[StoredEvent], reservation_id: str, settlement_key: str
+    ) -> StoredEvent | None:
+        return next(
+            (
+                event
+                for event in events
+                if event.event_type == "CostAdjusted"
+                and event.payload.get("status") == "reconciled"
+                and event.payload.get("reservation_id") == reservation_id
+                and event.payload.get("settlement_key") == settlement_key
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _check_reconciliation_fingerprint(
+        marker: StoredEvent, state: _ReservationState, record: UsageRecord
+    ) -> None:
+        expected = {
+            "adjustment_minor": record.cost_minor - state.reservation.reserved_minor,
+            "adjustment_tokens": record.total_tokens - state.reservation.reserved_tokens,
+            "currency": record.currency,
+            "reason": "unknown_reconciled",
+            "reservation_id": record.reservation_id,
+            "run_id": record.run_id,
+            "settlement_key": record.settlement_key,
+            "status": "reconciled",
+        }
+        if dict(marker.payload) != expected:
+            raise IdempotencyConflict(
+                "reconciliation settlement key was already used for different usage"
+            )
 
     def _state_for(
         self, reservation_id: str, run_id: str | None
@@ -867,6 +1009,14 @@ class BudgetLedger:
         )
 
     def _run_id_from_reservation(self, reservation_id: str) -> str:
+        indexed_run_id = _run_id_from_index(reservation_id)
+        if indexed_run_id is not None:
+            indexed_states = self._replay_states(
+                indexed_run_id, self.read(indexed_run_id)
+            )
+            indexed_state = indexed_states.get(reservation_id)
+            if indexed_state is not None and indexed_state.reservation.run_id == indexed_run_id:
+                return indexed_run_id
         stream_ids = getattr(self._event_store, "stream_ids", None)
         candidates = (
             stream_ids(_BUDGET_STREAM)
@@ -1287,6 +1437,7 @@ __all__ = [
     "BudgetReleasedError",
     "CurrencyMismatch",
     "IdempotencyConflict",
+    "ReservedKeyError",
     "ReservationNotFound",
     "ReservationStateError",
 ]
