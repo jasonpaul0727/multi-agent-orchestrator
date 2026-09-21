@@ -2,7 +2,10 @@
 
 一个本地运行的多模型、多 Agent 编排系统。项目以 GPT/Codex 为主要模型，同时支持通过 API Key 接入其他模型厂商；系统会根据任务角色、成本、风险和失败情况选择模型，并在必要时升级到更高能力的模型。
 
-> 当前状态：设计阶段，尚无可运行版本。完整设计获批后，项目才会进入实施规划和编码阶段。
+> **当前状态：持久化与成本底座已实现，整体系统尚不可运行。**
+> `src/orchestrator/` 下的事件存储、快照恢复、Artifact Store 和预算账本已完成并有测试覆盖。
+> 可观测性、跨规格契约校验、并发与崩溃矩阵仍在进行中；任务生命周期、模型路由、权限执行和 CLI/MCP 均尚未实现。
+> 本项目**不具备生产就绪状态**。
 
 ## V1 目标
 
@@ -16,7 +19,7 @@
 
 ## 架构原则
 
-系统采用“受控的去中心化 Agent 网络”：Agent 可以协作、委派和细化任务，但不能绕过确定性控制层。
+系统采用「受控的去中心化 Agent 网络」：Agent 可以协作、委派和细化任务，但不能绕过确定性控制层。
 
 - **编排核心**：CLI 与 MCP Server 共用相同的任务编排能力。
 - **确定性控制层**：统一管理运行状态、预算、权限、并发、检查点和审计。
@@ -25,9 +28,83 @@
 - **事件存储**：记录任务轨迹、模型调用、工具调用、Token、费用和证据。
 - **任务模型**：V1 使用事件驱动 DAG，并允许在执行期间仅追加或细化任务节点。
 
+## 核心规则
+
+以下两条规则约束所有已实现和后续模块，实现时不得绕过。
+
+### 事件为唯一真源
+
+追加式事件流是系统中唯一的权威事实来源。快照、预算余额、Artifact 元数据、投影、日志和指标**全部是派生视图**，必须能够从事件流重放重建。
+
+因此：
+
+- 任何组件都不得直接修改派生视图来表达状态变化，状态变化只能通过追加事件表达。
+- 投影（projection）是只读的，不得回写事件存储，也不得参与调度决策。
+- 恢复流程从最近一个合法快照开始重放事件，而不是信任任何已落盘的派生状态。
+
+### SQLite 控制目录
+
+V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录**：
+
+- 该目录由编排器独占，不与 Agent 工作区共享，也不在任何 `workspace-write` 权限边界内。
+- 目录内持有事件数据库、快照和内容寻址的 Artifact blob；Agent 无法通过工具网关访问这些路径。
+- 事件库必须以 WAL 模式打开，使用显式事务、唯一 stream 版本和幂等键。
+- 该目录的完整性即系统的可恢复性边界：目录丢失等同于运行历史丢失。
+
+## 已实现的模块边界
+
+所有模块只对外暴露经 Pydantic 校验的边界对象和小接口，**上层不会拿到数据库句柄**，因此生命周期、路由和权限等后续切片可以依赖稳定契约。
+
+| 模块 | 职责 | 对外契约 |
+| --- | --- | --- |
+| `orchestrator.identifiers` | 稳定标识符生成 | `new_id()` |
+| `orchestrator.persistence` | 追加式事件存储、快照 | `EventDraft` · `StoredEvent` · `SQLiteEventStore` · `SnapshotStore` |
+| `orchestrator.artifacts` | 内容寻址的 Artifact 存储与访问控制 | `ArtifactStore` · `ArtifactRecord` · `ArtifactAccessGrant` |
+| `orchestrator.budget` | Token 与费用的预留、结算、对账 | `BudgetLedger` · `RunLimit` · `CostEstimate` · `BudgetReservation` · `UsageRecord` · `BudgetBalance` |
+| `orchestrator.recovery` | 确定性恢复与不变式校验 | `bootstrap_recovery()` · `recover()` · `recover_aggregate()` |
+
+尚未实现：`orchestrator.observability`（脱敏观测与投影）、跨规格事件契约校验、任务生命周期、模型路由、权限执行、CLI 与 MCP Server。
+
+### 预算生命周期
+
+每次模型或工具调用都经过同一套四态账本，状态变化全部以事件形式落入事件流：
+
+```
+reserve ──┬──▶ commit   结算真实用量，按 settlement_key 幂等
+          ├──▶ release  调用失败，预留额度归还
+          └──▶ unknown  结果不明，保留最坏情况占用，等待对账
+```
+
+金额一律使用整数最小货币单位（如美分），并附带 tokenizer、价格与估算器的 snapshot ID，保证可追溯。
+
 ## 权限与安全
 
 项目规划提供 `read-only`、`workspace-write` 和 `full-trust` 三档权限。文件访问以声明的工作区边界为基础；删除、安装系统软件、发布、推送和密钥访问等高风险动作可分别配置策略，并由控制层强制执行与审计。
+
+上述权限模型的**执行层尚未实现**，当前仓库中只有对应的事件名称与持久化契约。
+
+## 开发
+
+需要 Python 3.12 或更高版本。
+
+```bash
+# 安装开发依赖
+python -m pip install -e ".[dev]"
+
+# 运行底座测试
+python -m pytest tests/unit tests/contract tests/integration tests/acceptance -q
+
+# 覆盖率检查
+python -m coverage run -m pytest -q
+python -m coverage report --fail-under=90
+
+# 语法检查与打包
+python -m compileall src
+python -m build
+```
+
+> `tests/contract` 与 `tests/acceptance` 随 Task 7、Task 8 落地，当前尚未建立。
+> 在那之前使用 `python -m pytest tests/unit tests/integration -q`。
 
 ## 设计文档
 
@@ -35,10 +112,14 @@
 - [任务生命周期与失败恢复](docs/superpowers/specs/2026-09-09-task-lifecycle-design.md)：已于 2026-09-10 批准。
 - [预设、DIY 配置与模型路由](docs/superpowers/specs/2026-09-11-presets-routing-design.md)：已于 2026-09-12 批准。
 - [权限、安全、隔离与审批](docs/superpowers/specs/2026-09-13-permissions-security-isolation-approval-design.md)：各章节已确认，等待书面规格终审。
+- [持久化、成本统计、可观测性与测试](docs/superpowers/specs/2026-09-14-persistence-cost-observability-testing-design.md)：已于 2026-09-14 确认并完成书面审阅。
+- [持久化底座实施计划](docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md)：Task 1–5 已完成，Task 6–9 进行中。
 
 ## 下一步
 
-1. 完成权限、安全、隔离与审批书面规格的终审。
-2. 设计持久化、成本统计、可观测性和测试方案。
-3. 汇总并审阅完整产品设计。
-4. 完整设计获批后编写实施计划，再开始编码。
+1. 实现脱敏观测与只读投影（Task 6）。
+2. 补齐跨规格事件契约校验：因果顺序与 attempt 身份一致性（Task 7）。
+3. 补齐并发竞争、崩溃注入矩阵与端到端验收流程（Task 8）。
+4. 完成打包检查与底座交付（Task 9）。
+5. 完成权限、安全、隔离与审批书面规格的终审。
+6. 为任务生命周期、模型路由、权限执行和 CLI/MCP 编写实施计划，再开始对应编码。

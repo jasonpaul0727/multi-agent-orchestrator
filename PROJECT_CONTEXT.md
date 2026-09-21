@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-项目处于设计阶段，尚未开始实现。后续工作应在本目录进行。
+持久化与成本底座已进入实现阶段。实施计划 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md` 的 Task 1–6 已完成并有测试覆盖（事件存储、快照与恢复、Artifact Store、预算账本、脱敏观测与只读投影）。Task 7（跨规格事件契约）、Task 8（并发/崩溃矩阵/验收）、Task 9（打包与交付）尚未开始。以 `src/` 与 `tests/` 下实际存在的文件为准。
 
 ## 产品目标
 
@@ -25,6 +25,17 @@
 选择“受控的去中心化 Agent 网络”：Root/Planner、Coder、Document Analyst、Researcher、Tester、Reviewer 和 Director 可以协作并动态创建子 Agent；确定性控制层负责运行状态、预算、权限、并发、检查点和审计，模型不能绕过这些硬限制。
 
 CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 和 Tool Gateway；运行轨迹、模型调用、工具调用、Token、费用和证据写入持久化事件存储。
+
+## 已完成的实现（Task 1–6）
+
+- `orchestrator.identifiers`、包骨架与测试夹具（Task 1）。
+- `orchestrator.persistence`：追加式 SQLite 事件存储、CAS、幂等（Task 2）。
+- `orchestrator.persistence.snapshots` 与 `orchestrator.recovery`：快照校验与确定性恢复（Task 3）。
+- `orchestrator.artifacts`：内容寻址、原子发布、访问隔离（Task 4）。
+- `orchestrator.budget`：整数最小货币单位的预留、结算、释放与结果不明（Task 5）。
+- `orchestrator.observability`：脱敏 Redactor、ObservationSink（LogRecord/TraceSpan/MetricSample）、Run/Budget/Cost/Approval/Audit 五个只读版本感知投影（Task 6）。投影不回写事件存储、不参与调度；脱敏失败即观测写入失败，无原始回落。
+
+测试：`python -m pytest tests/unit tests/integration -q` 全部通过。
 
 ## 已确认的设计部分
 

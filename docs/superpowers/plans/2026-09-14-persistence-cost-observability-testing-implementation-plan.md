@@ -53,7 +53,7 @@ The implementation must preserve the already approved event, security, routing, 
 - Create: tests/conftest.py
 - Create: tests/unit/test_bootstrap.py
 
-- [ ] **Step 1: Write the failing package test**
+- [x] **Step 1: Write the failing package test**
 
 ~~~python
 from orchestrator.identifiers import new_id
@@ -65,13 +65,13 @@ def test_new_id_is_non_empty_and_stable_as_text():
     assert len(value) == 36
 ~~~
 
-- [ ] **Step 2: Run the test and verify the failure**
+- [x] **Step 2: Run the test and verify the failure**
 
 Run: python -m pytest tests/unit/test_bootstrap.py -q
 
 Expected: FAIL because the orchestrator package and identifiers module do not exist.
 
-- [ ] **Step 3: Add the minimal package metadata and identifier helper**
+- [x] **Step 3: Add the minimal package metadata and identifier helper**
 
 ~~~toml
 [build-system]
@@ -122,13 +122,13 @@ def database_path(tmp_path: Path) -> Path:
     return tmp_path / "control.db"
 ~~~
 
-- [ ] **Step 4: Run the bootstrap test**
+- [x] **Step 4: Run the bootstrap test**
 
 Run: python -m pytest tests/unit/test_bootstrap.py -q
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the bootstrap**
+- [x] **Step 5: Commit the bootstrap**
 
 ~~~bash
 git add pyproject.toml src/orchestrator tests/unit/test_bootstrap.py
@@ -144,7 +144,7 @@ git commit -m "build: bootstrap orchestrator package"
 - Create: src/orchestrator/persistence/sqlite_event_store.py
 - Create: tests/unit/persistence/test_event_store.py
 
-- [ ] **Step 1: Write tests for append, replay, CAS, and idempotency**
+- [x] **Step 1: Write tests for append, replay, CAS, and idempotency**
 
 ~~~python
 from orchestrator.persistence.events import EventDraft
@@ -191,13 +191,13 @@ def test_repeating_an_idempotency_key_returns_original_events(tmp_path):
     assert len(store.read_stream("run", "run-1")) == 1
 ~~~
 
-- [ ] **Step 2: Run the tests and verify the expected failures**
+- [x] **Step 2: Run the tests and verify the expected failures**
 
 Run: python -m pytest tests/unit/persistence/test_event_store.py -q
 
 Expected: FAIL because EventDraft, SQLiteEventStore, and StaleStream are not defined.
 
-- [ ] **Step 3: Implement validated event models**
+- [x] **Step 3: Implement validated event models**
 
 ~~~python
 # src/orchestrator/persistence/events.py
@@ -228,7 +228,7 @@ class StoredEvent(BaseModel):
     causation_id: str | None = None
 ~~~
 
-- [ ] **Step 4: Implement SQLite schema and transactional append**
+- [x] **Step 4: Implement SQLite schema and transactional append**
 
 The schema must create events, stream_versions, and idempotency_records with unique constraints on event ID, stream/version, and stream/idempotency key. Use sqlite3.Row, PRAGMA journal_mode=WAL, PRAGMA foreign_keys=ON, and BEGIN IMMEDIATE for append. Canonicalize JSON with sorted keys before hashing.
 
@@ -255,13 +255,13 @@ class SQLiteEventStore:
 
 The implementation must return the original StoredEvent objects for an idempotency retry, reject different payloads with an existing key, and raise StaleStream before inserting any event when the expected version is wrong.
 
-- [ ] **Step 5: Run the event store tests**
+- [x] **Step 5: Run the event store tests**
 
 Run: python -m pytest tests/unit/persistence/test_event_store.py -q
 
 Expected: PASS with three tests.
 
-- [ ] **Step 6: Commit the event store**
+- [x] **Step 6: Commit the event store**
 
 ~~~bash
 git add src/orchestrator/persistence tests/unit/persistence/test_event_store.py
@@ -278,7 +278,7 @@ git commit -m "feat: add sqlite event store"
 - Create: tests/unit/persistence/test_snapshots.py
 - Create: tests/integration/test_recovery.py
 
-- [ ] **Step 1: Write snapshot and replay tests**
+- [x] **Step 1: Write snapshot and replay tests**
 
 ~~~python
 def test_snapshot_is_rejected_when_event_version_or_hash_is_wrong(tmp_path):
@@ -307,7 +307,7 @@ def apply_run_event(state, event):
     return next_state
 ~~~
 
-- [ ] **Step 2: Implement snapshot hashing and recovery ordering**
+- [x] **Step 2: Implement snapshot hashing and recovery ordering**
 
 SnapshotStore must persist aggregate type, aggregate ID, event version, state hash, schema version, and source event ID. Recovery must validate the snapshot, replay the tail, rebuild projections, mark expired leases and unknown effects, and stop new scheduling if event or budget invariants fail.
 
@@ -329,13 +329,13 @@ def recover_control_plane(database_path, reducers, projections):
     return state
 ~~~
 
-- [ ] **Step 3: Run recovery tests**
+- [x] **Step 3: Run recovery tests**
 
 Run: python -m pytest tests/unit/persistence/test_snapshots.py tests/integration/test_recovery.py -q
 
 Expected: PASS; corrupt snapshots must be ignored and event-chain or budget invariant failures must raise RecoveryFailure.
 
-- [ ] **Step 4: Commit snapshots and recovery**
+- [x] **Step 4: Commit snapshots and recovery**
 
 ~~~bash
 git add src/orchestrator/persistence/snapshots.py src/orchestrator/recovery tests/unit/persistence/test_snapshots.py tests/integration/test_recovery.py
@@ -350,7 +350,7 @@ git commit -m "feat: add snapshot validation and recovery"
 - Create: src/orchestrator/artifacts/store.py
 - Create: tests/unit/artifacts/test_store.py
 
-- [ ] **Step 1: Write hash, atomic publish, and access-scope tests**
+- [x] **Step 1: Write hash, atomic publish, and access-scope tests**
 
 ~~~python
 def test_publish_returns_content_hash_and_is_atomic(tmp_path):
@@ -372,19 +372,19 @@ def test_publish_rejects_modified_content_after_hashing(tmp_path):
         raise AssertionError("corrupt artifact was returned")
 ~~~
 
-- [ ] **Step 2: Implement private staging and atomic publication**
+- [x] **Step 2: Implement private staging and atomic publication**
 
 ArtifactStore must write to a private temporary path, fsync the content, compute SHA-256, atomically rename into the content-addressed location, then append metadata through EventStore. Reads must re-hash content and enforce the caller’s scope before returning bytes. The store must never expose the database or worker temporary directory.
 
 The corrupt_for_test helper used by the test mutates only a temporary test artifact; it is test-only and is not part of the production ArtifactStore API.
 
-- [ ] **Step 3: Run artifact tests**
+- [x] **Step 3: Run artifact tests**
 
 Run: python -m pytest tests/unit/artifacts/test_store.py -q
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit the Artifact Store**
+- [x] **Step 4: Commit the Artifact Store**
 
 ~~~bash
 git add src/orchestrator/artifacts tests/unit/artifacts/test_store.py
@@ -400,7 +400,7 @@ git commit -m "feat: add content addressed artifact store"
 - Create: src/orchestrator/budget/ledger.py
 - Create: tests/unit/budget/test_ledger.py
 
-- [ ] **Step 1: Write integer-cost and reservation tests**
+- [x] **Step 1: Write integer-cost and reservation tests**
 
 ~~~python
 def test_cost_rounds_up_and_reservation_is_atomic(tmp_path):
@@ -435,21 +435,21 @@ def estimate_with_worst_case(tokens):
     return CostEstimate(amount_minor=tokens, currency="USD", token_limit=tokens, snapshot_id="test")
 ~~~
 
-- [ ] **Step 2: Implement typed cost models**
+- [x] **Step 2: Implement typed cost models**
 
 Define RunLimit, CostEstimate, BudgetReservation, UsageRecord, and BudgetBalance with integer minor units, currency, tokenizer/price snapshot IDs, reservation version, and status values reserved, committed, released, or unknown. Reject negative values and currency mismatches.
 
-- [ ] **Step 3: Implement ledger transactions**
+- [x] **Step 3: Implement ledger transactions**
 
 BudgetLedger must append BudgetReserved, UsageObserved, CostCommitted, BudgetReleased, and CostAdjusted events through one EventStore transaction. A reservation cannot exceed the current Run envelope; unknown results keep the worst-case reservation until reconciliation; repeated settlement keys return the first settlement.
 
-- [ ] **Step 4: Run budget tests**
+- [x] **Step 4: Run budget tests**
 
 Run: python -m pytest tests/unit/budget/test_ledger.py -q
 
 Expected: PASS with rounding, unknown-result, duplicate-settlement, and budget-exhaustion coverage.
 
-- [ ] **Step 5: Commit budget and cost accounting**
+- [x] **Step 5: Commit budget and cost accounting**
 
 ~~~bash
 git add src/orchestrator/budget tests/unit/budget/test_ledger.py
@@ -468,7 +468,7 @@ git commit -m "feat: add budget and cost ledger"
 - Create: tests/unit/observability/test_redaction.py
 - Create: tests/unit/observability/test_projections.py
 
-- [ ] **Step 1: Write redaction and projection tests**
+- [x] **Step 1: Write redaction and projection tests**
 
 ~~~python
 def test_redactor_removes_secret_values_and_protected_paths():
@@ -484,21 +484,21 @@ def test_projection_reports_event_version_and_lag():
     assert projection.lag(current_stream_version=3, stream_id="run-1") == 2
 ~~~
 
-- [ ] **Step 2: Implement deterministic redaction**
+- [x] **Step 2: Implement deterministic redaction**
 
 Redactor must recursively handle dicts, lists, strings, and exception text; replace known secret values, secret-like headers, authorization fields, and protected path segments without changing event IDs or hashes already committed. Redaction failures must fail the observation write and emit no raw fallback.
 
-- [ ] **Step 3: Implement ObservationSink and projections**
+- [x] **Step 3: Implement ObservationSink and projections**
 
 ObservationSink accepts structured LogRecord, TraceSpan, and MetricSample objects. Run, budget, cost, approval, and audit projections consume StoredEvent objects in order and expose the last applied event version. A projection cannot mutate EventStore or make scheduling decisions.
 
-- [ ] **Step 4: Run observation tests**
+- [x] **Step 4: Run observation tests**
 
 Run: python -m pytest tests/unit/observability -q
 
 Expected: PASS; raw secrets and protected paths must not appear in logs, spans, metrics, or projection explanations.
 
-- [ ] **Step 5: Commit observations**
+- [x] **Step 5: Commit observations**
 
 ~~~bash
 git add src/orchestrator/observability tests/unit/observability
