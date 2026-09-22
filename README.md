@@ -61,7 +61,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 
 | 模块 | 职责 | 对外契约 |
 | --- | --- | --- |
-| `orchestrator.config` | 严格有效配置、四层覆盖/来源追踪、策略信封与去密钥模型注册表 | `EffectiveConfig` · `ResolvedConfig` · `resolve_effective_config()` · `ModelRegistryManifest` |
+| `orchestrator.config` | 严格有效配置、四层覆盖/来源追踪、原子 reload 与 Run 配置快照 | `EffectiveConfig` · `ResolvedConfig` · `ConfigManager` · `RunConfigSnapshot` · `ModelRegistryManifest` |
 | `orchestrator.identifiers` | 稳定标识符生成 | `new_id()` |
 | `orchestrator.persistence` | 追加式事件存储、快照 | `EventDraft` · `StoredEvent` · `SQLiteEventStore` · `SnapshotStore` |
 | `orchestrator.artifacts` | 内容寻址的 Artifact 存储与访问控制 | `ArtifactStore` · `ArtifactRecord` · `ArtifactAccessGrant` |
@@ -69,7 +69,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | `orchestrator.recovery` | 确定性恢复与不变式校验 | `bootstrap_recovery()` · `recover()` · `recover_aggregate()` |
 | `orchestrator.observability` | fail-closed 脱敏观测与只读投影 | `ObservationSink` · `Redactor` · Run/Budget/Cost/Approval/Audit projections |
 
-`orchestrator.config` 已实现完整配置 schema、system default → user global → project → Run 四层解析、逐字段来源追踪、Policy Envelope 单调收紧、selector tombstone/guard 累加、安全 YAML loaders 和 JSON Schema。它仍未接入原子 reload、Run 快照、Router 或生命周期执行。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
+`orchestrator.config` 已实现完整配置 schema、system default → user global → project → Run 四层解析、逐字段来源追踪、Policy Envelope 单调收紧、selector tombstone/guard 累加、安全 YAML loaders 和 JSON Schema。`ConfigManager` 会先完整构造并验证候选，再以单次原子切换替换活动配置；校验失败保留原配置。Run 启动时将有效配置、注册表及哈希、字段来源和来源标签冻结到 `RunCreated` 事件，并以校验快照作恢复加速；重启时从事件重放原始快照，不受配置文件后续变化影响。并发 reload、Run 启动竞争、重复 Run 创建、失败重试和重启恢复均有测试。该模块尚未接入 Router 或生命周期执行。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
 
 尚未实现：任务生命周期、模型路由、权限执行、CLI 与 MCP Server。因此当前交付是可验证的基础库，不是可执行的多 Agent 产品。
 
@@ -123,5 +123,5 @@ python -m build
 
 ## 下一步
 
-1. 继续 P1：接入配置原子 reload 和 Run 快照，再完成 tokenizer/FX 估算快照及 Gateway 契约。
+1. 继续 P1：完成 tokenizer/FX 估算快照及 Gateway 契约，并补齐 Provider/Model/Price manifest 校验。
 2. P0 隔离能力验证仍是任何 Worker 执行的硬门；无法证明的能力必须失败关闭。之后按计划推进路由、生命周期、权限网关和 CLI/MCP。

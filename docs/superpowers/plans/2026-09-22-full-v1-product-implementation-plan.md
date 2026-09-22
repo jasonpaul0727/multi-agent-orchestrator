@@ -63,13 +63,13 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 - [x] 为 Policy Envelope、Provider/Model/Price 与 Model Registry manifest 建立严格 Pydantic schema；拒绝未知字段、未知版本、明文秘密和不合法引用。
 - [x] 完成 EffectiveConfig、内置预设/角色/selector/guard/health policy 的严格 schema；校验注册表引用、SelectorRule 同优先级交集、角色升级环、fallback tier/能力和健康策略引用。
 - [x] 实现 system default → user global → project → Run 四层解析、字段来源追踪和只收紧的 Policy Envelope 合并；`null` 回退、普通列表替换、SelectorRule tombstone 和 GuardRule 累加均有测试。
-- [ ] 将候选配置验证接入原子 reload，并把完整有效 manifest/哈希冻结到 Run 快照。
+- [x] 将候选配置验证接入原子 reload，并把完整有效 manifest/哈希冻结到 Run 快照。
 - [x] 导出 Model Registry JSON Schema；安全加载拒绝重复键、别名、不安全标签和过大文档，错误诊断不回显输入值。
 - [x] 为完整 EffectiveConfig 与 Overlay 导出 JSON Schema 并提供无密钥 Run overlay 示例；配置预算需显式声明，Model Registry 的秘密字段只接受允许的引用格式。
 - [ ] 定义 provider/model/price/tokenizer manifest、适配器协议、请求/响应/usage/error 类型；固定费用按最小货币单位向上取整。
 - [ ] 增加 manifest 校验：角色引用、能力、上下文、输出上限、reasoning effort、价格有效期、fallback 和升级图均完整且无环。
 
-2026-09-22 已落地 `PolicyEnvelope`、Provider/Model/Price/Registry 和完整 EffectiveConfig 契约；增加四层解析、来源追踪、安全 YAML loaders、完整配置/Overlay JSON Schema、角色/selector/guard/health 校验与无密钥示例。配置专属测试 38 项通过；完整测试集 307 项通过，覆盖率 91%。原子 reload、Run 快照持久化、tokenizer/FX 快照、Gateway 和运行时路由仍未完成。
+2026-09-22 已落地 `PolicyEnvelope`、Provider/Model/Price/Registry 和完整 EffectiveConfig 契约；增加四层解析、来源追踪、安全 YAML loaders、完整配置/Overlay JSON Schema、角色/selector/guard/health 校验与无密钥示例。`ConfigManager` 仅在候选完整验证后原子切换；失败时保持活动对象与 generation 不变。`RunCreated` 事件持久化完整有效配置、Registry、双哈希、来源追踪/标签及代次；SnapshotStore checkpoint 可从事件重放修复，Run 重试返回原快照。已增加并发 reload、Run/reload 竞争、同 Run ID 并发启动、候选拒绝、checkpoint 失败重放等测试。tokenizer/FX 快照、Gateway 和运行时路由仍未完成。
 
 验收：配置合并与 schema 测试通过；任意覆盖无法放宽硬限制；相同输入 manifest 生成稳定哈希；任何错误配置不替换活动有效配置；测试输出和事件中无秘密值。
 

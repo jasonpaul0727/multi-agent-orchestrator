@@ -1,11 +1,15 @@
 """Tests for complete configuration, overlays, and source provenance."""
 
 from datetime import datetime, timedelta, timezone
+import json
+import threading
 
 import pytest
 from pydantic import ValidationError
 
 from orchestrator.config import (
+    ConfigCandidate,
+    ConfigManager,
     ConfigOverlay,
     ConfigSource,
     ConfigurationLoadError,
@@ -15,12 +19,17 @@ from orchestrator.config import (
     PolicyEnvelope,
     PriceSpec,
     ProviderSpec,
+    RunConfigSnapshot,
+    RunConfigSnapshotError,
     config_overlay_schema,
     effective_config_schema,
     load_config_overlay_yaml,
     load_effective_config_yaml,
     resolve_effective_config,
 )
+from orchestrator.persistence.events import EventDraft
+from orchestrator.persistence.snapshots import SnapshotStore
+from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
 
 
 NOW = datetime(2026, 9, 22, tzinfo=timezone.utc)
@@ -480,3 +489,306 @@ def test_yaml_loaders_and_json_schemas_cover_full_config_and_overlay():
     assert full_schema["additionalProperties"] is False
     assert overlay_schema["additionalProperties"] is False
     assert "registry_manifest_ref" not in overlay_schema["properties"]
+
+
+def runtime_candidate(reg: ModelRegistryManifest, requested_cost: int) -> ConfigCandidate:
+    overlay = ConfigOverlay.model_validate(
+        {
+            "presets": {
+                "balanced": {"requested_budget": {"max_cost_minor": requested_cost}}
+            }
+        }
+    )
+    resolved = resolve_effective_config(
+        base_config(reg), registry=reg, project=overlay
+    )
+    return ConfigCandidate(
+        resolved=resolved,
+        registry=reg,
+        source_details={"project": f"fixture:budget-{requested_cost}"},
+    )
+
+
+def test_failed_reload_keeps_active_config_and_generation_unchanged():
+    reg = registry()
+    active = runtime_candidate(reg, 100)
+    manager = ConfigManager(active)
+
+    rejected = manager.reload(lambda: ConfigCandidate.model_validate({"invalid": True}))
+
+    assert not rejected.applied
+    assert rejected.error_code == "candidate_rejected"
+    assert rejected.generation == 1
+    assert manager.generation == 1
+    assert manager.active is active
+    assert rejected.effective_config_hash == active.resolved.config.content_hash
+
+
+def test_config_and_snapshot_reject_registry_or_hash_mismatch(tmp_path):
+    reg = registry()
+    candidate = runtime_candidate(reg, 100)
+    changed_registry_data = reg.model_dump(mode="json")
+    changed_registry_data["providers"][0]["secret_ref"] = "env:OTHER_TEST_KEY"
+    changed_registry = ModelRegistryManifest.model_validate(changed_registry_data)
+    with pytest.raises(ValidationError, match="candidate registry"):
+        ConfigCandidate(resolved=candidate.resolved, registry=changed_registry)
+
+    store = SQLiteEventStore(tmp_path / "snapshot-model-validation.db")
+    snapshot = ConfigManager(candidate).start_run("snapshot-validation", store)
+    snapshot_data = snapshot.model_dump(mode="json")
+
+    bad_effective_hash = dict(snapshot_data, effective_config_hash="sha256:" + "0" * 64)
+    with pytest.raises(ValidationError, match="effective_config_hash"):
+        RunConfigSnapshot.model_validate_json(json.dumps(bad_effective_hash))
+
+    bad_registry_hash = dict(snapshot_data, registry_manifest_hash="sha256:" + "0" * 64)
+    with pytest.raises(ValidationError, match="registry_manifest_hash"):
+        RunConfigSnapshot.model_validate_json(json.dumps(bad_registry_hash))
+
+    mismatched_registry = dict(
+        snapshot_data,
+        registry_manifest=changed_registry.model_dump(mode="json"),
+        registry_manifest_hash=changed_registry.content_hash,
+    )
+    with pytest.raises(ValidationError, match="references a different registry"):
+        RunConfigSnapshot.model_validate_json(json.dumps(mismatched_registry))
+    store.close()
+
+
+def test_reload_rejects_non_candidate_results_without_mutating_state():
+    candidate = runtime_candidate(registry(), 100)
+    manager = ConfigManager(candidate)
+
+    result = manager.reload(lambda: None)
+
+    assert not result.applied
+    assert manager.active is candidate
+    assert manager.generation == 1
+    with pytest.raises(TypeError, match="callable"):
+        manager.reload(None)
+
+
+def test_run_start_during_candidate_validation_uses_whole_old_config(tmp_path):
+    reg = registry()
+    old_candidate = runtime_candidate(reg, 100)
+    new_candidate = runtime_candidate(reg, 200)
+    manager = ConfigManager(old_candidate)
+    candidate_loading = threading.Event()
+    allow_candidate = threading.Event()
+    reload_results = []
+
+    def load_candidate():
+        candidate_loading.set()
+        assert allow_candidate.wait(timeout=5)
+        return new_candidate
+
+    reload_thread = threading.Thread(
+        target=lambda: reload_results.append(manager.reload(load_candidate))
+    )
+    reload_thread.start()
+    assert candidate_loading.wait(timeout=5)
+    assert manager.active is old_candidate
+
+    store = SQLiteEventStore(tmp_path / "config-race.db")
+    run_snapshot = manager.start_run("race-run", store)
+    assert run_snapshot.effective_config_hash == old_candidate.resolved.config.content_hash
+    assert run_snapshot.registry_manifest_hash == old_candidate.registry.content_hash
+    assert run_snapshot.resolved_config.field_sources["/presets/balanced/requested_budget/max_cost_minor"] == (
+        ConfigSource.PROJECT,
+    )
+
+    allow_candidate.set()
+    reload_thread.join(timeout=5)
+    assert not reload_thread.is_alive()
+    assert reload_results[0].applied
+    assert manager.active is new_candidate
+    next_snapshot = manager.start_run("after-reload", store)
+    assert next_snapshot.effective_config_hash == new_candidate.resolved.config.content_hash
+    store.close()
+
+
+def test_concurrent_reloads_validate_one_candidate_at_a_time():
+    reg = registry()
+    candidates = [runtime_candidate(reg, cost) for cost in (100, 200, 300)]
+    manager = ConfigManager(candidates[0])
+    first_loading = threading.Event()
+    release_first = threading.Event()
+    second_called = threading.Event()
+    second_attempting = threading.Event()
+    lock = threading.Lock()
+    active_loaders = 0
+    max_loaders = 0
+    completed = []
+
+    def tracked_loader(candidate, *, wait=False):
+        nonlocal active_loaders, max_loaders
+        with lock:
+            active_loaders += 1
+            max_loaders = max(max_loaders, active_loaders)
+        try:
+            if wait:
+                first_loading.set()
+                assert release_first.wait(timeout=5)
+            else:
+                second_called.set()
+            return candidate
+        finally:
+            with lock:
+                active_loaders -= 1
+
+    first = threading.Thread(
+        target=lambda: completed.append(
+            manager.reload(lambda: tracked_loader(candidates[1], wait=True))
+        )
+    )
+    def run_second_reload():
+        second_attempting.set()
+        completed.append(manager.reload(lambda: tracked_loader(candidates[2])))
+
+    second = threading.Thread(target=run_second_reload)
+    first.start()
+    assert first_loading.wait(timeout=5)
+    second.start()
+    # The second thread is known to be live before the first builder is released.
+    assert second_attempting.wait(timeout=1)
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert max_loaders == 1
+    assert second_called.is_set()
+    assert all(result.applied for result in completed)
+    assert manager.generation == 3
+    assert manager.active is candidates[2]
+
+
+def test_restart_replays_original_config_registry_and_provenance(tmp_path):
+    database = tmp_path / "run-snapshot.db"
+    reg = registry()
+    original = runtime_candidate(reg, 100)
+    changed = runtime_candidate(reg, 300)
+    store = SQLiteEventStore(database)
+    manager = ConfigManager(original)
+    expected = manager.start_run("persistent-run", store)
+    store.close()
+
+    restarted_store = SQLiteEventStore(database)
+    restarted_manager = ConfigManager(changed)
+    replayed = restarted_manager.restore_run("persistent-run", restarted_store)
+    checkpoint = SnapshotStore(restarted_store).load_valid(
+        "run_config",
+        "persistent-run",
+        expected_event_version=1,
+        expected_source_event_id=restarted_store.read_stream("run", "persistent-run")[0].event_id,
+    )
+
+    assert replayed.effective_config_hash == expected.effective_config_hash
+    assert replayed.registry_manifest_hash == expected.registry_manifest_hash
+    assert replayed.resolved_config.field_sources == expected.resolved_config.field_sources
+    assert replayed.source_details == expected.source_details
+    assert replayed.effective_config_hash != changed.resolved.config.content_hash
+    assert checkpoint is not None
+    assert checkpoint.state["effective_config_hash"] == expected.effective_config_hash
+    restarted_store.close()
+
+
+def test_competing_run_starts_share_one_immutable_created_snapshot(tmp_path):
+    database = tmp_path / "competing-run-starts.db"
+    reg = registry()
+    candidates = [runtime_candidate(reg, 100), runtime_candidate(reg, 300)]
+    start_barrier = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def start(candidate):
+        store = SQLiteEventStore(database)
+        try:
+            start_barrier.wait(timeout=5)
+            results.append(ConfigManager(candidate).start_run("contended-run", store))
+        except Exception as exc:  # pragma: no cover - asserted empty below
+            errors.append(exc)
+        finally:
+            store.close()
+
+    threads = [threading.Thread(target=start, args=(candidate,)) for candidate in candidates]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    assert len(results) == 2
+    assert results[0].effective_config_hash == results[1].effective_config_hash
+    assert results[0].effective_config_hash in {
+        candidate.resolved.config.content_hash for candidate in candidates
+    }
+    verification_store = SQLiteEventStore(database)
+    created_events = verification_store.read_stream("run", "contended-run")
+    assert len(created_events) == 1
+    assert created_events[0].event_type == "RunCreated"
+    verification_store.close()
+
+
+def test_failed_checkpoint_write_is_replayed_and_repaired_on_retry(tmp_path, monkeypatch):
+    database = tmp_path / "run-checkpoint-retry.db"
+    reg = registry()
+    original = runtime_candidate(reg, 100)
+    changed = runtime_candidate(reg, 300)
+    manager = ConfigManager(original)
+    store = SQLiteEventStore(database)
+
+    def fail_checkpoint(*args, **kwargs):
+        raise OSError("simulated checkpoint failure")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(SnapshotStore, "save_snapshot", fail_checkpoint)
+        with pytest.raises(OSError, match="simulated checkpoint failure"):
+            manager.start_run("retry-run", store)
+
+    events = store.read_stream("run", "retry-run")
+    assert len(events) == 1
+    assert events[0].event_type == "RunCreated"
+    manager.reload(lambda: changed)
+    store.close()
+
+    restarted_store = SQLiteEventStore(database)
+    restarted_manager = ConfigManager(changed)
+    retried = restarted_manager.start_run("retry-run", restarted_store)
+
+    assert retried.effective_config_hash == original.resolved.config.content_hash
+    assert retried.source_details == original.source_details
+    checkpoint = SnapshotStore(restarted_store).load_valid(
+        "run_config", "retry-run", expected_event_version=1
+    )
+    assert checkpoint is not None
+    restarted_store.close()
+
+
+def test_run_snapshot_recovery_rejects_missing_or_malformed_creation_event(tmp_path):
+    store = SQLiteEventStore(tmp_path / "invalid-run-snapshot.db")
+    manager = ConfigManager(runtime_candidate(registry(), 100))
+
+    with pytest.raises(RunConfigSnapshotError, match="missing"):
+        manager.restore_run("missing-run", store)
+
+    store.append(
+        "run",
+        "malformed-run",
+        0,
+        [
+            EventDraft(
+                "RunCreated",
+                {"run_id": "malformed-run", "config_snapshot": {}},
+            )
+        ],
+        "create-malformed",
+    )
+    with pytest.raises(RunConfigSnapshotError, match="failed validation"):
+        manager.restore_run("malformed-run", store)
+
+    store.append("run", "wrong-first-event", 0, [EventDraft("RunChanged", {})], "wrong-first")
+    with pytest.raises(RunConfigSnapshotError, match="does not begin with RunCreated"):
+        manager.start_run("wrong-first-event", store)
+    store.close()

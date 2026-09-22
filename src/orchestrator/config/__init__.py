@@ -45,10 +45,20 @@ from orchestrator.config.models import (
     Tier,
     tighten_policy_envelopes,
 )
+from orchestrator.config.runtime import (
+    ConfigCandidate,
+    ConfigManager,
+    ConfigReloadResult,
+    RunConfigSnapshot,
+    RunConfigSnapshotError,
+)
 
 __all__ = [
     "ConfigIssue",
     "ConfigurationLoadError",
+    "ConfigCandidate",
+    "ConfigManager",
+    "ConfigReloadResult",
     "ClassifierOverlay",
     "ClassifierSpec",
     "ConfigOverlay",
@@ -73,6 +83,8 @@ __all__ = [
     "ResolvedConfig",
     "RequestedBudget",
     "RoleProfile",
+    "RunConfigSnapshot",
+    "RunConfigSnapshotError",
     "SelectorRule",
     "SelectorTarget",
     "SelectorTombstone",
