@@ -57,6 +57,124 @@ def _validate_non_blank(value: Any, field_name: str) -> Any:
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
+_CAUSAL_EVENT_TYPES = frozenset(
+    {
+        "PolicyDecision",
+        "CapabilityGrant",
+        "ApprovalRequested",
+        "ApprovalGrant",
+        "ApprovalGranted",
+        "ApprovalGrantConsumed",
+        "ApprovalDenied",
+        "ApprovalRevoked",
+        "ApprovalExpired",
+        "RoutingRequest",
+        "RoutingDecision",
+        "EffectIntentRecorded",
+        "EffectReceiptRecorded",
+    }
+)
+_BUDGET_EVENT_TYPES = frozenset(
+    {
+        "BudgetReserved",
+        "UsageObserved",
+        "CostCommitted",
+        "BudgetReleased",
+        "CostAdjusted",
+        "OutcomeUnknown",
+        "AwaitingReconciliation",
+    }
+)
+
+
+class EventContractError(ValueError):
+    """Raised when lifecycle, security, and budget event identities disagree."""
+
+
+def validate_event_contract(events: list[Any]) -> None:
+    """Validate ordering and identity rules for a single causal event stream.
+
+    Budget ledgers can also be used as a stand-alone accounting primitive.
+    Their legacy events remain valid without attempt metadata; once a budget
+    event is attempt-scoped, all execution identities and causation are
+    mandatory. Security, routing, approval, and external-effect events always
+    require that full context.
+    """
+
+    intents: dict[str, Any] = {}
+    consumed_grants: dict[str, Any] = {}
+    for event in events:
+        event_type = event.event_type
+        payload = event.payload or {}
+        if event_type == "EffectIntentRecorded":
+            effect_id = payload.get("effect_id")
+            if not isinstance(effect_id, str) or not effect_id.strip():
+                raise EventContractError("EffectIntentRecorded requires effect_id")
+            intents[effect_id] = event
+        elif event_type == "EffectReceiptRecorded":
+            effect_id = payload.get("effect_id")
+            intent = intents.get(effect_id)
+            if intent is None:
+                raise EventContractError(
+                    "EffectReceiptRecorded requires a prior EffectIntentRecorded in the same stream"
+                )
+            if (
+                intent.attempt_id != event.attempt_id
+                or intent.fencing_generation != event.fencing_generation
+            ):
+                raise EventContractError(
+                    "effect receipt attempt and fencing generation must match its intent"
+                )
+        elif event_type == "ApprovalGrantConsumed":
+            grant_id = payload.get("approval_grant_id") or payload.get("grant_id")
+            if not isinstance(grant_id, str) or not grant_id.strip():
+                raise EventContractError("ApprovalGrantConsumed requires approval_grant_id")
+            consumed_grants[grant_id] = event
+        elif event_type == "BudgetReserved":
+            grant_id = payload.get("approval_grant_id")
+            if grant_id is not None:
+                consumed = consumed_grants.get(grant_id)
+                if consumed is None:
+                    raise EventContractError(
+                        "approval-gated BudgetReserved requires prior ApprovalGrantConsumed"
+                    )
+                if consumed.attempt_id != event.attempt_id:
+                    raise EventContractError(
+                        "ApprovalGrantConsumed and BudgetReserved must share attempt_id"
+                    )
+                if consumed.fencing_generation != event.fencing_generation:
+                    raise EventContractError(
+                        "ApprovalGrantConsumed and BudgetReserved must share fencing_generation"
+                    )
+    # A consumed approval cannot be committed without its corresponding
+    # reservation in the same atomic append/causal stream.
+    for grant_id, consumed in consumed_grants.items():
+        matching = [
+            event
+            for event in events
+            if event.event_type == "BudgetReserved"
+            and event.payload.get("approval_grant_id") == grant_id
+        ]
+        if not matching:
+            raise EventContractError(
+                "ApprovalGrantConsumed must be paired with an approval-gated BudgetReserved"
+            )
+
+
+def _validate_execution_context(model: Any, *, event_type: str) -> None:
+    required = ("run_id", "node_id", "attempt_id", "fencing_generation", "causation_id")
+    context_present = any(getattr(model, name, None) is not None for name in required)
+    required_for_type = event_type in _CAUSAL_EVENT_TYPES
+    if event_type in _BUDGET_EVENT_TYPES and not context_present:
+        return
+    if not required_for_type and not context_present:
+        return
+    missing = [name for name in required if getattr(model, name, None) is None]
+    if missing:
+        raise ValueError(
+            f"{event_type} requires complete execution context; missing {', '.join(missing)}"
+        )
+
 
 def _validate_sha256_hex(value: Any, field_name: str = "payload_hash") -> str:
     if not isinstance(value, str) or _SHA256_HEX.fullmatch(value) is None:
@@ -147,6 +265,12 @@ class EventDraft(BaseModel):
 
     event_type: StrictStr = Field(min_length=1)
     payload: dict[str, Any]
+    run_id: StrictStr | None = None
+    node_id: StrictStr | None = None
+    attempt_id: StrictStr | None = None
+    fencing_generation: StrictInt | None = Field(default=None, ge=0)
+    correlation_id: StrictStr | None = None
+    causation_id: StrictStr | None = None
 
     def __init__(self, *args: Any, **data: Any) -> None:
         # The small positional form keeps the append API pleasant while the
@@ -174,6 +298,20 @@ class EventDraft(BaseModel):
         _validate_json_value(payload)
         return payload
 
+    @field_validator(
+        "run_id", "node_id", "attempt_id", "correlation_id", "causation_id", mode="before"
+    )
+    @classmethod
+    def validate_optional_identifiers(cls, value: Any, info: ValidationInfo) -> Any:
+        if value is None:
+            return None
+        return _validate_non_blank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_execution_context(self) -> "EventDraft":
+        _validate_execution_context(self, event_type=self.event_type)
+        return self
+
 
 class StoredEvent(BaseModel):
     """An immutable event read from the append-only event store."""
@@ -190,6 +328,10 @@ class StoredEvent(BaseModel):
     payload: dict[str, Any]
     payload_hash: StrictStr = Field(min_length=64, max_length=64)
     idempotency_key: StrictStr = Field(min_length=1)
+    run_id: StrictStr | None = None
+    node_id: StrictStr | None = None
+    attempt_id: StrictStr | None = None
+    fencing_generation: StrictInt | None = Field(default=None, ge=0)
     correlation_id: StrictStr | None = None
     causation_id: StrictStr | None = None
 
@@ -223,6 +365,11 @@ class StoredEvent(BaseModel):
         if value is None:
             return value
         return _validate_non_blank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_execution_context(self) -> "StoredEvent":
+        _validate_execution_context(self, event_type=self.event_type)
+        return self
 
     @model_validator(mode="after")
     def freeze_payload(self) -> "StoredEvent":

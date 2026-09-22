@@ -10,6 +10,9 @@ from orchestrator.recovery import (
     EventChainFailure,
     RecoveryBootstrap,
     SecurityInvariantFailure,
+    bootstrap_recovery,
+    recover,
+    recover_aggregate,
 )
 
 
@@ -404,3 +407,190 @@ def test_source_less_snapshot_is_anchored_by_version_for_tail_replay(tmp_path):
     assert result.replayed_from_version == 1
     assert result.replayed_event_count == 1
     assert result.state == "Planning"
+
+
+def test_recovery_validates_options_and_reports_result_aliases(tmp_path):
+    events = SQLiteEventStore(tmp_path / "recovery.db")
+    events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+    recovery = RecoveryBootstrap(events)
+
+    with pytest.raises(ValueError, match="aggregate_type"):
+        recovery.recover(" ", "run-1", lambda state, event: state)
+    with pytest.raises(TypeError, match="reducers"):
+        recovery.recover("run", "run-1", object())
+    with pytest.raises(TypeError, match="projections"):
+        recovery.recover(
+            "run", "run-1", lambda state, event: state, projections=[]
+        )
+    with pytest.raises(TypeError, match="projection_states"):
+        recovery.recover(
+            "run", "run-1", lambda state, event: state, projection_states=[]
+        )
+    with pytest.raises(ValueError, match="snapshot_schema_version"):
+        recovery.recover(
+            "run", "run-1", lambda state, event: state, snapshot_schema_version=0
+        )
+    with pytest.raises(ValueError, match="only one of lease_hook"):
+        recovery.recover(
+            "run",
+            "run-1",
+            lambda state, event: state,
+            lease_hook=lambda state: None,
+            lease_checker=lambda state: None,
+        )
+
+    recovered = recovery.recover(
+        "run", "run-1", lambda state, event: event.event_type
+    )
+    assert recovered.version == recovered.event_version == 1
+    assert recovered.aggregate_state == recovered.state == "RunCreated"
+
+
+def test_recovery_uses_wildcard_reducer_and_unknown_event_hook(tmp_path):
+    events = SQLiteEventStore(tmp_path / "recovery.db")
+    events.append(
+        "run",
+        "run-1",
+        0,
+        [EventDraft("RunCreated", {}), EventDraft("CustomEvent", {})],
+        "events",
+    )
+    hook_calls = []
+
+    recovered = RecoveryBootstrap(events).recover(
+        "run",
+        "run-1",
+        {"RunCreated": lambda state, event: "created"},
+        unknown_event_hook=lambda event: hook_calls.append(event.event_type),
+    )
+    assert recovered.state == "created"
+    assert hook_calls == ["CustomEvent"]
+
+    wildcard = RecoveryBootstrap(events).recover(
+        "run", "run-1", {"*": lambda state, event: (state or []) + [event.event_type]}
+    )
+    assert wildcard.state == ["RunCreated", "CustomEvent"]
+
+
+def test_recovery_wraps_noncallable_and_failing_reducers(tmp_path):
+    events = SQLiteEventStore(tmp_path / "recovery.db")
+    events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+    with pytest.raises(EventChainFailure, match="reducer is not callable"):
+        RecoveryBootstrap(events).recover("run", "run-1", {"RunCreated": 1})
+    with pytest.raises(EventChainFailure, match="reducer failed"):
+        RecoveryBootstrap(events).recover(
+            "run",
+            "run-1",
+            {"RunCreated": lambda state, event: (_ for _ in ()).throw(RuntimeError("secret"))},
+        )
+
+
+def test_projection_rebuild_mapping_skips_unhandled_events_and_validates_handlers(tmp_path):
+    events = SQLiteEventStore(tmp_path / "recovery.db")
+    events.append(
+        "run",
+        "run-1",
+        0,
+        [EventDraft("RunCreated", {}), EventDraft("InputAccepted", {})],
+        "events",
+    )
+    result = RecoveryBootstrap(events).recover(
+        "run",
+        "run-1",
+        lambda state, event: event.event_type,
+        projections={"timeline": {"InputAccepted": lambda state, event: [event.event_type]}},
+    )
+    assert result.projections == {"timeline": ["InputAccepted"]}
+
+    with pytest.raises(TypeError, match="must be callable or a mapping"):
+        RecoveryBootstrap(events).recover(
+            "run", "run-1", lambda state, event: state, projections={"bad": 1}
+        )
+    with pytest.raises(EventChainFailure, match="projection reducer is not callable"):
+        RecoveryBootstrap(events).recover(
+            "run",
+            "run-1",
+            lambda state, event: state,
+            projections={"bad": {"RunCreated": 1}},
+        )
+    with pytest.raises(EventChainFailure, match="projection rebuild failed"):
+        RecoveryBootstrap(events).recover(
+            "run",
+            "run-1",
+            lambda state, event: state,
+            projections={"bad": lambda state, event: 1 / 0},
+        )
+
+
+def test_recovery_accepts_budget_and_security_hooks_and_wraps_failures(tmp_path):
+    events = SQLiteEventStore(tmp_path / "recovery.db")
+    events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+    recovery = RecoveryBootstrap(events)
+    assert recovery.recover(
+        "run",
+        "run-1",
+        lambda state, event: state,
+        budget=lambda event_stream: len(event_stream) == 1,
+        security_hook=lambda event_stream: True,
+    ).event_version == 1
+
+    with pytest.raises(BudgetInvariantFailure, match="budget hook failed"):
+        recovery.recover(
+            "run",
+            "run-1",
+            lambda state, event: state,
+            budget=lambda event_stream: 1 / 0,
+        )
+    with pytest.raises(SecurityInvariantFailure, match="security hook failed"):
+        recovery.recover(
+            "run",
+            "run-1",
+            lambda state, event: state,
+            security_hook=lambda event_stream: 1 / 0,
+        )
+
+
+def test_recovery_budget_aliases_and_one_shot_helpers(tmp_path):
+    events = SQLiteEventStore(tmp_path / "recovery.db")
+    events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+    reducer = lambda state, event: event.event_type
+    for helper in (recover, bootstrap_recovery, recover_aggregate):
+        result = helper(events, "run", "run-1", reducer, budget={"max_events": 1})
+        assert result.state == "RunCreated"
+
+    with pytest.raises(ValueError, match="max_replay_events"):
+        RecoveryBootstrap(events).recover(
+            "run", "run-1", reducer, max_replay_events=True
+        )
+    with pytest.raises(ValueError, match="budget replay limit"):
+        RecoveryBootstrap(events).recover(
+            "run", "run-1", reducer, budget={"max_events": -1}
+        )
+    with pytest.raises(ValueError, match="non-negative integer"):
+        RecoveryBootstrap(events).recover("run", "run-1", reducer, budget=-1)
+
+
+def test_recovery_hook_accepts_scalar_findings_and_rejects_broken_iterators(tmp_path):
+    events = SQLiteEventStore(tmp_path / "recovery.db")
+    events.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+    recovery = RecoveryBootstrap(events)
+    scalar = recovery.recover(
+        "run", "run-1", lambda state, event: state, lease_hook=lambda state: 42
+    )
+    assert scalar.expired_leases == (42,)
+    string = recovery.recover(
+        "run", "run-1", lambda state, event: state, lease_hook=lambda state: "lease-extra"
+    )
+    assert string.expired_leases == ("lease-extra",)
+
+    class BrokenIterable:
+        def __iter__(self):
+            raise TypeError("not iterable after all")
+
+    with pytest.raises(EventChainFailure, match="invariant hook failed"):
+        recovery.recover(
+            "run",
+            "run-1",
+            lambda state, event: state,
+            lease_hook=lambda state: BrokenIterable(),
+        )

@@ -290,6 +290,11 @@ class BudgetLedger:
         *,
         reservation_id: str | None = None,
         idempotency_key: str | None = None,
+        node_id: str | None = None,
+        attempt_id: str | None = None,
+        fencing_generation: int | None = None,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> BudgetReservation:
         run_id = _identifier(run_id, "run_id")
         if not isinstance(estimate, CostEstimate):
@@ -300,6 +305,14 @@ class BudgetLedger:
         reserved_tokens = _nonnegative_int(reserved_tokens, "token_limit")
         if reserved_tokens < estimate.total_tokens:
             raise ValueError("token_limit cannot be lower than the estimate token totals")
+        execution_context = {
+            "run_id": run_id if attempt_id is not None or node_id is not None else None,
+            "node_id": node_id,
+            "attempt_id": attempt_id,
+            "fencing_generation": fencing_generation,
+            "correlation_id": correlation_id,
+            "causation_id": causation_id,
+        }
         reservation_id = (
             _identifier(reservation_id, "reservation_id")
             if reservation_id is not None
@@ -372,7 +385,7 @@ class BudgetLedger:
                 )
             balance = self._balance_from_events(run_id, events, limit, _version)
             self._ensure_fits(balance, estimate.amount_minor, reserved_tokens, estimate)
-            return [EventDraft("BudgetReserved", payload)]
+            return [EventDraft("BudgetReserved", payload, **execution_context)]
 
         events = self._transactional_append(run_id, append_key, decide)
         if not events:
@@ -457,7 +470,7 @@ class BudgetLedger:
                 raise ReservationStateError(
                     f"reservation {reservation_id!r} is already {state.reservation.status}"
                 )
-            return [EventDraft("CostAdjusted", payload)]
+            return [self._event_draft("CostAdjusted", payload, state.reservation)]
 
         self._transactional_append(run_id, append_key, decide)
         return self._state_for(reservation_id, run_id)[0].reservation
@@ -608,13 +621,13 @@ class BudgetLedger:
                 "status": "committed",
             }
             drafts: list[EventDraft] = [
-                EventDraft("UsageObserved", self._usage_payload(record)),
-                EventDraft("CostCommitted", committed_payload),
-                EventDraft("BudgetReleased", released_payload),
+                self._event_draft("UsageObserved", self._usage_payload(record), state.reservation),
+                self._event_draft("CostCommitted", committed_payload, state.reservation),
+                self._event_draft("BudgetReleased", released_payload, state.reservation),
             ]
             if state.reservation.status == "unknown":
                 drafts.append(
-                    EventDraft(
+                    self._event_draft(
                         "CostAdjusted",
                         {
                             "adjustment_minor": record.cost_minor
@@ -628,6 +641,7 @@ class BudgetLedger:
                             "settlement_key": settlement_key,
                             "status": "reconciled",
                         },
+                        state.reservation,
                     )
                 )
             return drafts
@@ -712,7 +726,7 @@ class BudgetLedger:
                 raise BudgetReleasedError(
                     "unknown reservations remain held until explicit reconciliation"
                 )
-            return [EventDraft("BudgetReleased", payload)]
+            return [self._event_draft("BudgetReleased", payload, state.reservation)]
 
         self._transactional_append(run_id, append_key, decide)
         return self._state_for(reservation_id, run_id)[0].reservation
@@ -1132,6 +1146,25 @@ class BudgetLedger:
         return payload
 
     @staticmethod
+    def _event_draft(
+        event_type: str,
+        payload: Mapping[str, Any],
+        reservation: BudgetReservation,
+    ) -> EventDraft:
+        """Carry an attempt's execution identity across every ledger event."""
+
+        return EventDraft(
+            event_type,
+            dict(payload),
+            run_id=reservation.run_id if reservation.attempt_id is not None else None,
+            node_id=reservation.node_id,
+            attempt_id=reservation.attempt_id,
+            fencing_generation=reservation.fencing_generation,
+            correlation_id=reservation.correlation_id,
+            causation_id=reservation.causation_id,
+        )
+
+    @staticmethod
     def _reservation_from_event(event: StoredEvent) -> BudgetReservation:
         payload = event.payload
         return BudgetReservation(
@@ -1150,6 +1183,11 @@ class BudgetLedger:
             tokenizer_snapshot_id=payload.get("tokenizer_snapshot_id", "unspecified"),
             price_snapshot_id=payload.get("price_snapshot_id", "unspecified"),
             estimator_snapshot_id=payload.get("estimator_snapshot_id", "unspecified"),
+            node_id=event.node_id,
+            attempt_id=event.attempt_id,
+            fencing_generation=event.fencing_generation,
+            correlation_id=event.correlation_id,
+            causation_id=event.causation_id,
         )
 
     @staticmethod

@@ -1,11 +1,13 @@
 from datetime import datetime
+import hashlib
 import sqlite3
 import threading
 
 import pytest
 from pydantic import ValidationError
 
-from orchestrator.persistence.events import EventDraft
+from orchestrator.persistence.events import EventContractError, EventDraft
+from orchestrator.persistence import sqlite_event_store as sqlite_event_store_module
 from orchestrator.persistence.sqlite_event_store import (
     EventIntegrityError,
     IdempotencyConflict,
@@ -116,6 +118,76 @@ def test_events_persist_across_reopened_connection(tmp_path):
     assert reopened.current_version("attempt", "attempt-1") == 1
 
 
+def test_schema_migration_adds_execution_context_without_rewriting_legacy_events(tmp_path):
+    database = tmp_path / "legacy.db"
+    payload_hash = hashlib.sha256(b"{}").hexdigest()
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO schema_migrations (version) VALUES (1), (2), (3);
+            CREATE TABLE stream_versions (
+                stream_type TEXT NOT NULL,
+                stream_id TEXT NOT NULL,
+                current_version INTEGER NOT NULL,
+                PRIMARY KEY (stream_type, stream_id)
+            );
+            INSERT INTO stream_versions VALUES ('run', 'legacy-run', 1);
+            CREATE TABLE events (
+                event_id TEXT NOT NULL UNIQUE,
+                stream_type TEXT NOT NULL,
+                stream_id TEXT NOT NULL,
+                stream_version INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                occurred_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                correlation_id TEXT,
+                causation_id TEXT,
+                PRIMARY KEY (event_id)
+            );
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO events (
+                event_id, stream_type, stream_id, stream_version, event_type,
+                schema_version, occurred_at, payload_json, payload_hash,
+                idempotency_key, correlation_id, causation_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-event",
+                "run",
+                "legacy-run",
+                1,
+                "RunCreated",
+                1,
+                "2026-09-01T00:00:00+00:00",
+                "{}",
+                payload_hash,
+                "create-run",
+                None,
+                None,
+            ),
+        )
+
+    store = SQLiteEventStore(database)
+    event = store.read_stream("run", "legacy-run")[0]
+
+    assert event.event_id == "legacy-event"
+    assert event.run_id is None
+    assert event.attempt_id is None
+    assert store._connection.execute(
+        "SELECT 1 FROM schema_migrations WHERE version = 4"
+    ).fetchone() is not None
+
+
 def test_event_draft_rejects_blank_types_and_non_json_payloads():
     with pytest.raises(ValidationError):
         EventDraft("   ", {})
@@ -123,6 +195,202 @@ def test_event_draft_rejects_blank_types_and_non_json_payloads():
         EventDraft("RunCreated", {"bad": object()})
     with pytest.raises(ValidationError):
         EventDraft("RunCreated", {1: "non-string-key"})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"value": float("nan")},
+        {"value": float("inf")},
+        {"value": "lone-\ud800-surrogate"},
+        {"nested": [{"value": object()}]},
+    ],
+)
+def test_event_draft_rejects_non_deterministic_json_values(payload):
+    with pytest.raises(ValidationError):
+        EventDraft("RunCreated", payload)
+
+
+def test_event_draft_positional_forms_and_duplicate_arguments_are_validated():
+    assert EventDraft("RunCreated", {}).payload == {}
+    assert EventDraft(event_type="RunCreated", payload={}).event_type == "RunCreated"
+    with pytest.raises(TypeError, match="at most"):
+        EventDraft("RunCreated", {}, {})
+    with pytest.raises(TypeError, match="both positionally"):
+        EventDraft("RunCreated", event_type="InputAccepted")
+
+
+@pytest.mark.parametrize("events", [None, [], [object()]])
+def test_append_rejects_empty_noniterable_or_invalid_event_batches(tmp_path, events):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    with pytest.raises(ValueError, match="events"):
+        store.append("run", "run-1", 0, events, "invalid-events")
+
+
+def test_append_checked_noop_and_failure_are_transactional(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    assert store.append_checked("run", "run-1", "no-op", lambda events, version: None) == []
+    assert not store._connection.in_transaction
+
+    with pytest.raises(RuntimeError, match="decision failed"):
+        store.append_checked(
+            "run", "run-1", "failure", lambda events, version: (_ for _ in ()).throw(RuntimeError("decision failed"))
+        )
+    assert not store._connection.in_transaction
+    assert store.read_stream("run", "run-1") == []
+
+
+def test_append_inside_outer_transaction_uses_savepoint_and_can_roll_back(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    store._connection.execute("BEGIN")
+    store.append(
+        "run", "run-1", 0, [EventDraft("RunCreated", {})], "create-in-outer"
+    )
+    assert store._connection.in_transaction
+    assert store.current_version("run", "run-1") == 1
+    store._connection.rollback()
+    assert store.current_version("run", "run-1") == 0
+    assert store.read_stream("run", "run-1") == []
+
+
+def test_read_stream_with_version_respects_existing_transaction(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    store.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")
+    store._connection.execute("BEGIN")
+    events, version = store.read_stream_with_version("run", "run-1")
+    assert [event.event_type for event in events] == ["RunCreated"]
+    assert version == 1
+    assert store._connection.in_transaction
+    store._connection.rollback()
+
+
+def test_stream_ids_are_sorted_and_context_manager_closes_connection(tmp_path):
+    database = tmp_path / "events.db"
+    with SQLiteEventStore(database) as store:
+        store.append("run", "run-z", 0, [EventDraft("RunCreated", {})], "z")
+        store.append("run", "run-a", 0, [EventDraft("RunCreated", {})], "a")
+        assert store.stream_ids("run") == ["run-a", "run-z"]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        store.current_version("run", "run-a")
+
+
+def test_idempotency_retry_inside_outer_transaction_releases_only_savepoint(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    draft = [EventDraft("RunCreated", {})]
+    store._connection.execute("BEGIN")
+    first = store.append("run", "run-1", 0, draft, "create")
+    repeated = store.append("run", "run-1", 0, draft, "create")
+    assert repeated == first
+    assert store._connection.in_transaction
+    store._connection.rollback()
+    assert store.read_stream("run", "run-1") == []
+
+
+def test_append_contract_failure_rolls_back_nested_savepoint(tmp_path):
+    store = SQLiteEventStore(tmp_path / "events.db")
+    store._connection.execute("BEGIN")
+    with pytest.raises(EventContractError, match="prior EffectIntentRecorded"):
+        store.append(
+            "run",
+            "run-1",
+            0,
+            [
+                EventDraft(
+                    "EffectReceiptRecorded",
+                    {"effect_id": "effect-1"},
+                    run_id="run-1",
+                    node_id="node-1",
+                    attempt_id="attempt-1",
+                    fencing_generation=1,
+                    causation_id="intent-1",
+                )
+            ],
+            "receipt-first",
+        )
+    assert store._connection.in_transaction
+    assert store.read_stream("run", "run-1") == []
+    store._connection.rollback()
+
+
+def test_snapshot_reader_rolls_back_nested_savepoint_on_integrity_failure(tmp_path):
+    database = tmp_path / "events.db"
+    store = SQLiteEventStore(database)
+    event = store.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")[0]
+    store._connection.execute("DROP TRIGGER events_immutable_update")
+    store._connection.execute(
+        "UPDATE events SET payload_json = ? WHERE event_id = ?", ("{", event.event_id)
+    )
+    store._connection.commit()
+    store._connection.execute("BEGIN")
+    with pytest.raises(EventIntegrityError):
+        store.read_stream_with_version("run", "run-1")
+    assert store._connection.in_transaction
+    store._connection.rollback()
+
+
+def test_wal_initialization_retries_transient_locks(monkeypatch):
+    class Cursor:
+        def __init__(self, value=None):
+            self.value = value
+
+        def fetchone(self):
+            return (self.value,)
+
+    class Connection:
+        row_factory = None
+
+        def __init__(self):
+            self.wal_reads = 0
+            self.closed = False
+
+        def execute(self, statement):
+            if statement == "PRAGMA journal_mode":
+                self.wal_reads += 1
+                if self.wal_reads == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return Cursor("wal")
+            return Cursor()
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    sleeps = []
+    monkeypatch.setattr(sqlite_event_store_module.sqlite3, "connect", lambda *args, **kwargs: connection)
+    monkeypatch.setattr(sqlite_event_store_module.time, "sleep", sleeps.append)
+
+    assert sqlite_event_store_module._open_connection("unused.db") is connection
+    assert connection.wal_reads == 2
+    assert sleeps
+
+
+def test_wal_initialization_closes_connection_when_sqlite_refuses_wal(monkeypatch):
+    class Cursor:
+        def __init__(self, value):
+            self.value = value
+
+        def fetchone(self):
+            return (self.value,)
+
+    class Connection:
+        row_factory = None
+
+        def __init__(self):
+            self.closed = False
+
+        def execute(self, statement):
+            if statement in {"PRAGMA journal_mode", "PRAGMA journal_mode = WAL"}:
+                return Cursor("delete")
+            return Cursor(None)
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    monkeypatch.setattr(sqlite_event_store_module.sqlite3, "connect", lambda *args, **kwargs: connection)
+    with pytest.raises(sqlite3.OperationalError, match="refused WAL"):
+        sqlite_event_store_module._open_connection("unused.db")
+    assert connection.closed
 
 
 @pytest.mark.parametrize(

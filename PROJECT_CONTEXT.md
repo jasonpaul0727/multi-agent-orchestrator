@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-持久化与成本底座已进入实现阶段。实施计划 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md` 的 Task 1–6 已完成并有测试覆盖（事件存储、快照与恢复、Artifact Store、预算账本、脱敏观测与只读投影）。Task 7（跨规格事件契约）、Task 8（并发/崩溃矩阵/验收）、Task 9（打包与交付）尚未开始。以 `src/` 与 `tests/` 下实际存在的文件为准。
+持久化、预算、观测与验证底座已完成。实施计划 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md` 的 Task 1–9 均已实现，包括跨规格事件契约、并发/崩溃矩阵、端到端验收和打包检查。当前完整测试集包含 269 项。完整多 Agent 产品仍不可运行：生命周期、模型路由、权限执行和 CLI/MCP 尚未实现。
 
 ## 产品目标
 
@@ -26,7 +26,7 @@
 
 CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 和 Tool Gateway；运行轨迹、模型调用、工具调用、Token、费用和证据写入持久化事件存储。
 
-## 已完成的实现（Task 1–6）
+## 已完成的实现（Task 1–9）
 
 - `orchestrator.identifiers`、包骨架与测试夹具（Task 1）。
 - `orchestrator.persistence`：追加式 SQLite 事件存储、CAS、幂等（Task 2）。
@@ -34,8 +34,11 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 - `orchestrator.artifacts`：内容寻址、原子发布、访问隔离（Task 4）。
 - `orchestrator.budget`：整数最小货币单位的预留、结算、释放与结果不明（Task 5）。
 - `orchestrator.observability`：脱敏 Redactor、ObservationSink（LogRecord/TraceSpan/MetricSample）、Run/Budget/Cost/Approval/Audit 五个只读版本感知投影（Task 6）。投影不回写事件存储、不参与调度；脱敏失败即观测写入失败，无原始回落。
+- 跨规格事件契约：为安全、路由、副作用等事件校验完整执行上下文；校验 EffectIntent/Receipt 因果次序、fencing/attempt 一致性，以及审批消费和预算预留的配对（Task 7）。
+- 并发与崩溃矩阵：覆盖多连接 SQLite CAS/幂等、并发预算预留、重启恢复及副作用 intent/receipt 故障窗口（Task 8）。
+- 验收及交付：端到端持久化流程测试、覆盖率/编译/打包命令与忽略构建产物的 `.gitignore`（Task 9）。
 
-测试：`python -m pytest tests/unit tests/integration -q` 全部通过。
+测试：`python -m pytest tests/unit tests/contract tests/integration tests/acceptance -q` 完整 269 项通过。
 
 ## 已确认的设计部分
 
@@ -49,15 +52,15 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 
 持久化、成本统计、可观测性和测试方案的 SQLite 本地优先方向已于 2026-09-14 获用户确认；正式规格位于 `docs/superpowers/specs/2026-09-14-persistence-cost-observability-testing-design.md`，已完成书面审阅。
 
-持久化、成本统计、可观测性和测试方案书面规格已获用户审阅确认；对应实施计划位于 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md`，尚未开始编码。
+持久化、成本统计、可观测性和测试方案书面规格已获用户审阅确认；对应实施计划位于 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md`，Task 1–9 已完成。
 
 ## 待确认的设计部分
 
-权限、安全、隔离与审批书面规格仍待最终审阅。持久化、成本统计、可观测性和测试方案已完成书面审阅，但实施层面的 SQLite schema、Python 接口、迁移、观测导出和测试夹具尚未开始。
+权限、安全、隔离与审批书面规格仍待最终审阅。尽管持久化底座包含审批和副作用的事件契约，这并不代表权限签发/验证、策略执行或工具隔离已实现。
 
 ## 后续设计顺序
 
-1. 用户审阅并批准权限、安全、隔离与审批书面规格。
+1. 完成权限、安全、隔离与审批书面规格终审。
 2. 汇总并审阅完整产品设计文档和各模块实施边界。
-3. 为生命周期、模型路由、权限安全、CLI/MCP 等模块编写实施计划。
-4. 用户批准完整实施计划后，按计划开始编码。
+3. 为生命周期、模型路由、权限执行、CLI/MCP 等模块编写实施计划。
+4. 按批准的计划逐模块实现并验证，最终形成可运行的端到端编排链路。

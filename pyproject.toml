@@ -23,3 +23,11 @@ dev = [
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
+
+[tool.coverage.run]
+source = ["orchestrator"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 90

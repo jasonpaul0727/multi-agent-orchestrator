@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -387,6 +388,172 @@ def test_direct_models_validate_digest_metadata_and_whitespace():
             signature="signature",
         )
     assert not hasattr(ArtifactStore, "corrupt_for_test")
+
+
+def test_artifact_metadata_normalizes_mapping_scopes_and_exposes_source_fields(tmp_path):
+    artifacts = _store(tmp_path / "artifacts")
+    record = artifacts.publish_bytes(
+        b"normalized",
+        source={
+            "run_id": "run-1",
+            "node_id": "node-1",
+            "attempt_id": "attempt-1",
+            "tool": "pytest",
+            "model": "model-a",
+            "optional": None,
+        },
+        readable_scope={"run": ["run-1", "run-2"]},
+        references={"artifact": "sha256:" + "a" * 64},
+    )
+    assert record.source_run_id == "run-1"
+    assert record.source_node_id == "node-1"
+    assert record.source_attempt_id == "attempt-1"
+    assert record.source_tool == "pytest"
+    assert record.source_model == "model-a"
+    assert record.type == record.artifact_type
+    assert record.content_hash == record.digest
+    assert record.source["optional"] is None
+    assert "run:run-1" in record.readable_scope
+    assert "artifact:sha256:" + "a" * 64 in record.references
+
+    mapped_grant = _grant(record, scope={"run": ["run-1"]})
+    assert "run:run-1" in mapped_grant.scope
+    assert artifacts.read_bytes(record.digest, grant=mapped_grant) == b"normalized"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"source": ["not", "a", "mapping"]},
+        {"source": {"run_id": "bad\nvalue"}},
+        {"readable_scope": b"bytes-are-not-scope-labels"},
+        {"readable_scope": {"run": 3}},
+        {"references": object()},
+    ],
+)
+def test_invalid_artifact_metadata_is_rejected_before_publication(tmp_path, kwargs):
+    artifacts = _store(tmp_path / "artifacts")
+    with pytest.raises((TypeError, ValueError)):
+        artifacts.publish_bytes(b"invalid-metadata", **kwargs)
+    assert not list((tmp_path / "artifacts").glob(".tmp-*"))
+
+
+def test_artifact_rejects_surrogates_and_control_characters_in_text_fields():
+    digest = "sha256:" + "a" * 64
+    with pytest.raises(ValidationError, match="lone surrogate"):
+        ArtifactRecord(digest=digest, artifact_type="bad\ud800type")
+    with pytest.raises(ValidationError, match="control characters"):
+        ArtifactAccessGrant(
+            digest=digest,
+            scope=("run-1",),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            issuer="bad\nissuer",
+            signature="valid",
+        )
+    with pytest.raises(ValidationError):
+        ArtifactRecord(digest=digest, created_at=datetime.now())
+
+
+class _ObjectVerifier:
+    def verify(self, grant):
+        return True
+
+
+class _RaisingVerifier:
+    def verify(self, grant):
+        raise RuntimeError("denied")
+
+
+@pytest.mark.parametrize(
+    ("verifier", "accepted"),
+    [(_ObjectVerifier(), True), (_RaisingVerifier(), False)],
+)
+def test_verifier_objects_are_supported_and_fail_closed(tmp_path, verifier, accepted):
+    artifacts = ArtifactStore(tmp_path / type(verifier).__name__, verifier=verifier)
+    record = artifacts.publish_bytes(b"verified", readable_scope=("run-1",))
+    grant = _grant(record)
+    if accepted:
+        assert artifacts.read_bytes(record.digest, access_grant=grant) == b"verified"
+    else:
+        with pytest.raises(ArtifactAccessDenied):
+            artifacts.read_bytes(record.digest, access_grant=grant)
+
+
+def test_artifact_grant_aliases_conflict_and_unbounded_metadata_query_is_denied(tmp_path):
+    artifacts = _store(tmp_path / "artifacts")
+    record = artifacts.publish_bytes(b"result", readable_scope=("run-1",))
+    grant = _grant(record)
+    with pytest.raises(TypeError, match="mutually exclusive"):
+        artifacts.read_bytes(record.digest, grant, access_grant=grant)
+    with pytest.raises(ArtifactAccessDenied):
+        artifacts.get_records()
+
+
+def test_owned_artifact_store_closes_its_metadata_database(tmp_path):
+    with ArtifactStore(
+        tmp_path / "owned-artifacts", grant_verifier=lambda grant: True
+    ) as artifacts:
+        artifacts.publish_bytes(b"owned", readable_scope=("run-1",))
+        metadata_store = artifacts._event_store
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        metadata_store.current_version("artifact", "missing")
+
+
+@pytest.mark.parametrize("bad_configuration", ["database-path", "duplicate-verifier"])
+def test_artifact_store_rejects_unsafe_constructor_capabilities(tmp_path, bad_configuration):
+    root = tmp_path / bad_configuration
+    if bad_configuration == "database-path":
+        with pytest.raises(TypeError, match="capability"):
+            ArtifactStore(root, event_store=tmp_path / "events.db")
+    else:
+        with pytest.raises(TypeError, match="only one"):
+            ArtifactStore(root, verifier=lambda grant: True, grant_verifier=lambda grant: True)
+
+
+class _TamperingMetadataStore:
+    def __init__(self, mutation):
+        self.events = []
+        self.mutation = mutation
+
+    def current_version(self, stream_type, stream_id):
+        return len(self.events)
+
+    def append(self, stream_type, stream_id, expected_version, events, idempotency_key):
+        draft = events[0]
+        payload = dict(draft.payload)
+        if self.mutation == "size":
+            payload["size"] += 1
+        elif self.mutation == "digest":
+            payload["digest"] = "sha256:" + "0" * 64
+        elif self.mutation == "not-object":
+            payload = None
+        event = SimpleNamespace(
+            event_id="event-1",
+            event_type="ArtifactPublished",
+            payload=payload,
+        )
+        self.events.append(event)
+        return [event]
+
+    def read_stream(self, stream_type, stream_id):
+        return list(self.events)
+
+
+def test_artifact_store_rejects_mismatched_metadata_event_content(tmp_path):
+    metadata = _TamperingMetadataStore("size")
+    artifacts = _store(tmp_path / "size-mismatch", metadata)
+    record = artifacts.publish_bytes(b"result", readable_scope=("run-1",))
+    with pytest.raises(ArtifactIntegrityError, match="size mismatch"):
+        artifacts.read_bytes(record.digest, grant=_grant(record))
+
+
+@pytest.mark.parametrize("mutation", ["digest", "not-object"])
+def test_artifact_store_rejects_invalid_metadata_event_envelopes(tmp_path, mutation):
+    metadata = _TamperingMetadataStore(mutation)
+    artifacts = _store(tmp_path / mutation, metadata)
+    with pytest.raises(ArtifactMetadataError) as failure:
+        artifacts.publish_bytes(b"result", readable_scope=("run-1",))
+    assert isinstance(failure.value.__cause__, ArtifactIntegrityError)
 
 
 def test_append_failure_cleans_new_object_but_not_existing_dedup(tmp_path):

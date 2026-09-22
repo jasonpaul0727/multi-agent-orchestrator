@@ -182,10 +182,26 @@ class BudgetReservation(_BudgetModel):
     tokenizer_snapshot_id: StrictStr = "unspecified"
     price_snapshot_id: StrictStr = "unspecified"
     estimator_snapshot_id: StrictStr = "unspecified"
+    node_id: StrictStr | None = None
+    attempt_id: StrictStr | None = None
+    fencing_generation: StrictInt | None = Field(default=None, ge=0)
+    correlation_id: StrictStr | None = None
+    causation_id: StrictStr | None = None
 
     @field_validator("reservation_id", "run_id", mode="before")
     @classmethod
     def validate_identifiers(cls, value: Any, info: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{info.field_name} must be a non-blank string")
+        return value
+
+    @field_validator(
+        "node_id", "attempt_id", "correlation_id", "causation_id", mode="before"
+    )
+    @classmethod
+    def validate_optional_execution_ids(cls, value: Any, info: Any) -> Any:
+        if value is None:
+            return None
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{info.field_name} must be a non-blank string")
         return value

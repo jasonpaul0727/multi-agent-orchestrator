@@ -514,7 +514,7 @@ git commit -m "feat: add redacted observations and projections"
 - Modify: src/orchestrator/budget/ledger.py
 - Modify: src/orchestrator/observability/projections.py
 
-- [ ] **Step 1: Write cross-spec contract tests**
+- [x] **Step 1: Write cross-spec contract tests**
 
 ~~~python
 from types import SimpleNamespace
@@ -553,17 +553,17 @@ def has_event_pair(events, first_type, second_type):
     return types.index(first_type) < types.index(second_type)
 ~~~
 
-- [ ] **Step 2: Add event validation for required security and lifecycle fields**
+- [x] **Step 2: Add event validation for required security and lifecycle fields**
 
-StoredEvent validation must require run_id, node_id, attempt_id, fencing_generation, and causation metadata on security, budget, routing, and side-effect events. It must reject a receipt without a prior intent in the same causal stream and reject an ApprovalGrantConsumed event whose attempt identity differs from the reservation.
+EventDraft/StoredEvent validation requires run_id, node_id, attempt_id, fencing_generation, and causation metadata on security, routing, approval, and side-effect events. A budget event with attempt context must provide the complete context; stand-alone budget accounting remains available without attempt metadata for compatibility with callers that have no lifecycle layer yet. The store rejects a receipt without a prior intent in the same causal stream and rejects an ApprovalGrantConsumed event whose attempt or fencing identity differs from its approval-gated reservation.
 
-- [ ] **Step 3: Run the contract tests**
+- [x] **Step 3: Run the contract tests**
 
 Run: python -m pytest tests/contract/test_cross_spec_events.py -q
 
 Expected: PASS; invalid ordering and mismatched identities must be rejected before event append.
 
-- [ ] **Step 4: Commit cross-spec contracts**
+- [x] **Step 4: Commit cross-spec contracts**
 
 ~~~bash
 git add src/orchestrator/persistence/events.py src/orchestrator/budget/ledger.py src/orchestrator/observability/projections.py tests/contract/test_cross_spec_events.py
@@ -579,25 +579,25 @@ git commit -m "test: enforce lifecycle and security event contracts"
 - Create: tests/integration/test_concurrency.py
 - Create: tests/acceptance/test_persistence_foundation.py
 
-- [ ] **Step 1: Write fault-injection tests**
+- [x] **Step 1: Write fault-injection tests**
 
 Inject failures at event append, after budget reservation, before and after EffectIntentRecorded, before receipt, after receipt, before settlement, and after ApprovalGrant consumption. For each injection, restart from the same database and assert no duplicate side effect, duplicate charge, lost evidence, or illegal state.
 
-- [ ] **Step 2: Write concurrency tests**
+- [x] **Step 2: Write concurrency tests**
 
 Use two SQLite connections and barriers to race the same expected stream version, budget reservation, idempotency key, and approval consumption. Assert exactly one winner, one stale/idempotent result, and no negative balance.
 
-- [ ] **Step 3: Add the acceptance flow**
+- [x] **Step 3: Add the acceptance flow**
 
 The acceptance test must create a Run, append a planning event, reserve a model call, publish an artifact, record an approval-gated effect, settle usage, rebuild projections, and recover after a forced process interruption. It must inspect the event chain and budget totals rather than only checking a final boolean.
 
-- [ ] **Step 4: Run the full foundation suite**
+- [x] **Step 4: Run the full foundation suite**
 
 Run: python -m pytest tests/unit tests/contract tests/integration tests/acceptance -q
 
 Expected: PASS with zero failures and no unclosed SQLite connections.
 
-- [ ] **Step 5: Commit the acceptance suite**
+- [x] **Step 5: Commit the acceptance suite**
 
 ~~~bash
 git add tests/integration tests/acceptance
@@ -612,7 +612,7 @@ git commit -m "test: cover persistence crash and concurrency matrix"
 - Modify: README.md
 - Create: .gitignore
 
-- [ ] **Step 1: Add reproducible developer commands**
+- [x] **Step 1: Add reproducible developer commands**
 
 Add pytest, coverage, and package build commands to pyproject.toml. The required commands are:
 
@@ -623,11 +623,11 @@ python -m compileall src
 python -m build
 ~~~
 
-- [ ] **Step 2: Document the foundation**
+- [x] **Step 2: Document the foundation**
 
 Update README.md with the implemented module boundaries, SQLite control-directory requirement, event-source-of-truth rule, and the command used to run the foundation tests. Do not document model provider credentials or claim the full orchestrator is production ready.
 
-- [ ] **Step 3: Run final checks**
+- [x] **Step 3: Run final checks**
 
 Run: python -m coverage run -m pytest -q
 
@@ -645,7 +645,7 @@ Run: python -m build
 
 Expected: wheel and source archive are produced in dist/.
 
-- [ ] **Step 4: Commit packaging and documentation**
+- [x] **Step 4: Commit packaging and documentation**
 
 ~~~bash
 git add pyproject.toml README.md .gitignore

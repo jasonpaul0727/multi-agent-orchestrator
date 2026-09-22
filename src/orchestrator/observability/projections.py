@@ -170,7 +170,9 @@ class BudgetProjection(_StreamProjection):
         if kind == "BudgetReserved":
             state["reserved_minor"] += _int(payload, "reserved_minor", "amount_minor")
             state["reserved_tokens"] += _int(payload, "reserved_tokens", "token_limit")
-        elif kind in ("UsageObserved", "CostCommitted"):
+        elif kind == "CostCommitted":
+            # UsageObserved is raw provider evidence; counting both it and the
+            # settlement event would double-count every successful call.
             state["used_minor"] += _int(payload, "cost_minor", "amount_minor", "used_minor")
             state["used_tokens"] += _int(payload, "total_tokens", "used_tokens", "tokens")
         elif kind == "BudgetReleased":

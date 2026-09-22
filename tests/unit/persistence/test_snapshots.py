@@ -5,7 +5,12 @@ import hashlib
 import pytest
 
 from orchestrator.persistence.events import EventDraft
-from orchestrator.persistence.snapshots import SnapshotConflict, SnapshotStore, StaleSnapshot
+from orchestrator.persistence.snapshots import (
+    SnapshotConflict,
+    SnapshotIntegrityError,
+    SnapshotStore,
+    StaleSnapshot,
+)
 from orchestrator.persistence.sqlite_event_store import SQLiteEventStore, canonical_json
 
 
@@ -498,3 +503,111 @@ def test_state_first_positional_save_is_deprecated_but_deterministic(tmp_path):
     assert saved.event_version == 1
     assert saved.schema_version == 2
     assert saved.source_event_id == "event-1"
+
+
+def test_snapshot_save_legacy_and_integrity_arguments(tmp_path):
+    snapshots = SnapshotStore(tmp_path / "snapshots.db")
+    with pytest.warns(DeprecationWarning, match="save_legacy"):
+        saved = snapshots.save_legacy("run", "run-1", 1, {"status": "Ready"})
+    assert saved.version == saved.source_version == 1
+    assert saved.canonical_state_hash == saved.state_hash
+
+    with pytest.raises(ValueError, match="state_hash does not match"):
+        snapshots.save_snapshot(
+            "run", "run-2", 1, {"status": "Ready"}, state_hash="0" * 64
+        )
+    with pytest.raises(ValueError, match="canonically JSON"):
+        snapshots.save_snapshot("run", "run-3", 1, {"bad": float("nan")})
+
+
+def test_snapshot_load_aliases_reject_conflicting_or_invalid_expectations(tmp_path):
+    snapshots = SnapshotStore(tmp_path / "snapshots.db")
+    saved = snapshots.save(
+        "run", "run-1", state={"status": "Ready"}, version=1
+    )
+    assert snapshots.load_valid("run", "run-1", version=1) == saved
+    assert snapshots.load_valid("run", "run-1", expected_version=1) == saved
+    assert snapshots.load_valid(
+        "run", "run-1", schema_version=1, source_version=1
+    ) == saved
+    assert snapshots.load_valid("run", "run-1", version=2) is None
+    assert snapshots.load_valid(
+        "run", "run-1", expected_version=1, version=2
+    ) is None
+    with pytest.raises(ValueError, match="positive integer"):
+        snapshots.load_valid("run", "run-1", expected_event_version=0)
+    assert snapshots.load_valid("run", "missing") is None
+
+
+def test_snapshot_save_rejects_ambiguous_or_duplicate_arguments(tmp_path):
+    snapshots = SnapshotStore(tmp_path / "snapshots.db")
+    with pytest.raises(TypeError, match="at most five"):
+        snapshots.save("run", "run-1", 1, {}, 1, "event", "hash", "extra")
+    with pytest.raises(TypeError, match="state was provided twice"):
+        snapshots.save("run", "run-1", {}, state={"duplicate": True})
+    with pytest.raises(TypeError, match="version and event_version disagree"):
+        snapshots.save(
+            "run", "run-1", state={}, version=1, event_version=2
+        )
+    with pytest.raises(TypeError, match="requires version"):
+        snapshots.save("run", "run-1", state={})
+    with pytest.raises(TypeError, match="integer version"):
+        snapshots.save("run", "run-1", state={}, version=True)
+
+
+def test_load_valid_checks_source_event_and_schema_aliases(tmp_path):
+    snapshots = SnapshotStore(tmp_path / "snapshots.db")
+    saved = snapshots.save(
+        "run", "run-1", state={}, version=1, schema_version=2, source_event_id="event-1"
+    )
+    assert snapshots.load_valid(
+        "run",
+        "run-1",
+        expected_schema_version=2,
+        expected_source_version=1,
+        expected_source_event_id="event-1",
+    ) == saved
+    assert snapshots.load_valid(
+        "run", "run-1", expected_source_event_id="different-event"
+    ) is None
+    assert snapshots.load_valid(
+        "run", "run-1", expected_schema_version=1
+    ) is None
+    assert snapshots.load_valid(
+        "run", "run-1", expected_source_version=2
+    ) is None
+    with pytest.raises(ValueError, match="expected_source_event_id"):
+        snapshots.load_valid("run", "run-1", expected_source_event_id=" ")
+
+
+def test_malformed_snapshot_json_is_unusable_and_owned_context_manager_closes(tmp_path):
+    database = tmp_path / "snapshots.db"
+    with SnapshotStore(database) as snapshots:
+        snapshots.save("run", "run-1", state={}, version=1)
+        connection = snapshots._connection
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE snapshots SET state_json = ? WHERE aggregate_id = ?",
+            ("not-json", "run-1"),
+        )
+    assert SnapshotStore(database).load_valid("run", "run-1") is None
+
+
+def test_snapshot_detects_malformed_current_version_after_write(tmp_path):
+    database = tmp_path / "snapshots.db"
+    snapshots = SnapshotStore(database)
+    snapshots._connection.execute(
+        """
+        CREATE TRIGGER corrupt_snapshot_version AFTER INSERT ON snapshots
+        BEGIN
+            UPDATE snapshots SET event_version = 'not-an-integer'
+            WHERE aggregate_type = NEW.aggregate_type AND aggregate_id = NEW.aggregate_id;
+        END;
+        """
+    )
+    with pytest.raises(SnapshotIntegrityError):
+        snapshots.save("run", "run-1", state={}, version=1)
+    assert snapshots.load_valid("run", "run-1") is None

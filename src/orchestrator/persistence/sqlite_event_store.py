@@ -9,11 +9,18 @@ import hmac
 import json
 from pathlib import Path
 import sqlite3
+import time
 from typing import Any, Callable
 
 from orchestrator.identifiers import new_id
 
-from .events import EventDraft, StoredEvent, _validate_sha256_hex
+from .events import (
+    EventContractError,
+    EventDraft,
+    StoredEvent,
+    _validate_sha256_hex,
+    validate_event_contract,
+)
 
 
 class StaleStream(RuntimeError):
@@ -80,11 +87,45 @@ def _open_connection(path: str | Path) -> sqlite3.Connection:
         isolation_level=None,
         check_same_thread=True,
     )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA busy_timeout = 5000")
-    return connection
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        _enable_wal_with_retry(connection)
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def _enable_wal_with_retry(connection: sqlite3.Connection) -> None:
+    """Enable WAL despite simultaneous first-open journal-mode transitions.
+
+    SQLite's busy timeout does not consistently wait for locks taken while
+    changing ``journal_mode``. Opening several store instances together can
+    therefore produce ``database is locked`` before schema initialization.
+    Retry only that transient condition, bounded by the normal connection
+    timeout; all other SQLite errors remain visible to the caller.
+    """
+
+    deadline = time.monotonic() + 5.0
+    delay = 0.01
+    while True:
+        try:
+            mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(mode).lower() != "wal":
+                mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            if str(mode).lower() != "wal":
+                raise sqlite3.OperationalError("SQLite refused WAL journal mode")
+            return
+        except sqlite3.OperationalError as exc:
+            if not any(marker in str(exc).lower() for marker in ("locked", "busy")):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.1)
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
@@ -119,6 +160,10 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             payload_json TEXT NOT NULL,
             payload_hash TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
+            run_id TEXT,
+            node_id TEXT,
+            attempt_id TEXT,
+            fencing_generation INTEGER,
             correlation_id TEXT,
             causation_id TEXT,
             PRIMARY KEY (event_id),
@@ -178,9 +223,11 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             for statement in statements:
                 connection.execute(statement)
             _migrate_snapshot_metadata(connection)
+            _migrate_event_context(connection)
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
+            connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (4)")
             connection.execute(f"RELEASE SAVEPOINT {savepoint}")
         except BaseException:
             try:
@@ -195,9 +242,11 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         for statement in statements:
             connection.execute(statement)
         _migrate_snapshot_metadata(connection)
+        _migrate_event_context(connection)
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
+        connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (4)")
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -291,6 +340,22 @@ def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
             )
 
 
+def _migrate_event_context(connection: sqlite3.Connection) -> None:
+    """Add execution identity columns while preserving earlier event rows."""
+
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(events)").fetchall()
+    }
+    for name, sql_type in (
+        ("run_id", "TEXT"),
+        ("node_id", "TEXT"),
+        ("attempt_id", "TEXT"),
+        ("fencing_generation", "INTEGER"),
+    ):
+        if name not in columns:
+            connection.execute(f"ALTER TABLE events ADD COLUMN {name} {sql_type}")
+
+
 def _legacy_snapshot_metadata_hash(
     aggregate_type: str,
     aggregate_id: str,
@@ -336,14 +401,25 @@ def _snapshot_metadata_hash(
 
 
 def _draft_request_hash(stream_type: str, stream_id: str, drafts: list[EventDraft]) -> str:
+    serialized_events = []
+    for draft in drafts:
+        item = {"event_type": draft.event_type, "payload": draft.payload}
+        context = {
+            "run_id": draft.run_id,
+            "node_id": draft.node_id,
+            "attempt_id": draft.attempt_id,
+            "fencing_generation": draft.fencing_generation,
+            "correlation_id": draft.correlation_id,
+            "causation_id": draft.causation_id,
+        }
+        if any(value is not None for value in context.values()):
+            item["context"] = context
+        serialized_events.append(item)
     return _sha256_json(
         {
             "stream_type": stream_type,
             "stream_id": stream_id,
-            "events": [
-                {"event_type": draft.event_type, "payload": draft.payload}
-                for draft in drafts
-            ],
+            "events": serialized_events,
         }
     )
 
@@ -436,6 +512,12 @@ class SQLiteEventStore:
             if current_version != expected_version:
                 raise StaleStream(expected_version, current_version)
 
+            existing_events = self._read_rows(
+                stream_type,
+                stream_id,
+                first_version=1,
+                last_version=current_version,
+            )
             first_version = current_version + 1
             last_version = current_version + len(drafts)
             if version_row is None:
@@ -470,14 +552,29 @@ class SQLiteEventStore:
                     payload=draft.payload,
                     payload_hash=_sha256_json(draft.payload),
                     idempotency_key=idempotency_key,
+                    run_id=draft.run_id,
+                    node_id=draft.node_id,
+                    attempt_id=draft.attempt_id,
+                    fencing_generation=draft.fencing_generation,
+                    correlation_id=draft.correlation_id,
+                    causation_id=draft.causation_id,
                 )
+                stored_events.append(stored_event)
+
+            try:
+                validate_event_contract(existing_events + stored_events)
+            except EventContractError:
+                raise
+
+            for stored_event in stored_events:
                 connection.execute(
                     """
                     INSERT INTO events (
                         event_id, stream_type, stream_id, stream_version,
                         event_type, schema_version, occurred_at, payload_json,
-                        payload_hash, idempotency_key, correlation_id, causation_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        payload_hash, idempotency_key, run_id, node_id,
+                        attempt_id, fencing_generation, correlation_id, causation_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         stored_event.event_id,
@@ -490,11 +587,14 @@ class SQLiteEventStore:
                         canonical_json(stored_event.payload),
                         stored_event.payload_hash,
                         stored_event.idempotency_key,
+                        stored_event.run_id,
+                        stored_event.node_id,
+                        stored_event.attempt_id,
+                        stored_event.fencing_generation,
                         stored_event.correlation_id,
                         stored_event.causation_id,
                     ),
                 )
-                stored_events.append(stored_event)
 
             connection.execute(
                 """
@@ -593,7 +693,8 @@ class SQLiteEventStore:
             """
             SELECT event_id, stream_type, stream_id, stream_version,
                    event_type, schema_version, occurred_at, payload_json,
-                   payload_hash, idempotency_key, correlation_id, causation_id
+                   payload_hash, idempotency_key, run_id, node_id, attempt_id,
+                   fencing_generation, correlation_id, causation_id
             FROM events
             WHERE stream_type = ? AND stream_id = ? AND stream_version > ?
             ORDER BY stream_version ASC
@@ -630,7 +731,8 @@ class SQLiteEventStore:
                 """
                 SELECT event_id, stream_type, stream_id, stream_version,
                        event_type, schema_version, occurred_at, payload_json,
-                       payload_hash, idempotency_key, correlation_id, causation_id
+                       payload_hash, idempotency_key, run_id, node_id, attempt_id,
+                       fencing_generation, correlation_id, causation_id
                 FROM events
                 WHERE stream_type = ? AND stream_id = ? AND stream_version > ?
                 ORDER BY stream_version ASC
@@ -706,7 +808,8 @@ class SQLiteEventStore:
             """
             SELECT event_id, stream_type, stream_id, stream_version,
                    event_type, schema_version, occurred_at, payload_json,
-                   payload_hash, idempotency_key, correlation_id, causation_id
+                   payload_hash, idempotency_key, run_id, node_id, attempt_id,
+                   fencing_generation, correlation_id, causation_id
             FROM events
             WHERE stream_type = ? AND stream_id = ?
               AND stream_version BETWEEN ? AND ?
@@ -752,6 +855,10 @@ class SQLiteEventStore:
                 payload=payload,
                 payload_hash=row["payload_hash"],
                 idempotency_key=row["idempotency_key"],
+                run_id=row["run_id"],
+                node_id=row["node_id"],
+                attempt_id=row["attempt_id"],
+                fencing_generation=row["fencing_generation"],
                 correlation_id=row["correlation_id"],
                 causation_id=row["causation_id"],
             )

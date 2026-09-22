@@ -32,6 +32,29 @@ def event(event_type, version, payload=None, *, stream_type="run", stream_id=Non
         or payload.get("stream_id")
         or "run-1"
     )
+    execution_context = {}
+    if event_type in {
+        "PolicyDecision",
+        "CapabilityGrant",
+        "ApprovalRequested",
+        "ApprovalGrant",
+        "ApprovalGranted",
+        "ApprovalGrantConsumed",
+        "ApprovalDenied",
+        "ApprovalRevoked",
+        "ApprovalExpired",
+        "RoutingRequest",
+        "RoutingDecision",
+        "EffectIntentRecorded",
+        "EffectReceiptRecorded",
+    }:
+        execution_context = {
+            "run_id": "run-1",
+            "node_id": "node-1",
+            "attempt_id": "attempt-1",
+            "fencing_generation": 1,
+            "causation_id": "cause-1",
+        }
     return StoredEvent(
         event_id=new_id(),
         stream_type=stream_type,
@@ -43,6 +66,7 @@ def event(event_type, version, payload=None, *, stream_type="run", stream_id=Non
         payload=payload,
         payload_hash=_hash(payload),
         idempotency_key=f"key-{version}",
+        **execution_context,
     )
 
 

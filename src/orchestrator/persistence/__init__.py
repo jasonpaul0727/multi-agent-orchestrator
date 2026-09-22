@@ -1,6 +1,6 @@
 """Durable persistence primitives for orchestration facts."""
 
-from .events import EventDraft, StoredEvent
+from .events import EventContractError, EventDraft, StoredEvent, validate_event_contract
 from .snapshots import (
     Snapshot,
     SnapshotConflict,
@@ -17,6 +17,7 @@ from .sqlite_event_store import (
 )
 
 __all__ = [
+    "EventContractError",
     "EventDraft",
     "EventIntegrityError",
     "IdempotencyConflict",
@@ -29,4 +30,5 @@ __all__ = [
     "StaleSnapshot",
     "StaleStream",
     "StoredEvent",
+    "validate_event_contract",
 ]
