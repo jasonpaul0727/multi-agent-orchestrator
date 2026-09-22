@@ -1,0 +1,16 @@
+# A per-Run overlay: no secrets or registry data are accepted here.
+# Omitted fields inherit lower layers; null removes this layer's override.
+active_preset: balanced
+policy_envelope:
+  max_cost_minor: 250
+  max_total_tokens: 10000
+  max_agents: 4
+  max_depth: 3
+  max_concurrency: 2
+  max_parallel_candidates: 1
+presets:
+  balanced:
+    roles:
+      coder:
+        reasoning_effort: high
+        max_output_tokens: 4000

@@ -106,6 +106,16 @@ class PolicyEnvelope(_ConfigModel):
     require_approval: StrictBool | None = None
     max_parallel_candidates: StrictInt | None = Field(default=None, ge=0)
 
+    @field_serializer(
+        "allowed_models",
+        "allowed_providers",
+        "allowed_capabilities",
+        "denied_models",
+        "denied_providers",
+    )
+    def serialize_sets(self, value: frozenset[str] | None) -> list[str] | None:
+        return None if value is None else sorted(value)
+
     @field_validator(
         "allowed_models",
         "allowed_providers",

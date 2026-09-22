@@ -10,6 +10,12 @@ from pydantic import ValidationError
 from yaml.events import AliasEvent
 from yaml.nodes import MappingNode
 
+from orchestrator.config.effective import (
+    ConfigOverlay,
+    EffectiveConfig,
+    config_overlay_json_schema,
+    effective_config_json_schema,
+)
 from orchestrator.config.models import ModelRegistryManifest
 
 
@@ -39,6 +45,65 @@ _SAFE_FIELD_NAMES = frozenset(
         "estimator_id",
         "effective_from",
         "expires_at",
+        "active_preset",
+        "registry_manifest_ref",
+        "policy_envelope",
+        "mandatory_guard_rules",
+        "presets",
+        "classifier",
+        "health_policies",
+        "requested_budget",
+        "max_cost_minor",
+        "max_total_tokens",
+        "max_agents",
+        "max_depth",
+        "max_concurrency",
+        "max_parallel_candidates",
+        "allowed_models",
+        "allowed_providers",
+        "allowed_capabilities",
+        "denied_models",
+        "denied_providers",
+        "min_tier",
+        "require_independent_review",
+        "require_approval",
+        "roles",
+        "candidates",
+        "reasoning_effort",
+        "retries",
+        "escalate_to",
+        "selector_rules",
+        "guard_rules",
+        "health_policy_ref",
+        "priority",
+        "when",
+        "select",
+        "model",
+        "fallback",
+        "allow_degraded",
+        "disabled",
+        "task_class",
+        "complexity",
+        "risk",
+        "failure_category",
+        "authorized_recovery_action",
+        "health_state",
+        "required_capabilities_all",
+        "context_tokens",
+        "output_tokens",
+        "retry_level",
+        "minimum",
+        "maximum",
+        "constraints",
+        "failure_window_ms",
+        "degrade_after",
+        "open_after",
+        "recovery_successes",
+        "cooldown_ms",
+        "max_probe_permits",
+        "version",
+        "normalization_version",
+        "taxonomy_version",
     }
 )
 
@@ -132,6 +197,21 @@ def load_model_registry_yaml(source: str | bytes) -> ModelRegistryManifest:
     Parser and validation diagnostics include only paths and error codes, not
     rejected input values that could accidentally contain credentials.
     """
+    data = _load_yaml_data(source)
+    return _validate_model(data, ModelRegistryManifest)
+
+
+def load_effective_config_yaml(source: str | bytes) -> EffectiveConfig:
+    """Parse and validate a complete EffectiveConfig YAML document."""
+    return _validate_model(_load_yaml_data(source), EffectiveConfig)
+
+
+def load_config_overlay_yaml(source: str | bytes) -> ConfigOverlay:
+    """Parse a strict partial overlay for the user, project, or Run layer."""
+    return _validate_model(_load_yaml_data(source), ConfigOverlay)
+
+
+def _load_yaml_data(source: str | bytes) -> Any:
     text = _source_text(source)
     try:
         data = yaml.load(text, Loader=_StrictSafeLoader)
@@ -145,9 +225,12 @@ def load_model_registry_yaml(source: str | bytes) -> ModelRegistryManifest:
         )
         code = "duplicate_key" if problem == "duplicate mapping key" else "invalid_yaml"
         raise ConfigurationLoadError((ConfigIssue(path, code),)) from None
+    return data
 
+
+def _validate_model(data: Any, model_type: Any) -> Any:
     try:
-        return ModelRegistryManifest.model_validate(data)
+        return model_type.model_validate(data)
     except ValidationError as error:
         issues = tuple(
             ConfigIssue(
@@ -164,10 +247,24 @@ def model_registry_json_schema() -> dict[str, Any]:
     return ModelRegistryManifest.model_json_schema()
 
 
+def effective_config_schema() -> dict[str, Any]:
+    """Return the JSON Schema for a complete effective manifest."""
+    return effective_config_json_schema()
+
+
+def config_overlay_schema() -> dict[str, Any]:
+    """Return the JSON Schema for a partial config overlay."""
+    return config_overlay_json_schema()
+
+
 __all__ = [
     "ConfigIssue",
     "ConfigurationLoadError",
     "MAX_CONFIG_BYTES",
+    "config_overlay_schema",
+    "effective_config_schema",
+    "load_config_overlay_yaml",
+    "load_effective_config_yaml",
     "load_model_registry_yaml",
     "model_registry_json_schema",
 ]

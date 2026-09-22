@@ -14,9 +14,12 @@
 - 提供独立的本地 CLI 和 MCP Server，不建设 Web 服务。
 - 支持软件开发与文档分析两类任务。
 - 支持 Root/Planner、Coder、Document Analyst、Researcher、Tester、Reviewer 和 Director 等 Agent 角色协作。
+- 以角色 × 能力 × 预算进行确定性路由；模型通过单一 Gateway adapter 接入，复杂决策与任务执行可选择不同后端。
 - 允许 Agent 动态创建子 Agent，同时严格限制并发数、总数量、调用深度、Token 和金额预算。
 - 提供 `economic`、`balanced`、`quality` 三个内置预设，以及可完全自定义的 `custom` 预设。
 - 支持 OpenAI Responses、Anthropic Messages 和通用 OpenAI-compatible 模型适配器。
+
+Maestro 的性能数字仍是待基准验证的目标，不代表当前实现或生产结果：以可重放工作集测量单功能成本约 `$18 → $7`、Token 约 `90M → 40M`、失败后重复工作减少约 `65%`，并评估约 `15%` 决策任务使用高能力模型、约 `85%` 执行任务使用低成本模型的路由组合。
 
 ## 架构原则
 
@@ -58,7 +61,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 
 | 模块 | 职责 | 对外契约 |
 | --- | --- | --- |
-| `orchestrator.config` | 严格策略信封与去密钥模型注册表；安全 YAML 加载、JSON Schema 和内容哈希 | `PolicyEnvelope` · `ModelRegistryManifest` · `load_model_registry_yaml()` |
+| `orchestrator.config` | 严格有效配置、四层覆盖/来源追踪、策略信封与去密钥模型注册表 | `EffectiveConfig` · `ResolvedConfig` · `resolve_effective_config()` · `ModelRegistryManifest` |
 | `orchestrator.identifiers` | 稳定标识符生成 | `new_id()` |
 | `orchestrator.persistence` | 追加式事件存储、快照 | `EventDraft` · `StoredEvent` · `SQLiteEventStore` · `SnapshotStore` |
 | `orchestrator.artifacts` | 内容寻址的 Artifact 存储与访问控制 | `ArtifactStore` · `ArtifactRecord` · `ArtifactAccessGrant` |
@@ -66,7 +69,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | `orchestrator.recovery` | 确定性恢复与不变式校验 | `bootstrap_recovery()` · `recover()` · `recover_aggregate()` |
 | `orchestrator.observability` | fail-closed 脱敏观测与只读投影 | `ObservationSink` · `Redactor` · Run/Budget/Cost/Approval/Audit projections |
 
-`orchestrator.config` 是 V1 实施的首批配置边界，不代表完整有效配置、四层覆盖或运行时路由已完成。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
+`orchestrator.config` 已实现完整配置 schema、system default → user global → project → Run 四层解析、逐字段来源追踪、Policy Envelope 单调收紧、selector tombstone/guard 累加、安全 YAML loaders 和 JSON Schema。它仍未接入原子 reload、Run 快照、Router 或生命周期执行。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
 
 尚未实现：任务生命周期、模型路由、权限执行、CLI 与 MCP Server。因此当前交付是可验证的基础库，不是可执行的多 Agent 产品。
 
@@ -120,5 +123,5 @@ python -m build
 
 ## 下一步
 
-1. 完成并记录目标平台的隔离后端能力验证；无法证明的能力必须失败关闭。
-2. 按完整 V1 实施计划推进配置/路由、生命周期、权限网关、运行时和 CLI/MCP。
+1. 继续 P1：接入配置原子 reload 和 Run 快照，再完成 tokenizer/FX 估算快照及 Gateway 契约。
+2. P0 隔离能力验证仍是任何 Worker 执行的硬门；无法证明的能力必须失败关闭。之后按计划推进路由、生命周期、权限网关和 CLI/MCP。

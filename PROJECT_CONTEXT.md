@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-持久化、预算、观测与验证底座已完成。实施计划 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md` 的 Task 1–9 均已实现，包括跨规格事件契约、并发/崩溃矩阵、端到端验收和打包检查。完整多 Agent 产品仍不可运行：生命周期、模型路由、权限执行和 CLI/MCP 尚未实现。V1 实施已启动，配置/Model Registry 首批边界模型与安全 YAML 加载已加入；完整配置覆盖及运行时集成仍待实现。当前完整测试集为 291 项，覆盖率 91%。
+持久化、预算、观测与验证底座已完成。实施计划 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md` 的 Task 1–9 均已实现，包括跨规格事件契约、并发/崩溃矩阵、端到端验收和打包检查。完整多 Agent 产品仍不可运行：生命周期、模型路由、权限执行和 CLI/MCP 尚未实现。V1 配置核心契约与四层 resolver 切片已完成；原子 reload、Run 快照和路由运行时仍待实现。当前完整测试集为 307 项，覆盖率 91%。
 
 ## 产品目标
 
@@ -19,6 +19,11 @@
 - 提供 `economic`、`balanced`、`quality` 三个内置预设，以及可完全 DIY 的 `custom` 预设。
 - 支持按角色配置厂商、模型、reasoning effort、最大 Token、重试次数和升级目标。
 - 模型接入采用 OpenAI Responses 原生适配器、Anthropic Messages 原生适配器和通用 OpenAI-compatible 适配器。
+- 路由维度为角色 × 能力 × 预算，统一经 Model Gateway adapter 接入；通过事件/checkpoint 做故障恢复，确定性控制层负责权限和每 Run 硬预算。
+
+### Maestro 性能验收目标（尚待基准验证）
+
+以下是目标与待验证假设，不是已实现能力或生产数据：用固定、可重放工作集评估单功能成本约 `$18 → $7`、Token 约 `90M → 40M`、模型故障后的重复工作减少约 `65%`；同时测量约 `15%` 决策节点采用高能力模型、约 `85%` 执行节点采用低成本模型的组合。模型比例由真实任务分布和质量门槛验证，不作为写死的配置默认值。
 
 ## 已选择的总体架构
 
@@ -38,13 +43,13 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 - 并发与崩溃矩阵：覆盖多连接 SQLite CAS/幂等、并发预算预留、重启恢复及副作用 intent/receipt 故障窗口（Task 8）。
 - 验收及交付：端到端持久化流程测试、覆盖率/编译/打包命令与忽略构建产物的 `.gitignore`（Task 9）。
 
-测试：`python -m pytest tests/unit tests/contract tests/integration tests/acceptance -q` 完整 269 项通过。
+测试：`python -m pytest tests/unit tests/contract tests/integration tests/acceptance -q` 完整 307 项通过（覆盖率 91%）。
 
 ## V1 后续实施进度
 
-- `orchestrator.config` 首批边界已实现：不可变 `PolicyEnvelope`、单调收紧合并、Provider/Model/Price 及 Registry manifest、SHA-256 内容哈希、安全 YAML loader（拒绝重复键/别名/不安全标签并脱敏校验错误）和 Model Registry JSON Schema。
+- `orchestrator.config` 已实现：不可变 `EffectiveConfig`、七种角色 schema、经济/平衡/质量/自定义预设、selector/guard/health policy 校验、Provider/Model/Price/Registry manifest、SHA-256 内容哈希、安全 YAML loaders、配置/Overlay JSON Schema，以及 system default → user global → project → Run 四层合并和逐字段来源追踪。`PolicyEnvelope` 只单调收紧；registry 引用和强制 guards 不能被普通覆盖修改。
 - 权限、安全规格已于 2026-09-22 获用户书面批准。当前 WSL2 只列为隔离后端候选；namespace、Landlock 与 `prlimit` 原语探测通过，但 cgroup 未委派，完整执行隔离尚未验证，不能宣称平台已支持。
-- 配置模型新增 22 项单元测试；完整 291 项测试通过，覆盖率 91%。编译、打包和 `pip check` 通过。
+- 配置模块 38 项单元测试通过；完整测试集 307 项通过，覆盖率 91%。编译、打包和 `pip check` 通过。Maestro 的 `$18 → $7` 单功能费用、`90M → 40M` Token 和约 65% 重复工作下降均只是待固定工作集测量的目标，尚非项目结果。
 
 ## 已确认的设计部分
 
