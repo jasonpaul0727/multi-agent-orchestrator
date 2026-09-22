@@ -4,6 +4,7 @@
 
 > **当前状态：持久化、预算、观测与验证底座已完成；整体编排系统尚不可运行。**
 > 实施计划 Task 1–9 已完成，涵盖事件存储、快照恢复、Artifact Store、预算账本、脱敏投影、跨规格事件契约、崩溃/并发测试及打包验收。
+> 完整 V1 实施已启动：`orchestrator.config` 首批严格策略/Model Registry 契约和 YAML 校验已加入，尚未接入运行时。
 > 任务生命周期、模型路由、权限执行和 CLI/MCP 均尚未实现。
 > 本项目**不具备生产就绪状态**。
 
@@ -57,6 +58,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 
 | 模块 | 职责 | 对外契约 |
 | --- | --- | --- |
+| `orchestrator.config` | 严格策略信封与去密钥模型注册表；安全 YAML 加载、JSON Schema 和内容哈希 | `PolicyEnvelope` · `ModelRegistryManifest` · `load_model_registry_yaml()` |
 | `orchestrator.identifiers` | 稳定标识符生成 | `new_id()` |
 | `orchestrator.persistence` | 追加式事件存储、快照 | `EventDraft` · `StoredEvent` · `SQLiteEventStore` · `SnapshotStore` |
 | `orchestrator.artifacts` | 内容寻址的 Artifact 存储与访问控制 | `ArtifactStore` · `ArtifactRecord` · `ArtifactAccessGrant` |
@@ -64,7 +66,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | `orchestrator.recovery` | 确定性恢复与不变式校验 | `bootstrap_recovery()` · `recover()` · `recover_aggregate()` |
 | `orchestrator.observability` | fail-closed 脱敏观测与只读投影 | `ObservationSink` · `Redactor` · Run/Budget/Cost/Approval/Audit projections |
 
-已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
+`orchestrator.config` 是 V1 实施的首批配置边界，不代表完整有效配置、四层覆盖或运行时路由已完成。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
 
 尚未实现：任务生命周期、模型路由、权限执行、CLI 与 MCP Server。因此当前交付是可验证的基础库，不是可执行的多 Agent 产品。
 
@@ -111,11 +113,12 @@ python -m build
 - [项目上下文](PROJECT_CONTEXT.md)：已确认范围、总体架构和当前进度。
 - [任务生命周期与失败恢复](docs/superpowers/specs/2026-09-09-task-lifecycle-design.md)：已于 2026-09-10 批准。
 - [预设、DIY 配置与模型路由](docs/superpowers/specs/2026-09-11-presets-routing-design.md)：已于 2026-09-12 批准。
-- [权限、安全、隔离与审批](docs/superpowers/specs/2026-09-13-permissions-security-isolation-approval-design.md)：各章节已确认，等待书面规格终审。
+- [权限、安全、隔离与审批](docs/superpowers/specs/2026-09-13-permissions-security-isolation-approval-design.md)：已于 2026-09-22 获书面批准；执行隔离层仍未实现。
 - [持久化、成本统计、可观测性与测试](docs/superpowers/specs/2026-09-14-persistence-cost-observability-testing-design.md)：已于 2026-09-14 确认并完成书面审阅。
 - [持久化底座实施计划](docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md)：Task 1–9 已完成。
+- [完整 V1 产品实施计划](docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md)：P0–P7 分阶段实施与验收路线；当前执行 P0 平台隔离能力验证。
 
 ## 下一步
 
-1. 完成权限、安全、隔离与审批书面规格的终审。
-2. 为任务生命周期、模型路由、权限执行和 CLI/MCP 编写实施计划，再开始对应编码。
+1. 完成并记录目标平台的隔离后端能力验证；无法证明的能力必须失败关闭。
+2. 按完整 V1 实施计划推进配置/路由、生命周期、权限网关、运行时和 CLI/MCP。

@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-持久化、预算、观测与验证底座已完成。实施计划 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md` 的 Task 1–9 均已实现，包括跨规格事件契约、并发/崩溃矩阵、端到端验收和打包检查。当前完整测试集包含 269 项。完整多 Agent 产品仍不可运行：生命周期、模型路由、权限执行和 CLI/MCP 尚未实现。
+持久化、预算、观测与验证底座已完成。实施计划 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md` 的 Task 1–9 均已实现，包括跨规格事件契约、并发/崩溃矩阵、端到端验收和打包检查。完整多 Agent 产品仍不可运行：生命周期、模型路由、权限执行和 CLI/MCP 尚未实现。V1 实施已启动，配置/Model Registry 首批边界模型与安全 YAML 加载已加入；完整配置覆盖及运行时集成仍待实现。当前完整测试集为 291 项，覆盖率 91%。
 
 ## 产品目标
 
@@ -40,6 +40,12 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 
 测试：`python -m pytest tests/unit tests/contract tests/integration tests/acceptance -q` 完整 269 项通过。
 
+## V1 后续实施进度
+
+- `orchestrator.config` 首批边界已实现：不可变 `PolicyEnvelope`、单调收紧合并、Provider/Model/Price 及 Registry manifest、SHA-256 内容哈希、安全 YAML loader（拒绝重复键/别名/不安全标签并脱敏校验错误）和 Model Registry JSON Schema。
+- 权限、安全规格已于 2026-09-22 获用户书面批准。当前 WSL2 只列为隔离后端候选；namespace、Landlock 与 `prlimit` 原语探测通过，但 cgroup 未委派，完整执行隔离尚未验证，不能宣称平台已支持。
+- 配置模型新增 22 项单元测试；完整 291 项测试通过，覆盖率 91%。编译、打包和 `pip check` 通过。
+
 ## 已确认的设计部分
 
 整体架构和分层职责已获用户确认，不需要调整。
@@ -48,19 +54,21 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 
 预设、DIY 配置与模型路由设计已于 2026-09-12 获用户批准；正式规格位于 `docs/superpowers/specs/2026-09-11-presets-routing-design.md`。
 
-权限、安全、隔离与审批设计已逐节获得用户确认；正式规格位于 `docs/superpowers/specs/2026-09-13-permissions-security-isolation-approval-design.md`，当前等待用户审阅书面规格。
+权限、安全、隔离与审批设计正式规格位于 `docs/superpowers/specs/2026-09-13-permissions-security-isolation-approval-design.md`，已于 2026-09-22 获用户书面批准。规格批准不代表执行隔离已实现；平台隔离能力仍须实测并失败关闭。
 
 持久化、成本统计、可观测性和测试方案的 SQLite 本地优先方向已于 2026-09-14 获用户确认；正式规格位于 `docs/superpowers/specs/2026-09-14-persistence-cost-observability-testing-design.md`，已完成书面审阅。
 
 持久化、成本统计、可观测性和测试方案书面规格已获用户审阅确认；对应实施计划位于 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md`，Task 1–9 已完成。
 
-## 待确认的设计部分
+## 实施前置门与待解决技术风险
 
-权限、安全、隔离与审批书面规格仍待最终审阅。尽管持久化底座包含审批和副作用的事件契约，这并不代表权限签发/验证、策略执行或工具隔离已实现。
+权限、安全、隔离与审批书面规格已获批准。尽管持久化底座包含审批和副作用的事件契约，这并不代表权限签发/验证、策略执行或工具隔离已实现。
+
+2026-09-22 对当前 Ubuntu 24.04 / WSL2（Microsoft Linux kernel 6.6.87）进行只读能力探测：用户、挂载、PID、网络 namespace 组合可创建；namespace 内仅有 loopback 且无路由；私有挂载 namespace 中 tmpfs 挂载成功；Landlock ABI 3 可用，并实测允许白名单文件、拒绝目录外读取；`prlimit` 可为进程设置 CPU、地址空间、进程数、文件大小和文件描述符上限。当前环境未安装 bubblewrap；cgroup v2 未向当前用户提供可写委派，因此不能依赖它落实每 attempt 的内存/PID 控制。结论：WSL2 隔离后端仍是待验证/待决策，不列为已支持平台；需要证明资源上限、进程树终止和控制目录隔离的实现，或对不满足的执行模式失败关闭。
 
 ## 后续设计顺序
 
-1. 完成权限、安全、隔离与审批书面规格终审。
-2. 汇总并审阅完整产品设计文档和各模块实施边界。
-3. 为生命周期、模型路由、权限执行、CLI/MCP 等模块编写实施计划。
-4. 按批准的计划逐模块实现并验证，最终形成可运行的端到端编排链路。
+1. 完成 P0 隔离后端可行性验证并形成明确的平台支持矩阵。
+2. 按 `docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md` 的依赖顺序，先建立跨模块契约、配置和注册表，再实现策略/路由及生命周期控制平面。
+3. 实现并实测 OS 隔离、Tool/Model Gateway、密钥和审批服务后，再接入 Worker/Verifier。
+4. 完成 CLI/MCP 与端到端、安全验收，形成可运行且有证据链的 V1 闭环。
