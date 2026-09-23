@@ -27,6 +27,7 @@ _SAFE_FIELD_NAMES = frozenset(
         "models",
         "id",
         "adapter",
+        "endpoint",
         "secret_ref",
         "enabled",
         "remote_model",

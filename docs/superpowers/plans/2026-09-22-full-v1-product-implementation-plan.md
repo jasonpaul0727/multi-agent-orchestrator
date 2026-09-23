@@ -66,10 +66,10 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 - [x] 将候选配置验证接入原子 reload，并把完整有效 manifest/哈希冻结到 Run 快照。
 - [x] 导出 Model Registry JSON Schema；安全加载拒绝重复键、别名、不安全标签和过大文档，错误诊断不回显输入值。
 - [x] 为完整 EffectiveConfig 与 Overlay 导出 JSON Schema 并提供无密钥 Run overlay 示例；配置预算需显式声明，Model Registry 的秘密字段只接受允许的引用格式。
-- [ ] 定义 provider/model/price/tokenizer manifest、适配器协议、请求/响应/usage/error 类型；固定费用按最小货币单位向上取整。
-- [ ] 增加 manifest 校验：角色引用、能力、上下文、输出上限、reasoning effort、价格有效期、fallback 和升级图均完整且无环。
+- [x] 定义 provider/model/price/tokenizer manifest、适配器协议、请求/响应/usage/error 类型；固定费用按最小货币单位向上取整。
+- [x] 增加 manifest 校验：角色引用、能力、上下文、输出上限、reasoning effort、价格有效期、fallback 和升级图均完整且无环。
 
-2026-09-22 已落地 `PolicyEnvelope`、Provider/Model/Price/Registry 和完整 EffectiveConfig 契约；增加四层解析、来源追踪、安全 YAML loaders、完整配置/Overlay JSON Schema、角色/selector/guard/health 校验与无密钥示例。`ConfigManager` 仅在候选完整验证后原子切换；失败时保持活动对象与 generation 不变。`RunCreated` 事件持久化完整有效配置、Registry、双哈希、来源追踪/标签及代次；SnapshotStore checkpoint 可从事件重放修复，Run 重试返回原快照。已增加并发 reload、Run/reload 竞争、同 Run ID 并发启动、候选拒绝、checkpoint 失败重放等测试。tokenizer/FX 快照、Gateway 和运行时路由仍未完成。
+2026-09-22 已落地 `PolicyEnvelope`、Provider/Model/Price/Registry 和完整 EffectiveConfig 契约；增加四层解析、来源追踪、安全 YAML loaders、完整配置/Overlay JSON Schema、角色/selector/guard/health 校验与无密钥示例。`ConfigManager` 仅在候选完整验证后原子切换；失败时保持活动对象与 generation 不变。`RunCreated` 事件持久化完整有效配置、Registry、双哈希、来源追踪/标签及代次；SnapshotStore checkpoint 可从事件重放修复，Run 重试返回原快照。新增 Tokenizer/FX 版本化快照、事件时间有效性校验、整数有理汇率换算/向上舍入、成本快照 ID 写入估算与预算预留事件；新增 provider endpoint 约束及 Model Gateway/Adapter 请求、响应、usage、失败类型与 accepted route/attempt/reservation 绑定校验。Gateway 当前是纯契约层，真实 provider codecs/HTTP transport 尚未实现。测试覆盖并发 reload、Run/reload 竞争、同 Run ID 并发启动、成本快照过期/错配、汇率舍入、Adapter endpoint/auth 约束和 checkpoint 失败重放。
 
 验收：配置合并与 schema 测试通过；任意覆盖无法放宽硬限制；相同输入 manifest 生成稳定哈希；任何错误配置不替换活动有效配置；测试输出和事件中无秘密值。
 

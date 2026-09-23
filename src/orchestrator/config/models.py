@@ -12,6 +12,7 @@ import json
 import re
 from datetime import datetime
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -149,6 +150,7 @@ class PolicyEnvelope(_ConfigModel):
 class ProviderSpec(_ConfigModel):
     id: StrictStr = Field(min_length=1, pattern=_REFERENCE.pattern)
     adapter: ProviderAdapter
+    endpoint: StrictStr | None = None
     secret_ref: StrictStr = Field(
         min_length=1,
         pattern=r"^(?:env:[A-Za-z_][A-Za-z0-9_]*|(?:keyring|plugin):[^\s=]+)$",
@@ -171,6 +173,56 @@ class ProviderSpec(_ConfigModel):
                 "secret values are not accepted"
             )
         return value
+
+    @field_validator("endpoint")
+    @classmethod
+    def validate_endpoint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value != value.strip() or any(character.isspace() for character in value):
+            raise ValueError("endpoint must be a canonical HTTPS URL")
+        try:
+            parsed = urlsplit(value)
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("endpoint must be a canonical HTTPS URL") from exc
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or any(part in {".", ".."} for part in parsed.path.split("/"))
+        ):
+            raise ValueError("endpoint must be HTTPS without credentials, query, or fragment")
+        return value.rstrip("/")
+
+    @model_validator(mode="after")
+    def validate_adapter_endpoint(self) -> "ProviderSpec":
+        if self.adapter == "openai_compatible" and self.endpoint is None:
+            raise ValueError("openai_compatible providers require a registered HTTPS endpoint")
+        if self.adapter == "openai_responses" and self.endpoint not in {
+            None,
+            "https://api.openai.com/v1",
+        }:
+            raise ValueError("openai_responses endpoint must use the fixed OpenAI API origin")
+        if self.adapter == "anthropic_messages" and self.endpoint not in {
+            None,
+            "https://api.anthropic.com/v1",
+        }:
+            raise ValueError("anthropic_messages endpoint must use the fixed Anthropic API origin")
+        return self
+
+    @property
+    def effective_endpoint(self) -> str:
+        if self.endpoint is not None:
+            return self.endpoint
+        return {
+            "openai_responses": "https://api.openai.com/v1",
+            "anthropic_messages": "https://api.anthropic.com/v1",
+            "openai_compatible": "",
+        }[self.adapter]
 
 
 class PriceSpec(_ConfigModel):

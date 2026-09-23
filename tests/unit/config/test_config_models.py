@@ -147,6 +147,41 @@ def test_provider_accepts_secret_references(secret_ref):
     assert provider(secret_ref=secret_ref).secret_ref == secret_ref
 
 
+def test_provider_endpoint_is_registered_https_and_adapter_scoped():
+    assert provider().effective_endpoint == "https://api.openai.com/v1"
+    compatible = ProviderSpec(
+        id="compatible",
+        adapter="openai_compatible",
+        endpoint="https://models.example.com/v1",
+        secret_ref="env:MODEL_KEY",
+        enabled=True,
+    )
+    assert compatible.effective_endpoint == "https://models.example.com/v1"
+    with pytest.raises(ValidationError, match="require a registered HTTPS endpoint"):
+        ProviderSpec(
+            id="missing-endpoint",
+            adapter="openai_compatible",
+            secret_ref="env:MODEL_KEY",
+            enabled=True,
+        )
+    with pytest.raises(ValidationError, match="HTTPS"):
+        ProviderSpec(
+            id="unsafe",
+            adapter="openai_compatible",
+            endpoint="http://models.example.com/v1",
+            secret_ref="env:MODEL_KEY",
+            enabled=True,
+        )
+    with pytest.raises(ValidationError, match="fixed OpenAI API origin"):
+        ProviderSpec(
+            id="spoofed-openai",
+            adapter="openai_responses",
+            endpoint="https://evil.example/v1",
+            secret_ref="env:MODEL_KEY",
+            enabled=True,
+        )
+
+
 def test_price_uses_integer_minor_units_and_timezone_aware_window():
     assert price().currency == "USD"
     with pytest.raises(ValidationError):

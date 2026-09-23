@@ -215,6 +215,8 @@ class BudgetLedger:
         tool_fee_minor: int = 0,
         currency: str,
         snapshot_id: str = "unspecified",
+        fx_snapshot_id: str = "unspecified",
+        price_currency: str | None = None,
         price_snapshot_id: str = "unspecified",
         tokenizer_snapshot_id: str = "unspecified",
         estimator_snapshot_id: str = "unspecified",
@@ -277,6 +279,8 @@ class BudgetLedger:
                 "cached_input_price_minor_per_million"
             ],
             snapshot_id=snapshot_id,
+            fx_snapshot_id=fx_snapshot_id,
+            price_currency=price_currency,
             price_snapshot_id=price_snapshot_id,
             tokenizer_snapshot_id=tokenizer_snapshot_id,
             estimator_snapshot_id=estimator_snapshot_id,
@@ -1125,6 +1129,7 @@ class BudgetLedger:
             "max_cached_input_tokens": limit.max_cached_input_tokens,
             "output_price_minor_per_million": estimate.output_price_minor_per_million,
             "output_tokens": estimate.output_tokens,
+            "price_currency": estimate.price_currency,
             "price_snapshot_id": estimate.price_snapshot_id,
             "estimator_snapshot_id": estimate.estimator_snapshot_id,
             "provider_fee_minor": estimate.provider_fee_minor,
@@ -1139,6 +1144,7 @@ class BudgetLedger:
             "reserved_cached_input_tokens": estimate.cached_input_tokens,
             "run_id": run_id,
             "snapshot_id": estimate.snapshot_id,
+            "fx_snapshot_id": estimate.fx_snapshot_id,
             "status": "reserved",
             "tokenizer_snapshot_id": estimate.tokenizer_snapshot_id,
             "tool_fee_minor": estimate.tool_fee_minor,
@@ -1180,6 +1186,7 @@ class BudgetLedger:
             reservation_version=event.stream_version,
             status=payload.get("status", "reserved"),
             snapshot_id=payload.get("snapshot_id", "unspecified"),
+            fx_snapshot_id=payload.get("fx_snapshot_id", "unspecified"),
             tokenizer_snapshot_id=payload.get("tokenizer_snapshot_id", "unspecified"),
             price_snapshot_id=payload.get("price_snapshot_id", "unspecified"),
             estimator_snapshot_id=payload.get("estimator_snapshot_id", "unspecified"),
@@ -1194,6 +1201,8 @@ class BudgetLedger:
     def _is_legacy_reservation_payload(payload: Mapping[str, Any]) -> bool:
         modern_fields = (
             "estimator_snapshot_id",
+            "fx_snapshot_id",
+            "price_currency",
             "max_cached_input_tokens",
             "max_input_tokens",
             "max_output_tokens",
@@ -1230,6 +1239,8 @@ class BudgetLedger:
             # the complete request fingerprint comparison below.
             legacy_defaults = {
                 "estimator_snapshot_id": "unspecified",
+                "fx_snapshot_id": "unspecified",
+                "price_currency": None,
                 "max_cached_input_tokens": None,
                 "max_input_tokens": None,
                 "max_output_tokens": None,

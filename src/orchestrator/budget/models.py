@@ -111,17 +111,20 @@ class CostEstimate(_BudgetModel):
     )
     provider_fee_minor: StrictInt = Field(default=0, ge=0)
     tool_fee_minor: StrictInt = Field(default=0, ge=0)
+    price_currency: Currency | None = None
     input_price_minor_per_million: StrictInt = Field(default=0, ge=0)
     output_price_minor_per_million: StrictInt = Field(default=0, ge=0)
     reasoning_price_minor_per_million: StrictInt = Field(default=0, ge=0)
     cached_input_price_minor_per_million: StrictInt = Field(default=0, ge=0)
     snapshot_id: StrictStr = "unspecified"
+    fx_snapshot_id: StrictStr = "unspecified"
     tokenizer_snapshot_id: StrictStr = "unspecified"
     price_snapshot_id: StrictStr = "unspecified"
     estimator_snapshot_id: StrictStr = "unspecified"
 
     @field_validator(
         "snapshot_id",
+        "fx_snapshot_id",
         "tokenizer_snapshot_id",
         "price_snapshot_id",
         "estimator_snapshot_id",
@@ -130,6 +133,11 @@ class CostEstimate(_BudgetModel):
     @classmethod
     def validate_snapshots(cls, value: Any, info: Any) -> Any:
         return _snapshot_id(value, info.field_name)
+
+    @field_validator("price_currency", mode="before")
+    @classmethod
+    def validate_price_currency(cls, value: Any) -> Any:
+        return None if value is None else _currency(value)
 
     @model_validator(mode="after")
     def derive_token_limit(self) -> "CostEstimate":
@@ -179,6 +187,7 @@ class BudgetReservation(_BudgetModel):
     reservation_version: StrictInt = Field(default=1, gt=0)
     status: ReservationStatus = "reserved"
     snapshot_id: StrictStr = "unspecified"
+    fx_snapshot_id: StrictStr = "unspecified"
     tokenizer_snapshot_id: StrictStr = "unspecified"
     price_snapshot_id: StrictStr = "unspecified"
     estimator_snapshot_id: StrictStr = "unspecified"
@@ -208,6 +217,7 @@ class BudgetReservation(_BudgetModel):
 
     @field_validator(
         "snapshot_id",
+        "fx_snapshot_id",
         "tokenizer_snapshot_id",
         "price_snapshot_id",
         "estimator_snapshot_id",
