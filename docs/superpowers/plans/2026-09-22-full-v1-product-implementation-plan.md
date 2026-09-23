@@ -77,14 +77,14 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 建议新增包：`orchestrator/security`、`orchestrator/routing`、`orchestrator/models` 下的 adapter/gateway 接口。
 
-- [ ] 实现纯确定性 `Policy Engine`：规则规范化、deny 优先、权限/allowlist 交集、收紧型约束、`PolicyDecision` 和可解释原因；校验请求绑定 Run/节点/attempt/generation/策略版本。
-- [ ] 实现确定性 TaskClassifier、GuardRule、`economic`/`balanced`/`quality`/`custom` 的完整配置语义，以及 Planning 时冻结节点约束。
-- [ ] 实现 `RoutingRequest`、资格快照、候选过滤/稳定排序、候选排除原因、最坏费用估算、`RoutingDecision` 和精确重放/预览解释。
-- [ ] 实现 Recovery Controller 与 Router 的职责边界：Router 只执行被授权的 retry/fallback/escalation/reviewer/director 动作；升级严格遵守 tier 和证据要求。
-- [ ] 实现版本化 provider/model Health aggregate、退避/熔断和完整 ProbeLease CAS；不能仅以本地计数器或墙钟做不可重放的健康判定。
-- [ ] 实现三种 provider adapter 的协议转换、错误归一化、usage 提取和取消/超时边界；用 mock HTTP/recorded fixtures 做契约测试，密钥只通过后续 Secret Broker 使用。
+- [x] 实现纯确定性 `Policy Engine`：规则规范化、deny 优先、权限/allowlist 交集、收紧型约束、`PolicyDecision` 和可解释原因；校验请求绑定 Run/节点/attempt/generation/策略版本。
+- [x] 实现确定性 TaskClassifier、GuardRule、`economic`/`balanced`/`quality`/`custom` 的完整配置语义，以及 Planning 时冻结节点约束。
+- [x] 实现 `RoutingRequest`、资格快照、候选过滤/稳定排序、候选排除原因、最坏费用估算、`RoutingDecision` 和精确重放/预览解释。
+- [x] 实现 Recovery Controller 与 Router 的职责边界：Router 只执行被授权的 retry/fallback/escalation/reviewer/director 动作；升级严格遵守 tier 和证据要求。
+- [x] 实现版本化 provider/model Health aggregate、退避/熔断和完整 ProbeLease CAS；不能仅以本地计数器或墙钟做不可重放的健康判定。
+- [x] 实现三种 provider adapter 的协议转换、错误归一化、usage 提取和取消/超时边界；以 mock transport/recorded fixtures 做契约测试；Gateway 不直接读取密钥，后续 P4 Secret Broker 是 live 调用前置。
 
-验收：相同配置、RoutingRequest、EligibilitySnapshot 与健康版本必得相同结果；所有预算/权限/能力/密钥/健康排除有证据；Decision 接纳必须等调度阶段与账本、租约进行原子 CAS；没有合格模型时返回明确阻塞，不调用模型。
+验收：P2 单元/契约测试证明相同配置、RoutingRequest、EligibilitySnapshot 与健康版本必得相同结果；所有预算/权限/能力/密钥/健康排除有证据；没有合格模型时 Router 返回明确阻塞，不调用模型。Decision 原子接纳仍须由 P3 Scheduler 与账本、租约 CAS 实现；未有 P4 Secret Broker 时 Gateway fail-closed，不发在线请求。
 
 ## P3：生命周期状态机、事件驱动 DAG 与控制平面
 

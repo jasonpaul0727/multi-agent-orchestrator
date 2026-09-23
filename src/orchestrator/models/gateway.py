@@ -21,6 +21,7 @@ from orchestrator.config.models import (
     ProviderSpec,
     ReasoningEffort,
 )
+from orchestrator.validation import revalidate_model
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$")
@@ -411,6 +412,8 @@ def validate_gateway_request(
 ) -> tuple[ProviderSpec, ModelSpec]:
     """Validate a selected model and its call limits against a frozen registry."""
 
+    request = revalidate_model(ModelRequest, request)
+    registry = revalidate_model(ModelRegistryManifest, registry)
     route = request.accepted_route
     if route.registry_manifest_hash != registry.content_hash:
         raise ValueError("accepted route does not reference the supplied registry snapshot")
@@ -437,6 +440,8 @@ def validate_gateway_request(
 def validate_gateway_response(request: ModelRequest, response: ModelResponse) -> ModelResponse:
     """Bind a decoded provider response to the exact request and offered tools."""
 
+    request = revalidate_model(ModelRequest, request)
+    response = revalidate_model(ModelResponse, response)
     if response.request_id != request.request_id:
         raise ValueError("gateway response request_id does not match the request")
     if response.model_id != request.model_id:
@@ -450,6 +455,8 @@ def validate_gateway_response(request: ModelRequest, response: ModelResponse) ->
 def resolve_provider_url(provider: ProviderSpec, request: AdapterRequest) -> str:
     """Join an adapter-owned relative path to the endpoint fixed by the manifest."""
 
+    provider = revalidate_model(ProviderSpec, provider)
+    request = revalidate_model(AdapterRequest, request)
     endpoint = provider.effective_endpoint
     parsed = urlsplit(endpoint)
     if parsed.scheme != "https" or not parsed.hostname:

@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-持久化、预算、观测与验证底座已完成。实施计划 `docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md` 的 Task 1–9 均已实现，包括跨规格事件契约、并发/崩溃矩阵、端到端验收和打包检查。完整多 Agent 产品仍不可运行：生命周期、模型路由、权限执行和 CLI/MCP 尚未实现。V1 配置核心契约与四层 resolver 切片已完成；原子 reload、Run 快照和路由运行时仍待实现。当前完整测试集为 307 项，覆盖率 91%。
+持久化、预算、观测与验证底座及 P1 配置阶段已完成；P2 Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件驱动健康熔断/ProbeLease CAS、Recovery Controller、三种 Provider codec 与受限 HTTPS transport 已实现。完整多 Agent 产品仍不可运行：P3 生命周期/DAG/Scheduler 与决策接纳 CAS、P4 OS 隔离/Tool Gateway/Secret Broker/Approval、P5 Worker/Verifier、CLI/MCP 尚未实现。Provider Gateway 默认没有凭据 Broker，在线调用会 fail-closed。全量 369 项测试通过，覆盖率门槛 90% 通过。
 
 ## 产品目标
 
@@ -47,9 +47,13 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 
 ## V1 后续实施进度
 
-- `orchestrator.config` 已实现：不可变 `EffectiveConfig`、七种角色 schema、经济/平衡/质量/自定义预设、selector/guard/health policy 校验、Provider/Model/Price/Registry manifest、SHA-256 内容哈希、安全 YAML loaders、配置/Overlay JSON Schema，以及 system default → user global → project → Run 四层合并和逐字段来源追踪。`PolicyEnvelope` 只单调收紧；registry 引用和强制 guards 不能被普通覆盖修改。
+- `orchestrator.config` 已实现：不可变 `EffectiveConfig`、七种角色 schema、经济/平衡/质量/自定义预设、selector/guard/health policy 校验、Provider/Model/Price/Registry manifest、SHA-256 内容哈希、安全 YAML loaders、配置/Overlay JSON Schema，以及 system default → user global → project → Run 四层合并和逐字段来源追踪。候选 reload 经完整验证后原子切换，Run 创建冻结有效配置、Registry、哈希和来源；Run 快照可从事件重放恢复。`PolicyEnvelope` 只单调收紧；registry 引用和强制 guards 不能被普通覆盖修改。
+- `orchestrator.security` / `orchestrator.routing` 已实现确定性策略判定、TaskClassifier、Planning 节点契约冻结、按资格/策略/健康/秘密/预算过滤并稳定排序的 ModelRouter。模型输入任务原文不进入分类结果，只保留规范化 hash 与稳定证据码。
+- Recovery Controller 只授权有限策略：瞬时且安全失败优先同模型有限重试；已不可用/耗尽才同 tier fallback；高层级能力升级必须由 `escalate_to` 和 failure evidence 支持；输出/任务失败要求独立修复子节点；未知副作用结果不自动重试。
+- Health Controller 将 provider/model aggregate 变化写入 event streams，基于持久化事件时间重放滑动失败窗口、degraded/open/half-open 状态；ProbeLease 覆盖 provider/model 所有 open aggregate，通过 SQLite 单事务 CAS，重启后可复原，过期探测会被记录为失败并重新打开熔断。
+- `orchestrator.models` 已实现三种协议 codec 和 bounded HTTPS transport。Gateway 强制检查 Registry/provider/model/accepted-route verifier，再向注入的 Secret Broker 获取凭据；默认 Broker 无法交付凭据，避免环境变量回退。真实 Provider 在线请求和凭据管理仍由 P4 Secret Broker 前置阻挡；Tool Gateway、预算结算/执行生命周期尚未集成。
 - 权限、安全规格已于 2026-09-22 获用户书面批准。当前 WSL2 只列为隔离后端候选；namespace、Landlock 与 `prlimit` 原语探测通过，但 cgroup 未委派，完整执行隔离尚未验证，不能宣称平台已支持。
-- 配置模块 38 项单元测试通过；完整测试集 307 项通过，覆盖率 91%。编译、打包和 `pip check` 通过。Maestro 的 `$18 → $7` 单功能费用、`90M → 40M` Token 和约 65% 重复工作下降均只是待固定工作集测量的目标，尚非项目结果。
+- 全量测试 369 项通过，coverage 门槛 90% 通过；编译和 `pip check` 通过。Maestro 的 `$18 → $7` 单功能费用、`90M → 40M` Token 和约 65% 重复工作下降均只是待固定工作集测量的目标，尚非项目结果。
 
 ## 已确认的设计部分
 
@@ -74,6 +78,6 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 ## 后续设计顺序
 
 1. 完成 P0 隔离后端可行性验证并形成明确的平台支持矩阵。
-2. 按 `docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md` 的依赖顺序，先建立跨模块契约、配置和注册表，再实现策略/路由及生命周期控制平面。
-3. 实现并实测 OS 隔离、Tool/Model Gateway、密钥和审批服务后，再接入 Worker/Verifier。
+2. 按 `docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md` 继续 P3：实现生命周期/DAG/Scheduler，并以原子 CAS 接纳路由、预算和租约。
+3. P0/P4 实现并实测 OS 隔离、Tool Gateway、Secret Broker 和 Approval 后，再启用真实 Provider 调用及 Worker/Verifier。
 4. 完成 CLI/MCP 与端到端、安全验收，形成可运行且有证据链的 V1 闭环。

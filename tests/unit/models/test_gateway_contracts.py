@@ -205,7 +205,7 @@ def test_tool_calls_are_untrusted_proposals_and_must_match_finish_reason():
             },
         )
     )
-    assert validate_gateway_response(request_with_tool, response) is response
+    assert validate_gateway_response(request_with_tool, response) == response
     with pytest.raises(ValueError, match="not offered"):
         validate_gateway_response(request(), response)
     with pytest.raises(ValueError, match="request_id"):

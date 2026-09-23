@@ -1,5 +1,11 @@
 """Typed model Gateway, adapter, and deterministic pricing contracts."""
 
+from .adapters import (
+    AnthropicMessagesAdapter,
+    OpenAICompatibleAdapter,
+    OpenAIResponsesAdapter,
+    adapter_for,
+)
 from .gateway import (
     AdapterRequest,
     AdapterRequestHeader,
@@ -22,6 +28,19 @@ from .gateway import (
     validate_gateway_request,
     validate_gateway_response,
 )
+from .transport import (
+    AcceptedRouteVerifier,
+    HTTPTransport,
+    HTTPTransportCancelled,
+    HTTPTransportFailed,
+    HTTPTransportResponse,
+    HTTPTransportTimedOut,
+    ProviderCredential,
+    ProviderModelGateway,
+    SecretBroker,
+    UnavailableSecretBroker,
+    UrllibHTTPSTransport,
+)
 from .pricing import (
     CostingDataUnavailable,
     ExchangeRate,
@@ -38,12 +57,19 @@ __all__ = [
     "AdapterRequestHeader",
     "AdapterResponse",
     "AcceptedModelRoute",
+    "AcceptedRouteVerifier",
+    "AnthropicMessagesAdapter",
     "CancellationSignal",
     "CostSnapshotRefs",
     "CostingDataUnavailable",
     "ExchangeRate",
     "FXSnapshot",
     "GatewayFailureCode",
+    "HTTPTransport",
+    "HTTPTransportCancelled",
+    "HTTPTransportFailed",
+    "HTTPTransportResponse",
+    "HTTPTransportTimedOut",
     "ModelAdapter",
     "ModelGateway",
     "ModelGatewayError",
@@ -53,7 +79,15 @@ __all__ = [
     "ModelResponse",
     "ModelToolCall",
     "ModelToolDefinition",
+    "OpenAICompatibleAdapter",
+    "OpenAIResponsesAdapter",
+    "ProviderCredential",
+    "ProviderModelGateway",
+    "SecretBroker",
     "TokenUsage",
+    "UnavailableSecretBroker",
+    "UrllibHTTPSTransport",
+    "adapter_for",
     "TokenizerBinding",
     "TokenizerCounter",
     "TokenizerSnapshot",

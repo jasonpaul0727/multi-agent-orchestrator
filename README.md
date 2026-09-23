@@ -2,10 +2,10 @@
 
 一个本地运行的多模型、多 Agent 编排系统。项目以 GPT/Codex 为主要模型，同时支持通过 API Key 接入其他模型厂商；系统会根据任务角色、成本、风险和失败情况选择模型，并在必要时升级到更高能力的模型。
 
-> **当前状态：持久化、预算、观测与验证底座已完成；整体编排系统尚不可运行。**
+> **当前状态：P1 基础契约与 P2 策略/路由控制模块已实现；整体编排系统仍不可运行。**
 > 实施计划 Task 1–9 已完成，涵盖事件存储、快照恢复、Artifact Store、预算账本、脱敏投影、跨规格事件契约、崩溃/并发测试及打包验收。
-> 完整 V1 实施已启动：`orchestrator.config` 首批严格策略/Model Registry 契约和 YAML 校验已加入，尚未接入运行时。
-> 任务生命周期、模型路由、权限执行和 CLI/MCP 均尚未实现。
+> 已完成严格四层配置及 Run 快照、Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件存储驱动的健康熔断/ProbeLease、Recovery Controller，以及三种 Provider codec 和受限 HTTPS transport。
+> P3 生命周期/Scheduler 决策接纳 CAS、P4 Tool/Isolation/Secret Broker/Approval、P5 Worker 执行和 CLI/MCP 尚未实现；Provider 在线请求默认因无 Secret Broker 而拒绝。
 > 本项目**不具备生产就绪状态**。
 
 ## V1 目标
@@ -62,7 +62,9 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | 模块 | 职责 | 对外契约 |
 | --- | --- | --- |
 | `orchestrator.config` | 严格有效配置、四层覆盖/来源追踪、原子 reload 与 Run 配置快照 | `EffectiveConfig` · `ResolvedConfig` · `ConfigManager` · `RunConfigSnapshot` · `ModelRegistryManifest` |
-| `orchestrator.models` | Tokenizer/FX 成本快照、确定性成本估算与 Model Gateway/Adapter 边界契约 | `TokenizerSnapshot` · `FXSnapshot` · `ModelRequest` · `ModelResponse` · `ModelAdapter` · `ModelGateway` |
+| `orchestrator.models` | Tokenizer/FX 成本快照、确定性成本估算、三种 Provider codec 和 fail-closed HTTPS Gateway | `TokenizerSnapshot` · `FXSnapshot` · `ProviderModelGateway` · `OpenAIResponsesAdapter` · `AnthropicMessagesAdapter` · `OpenAICompatibleAdapter` |
+| `orchestrator.security` | Policy manifest 与确定性权限判定 | `PolicyManifest` · `PolicyEngine` · `PolicyDecision` |
+| `orchestrator.routing` | TaskClassifier、Planning 节点契约、确定性路由、事件驱动健康熔断和恢复授权 | `TaskClassifier` · `PlanningNodeContract` · `ModelRouter` · `HealthController` · `RecoveryController` |
 | `orchestrator.identifiers` | 稳定标识符生成 | `new_id()` |
 | `orchestrator.persistence` | 追加式事件存储、快照 | `EventDraft` · `StoredEvent` · `SQLiteEventStore` · `SnapshotStore` |
 | `orchestrator.artifacts` | 内容寻址的 Artifact 存储与访问控制 | `ArtifactStore` · `ArtifactRecord` · `ArtifactAccessGrant` |
@@ -70,11 +72,13 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | `orchestrator.recovery` | 确定性恢复与不变式校验 | `bootstrap_recovery()` · `recover()` · `recover_aggregate()` |
 | `orchestrator.observability` | fail-closed 脱敏观测与只读投影 | `ObservationSink` · `Redactor` · Run/Budget/Cost/Approval/Audit projections |
 
-`orchestrator.config` 已实现完整配置 schema、system default → user global → project → Run 四层解析、逐字段来源追踪、Policy Envelope 单调收紧、selector tombstone/guard 累加、安全 YAML loaders 和 JSON Schema。`ConfigManager` 会先完整构造并验证候选，再以单次原子切换替换活动配置；校验失败保留原配置。Run 启动时将有效配置、注册表及哈希、字段来源和来源标签冻结到 `RunCreated` 事件，并以校验快照作恢复加速；重启时从事件重放原始快照，不受配置文件后续变化影响。并发 reload、Run 启动竞争、重复 Run 创建、失败重试和重启恢复均有测试。该模块尚未接入 Router 或生命周期执行。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
+`orchestrator.config` 已实现完整配置 schema、system default → user global → project → Run 四层解析、逐字段来源追踪、Policy Envelope 单调收紧、selector tombstone/guard 累加、安全 YAML loaders 和 JSON Schema。`ConfigManager` 会先完整构造并验证候选，再以单次原子切换替换活动配置；校验失败保留原配置。Run 启动时将有效配置、注册表及哈希、字段来源和来源标签冻结到 `RunCreated` 事件，并以校验快照作恢复加速；重启时从事件重放原始快照，不受配置文件后续变化影响。并发 reload、Run 启动竞争、重复 Run 创建、失败重试和重启恢复均有测试。当前尚未接入完整生命周期执行。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
 
-`orchestrator.models` 增加版本化 Tokenizer/FX snapshots：都以规范化内容生成稳定 SHA-256 ID，并在调用事件时间验证有效期；汇率用整数有理数表示，转换与费用估算均向上取整。`CostEstimate` 和预算预留事件保存 FX、Tokenizer、Estimator、Price snapshot 引用及价格原币种。Model Gateway/Adapter 已有类型化调用、响应、usage、工具提案和脱敏错误契约；请求必须绑定已接受路由、attempt、fencing generation、预算预留与成本快照，Adapter 只能返回注册 endpoint 内的相对路径，不能提供凭据或任意主机。当前只实现契约与校验、没有真实 HTTP transport/provider codecs；Tool Gateway、策略执行和生命周期也未实现。
+`orchestrator.models` 增加版本化 Tokenizer/FX snapshots：都以规范化内容生成稳定 SHA-256 ID，并在调用事件时间验证有效期；汇率用整数有理数表示，转换与费用估算均向上取整。三种 codec 已实现 Responses、Anthropic Messages 和 OpenAI-compatible Chat Completions 的请求/响应转换、工具提案、usage 和失败归一化。`UrllibHTTPSTransport` 使用注册 endpoint、关闭环境代理、拒绝重定向并限制响应大小；`ProviderModelGateway` 要求已接受路由验证器与凭据 Broker。当前未实现 P4 Secret Broker，因此默认 Broker fail-closed，不能读取环境变量或发出在线 Provider 请求；mock transport 契约测试不代表在线验收。Tool Gateway、预算结算与执行生命周期仍未实现。
 
-尚未实现：任务生命周期、模型路由、权限执行、CLI 与 MCP Server。因此当前交付是可验证的基础库，不是可执行的多 Agent 产品。
+`orchestrator.security` 的 Policy Engine 对冻结策略版本作 deny 优先判定，按权限/工具 allowlist 交集处理并返回 scope-bound `PolicyDecision`。`orchestrator.routing` 以固定本地分类器生成不含原文的标签/哈希，Planning 阶段将 GuardRule、预算和角色限制冻结进节点契约；Router 对候选执行授权、能力、健康、凭据和最坏成本过滤，并按成本/配置顺位/模型 ID 稳定排序。Health Controller 将 provider/model 健康变化写入独立 SQLite event streams；跨聚合 ProbeLease 使用控制器 stream 与 aggregate stream 的同一 SQLite 事务完成版本 CAS，可按记录的事件时间重放/过期。Recovery Controller 仅生成有界的重试、同层 fallback、升级或独立角色节点计划；未知调用结果会要求先对账。Router 决策尚未由 P3 Scheduler 和账本/租约进行原子接纳。
+
+尚未实现：任务生命周期/DAG/Scheduler、RoutingDecision 原子接纳、Policy 执行入口、OS 隔离、Tool Gateway、Secret Broker、Approval、Worker、Verifier、CLI 与 MCP Server。因此当前交付仍是可验证的控制与基础库切片，不是可执行的多 Agent 产品。
 
 ### 预算生命周期
 
@@ -126,5 +130,5 @@ python -m build
 
 ## 下一步
 
-1. 按 P2 实现确定性 Policy Engine、TaskClassifier 和候选路由/成本过滤；真实 Provider codecs/HTTP transport 必须留在 Gateway 内，并遵守注册 endpoint 与 Secret Broker 边界。
-2. P0 隔离能力验证仍是任何 Worker 执行的硬门；无法证明的能力必须失败关闭。之后按计划推进生命周期、权限网关和 CLI/MCP。
+1. 按计划推进 P3 Run/Node/Attempt 状态机、DAG 与 Scheduler，并在同一事务中接纳 `RoutingDecision`、预算预留、并发额度和 fencing lease。
+2. P0 隔离验证仍是任何 Worker 执行的硬门；P4 必须完成 Secret Broker、Tool Gateway、Approval 和真实 OS 隔离后，才可启用 live Provider/Worker 调用。
