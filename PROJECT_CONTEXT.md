@@ -2,6 +2,8 @@
 
 ## 当前状态
 
+2026-09-23 P0 隔离原语 spike 更新：对 WSL2 的 systemd transient service/cgroup 实际资源限制与超限终止、进程树 kill、user/mount/network namespace、PrivateTmp/ProtectHome、workspace bind、`.git`/控制目录只读、Git worktree metadata 隐藏、Landlock 越界拒绝和 4 MiB tmpfs Overlay 写满/lower 不变完成 23 项定向 live/unit tests。全量测试及 90.25% 覆盖率门槛、`compileall`、`pip check`、sdist/wheel 构建均通过。它仍只是原语组合证据：未有集成 Launcher、race-safe 路径打开、Overlay diff 导出/原子应用、Tool Gateway 或 Worker；故 WSL2 仍为候选，不是已支持执行平台，V1 仍不可交付。
+
 持久化、预算、观测与验证底座及 P1 配置阶段已完成；P2 Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件驱动健康熔断/ProbeLease CAS、Recovery Controller、三种 Provider codec 与受限 HTTPS transport 已实现。P3 已有 Run/Node/Attempt、追加式 DAG、Agent Registry 累计数量/深度与原子路由接纳；Run 等待用户/取消门控和生命周期检查点/尾部重放也已实现。新增只读 Run Recovery Coordinator，重放并核对生命周期、Agent Registry、预算预留和 scheduler lease；新路由接纳前进行一致性检查，分裂状态 fail-closed。真实子进程故障注入验证接纳提交前的全事务回滚和提交后丢响应的恢复/幂等重放。恢复器保留活动/未知 lease，不猜测结果、不释放占用、不重派工作；effect/artifact 跨流恢复和完整多进程中断矩阵仍未完成，取消回执也尚无真实 Worker/OS 终止器验证。完整产品目前仍不可交付：P3 失败分类/有界重试与全恢复验收缺失；P4 OS 隔离/Tool Gateway/Secret Broker/Approval、P5 Worker/Verifier、P6 CLI/MCP、P7 E2E/安全验收与基准证据均未完成。Provider Gateway 默认没有凭据 Broker，在线调用会 fail-closed。本次 P3 一致性恢复切片：全量 417 项测试通过；总覆盖率 90.02%（项目门槛 90%）通过；`compileall`、`pip check`、sdist/wheel 构建及 `git diff --check` 通过。Maestro 成本、Token 和重复工作改善目标仍未有基准证据。
 
 ## 产品目标
@@ -54,7 +56,7 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 - `orchestrator.models` 已实现三种协议 codec 和 bounded HTTPS transport。Gateway 强制检查 Registry/provider/model/accepted-route verifier，再向注入的 Secret Broker 获取凭据；默认 Broker 无法交付凭据，避免环境变量回退。真实 Provider 在线请求和凭据管理仍由 P4 Secret Broker 前置阻挡；P3 已把模型路由预算预留/结算接入 attempt lifecycle，但 Tool Gateway、Worker 执行期集成尚未实现。
 - `orchestrator.lifecycle` / `orchestrator.scheduler` 的 P3 控制面：冻结 Run 配置与 Registry 哈希，事件重放 Run/Node/Attempt；append-only DAG 以 graph version CAS、节点数和深度界限校验。Scheduler 在共享 SQLiteEventStore 的事务内校验路由与 Policy scope，原子写入预算预留、生命周期 Attempt、Agent 实例、全局并发 slot 和 lease；用 fencing generation 拒绝迟到结果，未知结果保留资源直到 reconciliation。等待用户、取消门控、生命周期 checkpoint/replay 已有实现；只读 Run Recovery Coordinator 会校验 lifecycle/Agent/budget/scheduler 四类记录并作为新调度的 fail-closed admission barrier。它不恢复外部副作用或 artifact，也不重启/杀死真实进程；P3 跨进程故障矩阵、失败分类及有界重试尚缺。
 - `orchestrator.agents` 已接入 P3 Scheduler：每个模型 Attempt 有确定性 AgentInstance ID；创建与 Attempt/预算/slot 同事务，记录 parent、深度、角色、模型、provider、决策和策略哈希。累计数量按创建事件计数且永不退款；深度从已完成父实例派生；活动与未知结果均占 Agent 并发上限；终结/对账和状态重放也与预算及 slot 更新原子提交。
-- 权限、安全规格已于 2026-09-22 获用户书面批准。当前 WSL2 只列为隔离后端候选；namespace、Landlock 与 `prlimit` 原语探测通过，但 cgroup 未委派，完整执行隔离尚未验证，不能宣称平台已支持。
+- 权限、安全规格已于 2026-09-22 获用户书面批准。2026-09-23 的 live probes 补证 `systemd --user` transient service 可创建实际任务 cgroup 并施加资源限制；但没有集成隔离 Launcher/Tool Gateway/Worker，当前 WSL2 仍只列为候选，不能宣称平台已支持。
 - 本次 Agent Registry 验收：全量 402 项测试通过；`coverage report --precision=2 --fail-under=90` 精确覆盖率 90.19% 通过；编译、`pip check` 与 sdist/wheel 打包通过。Maestro 的 `$18 → $7` 单功能费用、`90M → 40M` Token 和约 65% 重复工作下降均只是待固定工作集测量的目标，尚非项目结果。
 
 ## 已确认的设计部分

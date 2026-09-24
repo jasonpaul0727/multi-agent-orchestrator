@@ -48,11 +48,14 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 - [x] 用户于 2026-09-22 书面批准 `docs/superpowers/specs/2026-09-13-permissions-security-isolation-approval-design.md`；如后续实现发现规格冲突，先更新规格和接口，再开始相关安全实现。
 - [ ] 建立完整 V1 的接口/架构决策记录：Run/节点/attempt 标识，事件类型归属，stream/CAS 边界，GraphExpansion、PolicyDecision、RoutingDecision、ToolRequest、候选结果、验证证据及统一错误分类。
-- [ ] 做隔离后端可行性 spike，逐项验证声明工作区文件边界、符号链接/挂载逃逸防护、进程树终止、资源限制、原始网络阻断、私有临时目录和 Git worktree。给出明确支持的平台/版本矩阵及可重复测试。
+- [x] 做隔离原语可行性 spike，逐项以 live tests 验证工作区文件边界、符号链接/挂载逃逸、进程树终止、资源限制、原始网络阻断、私有临时目录和 Git worktree。
+- [ ] 将 spike 结果落实为集成式隔离后端决策及平台支持矩阵；证明 race-safe Launcher、写入差异导出/应用和 Worker/Gateway 接入。在此之前 WSL2 仅是候选，不可作为已支持执行平台。
 - [ ] 若某平台没有满足规格的可验证后端，将该平台/能力标记为不支持并返回 `Blocked(isolation_unavailable)`；禁止无隔离 fallback。记录 Secret Broker 的密钥来源、生命周期、端点绑定方式和 MCP 调用者身份信任边界。
 - [ ] 将 V1 最小交付平台及必要用户决策写入 README/ADR；没有获得书面终审或安全能力证据时，停止安全执行层和 Worker 的合并。
 
-2026-09-22 探测记录：当前 Ubuntu 24.04 / WSL2（kernel `6.6.87.2-microsoft-standard-WSL2`）支持组合 user/mount/PID/network namespace；新 network namespace 仅有 loopback 且无路由；私有 mount namespace 内 tmpfs mount 成功；Landlock ABI 3 的白名单读取/越界拒绝已通过一次性实测；`prlimit` 的 CPU、地址空间、NPROC、文件大小和打开文件数限制在子进程中可见，`NPROC=1` 时 fork 实测被内核拒绝。当前未安装 bubblewrap；cgroup v2 对当前用户不可写且没有 delegated cgroup，`NPROC` 仍是 UID 级而非独立 per-attempt controller。WSL2 **仅列为隔离后端候选，不能据此宣布受支持**；P0 仍需验证进程树终止、控制目录隐藏、网络/文件边界和资源限制的组合执行路径，或明确将相关执行模式标记不支持并失败关闭。
+2026-09-22 首轮探测记录：当前 Ubuntu 24.04 / WSL2（kernel `6.6.87.2-microsoft-standard-WSL2`）支持组合 user/mount/PID/network namespace；新 network namespace 仅有 loopback 且无路由；私有 mount namespace 内 tmpfs mount 成功；Landlock ABI 3 的白名单读取/越界拒绝已通过一次性实测；`prlimit` 的 CPU、地址空间、NPROC、文件大小和打开文件数限制在子进程中可见，`NPROC=1` 时 fork 实测被内核拒绝。当时未安装 bubblewrap，且用户不能直接写 cgroup v2 根目录。
+
+2026-09-23 后续 live spike：发现 `systemd --user` transient service 能建立实际 task cgroup；MemoryMax、TasksMax、CPUQuota 和文件 rlimit 按请求施加，真实内存超限服务终止、TasksMax 阻止额外 fork，systemd kill-all 终止服务进程树。组合 probes 还通过 network namespace 外连阻断、PrivateTmp/ProtectHome、workspace bind、`.git`/`.maestro` 只读、Git worktree host metadata 隐藏、Landlock 越界和 symlink 读取拒绝，以及 4 MiB tmpfs Overlay 写满拒绝/lower 不变。`tests/unit/isolation` 与 `tests/integration/test_systemd_isolation_probe.py` 共 23 项通过。以上只证明隔离原语组合可用，不是集成执行后端；没有 Launcher、竞态安全路径打开、overlay diff 导出/应用、Tool Gateway/Worker 接入，故 WSL2 仍是候选，未列入支持平台。
 
 验收：所有跨模块边界有类型化接口和因果/版本语义；安全规格状态明确；隔离 spike 有可重复的通过/失败证据、支持矩阵和失败关闭方案。
 
