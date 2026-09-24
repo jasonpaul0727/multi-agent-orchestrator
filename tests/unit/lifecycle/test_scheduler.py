@@ -1897,6 +1897,97 @@ def test_run_recovery_survives_process_death_before_and_after_acceptance_commit(
             assert len(reopened.read_stream("budget", "run-1")) == 1
 
 
+def test_run_recovery_survives_process_death_before_and_after_reconciliation_commit(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("the crash-injection harness currently requires fork")
+
+    def reconcile_then_die(database, request, crash_point):
+        child_store = SQLiteEventStore(database)
+        control = scheduler(child_store)
+        if crash_point == "before_commit":
+            record = control.lifecycle.record_attempt_reconciled
+
+            def record_then_die(*args, **kwargs):
+                record(*args, **kwargs)
+                os._exit(76)
+
+            control.lifecycle.record_attempt_reconciled = record_then_die
+        control.reconcile_attempt(
+            run_id="run-1",
+            node_id=request.node_id,
+            attempt_id=request.attempt_id,
+            fencing_generation=1,
+            reconciled_at=NOW + timedelta(minutes=3),
+            outcome="failed",
+            known_no_effect=True,
+        )
+        # Models a lost IPC response after the multi-stream transaction commits.
+        os._exit(77)
+
+    for crash_point in ("before_commit", "after_commit"):
+        database = tmp_path / f"reconciliation-recovery-{crash_point}.db"
+        store = SQLiteEventStore(database)
+        reg, config, _, manifest = run_setup(store)
+        request, decision = routed_pair(reg, config, manifest)
+        control = scheduler(store)
+        accept(control, request, decision)
+        control.finish_attempt(
+            run_id="run-1",
+            node_id=request.node_id,
+            attempt_id=request.attempt_id,
+            fencing_generation=1,
+            completed_at=NOW + timedelta(minutes=2),
+            outcome="outcome_unknown",
+        )
+        store.close()
+
+        process = multiprocessing.get_context("fork").Process(
+            target=reconcile_then_die,
+            args=(str(database), request, crash_point),
+        )
+        process.start()
+        process.join(timeout=20)
+        if process.is_alive():
+            process.kill()
+            process.join()
+            pytest.fail(f"child process timed out at reconciliation crash point {crash_point}")
+        assert process.exitcode == (76 if crash_point == "before_commit" else 77)
+
+        reopened = SQLiteEventStore(database)
+        recovery = RunRecoveryCoordinator(reopened).recover("run-1")
+        control = scheduler(reopened)
+        releases = [
+            event for event in reopened.read_stream("scheduler", "global")
+            if event.event_type == "AttemptSlotReleased"
+        ]
+        if crash_point == "before_commit":
+            assert recovery.lifecycle.node("node-1").status == "awaiting_reconciliation"
+            assert recovery.agents.for_attempt(request.attempt_id).status == "outcome_unknown"
+            assert recovery.budget.unknown_minor == 20
+            assert recovery.active_attempts[0].status == "outcome_unknown"
+            assert releases == []
+            control.reconcile_attempt(
+                run_id="run-1", node_id=request.node_id, attempt_id=request.attempt_id,
+                fencing_generation=1, reconciled_at=NOW + timedelta(minutes=3),
+                outcome="failed", known_no_effect=True,
+            )
+        else:
+            assert recovery.lifecycle.node("node-1").status == "ready"
+            assert recovery.agents.for_attempt(request.attempt_id).status == "failed"
+            assert recovery.budget.unknown_minor == 0
+            assert recovery.active_attempts == ()
+            assert len(releases) == 1
+            control.reconcile_attempt(
+                run_id="run-1", node_id=request.node_id, attempt_id=request.attempt_id,
+                fencing_generation=1, reconciled_at=NOW + timedelta(minutes=3),
+                outcome="failed", known_no_effect=True,
+            )
+            assert len([
+                event for event in reopened.read_stream("scheduler", "global")
+                if event.event_type == "AttemptSlotReleased"
+            ]) == 1
+
+
 def test_run_recovery_replays_effect_state_after_process_death(tmp_path):
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("the crash-injection harness currently requires fork")

@@ -93,7 +93,7 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 ## P3：生命周期状态机、事件驱动 DAG 与控制平面
 
-状态：Run/Node/Attempt + Scheduler + Agent Registry 首个垂直切片已实现；生命周期检查点/尾部重放和只读跨流一致性协调已加入。2026-09-23 又将 EffectIntent/Receipt 与 ArtifactPublished 元数据/对象完整性检查接入恢复 admission；无回执副作用保持 outcome_unknown，终态 Attempt 仍有未决副作用时 fail-closed；ArtifactStore 可并发安全地全局盘点未发布 orphan blob，但不自动清理或尝试归属 Run。Gateway failure classification 与 RecoveryPlan 现可被 Scheduler 脱敏持久化；同节点恢复授权必须精确绑定 failure evidence、Retry/failure/exhaustion counters，且只可消费一次。P3 仍未完成：跨进程 Worker 中断矩阵、Provider reconciliation、真实 Worker/OS 终止回执及 Worker 自动恢复/调度对接仍缺，不得视作 P3 完成或可交付产品。Agent 记录冻结路由的 reasoning effort，Gateway accepted route 校验请求与所选 effort 一致。
+状态：Run/Node/Attempt + Scheduler + Agent Registry 首个垂直切片已实现；生命周期检查点/尾部重放和只读跨流一致性协调已加入。2026-09-23 又将 EffectIntent/Receipt 与 ArtifactPublished 元数据/对象完整性检查接入恢复 admission；无回执副作用保持 outcome_unknown，终态 Attempt 仍有未决副作用时 fail-closed；ArtifactStore 可并发安全地全局盘点未发布 orphan blob，但不自动清理或尝试归属 Run。Gateway failure classification 与 RecoveryPlan 现可被 Scheduler 脱敏持久化；同节点恢复授权必须精确绑定 failure evidence、Retry/failure/exhaustion counters，且只可消费一次。另以子进程实测 Scheduler admission 和显式 Attempt reconciliation 在提交前死亡与提交后丢失 IPC 响应：提交前仍保留 unknown lease/预算/Agent，提交后可幂等重放单条结果。P3 仍未完成：完整跨进程 Worker 中断矩阵、Provider 侧查询/回执验证、真实 Worker/OS 终止回执及 Worker 自动恢复/调度对接仍缺，不得视作 P3 完成或可交付产品。Agent 记录冻结路由的 reasoning effort，Gateway accepted route 校验请求与所选 effort 一致。
 
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 

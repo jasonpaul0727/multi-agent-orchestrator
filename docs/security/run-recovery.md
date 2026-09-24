@@ -47,9 +47,15 @@ Unit/restart tests cover unknown-to-receipted effect projection, terminal
 unknown-effect rejection, missing verifier, artifact content tampering, and
 reopening the same database/artifact directory. Abrupt subprocess-death tests
 now cover durable effect-intent-only and intent-plus-receipt records as well as
-an artifact publication, followed by reopening and recovery. Existing process
-death around Scheduler admission still covers only its SQLite transaction
-boundary; no live Worker process is being supervised or restarted.
+an artifact publication, followed by reopening and recovery. The Scheduler
+admission transaction and the explicit attempt-reconciliation transaction are
+also tested with child-process death before commit and after commit/lost IPC
+response. Before-commit death leaves the attempt `OutcomeUnknown` with budget,
+Agent, and lease held; after-commit death replays a single terminal event and a
+repeated reconciliation is idempotent. These tests exercise the trusted host
+API's no-effect attestation path; they do not query a Provider or authenticate
+provider-side receipts. No live Worker process is being supervised or
+restarted.
 
 The Gateway now exposes a deterministic failure classifier that turns only
 sanitized failure facts into `RecoveryEvidence`: retryable known failures may
