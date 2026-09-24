@@ -60,6 +60,7 @@ class PlanningNodeContract(BaseModel):
     policy_manifest_hash: StrictStr = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     candidate_model_ids: tuple[StrictStr, ...] = Field(min_length=1)
     required_capabilities: tuple[StrictStr, ...]
+    tool_ids: tuple[StrictStr, ...] = ()
     context_tokens: StrictInt = Field(ge=0)
     max_output_tokens: StrictInt = Field(gt=0)
     reasoning_effort: StrictStr = Field(min_length=1)
@@ -70,7 +71,8 @@ class PlanningNodeContract(BaseModel):
     matched_guard_rule_ids: tuple[StrictStr, ...]
 
     @field_validator(
-        "candidate_model_ids", "required_capabilities", "matched_guard_rule_ids", mode="before"
+        "candidate_model_ids", "required_capabilities", "tool_ids", "matched_guard_rule_ids",
+        mode="before",
     )
     @classmethod
     def normalize_tuples(cls, value: object, info: object) -> tuple[object, ...]:
@@ -78,7 +80,7 @@ class PlanningNodeContract(BaseModel):
             raise ValueError(f"{getattr(info, 'field_name', 'field')} must be an array")
         return tuple(value)
 
-    @field_validator("candidate_model_ids", "required_capabilities")
+    @field_validator("candidate_model_ids", "required_capabilities", "tool_ids")
     @classmethod
     def validate_identifiers(cls, value: tuple[str, ...], info: object) -> tuple[str, ...]:
         if len(value) != len(set(value)):
@@ -104,6 +106,7 @@ def compile_node_contract(
     context_tokens: int,
     max_output_tokens: int | None = None,
     required_capabilities: tuple[str, ...] = (),
+    tool_ids: tuple[str, ...] = (),
 ) -> PlanningNodeContract:
     """Classify a task, apply all matching guards, and freeze its node envelope."""
 
@@ -125,6 +128,10 @@ def compile_node_contract(
         raise PlanningError("output_requirement_exceeds_role_limit")
     if len(set(required_capabilities)) != len(required_capabilities):
         raise PlanningError("duplicate_required_capability")
+    if len(set(tool_ids)) != len(tool_ids) or any(
+        not isinstance(tool_id, str) or not _IDENTIFIER.fullmatch(tool_id) for tool_id in tool_ids
+    ):
+        raise PlanningError("invalid_tool_declaration")
 
     model_by_id = {model.id: model for model in registry.models}
     providers = {provider.id: provider for provider in registry.providers}
@@ -191,6 +198,7 @@ def compile_node_contract(
         policy_manifest_hash=policy_manifest.content_hash,
         candidate_model_ids=candidate_ids,
         required_capabilities=tuple(sorted(required_capabilities)),
+        tool_ids=tuple(sorted(tool_ids)),
         context_tokens=context_tokens,
         max_output_tokens=planned_output_tokens,
         reasoning_effort=profile.reasoning_effort,

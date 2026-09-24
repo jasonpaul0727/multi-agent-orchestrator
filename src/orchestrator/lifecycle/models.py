@@ -6,10 +6,19 @@ from datetime import datetime
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from orchestrator.config.effective import RoleName
 from orchestrator.config.models import ReasoningEffort
+from orchestrator.routing.planning import PlanningNodeContract
 
 
 _HASH = r"^sha256:[0-9a-f]{64}$"
@@ -26,10 +35,22 @@ class NodeSpec(_LifecycleModel):
     node_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER)
     role: RoleName
     planning_contract_hash: StrictStr = Field(pattern=_HASH)
+    planning_contract: PlanningNodeContract | None = None
     depends_on: tuple[StrictStr, ...] = ()
     parent_agent_instance_id: StrictStr | None = None
     tool_ids: tuple[StrictStr, ...] = ()
     max_attempts: StrictInt = Field(default=1, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def validate_frozen_contract_binding(self) -> "NodeSpec":
+        contract = self.planning_contract
+        if contract is not None and (
+            contract.node_id != self.node_id
+            or contract.role != self.role
+            or contract.contract_hash != self.planning_contract_hash
+        ):
+            raise ValueError("frozen planning contract does not match its node identity/hash")
+        return self
 
     @field_validator("depends_on", mode="before")
     @classmethod
@@ -117,6 +138,7 @@ class RunLifecycleState(_LifecycleModel):
     cancellation_request_event_id: StrictStr | None = None
     config_hash: StrictStr = Field(pattern=_HASH)
     registry_hash: StrictStr = Field(pattern=_HASH)
+    policy_manifest_hash: StrictStr | None = Field(default=None, pattern=_HASH)
     max_nodes: StrictInt = Field(gt=0)
     max_depth: StrictInt = Field(ge=0)
     graph_version: StrictInt = Field(ge=0)

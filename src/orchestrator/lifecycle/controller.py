@@ -9,6 +9,7 @@ from typing import Literal
 
 from orchestrator.config.runtime import RunConfigSnapshot
 from orchestrator.persistence import EventDraft, SQLiteEventStore, SnapshotStore, StoredEvent
+from orchestrator.security import PolicyManifest
 
 from .graph import GraphError, validate_graph_append
 from .models import AttemptState, NodeSpec, NodeState, RunLifecycleState
@@ -133,6 +134,7 @@ class LifecycleController:
         *,
         expected_graph_version: int,
         idempotency_key: str,
+        policy_manifest: PolicyManifest | None = None,
     ) -> RunLifecycleState:
         if not nodes:
             raise ValueError("nodes must not be empty")
@@ -142,6 +144,13 @@ class LifecycleController:
             "graph_version": expected_graph_version + 1,
             "nodes": [node.model_dump(mode="json") for node in payload_nodes],
         }
+        if policy_manifest is not None:
+            if not isinstance(policy_manifest, PolicyManifest):
+                raise TypeError("policy_manifest must be a validated PolicyManifest")
+            payload["policy_manifest"] = policy_manifest.model_dump(mode="json")
+            payload["policy_manifest_hash"] = policy_manifest.content_hash
+        elif any(node.planning_contract is not None for node in payload_nodes):
+            raise LifecycleError("planned graph append requires its frozen PolicyManifest")
         key = f"graph:{idempotency_key}"
 
         def decide(events: list[StoredEvent], version: int):
@@ -154,6 +163,22 @@ class LifecycleController:
                 raise LifecycleError("nodes can only be appended to a non-terminal Run")
             if state.graph_version != expected_graph_version:
                 raise LifecycleConflict("graph version changed before append")
+            proposed_policy_hash = payload.get("policy_manifest_hash")
+            if (
+                proposed_policy_hash is not None
+                and state.policy_manifest_hash is not None
+                and proposed_policy_hash != state.policy_manifest_hash
+            ):
+                raise LifecycleError("PolicyManifest changed after it was frozen for this Run")
+            for spec in payload_nodes:
+                contract = spec.planning_contract
+                if contract is not None and (
+                    contract.run_id != run_id
+                    or contract.config_hash != snapshot.effective_config_hash
+                    or contract.registry_hash != snapshot.registry_manifest_hash
+                    or contract.policy_manifest_hash != proposed_policy_hash
+                ):
+                    raise LifecycleError("frozen node contract does not match its Run snapshot")
             max_nodes = _node_limit(snapshot)
             max_depth = _depth_limit(snapshot)
             try:
@@ -578,6 +603,7 @@ def apply_lifecycle_event(
     status = state.status
     awaiting_user_request_id = state.awaiting_user_request_id
     cancellation_request_event_id = state.cancellation_request_event_id
+    policy_manifest_hash = state.policy_manifest_hash
     graph_version = state.graph_version
     nodes = {item.spec.node_id: item for item in state.nodes}
 
@@ -587,7 +613,30 @@ def apply_lifecycle_event(
         next_version = payload.get("graph_version")
         if next_version != graph_version + 1:
             raise LifecycleConflict("graph version is not monotonic")
+        manifest_payload = payload.get("policy_manifest")
+        proposed_policy_hash = payload.get("policy_manifest_hash")
+        if manifest_payload is not None:
+            try:
+                policy_manifest = PolicyManifest.model_validate(manifest_payload)
+            except (TypeError, ValueError) as exc:
+                raise LifecycleError("persisted PolicyManifest failed validation") from exc
+            if policy_manifest.content_hash != proposed_policy_hash:
+                raise LifecycleError("persisted PolicyManifest hash is invalid")
+            if policy_manifest_hash is not None and policy_manifest_hash != proposed_policy_hash:
+                raise LifecycleError("persisted PolicyManifest changed after Run planning")
+            policy_manifest_hash = proposed_policy_hash
+        elif proposed_policy_hash is not None and proposed_policy_hash != policy_manifest_hash:
+            raise LifecycleError("graph append references an unfrozen PolicyManifest")
         specs = tuple(NodeSpec.model_validate(item) for item in payload.get("nodes", []))
+        for spec in specs:
+            contract = spec.planning_contract
+            if contract is not None and (
+                contract.run_id != run_id
+                or contract.config_hash != state.config_hash
+                or contract.registry_hash != state.registry_hash
+                or contract.policy_manifest_hash != policy_manifest_hash
+            ):
+                raise LifecycleError("persisted node contract does not match its Run snapshot")
         try:
             specs = validate_graph_append(
                 tuple(item.spec for item in nodes.values()),
@@ -766,6 +815,7 @@ def apply_lifecycle_event(
         cancellation_request_event_id=cancellation_request_event_id,
         config_hash=state.config_hash,
         registry_hash=state.registry_hash,
+        policy_manifest_hash=policy_manifest_hash,
         max_nodes=state.max_nodes,
         max_depth=state.max_depth,
         graph_version=graph_version,

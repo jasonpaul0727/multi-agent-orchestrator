@@ -217,10 +217,12 @@ def run_setup_with_frozen_contract(store, *, max_attempts=3):
             node_id="node-1",
             role="coder",
             planning_contract_hash=contract.contract_hash,
+            planning_contract=contract,
             max_attempts=max_attempts,
         ),),
         expected_graph_version=0,
         idempotency_key="initial-graph",
+        policy_manifest=manifest,
     )
     lifecycle.start_run("run-1")
     return reg, resolved.config, lifecycle, manifest, contract
@@ -1170,6 +1172,30 @@ def test_scheduler_persists_recovery_evidence_and_consumes_retry_authorization_o
     ]
     with pytest.raises(RunRecoveryError, match="authorization is inconsistent"):
         RunRecoveryCoordinator(ReadOnlySchedulerEvents(invalid_plan_events))._scheduler_state("run-1")
+
+def test_scheduler_rejects_route_using_policy_other_than_frozen_node_policy(tmp_path):
+    store = SQLiteEventStore(tmp_path / "frozen-node-policy.db")
+    reg, config, _lifecycle, _manifest, contract = run_setup_with_frozen_contract(store)
+    changed_manifest = PolicyManifest(
+        authorities=(
+            PolicyAuthority(
+                source="system",
+                max_permission="read-only",
+                allowed_actions={"model_invoke"},
+                allowed_tools={"model:other-model"},
+            ),
+        )
+    )
+    request, decision = routed_pair(
+        reg,
+        config,
+        changed_manifest,
+        contract_hash=contract.contract_hash,
+    )
+
+    with pytest.raises(StaleRoutingDecision, match="route policy version differs"):
+        accept(scheduler(store), request, decision)
+
 
 def test_scheduler_persists_unknown_failure_as_reconciliation_only(tmp_path):
     store = SQLiteEventStore(tmp_path / "unknown-recovery-plan.db")

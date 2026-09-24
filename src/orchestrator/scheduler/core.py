@@ -168,6 +168,12 @@ class Scheduler:
                 raise StaleRoutingDecision("route references a node outside the frozen graph") from exc
             if node.status != "ready" or request.planning_contract_hash != node.spec.planning_contract_hash:
                 raise StaleRoutingDecision("route does not match the Ready node planning contract")
+            frozen_contract = node.spec.planning_contract
+            if frozen_contract is not None and (
+                state.policy_manifest_hash != frozen_contract.policy_manifest_hash
+                or request.policy_manifest_hash != frozen_contract.policy_manifest_hash
+            ):
+                raise StaleRoutingDecision("route policy version differs from the frozen node contract")
             if request.fencing_generation != len(node.attempts) + 1:
                 raise LifecycleConflict("route fencing generation is not monotonic")
             if len(node.attempts) >= node.spec.max_attempts:

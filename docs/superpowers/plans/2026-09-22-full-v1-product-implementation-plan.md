@@ -95,11 +95,13 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 状态：Run/Node/Attempt + Scheduler + Agent Registry 首个垂直切片已实现；生命周期检查点/尾部重放和只读跨流一致性协调已加入。2026-09-23 又将 EffectIntent/Receipt 与 ArtifactPublished 元数据/对象完整性检查接入恢复 admission；无回执副作用保持 outcome_unknown，终态 Attempt 仍有未决副作用时 fail-closed。ArtifactStore 可并发安全地全局盘点裸 orphan blob；新的 artifact publish 在落盘前先记录 `ArtifactPublicationIntent`，Run Recovery 可按 Run 归属 incomplete intent、检查已落盘对象 digest/size/provenance，并覆盖进程死于 intent 后或 blob 后的测试窗口；它不自动采纳、删除，也无法归属没有 intent 的旧/裸 orphan。Gateway failure classification 与 RecoveryPlan 现可被 Scheduler 脱敏持久化；同节点恢复授权必须精确绑定 failure evidence、Retry/failure/exhaustion counters，且只可消费一次。另以子进程实测 Scheduler admission 和显式 Attempt reconciliation 在提交前死亡与提交后丢失 IPC 响应：提交前仍保留 unknown lease/预算/Agent，提交后可幂等重放单条结果。P3 仍未完成：完整跨进程 Worker 中断矩阵、Provider 侧查询/回执验证、真实 Worker/OS 终止回执及 Worker 自动恢复/调度对接仍缺，不得视作 P3 完成或可交付产品。Agent 记录冻结路由的 reasoning effort，Gateway accepted route 校验请求与所选 effort 一致。
 
+2026-09-23 P3 Planning 切片：新增可信 host-side `GraphPlanningService`，从 Run 冻结的 EffectiveConfig/Registry 和首次图追加冻结的完整 `PolicyManifest` 编译完整节点契约并与图事件一同持久化。重放校验 Run/config/Registry/policy/node/role/hash 绑定；动态规划不能改变 Run policy，任务原文不进入事件。该入口尚未接入非可信 Planner Worker 或用户 application service。
+
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 
 - [x] 建立 Run/Node/Attempt/Graph 生命周期投影；实现基础状态机与非法转换拒绝。
 - [x] 建立 Agent 实例 aggregate 和 Agent Registry；每个模型 attempt 在调度接纳时创建事件化实例。
-- [ ] 实现 Intake/Planning 与完整节点契约集成。
+- [x] 实现可信 host-side `GraphPlanningService`/提案校验、完整节点契约冻结、PolicyManifest 首次冻结与事件重放校验；非可信 Planner Worker、用户 application service 接入仍属于 P5/P6。
 - [x] 实现 DAG/依赖无环校验、有界追加式扩展和图版本；执行历史不可改写，修复须作为新节点表达。
 - [x] 实现 Scheduler 的系统、Run、provider、tool 并发额度与 fencing generation；过期租约转未知结果并保留 slot，不假定旧 Worker 已停止。
 - [x] 在一个 SQLite 事务边界内接纳 RoutingDecision、预算最坏情况预留、并发 slot、attempt lease 与节点运行转换；失败注入验证回滚，多连接 CAS 验证互斥。
