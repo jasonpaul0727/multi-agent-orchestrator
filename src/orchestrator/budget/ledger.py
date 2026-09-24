@@ -299,6 +299,8 @@ class BudgetLedger:
         fencing_generation: int | None = None,
         correlation_id: str | None = None,
         causation_id: str | None = None,
+        approval_grant_id: str | None = None,
+        approval_event_factory: Callable[[], Iterable[EventDraft]] | None = None,
     ) -> BudgetReservation:
         run_id = _identifier(run_id, "run_id")
         if not isinstance(estimate, CostEstimate):
@@ -309,6 +311,17 @@ class BudgetLedger:
         reserved_tokens = _nonnegative_int(reserved_tokens, "token_limit")
         if reserved_tokens < estimate.total_tokens:
             raise ValueError("token_limit cannot be lower than the estimate token totals")
+        if approval_grant_id is None and approval_event_factory is not None:
+            raise ValueError("approval_event_factory requires approval_grant_id")
+        if approval_grant_id is not None:
+            approval_grant_id = _identifier(approval_grant_id, "approval_grant_id")
+            if approval_event_factory is None:
+                raise ValueError("approval_grant_id requires atomic approval and effect-intent events")
+            if any(
+                value is None
+                for value in (node_id, attempt_id, fencing_generation, causation_id)
+            ):
+                raise ValueError("approval-gated reservations require complete attempt context")
         execution_context = {
             "run_id": run_id if attempt_id is not None or node_id is not None else None,
             "node_id": node_id,
@@ -350,6 +363,8 @@ class BudgetLedger:
             payload = self._reservation_payload(
                 run_id, reservation_id, estimate, reserved_tokens, limit
             )
+            if approval_grant_id is not None:
+                payload["approval_grant_id"] = approval_grant_id
             same_key = [event for event in events if event.idempotency_key == append_key]
             legacy_key = (
                 [event for event in events if event.idempotency_key == caller_key]
@@ -389,7 +404,30 @@ class BudgetLedger:
                 )
             balance = self._balance_from_events(run_id, events, limit, _version)
             self._ensure_fits(balance, estimate.amount_minor, reserved_tokens, estimate)
-            return [EventDraft("BudgetReserved", payload, **execution_context)]
+            approval_drafts: list[EventDraft] = []
+            if approval_event_factory is not None:
+                approval_drafts = list(approval_event_factory())
+                if [draft.event_type for draft in approval_drafts] != [
+                    "EffectIntentRecorded",
+                    "ApprovalGrantConsumed",
+                ]:
+                    raise ValueError(
+                        "approved reservation requires ordered EffectIntentRecorded and ApprovalGrantConsumed events"
+                    )
+                intent, consumed = approval_drafts
+                if (
+                    intent.payload.get("approval_grant_id") != approval_grant_id
+                    or consumed.payload.get("approval_grant_id") != approval_grant_id
+                    or intent.payload.get("effect_id") != consumed.payload.get("effect_id")
+                ):
+                    raise ValueError("approval and effect-intent events must match the reserved grant")
+                for draft in approval_drafts:
+                    if any(
+                        getattr(draft, name) != execution_context[name]
+                        for name in ("run_id", "node_id", "attempt_id", "fencing_generation")
+                    ):
+                        raise ValueError("approval events must match reservation attempt context")
+            return [*approval_drafts, EventDraft("BudgetReserved", payload, **execution_context)]
 
         events = self._transactional_append(run_id, append_key, decide)
         if not events:

@@ -87,6 +87,44 @@ def test_approval_consumption_without_reservation_is_rejected(tmp_path):
         store.append("run", "run-1", 0, [approval], "approval-only")
 
 
+def test_approval_consumption_can_be_atomic_with_its_effect_intent(tmp_path):
+    store = SQLiteEventStore(tmp_path / "approved-effect.db")
+    intent = _domain_event(
+        "EffectIntentRecorded",
+        {"effect_id": "effect-1", "approval_grant_id": "grant-1", "request_hash": "abc"},
+    )
+    consumed = _domain_event(
+        "ApprovalGrantConsumed",
+        {"approval_grant_id": "grant-1", "effect_id": "effect-1"},
+    )
+
+    stored = store.append("security", "run-1", 0, [intent, consumed], "approved-effect")
+
+    assert [event.event_type for event in stored] == ["EffectIntentRecorded", "ApprovalGrantConsumed"]
+
+
+def test_approval_effect_intent_must_precede_consumption_and_match_fencing(tmp_path):
+    store = SQLiteEventStore(tmp_path / "approved-effect-order.db")
+    consumed = _domain_event(
+        "ApprovalGrantConsumed",
+        {"approval_grant_id": "grant-1", "effect_id": "effect-1"},
+    )
+    intent = _domain_event(
+        "EffectIntentRecorded",
+        {"effect_id": "effect-1", "approval_grant_id": "grant-1"},
+    )
+    with pytest.raises(EventContractError, match="must precede"):
+        store.append("security", "run-1", 0, [consumed, intent], "wrong-order")
+
+    wrong_fence = _domain_event(
+        "EffectIntentRecorded",
+        {"effect_id": "effect-1", "approval_grant_id": "grant-1"},
+        fencing_generation=4,
+    )
+    with pytest.raises(EventContractError, match="share attempt_id and fencing_generation"):
+        store.append("security", "run-1", 0, [wrong_fence, consumed], "wrong-fence")
+
+
 def test_approval_gated_reservation_requires_consumption_and_matching_fence(tmp_path):
     store = SQLiteEventStore(tmp_path / "approval-fence.db")
     reservation_payload = {

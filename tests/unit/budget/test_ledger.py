@@ -90,6 +90,69 @@ def test_cost_rounds_up_and_reservation_is_atomic(tmp_path):
     }
 
 
+def test_approval_effect_intent_and_budget_reservation_are_one_transaction(tmp_path):
+    store = SQLiteEventStore(tmp_path / "approved-effect.db")
+    ledger = BudgetLedger(
+        store,
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    context = {
+        "run_id": "run-1",
+        "node_id": "node-1",
+        "attempt_id": "attempt-2",
+        "fencing_generation": 2,
+        "causation_id": "grant-bound-event",
+    }
+
+    def approval_events():
+        return [
+            EventDraft(
+                "EffectIntentRecorded",
+                {"effect_id": "effect-1", "approval_grant_id": "grant-1", "request_hash": "sha256:" + "a" * 64},
+                **context,
+            ),
+            EventDraft(
+                "ApprovalGrantConsumed",
+                {"approval_grant_id": "grant-1", "effect_id": "effect-1"},
+                **context,
+            ),
+        ]
+
+    reservation = ledger.reserve(
+        "run-1",
+        estimate_with_worst_case(7),
+        idempotency_key="approved-effect-1",
+        node_id="node-1",
+        attempt_id="attempt-2",
+        fencing_generation=2,
+        causation_id="grant-bound-event",
+        approval_grant_id="grant-1",
+        approval_event_factory=approval_events,
+    )
+
+    events = ledger.read("run-1")
+    assert [event.event_type for event in events] == [
+        "EffectIntentRecorded",
+        "ApprovalGrantConsumed",
+        "BudgetReserved",
+    ]
+    assert events[2].payload["approval_grant_id"] == "grant-1"
+    assert events[2].payload["reservation_id"] == reservation.reservation_id
+
+
+def test_approval_gated_budget_reservation_requires_complete_transactional_pair(tmp_path):
+    ledger = BudgetLedger(
+        SQLiteEventStore(tmp_path / "approved-effect-invalid.db"),
+        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+    )
+    with pytest.raises(ValueError, match="requires atomic"):
+        ledger.reserve(
+            "run-1",
+            estimate_with_worst_case(1),
+            approval_grant_id="grant-1",
+        )
+
+
 def test_explicit_idempotency_retry_without_reservation_id_reuses_original(tmp_path):
     store = SQLiteEventStore(tmp_path / "events.db")
     ledger = BudgetLedger(

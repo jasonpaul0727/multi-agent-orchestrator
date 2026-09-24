@@ -155,6 +155,8 @@ def validate_event_contract(events: list[Any]) -> None:
             grant_id = payload.get("approval_grant_id") or payload.get("grant_id")
             if not isinstance(grant_id, str) or not grant_id.strip():
                 raise EventContractError("ApprovalGrantConsumed requires approval_grant_id")
+            if grant_id in consumed_grants:
+                raise EventContractError("an ApprovalGrant can be consumed only once")
             consumed_grants[grant_id] = event
         elif event_type == "BudgetReserved":
             grant_id = payload.get("approval_grant_id")
@@ -172,19 +174,40 @@ def validate_event_contract(events: list[Any]) -> None:
                     raise EventContractError(
                         "ApprovalGrantConsumed and BudgetReserved must share fencing_generation"
                     )
-    # A consumed approval cannot be committed without its corresponding
-    # reservation in the same atomic append/causal stream.
+    # A consumed approval must be paired with the budget reservation it
+    # authorizes, or with the external-effect intent it authorizes. The latter
+    # is recorded before consumption as required by the effect protocol.
     for grant_id, consumed in consumed_grants.items():
-        matching = [
+        matching_reservations = [
             event
             for event in events
             if event.event_type == "BudgetReserved"
             and event.payload.get("approval_grant_id") == grant_id
         ]
-        if not matching:
+        matching_intents = [
+            event
+            for event in events
+            if event.event_type == "EffectIntentRecorded"
+            and event.payload.get("approval_grant_id") == grant_id
+        ]
+        if not matching_reservations and not matching_intents:
             raise EventContractError(
-                "ApprovalGrantConsumed must be paired with an approval-gated BudgetReserved"
+                "ApprovalGrantConsumed must be paired with an approval-gated BudgetReserved or EffectIntentRecorded"
             )
+        if matching_intents:
+            intent = next(
+                (event for event in matching_intents if event.stream_version < consumed.stream_version),
+                None,
+            )
+            if intent is None:
+                raise EventContractError("approval-gated EffectIntentRecorded must precede grant consumption")
+            if (
+                intent.attempt_id != consumed.attempt_id
+                or intent.fencing_generation != consumed.fencing_generation
+            ):
+                raise EventContractError(
+                    "ApprovalGrantConsumed and EffectIntentRecorded must share attempt_id and fencing_generation"
+                )
 
 
 def _validate_execution_context(model: Any, *, event_type: str) -> None:
