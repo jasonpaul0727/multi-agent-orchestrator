@@ -4,10 +4,17 @@ import pytest
 
 from orchestrator.config.effective import EffectiveConfig, SelectorRule
 from orchestrator.config.models import ModelRegistryManifest, ModelSpec, PriceSpec, ProviderSpec
-from orchestrator.models import ExchangeRate, FXSnapshot, TokenizerBinding, TokenizerSnapshot
+from orchestrator.models import (
+    ExchangeRate,
+    FXSnapshot,
+    ModelGatewayFailure,
+    TokenizerBinding,
+    TokenizerSnapshot,
+)
 from orchestrator.routing import (
     EligibilityBlock,
     EligibilitySnapshot,
+    FailureClassification,
     HealthAggregateKey,
     HealthAggregateRef,
     ModelHealthSnapshot,
@@ -19,6 +26,7 @@ from orchestrator.routing import (
     ProbeLease,
     RoutingRequest,
     SecretAvailability,
+    classify_gateway_failure,
     compile_node_contract,
 )
 from orchestrator.security import PolicyAuthority, PolicyManifest, PolicyRule
@@ -563,6 +571,180 @@ def test_recovery_evidence_cannot_mark_unknown_outcome_retry_safe():
             retry_safe=True,
             outcome_unknown=True,
         )
+
+
+def test_gateway_failure_classification_is_deterministic_and_sanitized():
+    args = inputs()
+    original = route(args)
+    failure = ModelGatewayFailure(
+        code="rate_limited",
+        phase="provider",
+        outcome="known_failure",
+        retryable=True,
+        http_status=429,
+        provider_code="quota_window",
+        provider_request_id="provider-request-secret",
+        retry_after_ms=250,
+    )
+
+    classified = classify_gateway_failure(
+        failure, source_decision=original, retry_level=0
+    )
+    replayed = classify_gateway_failure(
+        failure.model_copy(update={"provider_request_id": "different-request-id"}),
+        source_decision=original,
+        retry_level=0,
+    )
+
+    assert classified == replayed
+    assert classified.disposition == "classified"
+    assert classified.reason == "gateway_failure_classified"
+    assert classified.evidence is not None
+    assert classified.evidence.failure_category == "transient"
+    assert classified.evidence.retry_safe is True
+    assert classified.evidence.outcome_unknown is False
+    _request, config, reg, contract, _eligibility, _policy, _tokens, _fx = args
+    recovery_plan = RecoveryController().plan(
+        source_decision=original,
+        contract=contract,
+        config=config,
+        registry=reg,
+        evidence=classified.evidence,
+    )
+    assert recovery_plan.action == "same_model_retry"
+    assert recovery_plan.authorized_model_ids == (original.selected_model_id,)
+
+
+@pytest.mark.parametrize(
+    "code,phase",
+    [("timeout", "transport"), ("transport_error", "transport"), ("outcome_unknown", "settlement")],
+)
+def test_gateway_unknown_outcome_classification_requires_reconciliation(code, phase):
+    original = route(inputs())
+    failure = ModelGatewayFailure(
+        code=code,
+        phase=phase,
+        outcome="unknown",
+        retryable=False,
+    )
+    result = classify_gateway_failure(failure, source_decision=original, retry_level=1)
+    args = inputs()
+    _request, config, reg, contract, _eligibility, _policy, _tokens, _fx = args
+
+    assert result.disposition == "reconciliation_required"
+    assert result.evidence is not None
+    assert result.evidence.outcome_unknown is True
+    plan = RecoveryController().plan(
+        source_decision=original,
+        contract=contract,
+        config=config,
+        registry=reg,
+        evidence=result.evidence,
+    )
+    assert plan.outcome == "blocked"
+    assert plan.reason == "unknown_outcome_requires_reconciliation"
+    assert plan.action is None
+
+
+@pytest.mark.parametrize(
+    "code,phase,outcome",
+    [
+        ("policy_denied", "preflight", "not_sent"),
+        ("authentication_failed", "provider", "known_failure"),
+        ("credential_unavailable", "preflight", "not_sent"),
+    ],
+)
+def test_gateway_nonrecoverable_failure_classification_is_blocked(code, phase, outcome):
+    original = route(inputs())
+    result = classify_gateway_failure(
+        ModelGatewayFailure(
+            code=code,
+            phase=phase,
+            outcome=outcome,
+            retryable=False,
+        ),
+        source_decision=original,
+        retry_level=0,
+    )
+
+    assert result.disposition == "blocked"
+    assert result.reason == "failure_not_recoverable"
+    assert result.evidence is None
+
+
+@pytest.mark.parametrize(
+    "code,category",
+    [
+        ("invalid_response", "output_invalid"),
+        ("context_length_exceeded", "capability_failure"),
+        ("output_limit_exceeded", "capability_failure"),
+    ],
+)
+def test_gateway_failure_classification_preserves_repair_category(code, category):
+    original = route(inputs())
+    result = classify_gateway_failure(
+        ModelGatewayFailure(
+            code=code,
+            phase="provider",
+            outcome="known_failure",
+            retryable=False,
+        ),
+        source_decision=original,
+        retry_level=0,
+    )
+
+    assert result.disposition == "classified"
+    assert result.evidence is not None
+    assert result.evidence.failure_category == category
+    assert result.evidence.retry_safe is False
+
+
+def test_gateway_failure_classification_requires_selected_source_and_consistent_evidence():
+    blocked_source = route(inputs()).model_copy(update={"outcome": "blocked"})
+    failure = ModelGatewayFailure(
+        code="rate_limited",
+        phase="provider",
+        outcome="known_failure",
+        retryable=True,
+    )
+
+    result = classify_gateway_failure(
+        failure, source_decision=blocked_source, retry_level=0
+    )
+    assert result.disposition == "blocked"
+    assert result.reason == "source_decision_not_selected"
+    assert result.evidence is None
+
+    evidence = RecoveryEvidence(
+        failure_category="transient",
+        evidence_hash=HASH,
+        retry_level=0,
+        outcome_unknown=True,
+    )
+    with pytest.raises(ValueError, match="unknown provider outcomes require reconciliation"):
+        FailureClassification(
+            disposition="classified",
+            reason="invalid",
+            evidence=evidence,
+        )
+
+
+def test_gateway_known_success_never_enters_failure_retry_or_fallback_planning():
+    original = route(inputs())
+    result = classify_gateway_failure(
+        ModelGatewayFailure(
+            code="usage_unavailable",
+            phase="settlement",
+            outcome="known_success",
+            retryable=False,
+        ),
+        source_decision=original,
+        retry_level=0,
+    )
+
+    assert result.disposition == "blocked"
+    assert result.reason == "successful_call_requires_settlement"
+    assert result.evidence is None
 
 
 def test_capability_escalation_uses_declared_tier_and_probe_lease_scope():

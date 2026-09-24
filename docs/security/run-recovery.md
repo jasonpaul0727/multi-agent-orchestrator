@@ -51,8 +51,17 @@ an artifact publication, followed by reopening and recovery. Existing process
 death around Scheduler admission still covers only its SQLite transaction
 boundary; no live Worker process is being supervised or restarted.
 
+The Gateway now exposes a deterministic failure classifier that turns only
+sanitized failure facts into `RecoveryEvidence`: retryable known failures may
+enter bounded planning; output/capability failures retain their repair class;
+unknown outcomes require reconciliation; nonrecoverable preflight failures
+and known-success settlement failures are blocked. Its evidence hash omits
+provider request IDs and never stores raw provider bodies. This classifier is
+not yet persisted with the Run event stream or wired into a Worker/Scheduler
+retry loop.
+
 The cross-process interruption matrix, real Worker/OS termination receipt,
-failure classification and bounded retry integration, provider-side effect
-reconciliation, and orphan-artifact accounting remain unimplemented. This
-slice is not full crash recovery and does not satisfy the P3 or V1 delivery
-gate by itself.
+bounded retry integration, provider-side effect reconciliation, and
+Run-attributable orphan-artifact accounting remain unimplemented. This slice
+is not full crash recovery and does not satisfy the P3 or V1 delivery gate by
+itself.

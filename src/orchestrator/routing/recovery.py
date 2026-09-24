@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, Strict
 
 from orchestrator.config.effective import EffectiveConfig, RecoveryAction, RoleName
 from orchestrator.config.models import ModelRegistryManifest
+from orchestrator.models import ModelGatewayFailure
 from orchestrator.routing.engine import RecoveryAuthorization, RoutingDecision
 from orchestrator.routing.planning import PlanningNodeContract
 
@@ -48,6 +49,108 @@ class RecoveryPlan(_RecoveryModel):
     target_role: RoleName | None
     authorized_model_ids: tuple[StrictStr, ...]
     reason: StrictStr
+
+
+class FailureClassification(_RecoveryModel):
+    """Sanitized deterministic classification handed to recovery planning."""
+
+    disposition: Literal["classified", "reconciliation_required", "blocked"]
+    reason: StrictStr
+    evidence: RecoveryEvidence | None
+
+    @model_validator(mode="after")
+    def validate_disposition_evidence(self) -> "FailureClassification":
+        if self.disposition == "blocked" and self.evidence is not None:
+            raise ValueError("blocked classifications cannot carry recovery evidence")
+        if self.disposition != "blocked" and self.evidence is None:
+            raise ValueError("classified failures require recovery evidence")
+        if self.disposition == "reconciliation_required" and not self.evidence.outcome_unknown:
+            raise ValueError("reconciliation requires an unknown provider outcome")
+        if self.disposition == "classified" and self.evidence.outcome_unknown:
+            raise ValueError("unknown provider outcomes require reconciliation")
+        return self
+
+
+def classify_gateway_failure(
+    failure: ModelGatewayFailure,
+    *,
+    source_decision: RoutingDecision,
+    retry_level: int,
+    exhausted_model_ids: tuple[str, ...] = (),
+) -> FailureClassification:
+    """Turn sanitized Gateway facts into bounded RecoveryController evidence.
+
+    Raw provider bodies and request IDs are deliberately excluded. Unknown
+    outcomes always require reconciliation before any retry/fallback plan.
+    """
+
+    if source_decision.outcome != "selected" or source_decision.selected_model_id is None:
+        return FailureClassification(
+            disposition="blocked", reason="source_decision_not_selected", evidence=None
+        )
+    if failure.outcome == "known_success":
+        return FailureClassification(
+            disposition="blocked", reason="successful_call_requires_settlement", evidence=None
+        )
+    if failure.outcome == "unknown":
+        category = _failure_category(failure.code) or "transient"
+        disposition: Literal["classified", "reconciliation_required", "blocked"] = (
+            "reconciliation_required"
+        )
+        reason = "provider_outcome_unknown"
+    else:
+        category = _failure_category(failure.code)
+        if category is None:
+            return FailureClassification(
+                disposition="blocked", reason="failure_not_recoverable", evidence=None
+            )
+        disposition = "classified"
+        reason = "gateway_failure_classified"
+
+    provider_code_hash = (
+        None if failure.provider_code is None else _hash({"provider_code": failure.provider_code})
+    )
+    evidence_hash = _hash(
+        {
+            "source_decision_hash": source_decision.decision_hash,
+            "model_id": source_decision.selected_model_id,
+            "run_id": source_decision.run_id,
+            "node_id": source_decision.node_id,
+            "attempt_id": source_decision.attempt_id,
+            "fencing_generation": source_decision.fencing_generation,
+            "failure_code": failure.code,
+            "failure_phase": failure.phase,
+            "failure_outcome": failure.outcome,
+            "failure_retryable": failure.retryable,
+            "http_status": failure.http_status,
+            "retry_after_ms": failure.retry_after_ms,
+            "provider_code_hash": provider_code_hash,
+            "retry_level": retry_level,
+            "exhausted_model_ids": sorted(exhausted_model_ids),
+        }
+    )
+    evidence = RecoveryEvidence(
+        failure_category=category,
+        evidence_hash=evidence_hash,
+        retry_level=retry_level,
+        retry_safe=failure.retryable and failure.outcome in {"not_sent", "known_failure"},
+        failed_model_unavailable=(failure.code == "provider_unavailable"),
+        outcome_unknown=failure.outcome == "unknown",
+        exhausted_model_ids=exhausted_model_ids,
+    )
+    return FailureClassification(disposition=disposition, reason=reason, evidence=evidence)
+
+
+def _failure_category(code: str) -> Literal[
+    "transient", "output_invalid", "task_failure", "capability_failure"
+] | None:
+    if code in {"rate_limited", "provider_unavailable", "timeout", "transport_error", "outcome_unknown"}:
+        return "transient"
+    if code == "invalid_response":
+        return "output_invalid"
+    if code in {"context_length_exceeded", "output_limit_exceeded"}:
+        return "capability_failure"
+    return None
 
 
 class RecoveryController:
@@ -241,4 +344,10 @@ def _blocked(reason: str) -> RecoveryPlan:
     )
 
 
-__all__ = ["RecoveryController", "RecoveryEvidence", "RecoveryPlan"]
+__all__ = [
+    "FailureClassification",
+    "RecoveryController",
+    "RecoveryEvidence",
+    "RecoveryPlan",
+    "classify_gateway_failure",
+]

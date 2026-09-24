@@ -26,13 +26,20 @@ from .health import (
     initial_health_state,
     reduce_health_events,
 )
-from .recovery import RecoveryController, RecoveryEvidence, RecoveryPlan
+from .recovery import (
+    FailureClassification,
+    RecoveryController,
+    RecoveryEvidence,
+    RecoveryPlan,
+    classify_gateway_failure,
+)
 
 __all__ = [
     "CandidateAssessment",
     "ClassificationResult",
     "EligibilityBlock",
     "EligibilitySnapshot",
+    "FailureClassification",
     "HealthAggregateRef",
     "HealthAggregateKey",
     "HealthAggregateState",
@@ -54,6 +61,7 @@ __all__ = [
     "ProbeLeaseConflict",
     "TaskClassifier",
     "compile_node_contract",
+    "classify_gateway_failure",
     "effective_health_state",
     "initial_health_state",
     "reduce_health_events",
