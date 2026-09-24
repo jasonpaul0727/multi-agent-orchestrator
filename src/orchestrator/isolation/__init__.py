@@ -1,6 +1,19 @@
 """Fail-closed operating-system isolation primitives."""
 
-from .workspace import WorkspaceBoundaryError, WorkspaceInspection, inspect_workspace
+from .workspace import (
+    WorkspaceBoundaryError,
+    WorkspaceInspection,
+    inspect_workspace,
+    snapshot_workspace,
+)
+from .launcher import (
+    InvalidSandboxRequest,
+    IsolationUnavailable,
+    SandboxLimits,
+    SandboxResult,
+    SandboxSession,
+    SystemdReadOnlyLauncher,
+)
 from .landlock import (
     FsAccess,
     LandlockResult,
@@ -13,6 +26,12 @@ from .landlock import (
 )
 
 __all__ = [
+    "InvalidSandboxRequest",
+    "IsolationUnavailable",
+    "SandboxLimits",
+    "SandboxResult",
+    "SandboxSession",
+    "SystemdReadOnlyLauncher",
     "FsAccess",
     "LandlockResult",
     "LandlockUnavailable",
@@ -22,6 +41,7 @@ __all__ = [
     "WorkspaceBoundaryError",
     "WorkspaceInspection",
     "inspect_workspace",
+    "snapshot_workspace",
     "landlock_abi",
     "restrict_current_process",
 ]

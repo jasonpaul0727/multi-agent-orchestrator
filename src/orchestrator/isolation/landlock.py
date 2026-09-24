@@ -122,7 +122,7 @@ def restrict_current_process(grants: tuple[PathGrant, ...] | list[PathGrant]) ->
 
     opened_fds: list[int] = []
     try:
-        for grant in grants:
+        for index, grant in enumerate(grants):
             if not isinstance(grant, PathGrant) or not isinstance(grant.access, FsAccess):
                 raise LandlockUnavailable("Landlock grants must use typed filesystem rights")
             if int(grant.access) == 0 or int(grant.access) & ~handled:
@@ -147,7 +147,10 @@ def restrict_current_process(grants: tuple[PathGrant, ...] | list[PathGrant]) ->
                 0,
             )
             if result < 0:
-                _raise_syscall("Landlock path grant was rejected")
+                error = ctypes.get_errno() or errno.EPERM
+                raise LandlockUnavailable(
+                    f"Landlock path grant was rejected at index {index} (errno {error})"
+                ) from OSError(error, os.strerror(error))
 
         if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
             _raise_syscall("no_new_privs could not be enabled")
@@ -169,7 +172,7 @@ def _syscalls() -> tuple[int, int, int]:
 
 def _raise_syscall(message: str) -> None:
     error = ctypes.get_errno() or errno.EPERM
-    raise LandlockUnavailable(message) from OSError(error, os.strerror(error))
+    raise LandlockUnavailable(f"{message} (errno {error})") from OSError(error, os.strerror(error))
 
 
 __all__ = [

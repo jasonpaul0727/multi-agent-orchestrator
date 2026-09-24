@@ -49,13 +49,15 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 - [x] 用户于 2026-09-22 书面批准 `docs/superpowers/specs/2026-09-13-permissions-security-isolation-approval-design.md`；如后续实现发现规格冲突，先更新规格和接口，再开始相关安全实现。
 - [ ] 建立完整 V1 的接口/架构决策记录：Run/节点/attempt 标识，事件类型归属，stream/CAS 边界，GraphExpansion、PolicyDecision、RoutingDecision、ToolRequest、候选结果、验证证据及统一错误分类。
 - [x] 做隔离原语可行性 spike，逐项以 live tests 验证工作区文件边界、符号链接/挂载逃逸、进程树终止、资源限制、原始网络阻断、私有临时目录和 Git worktree。
-- [ ] 将 spike 结果落实为集成式隔离后端决策及平台支持矩阵；证明 race-safe Launcher、写入差异导出/应用和 Worker/Gateway 接入。在此之前 WSL2 仅是候选，不可作为已支持执行平台。
+- [x] 将已测原语接入真实 `SystemdReadOnlyLauncher`：每次启动核验 cgroup/rlimit，bind 只读 workspace/runtime，隐藏 Home、Git/控制和主机凭证路径，限制网络/临时目录/filesystem、资源、时长和输出；停止通过 systemd unit wait 收据确认。
+- [x] 记录隔离平台矩阵与边界：`docs/security/platform-support.md` 只把 Ubuntu 24.04/WSL2/systemd 255 的只读 profile 列为已测候选，不宣称完整 V1 支持。
+- [ ] 完成 workspace-write 的安全路径操作、Overlay 差异导出/验证/原子应用及 Worker/Gateway 接入；在这些闭环前 WSL2 仍不是完整 V1 支持平台。
 - [ ] 若某平台没有满足规格的可验证后端，将该平台/能力标记为不支持并返回 `Blocked(isolation_unavailable)`；禁止无隔离 fallback。记录 Secret Broker 的密钥来源、生命周期、端点绑定方式和 MCP 调用者身份信任边界。
 - [ ] 将 V1 最小交付平台及必要用户决策写入 README/ADR；没有获得书面终审或安全能力证据时，停止安全执行层和 Worker 的合并。
 
 2026-09-22 首轮探测记录：当前 Ubuntu 24.04 / WSL2（kernel `6.6.87.2-microsoft-standard-WSL2`）支持组合 user/mount/PID/network namespace；新 network namespace 仅有 loopback 且无路由；私有 mount namespace 内 tmpfs mount 成功；Landlock ABI 3 的白名单读取/越界拒绝已通过一次性实测；`prlimit` 的 CPU、地址空间、NPROC、文件大小和打开文件数限制在子进程中可见，`NPROC=1` 时 fork 实测被内核拒绝。当时未安装 bubblewrap，且用户不能直接写 cgroup v2 根目录。
 
-2026-09-23 后续 live spike：发现 `systemd --user` transient service 能建立实际 task cgroup；MemoryMax、TasksMax、CPUQuota 和文件 rlimit 按请求施加，真实内存超限服务终止、TasksMax 阻止额外 fork，systemd kill-all 终止服务进程树。组合 probes 还通过 network namespace 外连阻断、PrivateTmp/ProtectHome、workspace bind、`.git`/`.maestro` 只读、Git worktree host metadata 隐藏、Landlock 越界和 symlink 读取拒绝，以及 4 MiB tmpfs Overlay 写满拒绝/lower 不变。`tests/unit/isolation` 与 `tests/integration/test_systemd_isolation_probe.py` 共 23 项通过。以上只证明隔离原语组合可用，不是集成执行后端；没有 Launcher、竞态安全路径打开、overlay diff 导出/应用、Tool Gateway/Worker 接入，故 WSL2 仍是候选，未列入支持平台。
+2026-09-23 后续 live spike：发现 `systemd --user` transient service 能建立实际 task cgroup；MemoryMax、TasksMax、CPUQuota 和文件 rlimit 按请求施加，真实内存超限服务终止、TasksMax 阻止额外 fork，systemd kill-all 终止服务进程树。组合 probes 还通过 network namespace 外连阻断、PrivateTmp/ProtectHome、workspace bind、`.git`/`.maestro` 只读、Git worktree host metadata 隐藏、Landlock 越界和 symlink 读取拒绝，以及 4 MiB tmpfs Overlay 写满拒绝/lower 不变。此后新增 `SystemdReadOnlyLauncher` 真实垂直切片：host 使用固定根目录 FD、`openat`/`O_NOFOLLOW` 与 mount-id 检查制成无写权限快照（忽略 `.git`/`.maestro`）；child 在 exec 前核验 cgroup/rlimit、设置最小 Landlock grants、运行代码只得到干净环境；systemd 属性配置包含网络/敏感路径隔离、资源/时长上限；host 对 stdout/stderr 限流，取消发 SIGKILL 至整个 unit 并等待 `systemd-run --wait` 退出才返回 `termination_confirmed`。`tests/integration/test_systemd_launcher.py` 实测读写、控制目录、home/凭证路径、网络、超时、输出洪泛和进程树取消；WSL2/systemd 具体版本与限制记录在 `docs/security/platform-support.md`。P4 尚缺 workspace-write 的安全修改、Overlay 差异导出/应用、Tool Gateway/Approval/Secret Broker/Worker 接入；故这只是只读 profile，不是完整受支持 V1 平台。
 
 验收：所有跨模块边界有类型化接口和因果/版本语义；安全规格状态明确；隔离 spike 有可重复的通过/失败证据、支持矩阵和失败关闭方案。
 
