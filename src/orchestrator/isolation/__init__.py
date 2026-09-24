@@ -38,6 +38,14 @@ from .workspace_lease import (
     WorkspaceWriteLease,
     acquire_workspace_write_lease,
 )
+from .workspace_publish import (
+    WorkspacePublishConflict,
+    WorkspacePublishError,
+    WorkspacePublishReceipt,
+    WorkspacePublishRecoveryConflict,
+    publish_workspace_diff,
+    recover_workspace_publications,
+)
 
 __all__ = [
     "InvalidSandboxRequest",
@@ -58,6 +66,10 @@ __all__ = [
     "WorkspaceLeaseBusy",
     "WorkspaceLeaseError",
     "WorkspaceLeaseUnavailable",
+    "WorkspacePublishConflict",
+    "WorkspacePublishError",
+    "WorkspacePublishReceipt",
+    "WorkspacePublishRecoveryConflict",
     "WorkspaceDiff",
     "WorkspaceDiffEntry",
     "WorkspaceInspection",
@@ -66,6 +78,8 @@ __all__ = [
     "export_overlay_diff",
     "check_workspace_publish_conflicts",
     "inspect_workspace",
+    "publish_workspace_diff",
+    "recover_workspace_publications",
     "snapshot_workspace",
     "validate_overlay_candidate",
     "landlock_abi",

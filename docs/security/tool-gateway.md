@@ -51,9 +51,13 @@ itself. Revocation is rechecked just before launch and polled during execution.
 
 Only the Ubuntu 24.04/WSL2 systemd read-only profile in
 [`platform-support.md`](platform-support.md) has live evidence. There is no
-workspace-write support, Overlay diff application, Approval service, Secret
-Broker, Worker, CLI, or MCP wiring. Thus this slice is not evidence that the
-complete P4/P5 execution path or the V1 product is deliverable.
+enabled workspace-write support, Approval service, Secret Broker, Worker, CLI,
+or MCP wiring. A host-side lease-bound Overlay candidate publisher and
+crash-recovery journal now exist and have unit/subprocess-crash evidence, but
+they have not been live-tested through the supported systemd/OverlayFS-to-host
+path and are not integrated with this Gateway, approval, audit, or attempt
+ownership. Thus these primitives are not evidence that the complete P4/P5
+execution path or the V1 product is deliverable.
 
 ## Verification
 
