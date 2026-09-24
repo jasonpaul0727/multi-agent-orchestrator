@@ -31,6 +31,13 @@ from .landlock import (
     landlock_abi,
     restrict_current_process,
 )
+from .workspace_lease import (
+    WorkspaceLeaseBusy,
+    WorkspaceLeaseError,
+    WorkspaceLeaseUnavailable,
+    WorkspaceWriteLease,
+    acquire_workspace_write_lease,
+)
 
 __all__ = [
     "InvalidSandboxRequest",
@@ -48,9 +55,14 @@ __all__ = [
     "WorkspaceBoundaryError",
     "WorkspaceConflict",
     "WorkspaceConflictReport",
+    "WorkspaceLeaseBusy",
+    "WorkspaceLeaseError",
+    "WorkspaceLeaseUnavailable",
     "WorkspaceDiff",
     "WorkspaceDiffEntry",
     "WorkspaceInspection",
+    "WorkspaceWriteLease",
+    "acquire_workspace_write_lease",
     "export_overlay_diff",
     "check_workspace_publish_conflicts",
     "inspect_workspace",

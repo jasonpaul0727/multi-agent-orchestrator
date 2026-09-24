@@ -7,7 +7,7 @@ full security acceptance suite are integrated and pass.
 
 | Platform | Observed runtime | Read-only command profile | Workspace-write profile | Product support |
 | --- | --- | --- | --- | --- |
-| Ubuntu 24.04 under WSL2 | Microsoft kernel `6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17` | Live-tested through `SystemdReadOnlyLauncher`; each launch uses a descriptor-anchored no-follow snapshot, requires exact cgroup/rlimit values, Landlock, private network/tmp/home, and read-only bind mounts. Any mismatch fails closed. | Still unsupported. A bounded Overlay upper-to-private-candidate exporter and read-only candidate validator have unit coverage and a live systemd-scope/OverlayFS probe. They reject deletions/whiteouts, xattrs, special files, hard links, permissive candidate modes, protected paths, lower symlink traversal, undeclared candidate entries, and bound violations; modified-file/symlink entries bind a digest of their lower baseline. A standalone read-only helper reports conflicts against touched live paths, but does not acquire a write lease or atomically publish changes. | Candidate only; not a complete V1 execution platform. |
+| Ubuntu 24.04 under WSL2 | Microsoft kernel `6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17` | Live-tested through `SystemdReadOnlyLauncher`; each launch uses a descriptor-anchored no-follow snapshot, requires exact cgroup/rlimit values, Landlock, private network/tmp/home, and read-only bind mounts. Any mismatch fails closed. | Still unsupported. A bounded Overlay upper-to-private-candidate exporter and read-only candidate validator have unit coverage and a live systemd-scope/OverlayFS probe. They reject deletions/whiteouts, xattrs, special files, hard links, permissive candidate modes, protected paths, lower symlink traversal, undeclared candidate entries, and bound violations; modified-file/symlink entries bind a digest of their lower baseline. A standalone read-only helper reports touched-path conflicts, and a separate cross-process lease primitive serializes writers; neither is wired to a crash-safe publisher. | Candidate only; not a complete V1 execution platform. |
 | Other Linux distributions | Not measured | Unverified; do not infer support from the presence of systemd. | Unsupported | Unsupported/unverified. |
 | Windows and macOS | Not measured | Unsupported by this backend | Unsupported | Unsupported. |
 
@@ -23,10 +23,12 @@ primitive can copy a bounded upper layer into a private candidate tree, and
 `validate_overlay_candidate` rechecks its private-only modes, no-follow
 inventory, bytes, manifest, and lower snapshot baselines, while
 `check_workspace_publish_conflicts` reports stale/occupied touched paths
-without mutation. A live namespace test confirms candidate export with the
-measured WSL OverlayFS metadata. Neither helper is an approval, write lease,
-diff-review, or publication path, and neither enables workspace-write. The
-Tool Gateway evaluates a frozen
+without mutation; `acquire_workspace_write_lease` separately offers a private
+cross-process lock and monotonic fence. The checker does not hold that lease,
+and no publisher binds the two yet. A live namespace test confirms candidate
+export with the measured WSL OverlayFS metadata. These primitives are not an
+approval, diff-review, or publication path, and do not enable workspace-write.
+The Tool Gateway evaluates a frozen
 `PolicyManifest`, records `PolicyDecision` and a one-use capability in the
 security event stream, checks an injected attempt/fencing authority before and
 during execution, and logs only output digests and lengths. A live integration
