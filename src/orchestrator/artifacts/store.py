@@ -44,6 +44,7 @@ from orchestrator.persistence.sqlite_event_store import (
 
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+_DIGEST_FILENAME_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _DEFAULT_MEDIA_TYPE = "application/octet-stream"
 _PUBLICATION_LOCK = threading.RLock()
 
@@ -833,6 +834,43 @@ class ArtifactStore:
                 raise ArtifactIntegrityError(digest, "artifact metadata size mismatch")
             recovered.extend(matching)
         return sorted(recovered, key=lambda record: (record.created_at, record.publication_id))
+
+    def find_orphan_blobs(self) -> tuple[str, ...]:
+        """List valid content-addressed files without publication metadata.
+
+        Each candidate is checked under its normal digest lock so a concurrent
+        publisher cannot be reported in the byte-install/metadata-append gap.
+        This is inventory only: it never deletes, adopts, or exposes bytes.
+        """
+
+        if not callable(getattr(self._event_store, "read_stream", None)):
+            raise ArtifactMetadataError("event store cannot inspect artifact metadata for orphan inventory")
+        try:
+            candidates = tuple(self._root.iterdir())
+        except OSError as exc:
+            raise ArtifactFilesystemError("unable to enumerate artifact directory") from exc
+
+        orphan_digests: list[str] = []
+        for candidate in candidates:
+            if _DIGEST_FILENAME_RE.fullmatch(candidate.name) is None:
+                continue
+            digest = f"sha256:{candidate.name}"
+            with self._digest_lock(digest):
+                if self._load_records(digest):
+                    continue
+                try:
+                    candidate_stat = candidate.lstat()
+                except FileNotFoundError:
+                    # The object was concurrently removed before we acquired
+                    # its digest lock; it is no longer an inventory finding.
+                    continue
+                except OSError as exc:
+                    raise ArtifactFilesystemError("unable to inspect orphan artifact object") from exc
+                if stat.S_ISLNK(candidate_stat.st_mode) or not stat.S_ISREG(candidate_stat.st_mode):
+                    raise ArtifactIntegrityError(digest, "orphan artifact path is not a regular file")
+                self._verify_file_and_size(candidate, digest)
+                orphan_digests.append(digest)
+        return tuple(sorted(orphan_digests))
 
     def _record_metadata(self, record: ArtifactRecord) -> ArtifactRecord:
         """Append a unique provenance event; never use digest as idempotency key."""

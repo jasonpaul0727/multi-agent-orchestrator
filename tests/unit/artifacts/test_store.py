@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
 import multiprocessing
@@ -85,6 +86,100 @@ def test_streamed_recovery_verifier_rejects_non_regular_artifact(tmp_path):
 
     with pytest.raises(ArtifactIntegrityError, match="not a regular file"):
         ArtifactStore._verify_file_and_size(tmp_path, digest)
+
+
+def test_orphan_inventory_reports_only_valid_unpublished_artifact_blobs(tmp_path):
+    event_store = SQLiteEventStore(tmp_path / "orphan-inventory.db")
+    root = tmp_path / "artifacts"
+    artifacts = _store(root, event_store=event_store)
+    published = artifacts.publish_bytes(b"published bytes", source={"run_id": "run-1"})
+    orphan_bytes = b"crash-left content-addressed object"
+    orphan_digest = "sha256:" + hashlib.sha256(orphan_bytes).hexdigest()
+    (root / orphan_digest.removeprefix("sha256:")).write_bytes(orphan_bytes)
+    (root / ".tmp-interrupted-publish").write_bytes(b"incomplete")
+
+    initial_orphans = artifacts.find_orphan_blobs()
+    assert initial_orphans == (orphan_digest,)
+    assert published.digest not in initial_orphans
+
+    # A later successful metadata append makes the existing content-addressed
+    # object owned by a durable ArtifactPublished record.
+    adopted = artifacts.publish_bytes(orphan_bytes, source={"run_id": "run-2"})
+    assert adopted.digest == orphan_digest
+    assert artifacts.find_orphan_blobs() == ()
+
+
+def test_orphan_inventory_fails_closed_without_metadata_reads(tmp_path):
+    artifacts = _store(tmp_path / "artifacts", event_store=object())
+
+    with pytest.raises(ArtifactMetadataError, match="cannot inspect artifact metadata"):
+        artifacts.find_orphan_blobs()
+
+
+def test_orphan_inventory_fails_closed_if_artifact_root_disappears(tmp_path):
+    root = tmp_path / "artifacts"
+    artifacts = _store(root, event_store=SQLiteEventStore(tmp_path / "orphan-root.db"))
+    root.rmdir()
+
+    with pytest.raises(ArtifactFilesystemError, match="unable to enumerate artifact directory"):
+        artifacts.find_orphan_blobs()
+
+
+def test_orphan_inventory_waits_for_concurrent_publication_metadata(tmp_path):
+    database = tmp_path / "orphan-publication-race.db"
+    root = tmp_path / "artifacts"
+    metadata_started = threading.Event()
+    release_metadata = threading.Event()
+    scan_started = threading.Event()
+    metadata_read = threading.Event()
+
+    def publish():
+        event_store = SQLiteEventStore(database)
+        artifacts = _store(root, event_store=event_store)
+        record_metadata = artifacts._record_metadata
+
+        def pause_metadata(record):
+            metadata_started.set()
+            if not release_metadata.wait(5):
+                raise TimeoutError("test did not release the publication pause")
+            return record_metadata(record)
+
+        artifacts._record_metadata = pause_metadata
+        try:
+            return artifacts.publish_bytes(b"publication race")
+        finally:
+            event_store.close()
+
+    def scan():
+        event_store = SQLiteEventStore(database)
+        artifacts = _store(root, event_store=event_store)
+        load_records = artifacts._load_records
+
+        def observe_metadata_read(digest):
+            metadata_read.set()
+            return load_records(digest)
+
+        artifacts._load_records = observe_metadata_read
+        scan_started.set()
+        try:
+            return artifacts.find_orphan_blobs()
+        finally:
+            event_store.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        publication = executor.submit(publish)
+        assert metadata_started.wait(2)
+        inventory = executor.submit(scan)
+        try:
+            assert scan_started.wait(2)
+            assert not metadata_read.wait(0.25)
+        finally:
+            release_metadata.set()
+        record = publication.result(timeout=5)
+        assert inventory.result(timeout=5) == ()
+    reopened_store = SQLiteEventStore(database)
+    assert _store(root, event_store=reopened_store)._load_records(record.digest)
+    reopened_store.close()
 
 
 def test_publish_rejects_modified_content_after_hashing(tmp_path):

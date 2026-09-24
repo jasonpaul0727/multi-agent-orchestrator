@@ -35,8 +35,11 @@ plans.
   any supplied fencing generation are checked against the Run replay. A
   fencing generation without an attempt is rejected.
 - Filesystem blobs with no `ArtifactPublished` event cannot be attributed to a
-  Run by this operation and are not discovered or cleaned up. This is not a
-  general orphan-blob scanner.
+  Run by this operation. `ArtifactStore.find_orphan_blobs()` separately lists
+  regular, content-address-verified files with no publication metadata. It
+  serializes each candidate against publication using the digest lock, returns
+  digests only, and never deletes or adopts objects. This is a global inventory,
+  not a Run-level recovery action or a garbage collector.
 
 ## Verification and remaining P3 work
 
