@@ -1270,6 +1270,118 @@ def test_run_recovery_survives_process_death_before_and_after_acceptance_commit(
             assert len(reopened.read_stream("budget", "run-1")) == 1
 
 
+def test_run_recovery_replays_effect_state_after_process_death(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("the crash-injection harness currently requires fork")
+
+    def record_effect_then_die(database, request, decision, include_receipt):
+        child_store = SQLiteEventStore(database)
+        effect_id = "effect-with-receipt" if include_receipt else "effect-without-receipt"
+        events = [
+            EventDraft(
+                "EffectIntentRecorded",
+                {"effect_id": effect_id, "recovery_class": "manual_only"},
+                run_id=request.run_id,
+                node_id=request.node_id,
+                attempt_id=request.attempt_id,
+                fencing_generation=request.fencing_generation,
+                causation_id=decision.decision_hash,
+            )
+        ]
+        if include_receipt:
+            events.append(
+                EventDraft(
+                    "EffectReceiptRecorded",
+                    {"effect_id": effect_id, "outcome": "applied", "receipt_hash": HASH},
+                    run_id=request.run_id,
+                    node_id=request.node_id,
+                    attempt_id=request.attempt_id,
+                    fencing_generation=request.fencing_generation,
+                    causation_id=decision.decision_hash,
+                )
+            )
+        child_store.append(
+            "budget",
+            request.run_id,
+            child_store.current_version("budget", request.run_id),
+            events,
+            f"effect-crash-{include_receipt}",
+        )
+        # Simulate abrupt process termination after the durable effect record.
+        os._exit(74)
+
+    for include_receipt, expected_status in (
+        (False, "outcome_unknown"),
+        (True, "applied"),
+    ):
+        database = tmp_path / f"run-recovery-effect-{include_receipt}.db"
+        store = SQLiteEventStore(database)
+        reg, config, _lifecycle, manifest = run_setup(store)
+        control = scheduler(store)
+        request, decision = routed_pair(reg, config, manifest)
+        accept(control, request, decision)
+        store.close()
+
+        process = multiprocessing.get_context("fork").Process(
+            target=record_effect_then_die,
+            args=(str(database), request, decision, include_receipt),
+        )
+        process.start()
+        process.join(timeout=20)
+        if process.is_alive():
+            process.kill()
+            process.join()
+            pytest.fail("effect crash-injection child process timed out")
+        assert process.exitcode == 74
+
+        reopened = SQLiteEventStore(database)
+        recovered = RunRecoveryCoordinator(reopened).recover(request.run_id)
+        assert len(recovered.effects) == 1
+        assert recovered.effects[0].status == expected_status
+        assert recovered.budget.reserved_minor == 20
+        assert len(recovered.active_attempts) == 1
+        reopened.close()
+
+
+def test_run_recovery_verifies_artifact_after_publisher_process_death(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("the crash-injection harness currently requires fork")
+
+    def publish_artifact_then_die(database, artifact_root):
+        child_store = SQLiteEventStore(database)
+        ArtifactStore(artifact_root, event_store=child_store).publish_bytes(
+            b"durably published before worker process death",
+            source={"run_id": "run-1", "node_id": "node-1"},
+            artifact_type="worker-output",
+        )
+        os._exit(75)
+
+    database = tmp_path / "run-recovery-artifact-process-death.db"
+    artifact_root = tmp_path / "run-recovery-artifact-process-death"
+    store = SQLiteEventStore(database)
+    run_setup(store, nodes=())
+    store.close()
+
+    process = multiprocessing.get_context("fork").Process(
+        target=publish_artifact_then_die,
+        args=(str(database), str(artifact_root)),
+    )
+    process.start()
+    process.join(timeout=20)
+    if process.is_alive():
+        process.kill()
+        process.join()
+        pytest.fail("artifact crash-injection child process timed out")
+    assert process.exitcode == 75
+
+    reopened = SQLiteEventStore(database)
+    artifacts = ArtifactStore(artifact_root, event_store=reopened)
+    recovered = RunRecoveryCoordinator(reopened, artifact_store=artifacts).recover("run-1")
+    assert len(recovered.artifacts) == 1
+    assert recovered.artifacts[0].size == len(b"durably published before worker process death")
+    reopened.close()
+
+
 def test_route_acceptance_fails_closed_when_replayed_streams_disagree(tmp_path):
     store = SQLiteEventStore(tmp_path / "run-recovery-mismatch.db")
     nodes = (

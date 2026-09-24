@@ -45,9 +45,11 @@ plans.
 
 Unit/restart tests cover unknown-to-receipted effect projection, terminal
 unknown-effect rejection, missing verifier, artifact content tampering, and
-reopening the same database/artifact directory. Existing process-death tests
-cover Scheduler admission before/after a SQLite transaction, not a live Worker
-execution lifecycle.
+reopening the same database/artifact directory. Abrupt subprocess-death tests
+now cover durable effect-intent-only and intent-plus-receipt records as well as
+an artifact publication, followed by reopening and recovery. Existing process
+death around Scheduler admission still covers only its SQLite transaction
+boundary; no live Worker process is being supervised or restarted.
 
 The cross-process interruption matrix, real Worker/OS termination receipt,
 failure classification and bounded retry integration, provider-side effect
