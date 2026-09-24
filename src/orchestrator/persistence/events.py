@@ -70,6 +70,12 @@ _CAUSAL_EVENT_TYPES = frozenset(
         "ApprovalExpired",
         "RoutingRequest",
         "RoutingDecision",
+        "RoutingDecisionAccepted",
+        "AttemptAccepted",
+        "AttemptCompleted",
+        "AttemptReconciled",
+        "AttemptOutcomeUnknown",
+        "AttemptSlotReleased",
         "EffectIntentRecorded",
         "EffectReceiptRecorded",
     }

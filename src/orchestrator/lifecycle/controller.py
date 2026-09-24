@@ -1,0 +1,492 @@
+"""Run lifecycle commands and deterministic replay of lifecycle event streams."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from typing import Literal
+
+from orchestrator.config.runtime import RunConfigSnapshot
+from orchestrator.persistence import EventDraft, SQLiteEventStore, StoredEvent
+
+from .graph import GraphError, validate_graph_append
+from .models import AttemptState, NodeSpec, NodeState, RunLifecycleState
+
+
+_LIFECYCLE_STREAM = "run_lifecycle"
+_RUN_STREAM = "run"
+
+
+class LifecycleError(RuntimeError):
+    """The requested lifecycle transition is stale or invalid."""
+
+
+class LifecycleConflict(LifecycleError):
+    """The expected aggregate or graph version no longer matches."""
+
+
+def _hash(value: object) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+class LifecycleController:
+    """Event-backed Run/Node/Attempt lifecycle with append-only graph changes."""
+
+    def __init__(self, event_store: SQLiteEventStore) -> None:
+        self.event_store = event_store
+
+    def initialize_run(self, run_id: str) -> RunLifecycleState:
+        snapshot = self.config_snapshot(run_id)
+        payload = {
+            "run_id": run_id,
+            "config_hash": snapshot.effective_config_hash,
+            "registry_hash": snapshot.registry_manifest_hash,
+            "max_nodes": _node_limit(snapshot),
+            "max_depth": _depth_limit(snapshot),
+        }
+        key = f"lifecycle-init:{run_id}"
+
+        def decide(events: list[StoredEvent], version: int):
+            if events:
+                _check_idempotent(events, key, "RunInitialized", payload)
+                return None
+            return [EventDraft("RunInitialized", payload)]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.replay(run_id)
+
+    def config_snapshot(self, run_id: str) -> RunConfigSnapshot:
+        events, version = self.event_store.read_stream_with_version(_RUN_STREAM, run_id)
+        if version < 1 or not events or events[0].event_type != "RunCreated":
+            raise LifecycleError("RunConfigSnapshot is missing")
+        try:
+            value = events[0].payload["config_snapshot"]
+            return RunConfigSnapshot.model_validate_json(json.dumps(value))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LifecycleError("RunConfigSnapshot failed validation") from exc
+
+    def replay(self, run_id: str) -> RunLifecycleState:
+        events, version = self.event_store.read_stream_with_version(_LIFECYCLE_STREAM, run_id)
+        if not events:
+            raise LifecycleError("Run lifecycle has not been initialized")
+        state = reduce_lifecycle(run_id, events)
+        if state.event_version != version:
+            raise LifecycleError("lifecycle stream version disagrees with its projection")
+        return state
+
+    def append_nodes(
+        self,
+        run_id: str,
+        nodes: tuple[NodeSpec, ...],
+        *,
+        expected_graph_version: int,
+        idempotency_key: str,
+    ) -> RunLifecycleState:
+        if not nodes:
+            raise ValueError("nodes must not be empty")
+        snapshot = self.config_snapshot(run_id)
+        payload_nodes = tuple(sorted(nodes, key=lambda item: item.node_id))
+        payload = {
+            "graph_version": expected_graph_version + 1,
+            "nodes": [node.model_dump(mode="json") for node in payload_nodes],
+        }
+        key = f"graph:{idempotency_key}"
+
+        def decide(events: list[StoredEvent], version: int):
+            for event in events:
+                if event.idempotency_key == key:
+                    _check_idempotent(events, key, "GraphNodesAppended", payload)
+                    return None
+            state = reduce_lifecycle(run_id, events)
+            if state.status not in {"created", "running"}:
+                raise LifecycleError("nodes can only be appended to a non-terminal Run")
+            if state.graph_version != expected_graph_version:
+                raise LifecycleConflict("graph version changed before append")
+            max_nodes = _node_limit(snapshot)
+            max_depth = _depth_limit(snapshot)
+            try:
+                validated = validate_graph_append(
+                    tuple(item.spec for item in state.nodes),
+                    payload_nodes,
+                    max_nodes=max_nodes,
+                    max_depth=max_depth,
+                )
+            except GraphError as exc:
+                raise LifecycleError(str(exc)) from exc
+            if validated != payload_nodes:
+                raise LifecycleError("graph append ordering is not canonical")
+            return [EventDraft("GraphNodesAppended", payload)]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.replay(run_id)
+
+    def start_run(self, run_id: str) -> RunLifecycleState:
+        key = f"run-start:{run_id}"
+        payload = {"run_id": run_id}
+
+        def decide(events: list[StoredEvent], version: int):
+            if any(event.idempotency_key == key for event in events):
+                _check_idempotent(events, key, "RunStarted", payload)
+                return None
+            state = reduce_lifecycle(run_id, events)
+            if state.status != "created":
+                raise LifecycleError("only a created Run can be started")
+            if not state.nodes:
+                raise LifecycleError("Run cannot start before its initial graph is appended")
+            return [EventDraft("RunStarted", payload)]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.replay(run_id)
+
+    def pause_run(self, run_id: str, *, reason_code: str) -> RunLifecycleState:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason_code):
+            raise ValueError("reason_code must be a stable lowercase code")
+        return self._run_transition(run_id, "RunPaused", "pause", reason_code=reason_code)
+
+    def resume_run(self, run_id: str) -> RunLifecycleState:
+        return self._run_transition(run_id, "RunResumed", "resume", reason_code=None)
+
+    def _run_transition(
+        self, run_id: str, event_type: str, operation: str, *, reason_code: str | None
+    ) -> RunLifecycleState:
+        payload = {"run_id": run_id, "reason_code": reason_code}
+        key = f"run-{operation}:{run_id}:{_hash(payload)}"
+
+        def decide(events: list[StoredEvent], version: int):
+            if any(event.idempotency_key == key for event in events):
+                _check_idempotent(events, key, event_type, payload)
+                return None
+            state = reduce_lifecycle(run_id, events)
+            expected = "running" if operation == "pause" else "paused"
+            if state.status != expected:
+                raise LifecycleError(f"only a {expected} Run can {operation}")
+            return [EventDraft(event_type, payload)]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.replay(run_id)
+
+    def record_attempt_accepted(
+        self,
+        run_id: str,
+        *,
+        node_id: str,
+        attempt: AttemptState,
+        decision_hash: str,
+        causation_id: str,
+    ) -> RunLifecycleState:
+        if attempt.status != "accepted":
+            raise LifecycleError("newly accepted attempts must start in accepted state")
+        payload = {
+            "node_id": node_id,
+            "attempt": attempt.model_dump(mode="json"),
+        }
+        key = f"attempt-accepted:{attempt.attempt_id}"
+
+        def decide(events: list[StoredEvent], version: int):
+            if any(event.idempotency_key == key for event in events):
+                _check_idempotent(events, key, "AttemptAccepted", payload)
+                return None
+            state = reduce_lifecycle(run_id, events)
+            node = state.node(node_id)
+            if state.status != "running" or node.status != "ready":
+                raise LifecycleError("attempt acceptance requires a ready node in a running Run")
+            expected_generation = len(node.attempts) + 1
+            if attempt.fencing_generation != expected_generation:
+                raise LifecycleConflict("attempt fencing generation is not the next generation")
+            if any(item.attempt_id == attempt.attempt_id for item in node.attempts):
+                raise LifecycleConflict("attempt ID has already been used")
+            if any(
+                attempt.attempt_id == prior.attempt_id
+                for other in state.nodes
+                for prior in other.attempts
+            ):
+                raise LifecycleConflict("attempt ID must be unique within its Run")
+            if len(node.attempts) >= node.spec.max_attempts:
+                raise LifecycleError("node has exhausted its configured attempt limit")
+            return [
+                EventDraft(
+                    "AttemptAccepted",
+                    payload,
+                    run_id=run_id,
+                    node_id=node_id,
+                    attempt_id=attempt.attempt_id,
+                    fencing_generation=attempt.fencing_generation,
+                    correlation_id=run_id,
+                    causation_id=causation_id or decision_hash,
+                )
+            ]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.replay(run_id)
+
+    def record_attempt_completed(
+        self,
+        run_id: str,
+        *,
+        node_id: str,
+        attempt_id: str,
+        fencing_generation: int,
+        outcome: Literal["succeeded", "failed", "outcome_unknown"],
+        causation_id: str,
+    ) -> RunLifecycleState:
+        return self._record_attempt_end(
+            run_id,
+            event_type="AttemptCompleted",
+            node_id=node_id,
+            attempt_id=attempt_id,
+            fencing_generation=fencing_generation,
+            outcome=outcome,
+            causation_id=causation_id,
+        )
+
+    def record_attempt_reconciled(
+        self,
+        run_id: str,
+        *,
+        node_id: str,
+        attempt_id: str,
+        fencing_generation: int,
+        outcome: Literal["succeeded", "failed"],
+        causation_id: str,
+    ) -> RunLifecycleState:
+        return self._record_attempt_end(
+            run_id,
+            event_type="AttemptReconciled",
+            node_id=node_id,
+            attempt_id=attempt_id,
+            fencing_generation=fencing_generation,
+            outcome=outcome,
+            causation_id=causation_id,
+        )
+
+    def _record_attempt_end(
+        self,
+        run_id: str,
+        *,
+        event_type: str,
+        node_id: str,
+        attempt_id: str,
+        fencing_generation: int,
+        outcome: str,
+        causation_id: str,
+    ) -> RunLifecycleState:
+        payload = {"node_id": node_id, "attempt_id": attempt_id, "outcome": outcome}
+        key = f"{event_type.lower()}:{attempt_id}"
+
+        def decide(events: list[StoredEvent], version: int):
+            if any(event.idempotency_key == key for event in events):
+                _check_idempotent(events, key, event_type, payload)
+                return None
+            state = reduce_lifecycle(run_id, events)
+            node = state.node(node_id)
+            active = _active_attempt(node)
+            expected_status = "outcome_unknown" if event_type == "AttemptReconciled" else "accepted"
+            if (
+                active is None
+                or active.attempt_id != attempt_id
+                or active.fencing_generation != fencing_generation
+                or active.status != expected_status
+            ):
+                raise LifecycleConflict("attempt result is stale or not the active attempt")
+            if event_type == "AttemptReconciled" and outcome == "outcome_unknown":
+                raise LifecycleError("reconciliation must resolve the unknown outcome")
+            return [
+                EventDraft(
+                    event_type,
+                    payload,
+                    run_id=run_id,
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                    fencing_generation=fencing_generation,
+                    correlation_id=run_id,
+                    causation_id=causation_id,
+                )
+            ]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.replay(run_id)
+
+
+def reduce_lifecycle(run_id: str, events: list[StoredEvent]) -> RunLifecycleState:
+    """Rebuild a lifecycle aggregate; clocks and process-local state are unused."""
+
+    if not events or events[0].event_type != "RunInitialized":
+        raise LifecycleError("lifecycle stream must start with RunInitialized")
+    first = events[0].payload
+    if first.get("run_id") != run_id:
+        raise LifecycleError("RunInitialized identity does not match its stream")
+    status: str = "created"
+    config_hash = first.get("config_hash")
+    registry_hash = first.get("registry_hash")
+    graph_version = 0
+    nodes: dict[str, NodeState] = {}
+    max_nodes = first.get("max_nodes")
+    max_depth = first.get("max_depth")
+    if (
+        isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes <= 0
+        or isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0
+    ):
+        raise LifecycleError("RunInitialized is missing valid frozen graph limits")
+
+    for event in events[1:]:
+        payload = event.payload
+        if event.event_type == "GraphNodesAppended":
+            if status not in {"created", "running"}:
+                raise LifecycleError("graph mutation occurred after Run termination")
+            next_version = payload.get("graph_version")
+            if next_version != graph_version + 1:
+                raise LifecycleConflict("graph version is not monotonic")
+            specs = tuple(NodeSpec.model_validate(item) for item in payload.get("nodes", []))
+            try:
+                specs = validate_graph_append(
+                    tuple(item.spec for item in nodes.values()),
+                    specs,
+                    max_nodes=max_nodes,
+                    max_depth=max_depth,
+                )
+            except GraphError as exc:
+                raise LifecycleError("persisted graph append violates its frozen limits") from exc
+            for spec in specs:
+                nodes[spec.node_id] = NodeState(spec=spec, status="blocked")
+            for spec in specs:
+                ready = not spec.depends_on or all(
+                    nodes[item].status == "succeeded" for item in spec.depends_on
+                )
+                if ready:
+                    nodes[spec.node_id] = nodes[spec.node_id].model_copy(update={"status": "ready"})
+            graph_version = next_version
+        elif event.event_type == "RunStarted":
+            if status != "created" or not nodes:
+                raise LifecycleError("invalid RunStarted transition")
+            status = "running"
+        elif event.event_type == "RunPaused":
+            if status != "running":
+                raise LifecycleError("invalid RunPaused transition")
+            status = "paused"
+        elif event.event_type == "RunResumed":
+            if status != "paused":
+                raise LifecycleError("invalid RunResumed transition")
+            status = "running"
+        elif event.event_type == "AttemptAccepted":
+            if status != "running":
+                raise LifecycleError("attempt accepted while Run is not running")
+            node_id = payload.get("node_id")
+            node = nodes.get(node_id)
+            if node is None or node.status != "ready":
+                raise LifecycleError("attempt accepted for a non-ready node")
+            attempt = AttemptState.model_validate(payload.get("attempt"))
+            if (
+                event.run_id != run_id
+                or event.node_id != node_id
+                or event.attempt_id != attempt.attempt_id
+                or event.fencing_generation != attempt.fencing_generation
+            ):
+                raise LifecycleError("AttemptAccepted event context disagrees with its payload")
+            if attempt.fencing_generation != len(node.attempts) + 1:
+                raise LifecycleError("attempt generation is not monotonic")
+            if len(node.attempts) >= node.spec.max_attempts:
+                raise LifecycleError("attempt count exceeds the frozen node limit")
+            if any(
+                attempt.attempt_id == prior.attempt_id
+                for other in nodes.values()
+                for prior in other.attempts
+            ):
+                raise LifecycleError("persisted attempt ID is duplicated in the Run")
+            nodes[node_id] = node.model_copy(update={"status": "running", "attempts": (*node.attempts, attempt)})
+        elif event.event_type in {"AttemptCompleted", "AttemptReconciled"}:
+            node_id = payload.get("node_id")
+            node = nodes.get(node_id)
+            if node is None:
+                raise LifecycleError("attempt result references an unknown node")
+            active = _active_attempt(node)
+            if active is None or active.attempt_id != payload.get("attempt_id"):
+                raise LifecycleError("attempt result is not for the active generation")
+            if event.fencing_generation != active.fencing_generation or event.attempt_id != active.attempt_id:
+                raise LifecycleError("attempt result context does not match the active generation")
+            outcome = payload.get("outcome")
+            if event.run_id != run_id or event.node_id != node_id:
+                raise LifecycleError("attempt result event context disagrees with its payload")
+            if event.event_type == "AttemptCompleted" and active.status != "accepted":
+                raise LifecycleError("only an accepted attempt may complete")
+            if event.event_type == "AttemptReconciled" and active.status != "outcome_unknown":
+                raise LifecycleError("only an unknown outcome may be reconciled")
+            if event.event_type == "AttemptCompleted" and outcome not in {
+                "succeeded", "failed", "outcome_unknown"
+            }:
+                raise LifecycleError("AttemptCompleted has an invalid outcome")
+            if event.event_type == "AttemptReconciled" and outcome not in {"succeeded", "failed"}:
+                raise LifecycleError("AttemptReconciled has an invalid outcome")
+            end_status = "outcome_unknown" if outcome == "outcome_unknown" else outcome
+            updated_attempt = active.model_copy(update={"status": end_status})
+            attempts = (*node.attempts[:-1], updated_attempt)
+            if outcome == "outcome_unknown":
+                node_status = "awaiting_reconciliation"
+            elif outcome == "succeeded":
+                node_status = "succeeded"
+            elif len(attempts) < node.spec.max_attempts:
+                node_status = "ready"
+            else:
+                node_status = "failed"
+            nodes[node_id] = node.model_copy(update={"status": node_status, "attempts": attempts})
+            if outcome == "succeeded":
+                for child_id, child in tuple(nodes.items()):
+                    if child.status == "blocked" and all(nodes[parent].status == "succeeded" for parent in child.spec.depends_on):
+                        nodes[child_id] = child.model_copy(update={"status": "ready"})
+        else:
+            raise LifecycleError("unsupported lifecycle event")
+
+        if status == "running" and nodes:
+            active_or_ready = any(
+                node.status in {"ready", "running", "awaiting_reconciliation"}
+                for node in nodes.values()
+            )
+            if any(node.status == "failed" for node in nodes.values()) and not active_or_ready:
+                status = "failed"
+            elif all(node.status == "succeeded" for node in nodes.values()):
+                status = "succeeded"
+
+    return RunLifecycleState(
+        run_id=run_id,
+        status=status,
+        config_hash=config_hash,
+        registry_hash=registry_hash,
+        graph_version=graph_version,
+        event_version=events[-1].stream_version,
+        nodes=tuple(nodes[node_id] for node_id in sorted(nodes)),
+    )
+
+
+def _active_attempt(node: NodeState) -> AttemptState | None:
+    if node.status not in {"running", "awaiting_reconciliation"}:
+        return None
+    return next(
+        (item for item in reversed(node.attempts) if item.status in {"accepted", "outcome_unknown"}),
+        None,
+    )
+
+
+def _check_idempotent(
+    events: list[StoredEvent], key: str, event_type: str, payload: dict[str, object]
+) -> None:
+    existing = [event for event in events if event.idempotency_key == key]
+    if len(existing) != 1 or existing[0].event_type != event_type or dict(existing[0].payload) != payload:
+        raise LifecycleConflict("lifecycle idempotency key was reused with different input")
+
+
+def _node_limit(snapshot: RunConfigSnapshot) -> int:
+    config = snapshot.resolved_config.config
+    requested = config.presets[config.active_preset].requested_budget.max_agents
+    envelope = config.policy_envelope.max_agents
+    return min(requested, envelope)
+
+
+def _depth_limit(snapshot: RunConfigSnapshot) -> int:
+    config = snapshot.resolved_config.config
+    requested = config.presets[config.active_preset].requested_budget.max_depth
+    envelope = config.policy_envelope.max_depth
+    return min(requested, envelope)
+
+
+__all__ = ["LifecycleConflict", "LifecycleController", "LifecycleError", "reduce_lifecycle"]

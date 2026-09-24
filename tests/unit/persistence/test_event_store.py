@@ -253,6 +253,36 @@ def test_append_inside_outer_transaction_uses_savepoint_and_can_roll_back(tmp_pa
     assert store.read_stream("run", "run-1") == []
 
 
+def test_nested_append_checked_shares_the_outer_atomic_transaction(tmp_path):
+    store = SQLiteEventStore(tmp_path / "nested-checked.db")
+
+    def outer_decide(events, version):
+        store.append_checked(
+            "budget",
+            "run-1",
+            "nested-reserve",
+            lambda nested_events, nested_version: [EventDraft("BudgetReserved", {"amount": 5})],
+        )
+        return [EventDraft("RoutingDecisionAccepted", {"accepted": True}, run_id="run-1",
+                           node_id="node-1", attempt_id="attempt-1", fencing_generation=1,
+                           correlation_id="run-1", causation_id="decision-1")]
+
+    store.append_checked("scheduler", "global", "outer-accept", outer_decide)
+    assert store.read_stream("budget", "run-1")[0].payload["amount"] == 5
+    assert store.read_stream("scheduler", "global")[0].payload["accepted"] is True
+
+    def failing_outer(events, version):
+        store.append_checked(
+            "budget", "run-2", "nested-rollback",
+            lambda nested_events, nested_version: [EventDraft("BudgetReserved", {"amount": 7})],
+        )
+        raise RuntimeError("abort outer transaction")
+
+    with pytest.raises(RuntimeError, match="abort outer"):
+        store.append_checked("scheduler", "global", "outer-rollback", failing_outer)
+    assert store.read_stream("budget", "run-2") == []
+
+
 def test_read_stream_with_version_respects_existing_transaction(tmp_path):
     store = SQLiteEventStore(tmp_path / "events.db")
     store.append("run", "run-1", 0, [EventDraft("RunCreated", {})], "create")

@@ -637,12 +637,13 @@ class SQLiteEventStore:
         """Run a locked read-modify-append operation atomically.
 
         ``decide`` executes while ``BEGIN IMMEDIATE`` holds the database
-        write lock.  It receives the complete validated stream and its
-        current version, and returns the drafts to append.  Returning ``None``
-        is a no-op and is useful for an operation whose idempotency key was
-        already observed by the caller.  The regular append implementation is
-        savepoint-aware, so the actual append remains subject to its normal
-        CAS and idempotency checks while sharing this transaction.
+        write lock. Nested calls use savepoints and remain part of the outer
+        transaction. The callback receives the complete validated stream and
+        its current version, and returns the drafts to append. Returning
+        ``None`` is a no-op and is useful for an operation whose idempotency
+        key was already observed by the caller. The regular append
+        implementation is savepoint-aware, so each append remains subject to
+        its normal CAS and idempotency checks while sharing this transaction.
         """
 
         stream_type = _validate_identifier(stream_type, "stream_type")
@@ -651,7 +652,13 @@ class SQLiteEventStore:
         if not callable(decide):
             raise TypeError("decide must be callable")
         connection = self._connection
-        connection.execute("BEGIN IMMEDIATE")
+        started_transaction = not connection.in_transaction
+        savepoint: str | None = None
+        if started_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        else:
+            savepoint = "orchestrator_append_checked"
+            connection.execute(f"SAVEPOINT {savepoint}")
         try:
             events = self._read_rows(
                 stream_type,
@@ -665,7 +672,10 @@ class SQLiteEventStore:
                 existing = [
                     event for event in events if event.idempotency_key == idempotency_key
                 ]
-                connection.commit()
+                if started_transaction:
+                    connection.commit()
+                else:
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
                 return existing
             appended = self.append(
                 stream_type,
@@ -674,10 +684,19 @@ class SQLiteEventStore:
                 drafts,
                 idempotency_key,
             )
-            connection.commit()
+            if started_transaction:
+                connection.commit()
+            else:
+                connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             return appended
         except BaseException:
-            connection.rollback()
+            if started_transaction:
+                connection.rollback()
+            elif savepoint is not None:
+                try:
+                    connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                finally:
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
 
     def read_stream(
