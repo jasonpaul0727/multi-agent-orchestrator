@@ -74,8 +74,13 @@ _CAUSAL_EVENT_TYPES = frozenset(
         "AttemptAccepted",
         "AttemptCompleted",
         "AttemptReconciled",
+        "AttemptCancelled",
         "AttemptOutcomeUnknown",
         "AttemptSlotReleased",
+        "RunAwaitingUser",
+        "RunUserResponseReceived",
+        "RunCancellationRequested",
+        "RunCancelled",
         "AgentInstanceCreated",
         "AgentStarted",
         "AgentCompleted",
@@ -85,6 +90,14 @@ _CAUSAL_EVENT_TYPES = frozenset(
         "AgentCancelled",
         "EffectIntentRecorded",
         "EffectReceiptRecorded",
+    }
+)
+_RUN_LEVEL_CAUSAL_EVENT_TYPES = frozenset(
+    {
+        "RunAwaitingUser",
+        "RunUserResponseReceived",
+        "RunCancellationRequested",
+        "RunCancelled",
     }
 )
 _BUDGET_EVENT_TYPES = frozenset(
@@ -175,6 +188,14 @@ def validate_event_contract(events: list[Any]) -> None:
 
 
 def _validate_execution_context(model: Any, *, event_type: str) -> None:
+    if event_type in _RUN_LEVEL_CAUSAL_EVENT_TYPES:
+        required = ("run_id", "correlation_id", "causation_id")
+        missing = [name for name in required if getattr(model, name, None) is None]
+        if missing:
+            raise ValueError(
+                f"{event_type} requires run-level causal context; missing {', '.join(missing)}"
+            )
+        return
     required = ("run_id", "node_id", "attempt_id", "fencing_generation", "causation_id")
     context_present = any(getattr(model, name, None) is not None for name in required)
     required_for_type = event_type in _CAUSAL_EVENT_TYPES

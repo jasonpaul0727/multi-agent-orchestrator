@@ -275,6 +275,28 @@ class AgentRegistry:
             allowed_statuses={"outcome_unknown"},
         )
 
+    def cancel_attempt(
+        self,
+        run_id: str,
+        *,
+        attempt_id: str,
+        agent_instance_id: str,
+        node_id: str,
+        fencing_generation: int,
+        causation_id: str,
+    ) -> None:
+        self._transition(
+            run_id,
+            event_type="AgentCancelled",
+            attempt_id=attempt_id,
+            agent_instance_id=agent_instance_id,
+            node_id=node_id,
+            fencing_generation=fencing_generation,
+            causation_id=causation_id,
+            outcome="cancelled",
+            allowed_statuses={"active"},
+        )
+
     def _transition(
         self,
         run_id: str,
@@ -402,6 +424,8 @@ def reduce_agent_registry(run_id: str, events: list[StoredEvent]) -> AgentRegist
                 raise AgentRegistryError("AgentReconciled must resolve an unknown outcome")
             expected_from, next_status = {"outcome_unknown"}, "completed" if outcome == "succeeded" else "failed"
         elif event.event_type == "AgentCancelled":
+            if payload.get("outcome") != "cancelled":
+                raise AgentRegistryError("AgentCancelled must record a cancelled outcome")
             expected_from, next_status = {"created", "active"}, "cancelled"
         else:
             raise AgentRegistryError("unsupported Agent registry event")

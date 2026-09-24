@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+from threading import Barrier
 
 import pytest
 
@@ -342,6 +343,236 @@ def test_run_lifecycle_rejects_invalid_transitions_and_freezes_graph_versions(tm
     controller.start_run("run-1")
     assert controller.pause_run("run-1", reason_code="user_request").status == "paused"
     assert controller.resume_run("run-1").status == "running"
+
+
+def test_awaiting_user_freezes_scheduling_until_hashed_response(tmp_path):
+    store = SQLiteEventStore(tmp_path / "awaiting-user.db")
+    reg, config, lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+
+    waiting = lifecycle.await_user(
+        "run-1", request_id="input-1", reason_code="clarify_scope", context_hash=HASH
+    )
+    assert lifecycle.await_user(
+        "run-1", request_id="input-1", reason_code="clarify_scope", context_hash=HASH
+    ) == waiting
+    assert waiting.status == "awaiting_user"
+    assert waiting.awaiting_user_request_id == "input-1"
+    with pytest.raises(LifecycleError, match="running Run"):
+        accept(control, request, decision)
+    with pytest.raises(LifecycleConflict, match="outstanding request"):
+        lifecycle.record_user_response("run-1", request_id="other-input", response_hash=HASH)
+
+    resumed = lifecycle.record_user_response(
+        "run-1", request_id="input-1", response_hash=HASH
+    )
+    assert resumed.status == "running"
+    assert resumed.awaiting_user_request_id is None
+    assert lifecycle.record_user_response(
+        "run-1", request_id="input-1", response_hash=HASH
+    ) == resumed
+
+
+def test_run_user_and_cancel_commands_validate_stable_identifiers_and_hashes(tmp_path):
+    store = SQLiteEventStore(tmp_path / "run-command-validation.db")
+    _, _, lifecycle, _ = run_setup(store)
+
+    with pytest.raises(ValueError, match="stable identifier"):
+        lifecycle.await_user(
+            "run-1", request_id="bad id", reason_code="clarify_scope", context_hash=HASH
+        )
+    with pytest.raises(ValueError, match="lowercase code"):
+        lifecycle.await_user(
+            "run-1", request_id="input-1", reason_code="Bad-Reason", context_hash=HASH
+        )
+    with pytest.raises(ValueError, match="context_hash"):
+        lifecycle.await_user(
+            "run-1", request_id="input-1", reason_code="clarify_scope", context_hash="not-hash"
+        )
+    with pytest.raises(ValueError, match="stable identifier"):
+        lifecycle.record_user_response("run-1", request_id="bad id", response_hash=HASH)
+    with pytest.raises(ValueError, match="response_hash"):
+        lifecycle.record_user_response("run-1", request_id="input-1", response_hash="not-hash")
+    with pytest.raises(ValueError, match="lowercase code"):
+        lifecycle.request_cancel("run-1", reason_code="Bad-Reason")
+    with pytest.raises(ValueError, match="stop_receipt_hash"):
+        lifecycle.record_attempt_cancelled(
+            "run-1", node_id="node-1", attempt_id="attempt-1",
+            fencing_generation=1, stop_receipt_hash="not-hash", causation_id=HASH,
+        )
+    with pytest.raises(LifecycleError, match="cancelling Run"):
+        lifecycle.record_attempt_cancelled(
+            "run-1", node_id="node-1", attempt_id="attempt-1",
+            fencing_generation=1, stop_receipt_hash=HASH, causation_id=HASH,
+        )
+
+
+def test_run_cancel_waits_for_stop_ack_and_cancels_ready_nodes(tmp_path):
+    store = SQLiteEventStore(tmp_path / "run-cancel.db")
+    nodes = (
+        NodeSpec(node_id="node-1", role="coder", planning_contract_hash=HASH),
+        NodeSpec(node_id="node-2", role="tester", planning_contract_hash=HASH),
+    )
+    reg, config, lifecycle, manifest = run_setup(store, nodes=nodes)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest, node_id="node-1")
+    accepted = accept(control, request, decision)
+
+    cancelling = lifecycle.request_cancel("run-1", reason_code="user_request")
+    assert lifecycle.request_cancel("run-1", reason_code="user_request") == cancelling
+    assert cancelling.status == "cancelling"
+    assert cancelling.node("node-1").status == "running"
+    assert cancelling.node("node-2").status == "ready"
+    with pytest.raises(LifecycleError, match="running Run"):
+        next_request, next_decision = routed_pair(
+            reg, config, manifest, node_id="node-2", role="tester"
+        )
+        accept(control, next_request, next_decision)
+    with pytest.raises(SchedulerError, match="requires usage or an explicit no-effect"):
+        control.acknowledge_cancellation(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=1, stopped_at=NOW + timedelta(seconds=5),
+            stop_receipt_hash=HASH,
+        )
+    with pytest.raises(SchedulerError, match="no-effect receipt hash"):
+        control.acknowledge_cancellation(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=1, stopped_at=NOW + timedelta(seconds=5),
+            stop_receipt_hash=HASH, no_effect_receipt_hash="invalid-proof",
+        )
+
+    control.acknowledge_cancellation(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, stopped_at=NOW + timedelta(seconds=5),
+        stop_receipt_hash=HASH, no_effect_receipt_hash=HASH,
+    )
+    control.acknowledge_cancellation(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, stopped_at=NOW + timedelta(seconds=5),
+        stop_receipt_hash=HASH, no_effect_receipt_hash=HASH,
+    )
+    cancelled = lifecycle.replay("run-1")
+    assert cancelled.status == "cancelled"
+    assert cancelled.node("node-1").status == "cancelled"
+    assert cancelled.node("node-1").attempts[-1].status == "cancelled"
+    assert cancelled.node("node-2").status == "cancelled"
+    agent = control.agents.replay("run-1").agent(accepted.agent_instance_id)
+    assert agent.status == "cancelled"
+    assert control._ledger_for_run("run-1").get_reservation(
+        accepted.reservation.reservation_id, run_id="run-1"
+    ).status == "released"
+
+
+def test_cancelled_attempt_with_provider_usage_still_settles_cost(tmp_path):
+    store = SQLiteEventStore(tmp_path / "cancel-with-usage.db")
+    reg, config, lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accepted = accept(control, request, decision)
+    lifecycle.request_cancel("run-1", reason_code="user_request")
+    usage = UsageRecord(
+        reservation_id=accepted.reservation.reservation_id,
+        run_id="run-1",
+        settlement_key="cancelled-provider-usage",
+        currency="USD",
+        input_tokens=3,
+        output_tokens=2,
+        cost_minor=7,
+    )
+
+    control.acknowledge_cancellation(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, stopped_at=NOW + timedelta(seconds=5),
+        stop_receipt_hash=HASH, usage=usage,
+    )
+
+    reservation = control._ledger_for_run("run-1").get_reservation(
+        accepted.reservation.reservation_id, run_id="run-1"
+    )
+    assert reservation.status == "committed"
+    assert control._ledger_for_run("run-1").available("run-1").used_minor == 7
+    assert lifecycle.replay("run-1").status == "cancelled"
+
+
+def test_cancellation_cannot_relabel_unknown_attempt_as_stopped(tmp_path):
+    store = SQLiteEventStore(tmp_path / "cancel-unknown.db")
+    _, _, lifecycle, _ = run_setup(store)
+    control = scheduler(store)
+    reg = registry()
+    config = effective_config(reg)
+    manifest = PolicyManifest(
+        authorities=(PolicyAuthority(
+            source="system", max_permission="read-only",
+            allowed_actions={"model_invoke"}, allowed_tools={"model:model-1"},
+        ),)
+    )
+    request, decision = routed_pair(reg, config, manifest)
+    accept(control, request, decision)
+    lifecycle.request_cancel("run-1", reason_code="user_request")
+    assert control.mark_expired_attempts_unknown(as_of=NOW + timedelta(minutes=2)) == (
+        request.attempt_id,
+    )
+    with pytest.raises(LifecycleConflict, match="reconciled, not cancelled"):
+        control.acknowledge_cancellation(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=1, stopped_at=NOW + timedelta(minutes=3),
+            stop_receipt_hash=HASH, no_effect_receipt_hash=HASH,
+        )
+    control.reconcile_attempt(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, reconciled_at=NOW + timedelta(minutes=4),
+        outcome="failed", known_no_effect=True,
+    )
+    assert lifecycle.replay("run-1").status == "cancelled"
+
+
+def test_cancellation_races_route_acceptance_without_post_cancel_admission(tmp_path):
+    path = tmp_path / "cancel-admission-race.db"
+    seed = SQLiteEventStore(path)
+    reg, config, _, manifest = run_setup(seed)
+    pair = routed_pair(reg, config, manifest)
+    seed.close()
+    barrier = Barrier(2)
+
+    def accept_route():
+        connection = SQLiteEventStore(path)
+        try:
+            barrier.wait()
+            try:
+                accept(scheduler(connection), *pair)
+                return "accepted"
+            except LifecycleError:
+                return "rejected"
+        finally:
+            connection.close()
+
+    def cancel_run():
+        connection = SQLiteEventStore(path)
+        try:
+            barrier.wait()
+            return LifecycleController(connection).request_cancel(
+                "run-1", reason_code="race_cancel"
+            ).status
+        finally:
+            connection.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        route_result = pool.submit(accept_route)
+        cancel_result = pool.submit(cancel_run)
+        route_status = route_result.result()
+        cancel_status = cancel_result.result()
+
+    check = SQLiteEventStore(path)
+    final_state = LifecycleController(check).replay("run-1")
+    assert cancel_status in {"cancelling", "cancelled"}
+    assert final_state.status in {"cancelling", "cancelled"}
+    if final_state.status == "cancelling":
+        assert route_status == "accepted"
+        assert final_state.node("node-1").status == "running"
+    else:
+        assert route_status == "rejected"
+        assert final_state.node("node-1").status == "cancelled"
 
 
 def test_route_acceptance_atomically_reserves_budget_slots_and_fences_attempt(tmp_path):

@@ -431,6 +431,7 @@ class Scheduler:
                 causation_id=decision_hash,
                 outcome=outcome,
             )
+            self.lifecycle.complete_cancellation_if_idle(run_id)
             return [
                 EventDraft(
                     "AttemptSlotReleased",
@@ -441,6 +442,114 @@ class Scheduler:
                     fencing_generation=fencing_generation,
                     correlation_id=run_id,
                     causation_id=decision_hash,
+                )
+            ]
+
+        self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
+
+    def acknowledge_cancellation(
+        self,
+        *,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        fencing_generation: int,
+        stopped_at: datetime,
+        stop_receipt_hash: str,
+        usage: UsageRecord | None = None,
+        no_effect_receipt_hash: str | None = None,
+    ) -> None:
+        """Release an attempt only after a runtime supplies a stop receipt.
+
+        A local stop receipt alone cannot prove that a model provider incurred
+        no charge, so cancellation requires usage to settle or explicit proof
+        that no provider/tool effect occurred.
+        """
+
+        stopped_at = _aware(stopped_at, "stopped_at")
+        if usage is not None:
+            usage = revalidate_model(UsageRecord, usage)
+        if no_effect_receipt_hash is not None and (
+            not isinstance(no_effect_receipt_hash, str)
+            or not no_effect_receipt_hash.startswith("sha256:")
+            or len(no_effect_receipt_hash) != 71
+            or any(character not in "0123456789abcdef" for character in no_effect_receipt_hash[7:])
+        ):
+            raise SchedulerError("no-effect receipt hash must be a sha256 content hash")
+        if usage is not None and no_effect_receipt_hash is not None:
+            raise SchedulerError("usage and no-effect proof are mutually exclusive")
+        if usage is None and no_effect_receipt_hash is None:
+            raise SchedulerError("cancellation requires usage or an explicit no-effect proof")
+        attempt_ref = _attempt_ref(run_id, node_id, attempt_id)
+        op_payload = {
+            "attempt_ref": attempt_ref,
+            "run_id": run_id,
+            "node_id": node_id,
+            "attempt_id": attempt_id,
+            "fencing_generation": fencing_generation,
+            "stopped_at": stopped_at.isoformat(),
+            "stop_receipt_hash": stop_receipt_hash,
+            "usage_hash": None if usage is None else _hash(usage.model_dump(mode="json")),
+            "no_effect_receipt_hash": no_effect_receipt_hash,
+        }
+        key = f"cancel-ack:{attempt_ref}"
+
+        def decide(events: list[StoredEvent], version: int):
+            prior = next((item for item in events if item.idempotency_key == key), None)
+            if prior is not None:
+                if prior.event_type != "AttemptSlotReleased" or dict(prior.payload) != op_payload:
+                    raise SchedulerError("attempt cancellation idempotency key was reused")
+                return None
+            accepted = _active_acceptance(events, attempt_ref)
+            if accepted is None or accepted.payload.get("run_id") != run_id:
+                raise LifecycleConflict("attempt is not holding an active scheduler lease")
+            if accepted.fencing_generation != fencing_generation:
+                raise LifecycleConflict("cancellation receipt is from a stale fencing generation")
+            if stopped_at < datetime.fromisoformat(accepted.payload["accepted_at"]):
+                raise LifecycleConflict("cancellation receipt precedes attempt acceptance")
+            if stopped_at >= datetime.fromisoformat(accepted.payload["lease_expires_at"]):
+                raise LifecycleConflict("expired attempt must be reconciled, not cancelled")
+            state = self.lifecycle.replay(run_id)
+            if state.status != "cancelling":
+                raise SchedulerError("cancellation acknowledgement requires a cancelling Run")
+            cancellation_event = next(
+                event for event in reversed(self.event_store.read_stream("run_lifecycle", run_id))
+                if event.event_type == "RunCancellationRequested"
+            )
+            reservation_id = accepted.payload["reservation_id"]
+            ledger = self._ledger_for_run(run_id)
+            if usage is not None:
+                _validate_usage(usage, run_id=run_id, reservation_id=reservation_id)
+                ledger.commit_usage(
+                    reservation_id, usage, settlement_key=usage.settlement_key, run_id=run_id
+                )
+            elif no_effect_receipt_hash is not None:
+                ledger.release(reservation_id, run_id=run_id, reason="attempt_cancelled_no_effect")
+            else:
+                raise SchedulerError("cancellation has neither usage nor a no-effect receipt")
+            self.lifecycle.record_attempt_cancelled(
+                run_id,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                fencing_generation=fencing_generation,
+                stop_receipt_hash=stop_receipt_hash,
+                causation_id=cancellation_event.event_id,
+            )
+            self.agents.cancel_attempt(
+                run_id,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                agent_instance_id=accepted.payload["agent_instance_id"],
+                fencing_generation=fencing_generation,
+                causation_id=cancellation_event.event_id,
+            )
+            self.lifecycle.complete_cancellation_if_idle(run_id)
+            return [
+                EventDraft(
+                    "AttemptSlotReleased", op_payload,
+                    run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                    fencing_generation=fencing_generation, correlation_id=run_id,
+                    causation_id=cancellation_event.event_id,
                 )
             ]
 
@@ -583,6 +692,7 @@ class Scheduler:
                 causation_id=decision_hash,
                 outcome=outcome,
             )
+            self.lifecycle.complete_cancellation_if_idle(run_id)
             return [
                 EventDraft(
                     "AttemptSlotReleased",

@@ -16,6 +16,8 @@ from .models import AttemptState, NodeSpec, NodeState, RunLifecycleState
 
 _LIFECYCLE_STREAM = "run_lifecycle"
 _RUN_STREAM = "run"
+_HASH = r"^sha256:[0-9a-f]{64}$"
+_IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$"
 
 
 class LifecycleError(RuntimeError):
@@ -29,6 +31,10 @@ class LifecycleConflict(LifecycleError):
 def _hash(value: object) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _valid_identifier(value: str) -> bool:
+    return isinstance(value, str) and re.fullmatch(_IDENTIFIER, value) is not None
 
 
 class LifecycleController:
@@ -148,6 +154,127 @@ class LifecycleController:
     def resume_run(self, run_id: str) -> RunLifecycleState:
         return self._run_transition(run_id, "RunResumed", "resume", reason_code=None)
 
+    def await_user(
+        self,
+        run_id: str,
+        *,
+        request_id: str,
+        reason_code: str,
+        context_hash: str,
+    ) -> RunLifecycleState:
+        if not _valid_identifier(request_id):
+            raise ValueError("request_id must be a stable identifier")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason_code):
+            raise ValueError("reason_code must be a stable lowercase code")
+        if not re.fullmatch(_HASH, context_hash):
+            raise ValueError("context_hash must be a sha256 content hash")
+        payload = {
+            "run_id": run_id,
+            "request_id": request_id,
+            "reason_code": reason_code,
+            "context_hash": context_hash,
+        }
+        key = f"run-awaiting-user:{run_id}:{request_id}"
+
+        def decide(events: list[StoredEvent], version: int):
+            if any(event.idempotency_key == key for event in events):
+                _check_idempotent(events, key, "RunAwaitingUser", payload)
+                return None
+            state = reduce_lifecycle(run_id, events)
+            if state.status != "running":
+                raise LifecycleError("only a running Run can await user input")
+            return [
+                EventDraft(
+                    "RunAwaitingUser", payload, run_id=run_id,
+                    correlation_id=run_id, causation_id=_hash(payload),
+                )
+            ]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.replay(run_id)
+
+    def record_user_response(
+        self, run_id: str, *, request_id: str, response_hash: str
+    ) -> RunLifecycleState:
+        if not _valid_identifier(request_id):
+            raise ValueError("request_id must be a stable identifier")
+        if not re.fullmatch(_HASH, response_hash):
+            raise ValueError("response_hash must be a sha256 content hash")
+        payload = {"run_id": run_id, "request_id": request_id, "response_hash": response_hash}
+        key = f"run-user-response:{run_id}:{request_id}"
+
+        def decide(events: list[StoredEvent], version: int):
+            if any(event.idempotency_key == key for event in events):
+                _check_idempotent(events, key, "RunUserResponseReceived", payload)
+                return None
+            state = reduce_lifecycle(run_id, events)
+            if state.status != "awaiting_user" or state.awaiting_user_request_id != request_id:
+                raise LifecycleConflict("user response does not match the outstanding request")
+            return [
+                EventDraft(
+                    "RunUserResponseReceived", payload, run_id=run_id,
+                    correlation_id=run_id, causation_id=response_hash,
+                )
+            ]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.replay(run_id)
+
+    def request_cancel(self, run_id: str, *, reason_code: str) -> RunLifecycleState:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason_code):
+            raise ValueError("reason_code must be a stable lowercase code")
+        payload = {"run_id": run_id, "reason_code": reason_code}
+        key = f"run-cancel-request:{run_id}"
+
+        def decide(events: list[StoredEvent], version: int):
+            if any(event.idempotency_key == key for event in events):
+                _check_idempotent(events, key, "RunCancellationRequested", payload)
+                return None
+            state = reduce_lifecycle(run_id, events)
+            if state.status not in {"created", "running", "paused", "awaiting_user"}:
+                raise LifecycleError("only a non-terminal Run can request cancellation")
+            return [
+                EventDraft(
+                    "RunCancellationRequested", payload, run_id=run_id,
+                    correlation_id=run_id, causation_id=_hash(payload),
+                )
+            ]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.complete_cancellation_if_idle(run_id)
+
+    def complete_cancellation_if_idle(self, run_id: str) -> RunLifecycleState:
+        state = self.replay(run_id)
+        if state.status != "cancelling" or any(
+            node.status in {"running", "awaiting_reconciliation"} for node in state.nodes
+        ):
+            return state
+        request_event = next(
+            event for event in reversed(self.event_store.read_stream(_LIFECYCLE_STREAM, run_id))
+            if event.event_type == "RunCancellationRequested"
+        )
+        payload = {"run_id": run_id, "cancellation_request_id": request_event.event_id}
+        key = f"run-cancel-complete:{run_id}"
+
+        def decide(events: list[StoredEvent], version: int):
+            if any(event.idempotency_key == key for event in events):
+                _check_idempotent(events, key, "RunCancelled", payload)
+                return None
+            current = reduce_lifecycle(run_id, events)
+            if current.status != "cancelling" or any(
+                node.status in {"running", "awaiting_reconciliation"} for node in current.nodes
+            ):
+                raise LifecycleConflict("Run still has attempts requiring termination or reconciliation")
+            return [
+                EventDraft(
+                    "RunCancelled", payload, run_id=run_id,
+                    correlation_id=run_id, causation_id=request_event.event_id,
+                )
+            ]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.replay(run_id)
+
     def _run_transition(
         self, run_id: str, event_type: str, operation: str, *, reason_code: str | None
     ) -> RunLifecycleState:
@@ -261,6 +388,53 @@ class LifecycleController:
             causation_id=causation_id,
         )
 
+    def record_attempt_cancelled(
+        self,
+        run_id: str,
+        *,
+        node_id: str,
+        attempt_id: str,
+        fencing_generation: int,
+        stop_receipt_hash: str,
+        causation_id: str,
+    ) -> RunLifecycleState:
+        if not re.fullmatch(_HASH, stop_receipt_hash):
+            raise ValueError("stop_receipt_hash must be a sha256 content hash")
+        payload = {
+            "node_id": node_id,
+            "attempt_id": attempt_id,
+            "outcome": "cancelled",
+            "stop_receipt_hash": stop_receipt_hash,
+        }
+        key = f"attempt-cancelled:{attempt_id}"
+
+        def decide(events: list[StoredEvent], version: int):
+            if any(event.idempotency_key == key for event in events):
+                _check_idempotent(events, key, "AttemptCancelled", payload)
+                return None
+            state = reduce_lifecycle(run_id, events)
+            if state.status != "cancelling":
+                raise LifecycleError("attempt cancellation requires a cancelling Run")
+            node = state.node(node_id)
+            active = _active_attempt(node)
+            if (
+                active is None or active.attempt_id != attempt_id
+                or active.fencing_generation != fencing_generation
+                or active.status != "accepted"
+            ):
+                raise LifecycleConflict("cancellation receipt is stale or attempt is not active")
+            return [
+                EventDraft(
+                    "AttemptCancelled", payload, run_id=run_id,
+                    node_id=node_id, attempt_id=attempt_id,
+                    fencing_generation=fencing_generation, correlation_id=run_id,
+                    causation_id=causation_id,
+                )
+            ]
+
+        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
+        return self.replay(run_id)
+
     def _record_attempt_end(
         self,
         run_id: str,
@@ -318,6 +492,7 @@ def reduce_lifecycle(run_id: str, events: list[StoredEvent]) -> RunLifecycleStat
     if first.get("run_id") != run_id:
         raise LifecycleError("RunInitialized identity does not match its stream")
     status: str = "created"
+    awaiting_user_request_id: str | None = None
     config_hash = first.get("config_hash")
     registry_hash = first.get("registry_hash")
     graph_version = 0
@@ -369,6 +544,56 @@ def reduce_lifecycle(run_id: str, events: list[StoredEvent]) -> RunLifecycleStat
             if status != "paused":
                 raise LifecycleError("invalid RunResumed transition")
             status = "running"
+        elif event.event_type == "RunAwaitingUser":
+            if status != "running" or event.run_id != run_id:
+                raise LifecycleError("invalid RunAwaitingUser transition or event identity")
+            request_id = payload.get("request_id")
+            if not _valid_identifier(request_id) or not re.fullmatch(
+                r"[a-z][a-z0-9_]{0,63}", str(payload.get("reason_code", ""))
+            ) or not re.fullmatch(_HASH, str(payload.get("context_hash", ""))):
+                raise LifecycleError("RunAwaitingUser request metadata is invalid")
+            if event.causation_id != _hash(payload):
+                raise LifecycleError("RunAwaitingUser causal hash is invalid")
+            status = "awaiting_user"
+            awaiting_user_request_id = request_id
+        elif event.event_type == "RunUserResponseReceived":
+            if (
+                status != "awaiting_user"
+                or event.run_id != run_id
+                or payload.get("request_id") != awaiting_user_request_id
+                or not re.fullmatch(_HASH, str(payload.get("response_hash", "")))
+                or event.causation_id != payload.get("response_hash")
+            ):
+                raise LifecycleConflict("RunUserResponseReceived does not match the outstanding request")
+            status = "running"
+            awaiting_user_request_id = None
+        elif event.event_type == "RunCancellationRequested":
+            if status not in {"created", "running", "paused", "awaiting_user"}:
+                raise LifecycleError("invalid RunCancellationRequested transition")
+            if (
+                event.run_id != run_id
+                or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", str(payload.get("reason_code", "")))
+                or event.causation_id != _hash(payload)
+            ):
+                raise LifecycleError("RunCancellationRequested metadata is invalid")
+            status = "cancelling"
+            awaiting_user_request_id = None
+        elif event.event_type == "RunCancelled":
+            request_event_id = payload.get("cancellation_request_id")
+            if status != "cancelling" or event.run_id != run_id or not any(
+                item.event_type == "RunCancellationRequested" and item.event_id == request_event_id
+                for item in events[: event.stream_version - 1]
+            ) or event.causation_id != request_event_id:
+                raise LifecycleError("invalid RunCancelled transition or request reference")
+            if any(node.status in {"running", "awaiting_reconciliation"} for node in nodes.values()):
+                raise LifecycleError("RunCancelled cannot abandon an active or unknown attempt")
+            nodes = {
+                node_id: node.model_copy(update={
+                    "status": "cancelled" if node.status in {"blocked", "ready"} else node.status
+                })
+                for node_id, node in nodes.items()
+            }
+            status = "cancelled"
         elif event.event_type == "AttemptAccepted":
             if status != "running":
                 raise LifecycleError("attempt accepted while Run is not running")
@@ -395,7 +620,7 @@ def reduce_lifecycle(run_id: str, events: list[StoredEvent]) -> RunLifecycleStat
             ):
                 raise LifecycleError("persisted attempt ID is duplicated in the Run")
             nodes[node_id] = node.model_copy(update={"status": "running", "attempts": (*node.attempts, attempt)})
-        elif event.event_type in {"AttemptCompleted", "AttemptReconciled"}:
+        elif event.event_type in {"AttemptCompleted", "AttemptReconciled", "AttemptCancelled"}:
             node_id = payload.get("node_id")
             node = nodes.get(node_id)
             if node is None:
@@ -408,7 +633,7 @@ def reduce_lifecycle(run_id: str, events: list[StoredEvent]) -> RunLifecycleStat
             outcome = payload.get("outcome")
             if event.run_id != run_id or event.node_id != node_id:
                 raise LifecycleError("attempt result event context disagrees with its payload")
-            if event.event_type == "AttemptCompleted" and active.status != "accepted":
+            if event.event_type in {"AttemptCompleted", "AttemptCancelled"} and active.status != "accepted":
                 raise LifecycleError("only an accepted attempt may complete")
             if event.event_type == "AttemptReconciled" and active.status != "outcome_unknown":
                 raise LifecycleError("only an unknown outcome may be reconciled")
@@ -418,6 +643,12 @@ def reduce_lifecycle(run_id: str, events: list[StoredEvent]) -> RunLifecycleStat
                 raise LifecycleError("AttemptCompleted has an invalid outcome")
             if event.event_type == "AttemptReconciled" and outcome not in {"succeeded", "failed"}:
                 raise LifecycleError("AttemptReconciled has an invalid outcome")
+            if event.event_type == "AttemptCancelled" and (
+                status != "cancelling"
+                or outcome != "cancelled"
+                or not re.fullmatch(_HASH, str(payload.get("stop_receipt_hash", "")))
+            ):
+                raise LifecycleError("AttemptCancelled requires a valid stop receipt during cancellation")
             end_status = "outcome_unknown" if outcome == "outcome_unknown" else outcome
             updated_attempt = active.model_copy(update={"status": end_status})
             attempts = (*node.attempts[:-1], updated_attempt)
@@ -425,6 +656,8 @@ def reduce_lifecycle(run_id: str, events: list[StoredEvent]) -> RunLifecycleStat
                 node_status = "awaiting_reconciliation"
             elif outcome == "succeeded":
                 node_status = "succeeded"
+            elif outcome == "cancelled":
+                node_status = "cancelled"
             elif len(attempts) < node.spec.max_attempts:
                 node_status = "ready"
             else:
@@ -450,6 +683,7 @@ def reduce_lifecycle(run_id: str, events: list[StoredEvent]) -> RunLifecycleStat
     return RunLifecycleState(
         run_id=run_id,
         status=status,
+        awaiting_user_request_id=awaiting_user_request_id,
         config_hash=config_hash,
         registry_hash=registry_hash,
         graph_version=graph_version,

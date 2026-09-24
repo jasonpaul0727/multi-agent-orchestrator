@@ -100,8 +100,9 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 - [x] 在一个 SQLite 事务边界内接纳 RoutingDecision、预算最坏情况预留、并发 slot、attempt lease 与节点运行转换；失败注入验证回滚，多连接 CAS 验证互斥。
 - [x] 实现 Agent Registry 的累计 Agent 数、父子深度、活动/未知结果计数和上限；重试/改名/结束不得重置累计限制。
 - [x] 将所选 reasoning effort 纳入路由决策、Attempt、Agent 实例和 Gateway accepted route 的完整性绑定。
-- [x] 实现 Run 暂停/恢复、事件重放及 terminal Run 状态派生。
-- [ ] 实现取消、等待用户、检查点、快照失效回退、崩溃恢复及 terminal Run 的全部控制限制。
+- [x] 实现 Run 暂停/恢复/等待用户，显式响应哈希解除等待。
+- [x] 实现 Run 取消门控：先拒绝新调度；只有活动 Attempt 收到停止回执且预算已结算/证明无副作用后才可释放；OutcomeUnknown 仍要求核对。
+- [ ] 实现自动检查点、快照失效回退和跨生命周期/Agent/预算/租约的完整崩溃恢复；当前取消 API 未连接真实 Worker/OS 终止器。
 - [ ] 实现失败分类/指纹、与 Recovery Controller 集成的有界重试阶梯和熔断。
 - [x] 实现 `OutcomeUnknown`/`AwaitingReconciliation`，显式对账前不释放预算与并发资源。
 

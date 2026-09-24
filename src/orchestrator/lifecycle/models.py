@@ -78,7 +78,7 @@ class AttemptState(_LifecycleModel):
     provider_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER)
     reservation_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER)
     lease_expires_at: StrictStr = Field(min_length=1)
-    status: Literal["accepted", "succeeded", "failed", "outcome_unknown"]
+    status: Literal["accepted", "succeeded", "failed", "outcome_unknown", "cancelled"]
 
     @field_validator("lease_expires_at")
     @classmethod
@@ -95,7 +95,7 @@ class AttemptState(_LifecycleModel):
 class NodeState(_LifecycleModel):
     spec: NodeSpec
     status: Literal[
-        "blocked", "ready", "running", "awaiting_reconciliation", "succeeded", "failed"
+        "blocked", "ready", "running", "awaiting_reconciliation", "succeeded", "failed", "cancelled"
     ]
     attempts: tuple[AttemptState, ...] = ()
 
@@ -109,7 +109,11 @@ class NodeState(_LifecycleModel):
 
 class RunLifecycleState(_LifecycleModel):
     run_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER)
-    status: Literal["created", "running", "paused", "succeeded", "failed", "cancelled"]
+    status: Literal[
+        "created", "running", "paused", "awaiting_user", "cancelling",
+        "succeeded", "failed", "cancelled",
+    ]
+    awaiting_user_request_id: StrictStr | None = Field(default=None, pattern=_IDENTIFIER)
     config_hash: StrictStr = Field(pattern=_HASH)
     registry_hash: StrictStr = Field(pattern=_HASH)
     graph_version: StrictInt = Field(ge=0)
