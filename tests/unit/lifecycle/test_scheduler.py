@@ -2,6 +2,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import multiprocessing
+import os
 from threading import Barrier
 
 import pytest
@@ -915,6 +917,63 @@ def test_run_recovery_sanitizes_unexpected_storage_failures(tmp_path, monkeypatc
     with pytest.raises(RunRecoveryError, match="durable-state invariant") as error:
         RunRecoveryCoordinator(store).recover("run-1")
     assert "secret-token" not in str(error.value)
+
+
+def test_run_recovery_survives_process_death_before_and_after_acceptance_commit(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("the crash-injection harness currently requires fork")
+
+    def die_in_child(database, request, decision, crash_point):
+        child_store = SQLiteEventStore(database)
+        control = scheduler(child_store)
+        if crash_point == "before_commit":
+            register_attempt = control.agents.register_attempt
+
+            def register_then_die(*args, **kwargs):
+                register_attempt(*args, **kwargs)
+                os._exit(73)
+
+            control.agents.register_attempt = register_then_die
+        accept(control, request, decision)
+        # Models a lost IPC response after the SQLite transaction committed.
+        os._exit(73)
+
+    for crash_point in ("before_commit", "after_commit"):
+        database = tmp_path / f"run-recovery-{crash_point}.db"
+        store = SQLiteEventStore(database)
+        reg, config, _, manifest = run_setup(store)
+        request, decision = routed_pair(reg, config, manifest)
+        store.close()
+
+        process = multiprocessing.get_context("fork").Process(
+            target=die_in_child,
+            args=(str(database), request, decision, crash_point),
+        )
+        process.start()
+        process.join(timeout=20)
+        if process.is_alive():
+            process.kill()
+            process.join()
+            pytest.fail(f"child process timed out at crash point {crash_point}")
+        assert process.exitcode == 73
+
+        reopened = SQLiteEventStore(database)
+        recovered = RunRecoveryCoordinator(reopened).recover("run-1")
+        control = scheduler(reopened)
+        if crash_point == "before_commit":
+            assert recovered.lifecycle.node("node-1").attempts == ()
+            assert recovered.agents.total_created == 0
+            assert recovered.budget.reserved_minor == 0
+            assert recovered.active_attempts == ()
+        else:
+            assert len(recovered.lifecycle.node("node-1").attempts) == 1
+            assert recovered.agents.total_created == 1
+            assert recovered.budget.reserved_minor == 20
+            assert len(recovered.active_attempts) == 1
+            repeated = accept(control, request, decision)
+            assert repeated.accepted_route.attempt_id == request.attempt_id
+            assert len(reopened.read_stream("scheduler", "global")) == 1
+            assert len(reopened.read_stream("budget", "run-1")) == 1
 
 
 def test_route_acceptance_fails_closed_when_replayed_streams_disagree(tmp_path):

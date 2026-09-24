@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-持久化、预算、观测与验证底座及 P1 配置阶段已完成；P2 Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件驱动健康熔断/ProbeLease CAS、Recovery Controller、三种 Provider codec 与受限 HTTPS transport 已实现。P3 已有 Run/Node/Attempt、追加式 DAG、Agent Registry 累计数量/深度与原子路由接纳；Run 等待用户/取消门控和生命周期检查点/尾部重放也已实现。新增只读 Run Recovery Coordinator，重放并核对生命周期、Agent Registry、预算预留和 scheduler lease；新路由接纳前进行一致性检查，分裂状态 fail-closed。恢复器保留活动/未知 lease，不猜测结果、不释放占用、不重派工作；effect/artifact 跨流恢复和多进程中断矩阵仍未完成，取消回执也尚无真实 Worker/OS 终止器验证。完整产品目前仍不可交付：P3 失败分类/有界重试与全恢复验收缺失；P4 OS 隔离/Tool Gateway/Secret Broker/Approval、P5 Worker/Verifier、P6 CLI/MCP、P7 E2E/安全验收与基准证据均未完成。Provider Gateway 默认没有凭据 Broker，在线调用会 fail-closed。本次 P3 一致性恢复切片：全量 416 项测试通过；总覆盖率 90.02%（项目门槛 90%）通过；`compileall`、`pip check`、sdist/wheel 构建及 `git diff --check` 通过。Maestro 成本、Token 和重复工作改善目标仍未有基准证据。
+持久化、预算、观测与验证底座及 P1 配置阶段已完成；P2 Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件驱动健康熔断/ProbeLease CAS、Recovery Controller、三种 Provider codec 与受限 HTTPS transport 已实现。P3 已有 Run/Node/Attempt、追加式 DAG、Agent Registry 累计数量/深度与原子路由接纳；Run 等待用户/取消门控和生命周期检查点/尾部重放也已实现。新增只读 Run Recovery Coordinator，重放并核对生命周期、Agent Registry、预算预留和 scheduler lease；新路由接纳前进行一致性检查，分裂状态 fail-closed。真实子进程故障注入验证接纳提交前的全事务回滚和提交后丢响应的恢复/幂等重放。恢复器保留活动/未知 lease，不猜测结果、不释放占用、不重派工作；effect/artifact 跨流恢复和完整多进程中断矩阵仍未完成，取消回执也尚无真实 Worker/OS 终止器验证。完整产品目前仍不可交付：P3 失败分类/有界重试与全恢复验收缺失；P4 OS 隔离/Tool Gateway/Secret Broker/Approval、P5 Worker/Verifier、P6 CLI/MCP、P7 E2E/安全验收与基准证据均未完成。Provider Gateway 默认没有凭据 Broker，在线调用会 fail-closed。本次 P3 一致性恢复切片：全量 417 项测试通过；总覆盖率 90.02%（项目门槛 90%）通过；`compileall`、`pip check`、sdist/wheel 构建及 `git diff --check` 通过。Maestro 成本、Token 和重复工作改善目标仍未有基准证据。
 
 ## 产品目标
 

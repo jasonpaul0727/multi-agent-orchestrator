@@ -103,8 +103,8 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 - [x] 实现 Run 暂停/恢复/等待用户，显式响应哈希解除等待。
 - [x] 实现 Run 取消门控：先拒绝新调度；只有活动 Attempt 收到停止回执且预算已结算/证明无副作用后才可释放；OutcomeUnknown 仍要求核对。
 - [x] lifecycle 初始化/图/Run/Attempt 边界自动检查点；重启优先校验快照 hash/schema/version/source-event anchor，再重放尾部；失效快照回退完整事件流。
-- [x] 增加只读 Run Recovery Coordinator，重放并交叉核对生命周期、Agent Registry、预算预留、scheduler lease/结果；新路由接纳前先运行一致性检查，发现分裂状态即 fail-closed。重启恢复只返回活动/未知 lease，不猜测结果、不释放资源、不重派工作。
-- [ ] 将 effect/artifact stream 纳入统一 Run Recovery Coordinator，并通过多进程中断矩阵验证跨流事务/崩溃窗口；接入能验证进程终止回执的真实 Worker/OS 终止器。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
+- [x] 增加只读 Run Recovery Coordinator，重放并交叉核对生命周期、Agent Registry、预算预留、scheduler lease/结果；新路由接纳前先运行一致性检查，发现分裂状态即 fail-closed。真实子进程中分别在接纳事务提交前、提交后丢响应并重开数据库，验证完整回滚、确定性重建和幂等重放。恢复器只返回活动/未知 lease，不猜测结果、不释放资源、不重派工作。
+- [ ] 将 effect/artifact stream 纳入统一 Run Recovery Coordinator，并扩展多进程中断矩阵覆盖每个跨流事务/副作用窗口；接入能验证进程终止回执的真实 Worker/OS 终止器。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
 - [ ] 实现失败分类/指纹、与 Recovery Controller 集成的有界重试阶梯和熔断。
 - [x] 实现 `OutcomeUnknown`/`AwaitingReconciliation`，显式对账前不释放预算与并发资源。
 
