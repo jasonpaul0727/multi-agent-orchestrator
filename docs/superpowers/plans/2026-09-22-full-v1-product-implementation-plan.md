@@ -102,7 +102,8 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 - [x] 将所选 reasoning effort 纳入路由决策、Attempt、Agent 实例和 Gateway accepted route 的完整性绑定。
 - [x] 实现 Run 暂停/恢复/等待用户，显式响应哈希解除等待。
 - [x] 实现 Run 取消门控：先拒绝新调度；只有活动 Attempt 收到停止回执且预算已结算/证明无副作用后才可释放；OutcomeUnknown 仍要求核对。
-- [ ] 实现自动检查点、快照失效回退和跨生命周期/Agent/预算/租约的完整崩溃恢复；当前取消 API 未连接真实 Worker/OS 终止器。
+- [x] lifecycle 初始化/图/Run/Attempt 边界自动检查点；重启优先校验快照 hash/schema/version/source-event anchor，再重放尾部；失效快照回退完整事件流。
+- [ ] 将 Agent Registry、预算、租约、副作用和 artifact 状态纳入 Run Recovery Coordinator，并通过多进程中断矩阵验证；当前取消 API 未连接真实 Worker/OS 终止器。
 - [ ] 实现失败分类/指纹、与 Recovery Controller 集成的有界重试阶梯和熔断。
 - [x] 实现 `OutcomeUnknown`/`AwaitingReconciliation`，显式对账前不释放预算与并发资源。
 

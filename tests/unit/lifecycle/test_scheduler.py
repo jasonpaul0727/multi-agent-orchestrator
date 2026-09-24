@@ -345,6 +345,81 @@ def test_run_lifecycle_rejects_invalid_transitions_and_freezes_graph_versions(tm
     assert controller.resume_run("run-1").status == "running"
 
 
+def test_lifecycle_replays_event_tail_from_checkpoint_after_checkpoint_write_failure(
+    tmp_path, monkeypatch
+):
+    store = SQLiteEventStore(tmp_path / "lifecycle-tail-replay.db")
+    _, _, lifecycle, _ = run_setup(store)
+    checkpoint_before = lifecycle.snapshots.load_valid("run_lifecycle", "run-1")
+    assert checkpoint_before is not None
+
+    def fail_checkpoint(*args, **kwargs):
+        raise OSError("simulated checkpoint interruption")
+
+    monkeypatch.setattr(lifecycle.snapshots, "save_snapshot", fail_checkpoint)
+    with pytest.raises(OSError, match="checkpoint interruption"):
+        lifecycle.pause_run("run-1", reason_code="user_request")
+    monkeypatch.undo()
+
+    applied = []
+    from orchestrator.lifecycle import controller as lifecycle_module
+
+    original_apply = lifecycle_module.apply_lifecycle_event
+
+    def count_tail_events(run_id, state, event):
+        applied.append(event.event_type)
+        return original_apply(run_id, state, event)
+
+    monkeypatch.setattr(lifecycle_module, "apply_lifecycle_event", count_tail_events)
+    state = lifecycle.replay("run-1")
+    assert state.status == "paused"
+    assert applied == ["RunPaused"]
+    latest_checkpoint = lifecycle.snapshots.load_valid("run_lifecycle", "run-1")
+    assert latest_checkpoint is not None
+    assert latest_checkpoint.event_version == checkpoint_before.event_version
+
+
+def test_lifecycle_replay_discards_invalid_checkpoint_and_rebuilds_full_stream(tmp_path):
+    store = SQLiteEventStore(tmp_path / "lifecycle-invalid-snapshot.db")
+    _, _, lifecycle, _ = run_setup(store)
+    expected = lifecycle.replay("run-1")
+    store._connection.execute(
+        "UPDATE snapshots SET source_event_id = ? WHERE aggregate_type = ? AND aggregate_id = ?",
+        ("not-the-anchored-event", "run_lifecycle", "run-1"),
+    )
+
+    recovered = lifecycle.replay("run-1")
+
+    assert recovered == expected
+    assert lifecycle.snapshots.load_valid("run_lifecycle", "run-1") is None
+    assert lifecycle.checkpoint("run-1") == expected
+    assert lifecycle.snapshots.load_valid("run_lifecycle", "run-1") is not None
+
+
+def test_lifecycle_checkpoint_is_used_after_database_reopen(tmp_path, monkeypatch):
+    path = tmp_path / "lifecycle-restart.db"
+    store = SQLiteEventStore(path)
+    _, _, lifecycle, _ = run_setup(store)
+    expected = lifecycle.pause_run("run-1", reason_code="user_request")
+    store.close()
+
+    reopened = SQLiteEventStore(path)
+    recovered = LifecycleController(reopened)
+    applied = []
+    from orchestrator.lifecycle import controller as lifecycle_module
+
+    original_apply = lifecycle_module.apply_lifecycle_event
+
+    def count_replayed_events(run_id, state, event):
+        applied.append(event.event_type)
+        return original_apply(run_id, state, event)
+
+    monkeypatch.setattr(lifecycle_module, "apply_lifecycle_event", count_replayed_events)
+    assert recovered.replay("run-1") == expected
+    assert applied == []
+    reopened.close()
+
+
 def test_awaiting_user_freezes_scheduling_until_hashed_response(tmp_path):
     store = SQLiteEventStore(tmp_path / "awaiting-user.db")
     reg, config, lifecycle, manifest = run_setup(store)
@@ -784,21 +859,28 @@ def test_provider_run_and_tool_concurrency_slots_are_bounded(tmp_path, scope, me
 
 def test_failure_after_nested_budget_reservation_rolls_back_every_stream(tmp_path, monkeypatch):
     store = SQLiteEventStore(tmp_path / "rollback.db")
-    reg, config, _, manifest = run_setup(store)
+    reg, config, lifecycle, manifest = run_setup(store)
     request, decision = routed_pair(reg, config, manifest)
     control = scheduler(store)
     original_append = store.append
+    baseline_lifecycle = store.read_stream("run_lifecycle", "run-1")
+    baseline_checkpoint = lifecycle.snapshots.load_valid("run_lifecycle", "run-1")
+    assert baseline_checkpoint is not None
 
-    def fail_lifecycle_append(stream_type, *args, **kwargs):
-        if stream_type == "run_lifecycle":
-            raise RuntimeError("injected lifecycle append failure")
+    def fail_scheduler_append(stream_type, *args, **kwargs):
+        if stream_type == "scheduler":
+            raise RuntimeError("injected scheduler append failure")
         return original_append(stream_type, *args, **kwargs)
 
-    monkeypatch.setattr(store, "append", fail_lifecycle_append)
+    monkeypatch.setattr(store, "append", fail_scheduler_append)
     with pytest.raises(RuntimeError, match="injected"):
         accept(control, request, decision)
     assert store.read_stream("budget", "run-1") == []
     assert store.read_stream("scheduler", "global") == []
+    assert store.read_stream("agent_registry", "run-1") == []
+    assert store.read_stream("run_lifecycle", "run-1") == baseline_lifecycle
+    unchanged_checkpoint = lifecycle.snapshots.load_valid("run_lifecycle", "run-1")
+    assert unchanged_checkpoint == baseline_checkpoint
     monkeypatch.undo()
     assert LifecycleController(store).replay("run-1").node("node-1").status == "ready"
 
@@ -1324,7 +1406,8 @@ def test_lifecycle_boundary_models_reject_unstable_collections_and_ids():
     with pytest.raises(ValueError, match="must be an array"):
         RunLifecycleState(
             run_id="run", status="created", config_hash=HASH, registry_hash=HASH,
-            graph_version=0, event_version=1, nodes="not-an-array",
+            max_nodes=1, max_depth=0, graph_version=0, event_version=1,
+            nodes="not-an-array",
         )
     with pytest.raises(ValueError):
         AgentRegistryLimits(max_total_agents=1, max_depth=-1, max_concurrent_agents=1)

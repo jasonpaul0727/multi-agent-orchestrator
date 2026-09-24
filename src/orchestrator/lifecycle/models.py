@@ -114,8 +114,11 @@ class RunLifecycleState(_LifecycleModel):
         "succeeded", "failed", "cancelled",
     ]
     awaiting_user_request_id: StrictStr | None = Field(default=None, pattern=_IDENTIFIER)
+    cancellation_request_event_id: StrictStr | None = None
     config_hash: StrictStr = Field(pattern=_HASH)
     registry_hash: StrictStr = Field(pattern=_HASH)
+    max_nodes: StrictInt = Field(gt=0)
+    max_depth: StrictInt = Field(ge=0)
     graph_version: StrictInt = Field(ge=0)
     event_version: StrictInt = Field(ge=1)
     nodes: tuple[NodeState, ...]

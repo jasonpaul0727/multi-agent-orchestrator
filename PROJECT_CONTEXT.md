@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-持久化、预算、观测与验证底座及 P1 配置阶段已完成；P2 Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件驱动健康熔断/ProbeLease CAS、Recovery Controller、三种 Provider codec 与受限 HTTPS transport 已实现。P3 首个控制平面切片已实现：Run/Node/Attempt 事件重放、追加式 DAG/版本校验、Agent Registry 累计数量/父子深度/活动与未知状态计数，以及将路由决策、预算预留、Agent 实例、并发 slot、fencing lease 原子接纳；路由决定中的 reasoning effort 会绑定到 Attempt、Agent 实例和 Gateway accepted route；过期 attempt 进入 OutcomeUnknown 并要求显式对账。Run 等待用户、取消门控与取消资源核算接口已加入：取消后拒绝新调度，仅在停止回执与 usage 结算或无副作用回执哈希被记录后终结 Attempt；Unknown 仍必须核对。回执来源尚无 Worker/隔离器验证，此接口不能替代实际进程终止。完整多 Agent 产品仍不可运行：P3 检查点与完整崩溃恢复仍待实现；P4 OS 隔离/Tool Gateway/Secret Broker/Approval、P5 Worker/Verifier、CLI/MCP 尚未实现。Provider Gateway 默认没有凭据 Broker，在线调用会 fail-closed。全量 408 项测试通过；小数两位严格覆盖率 90.10%，但产品仍未达交付标准。
+持久化、预算、观测与验证底座及 P1 配置阶段已完成；P2 Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件驱动健康熔断/ProbeLease CAS、Recovery Controller、三种 Provider codec 与受限 HTTPS transport 已实现。P3 首个控制平面切片已实现：Run/Node/Attempt 事件重放、追加式 DAG/版本校验、Agent Registry 累计数量/父子深度/活动与未知状态计数，以及将路由决策、预算预留、Agent 实例、并发 slot、fencing lease 原子接纳；路由决定中的 reasoning effort 会绑定到 Attempt、Agent 实例和 Gateway accepted route；过期 attempt 进入 OutcomeUnknown 并要求显式对账。Run 等待用户、取消门控与取消资源核算接口已加入：取消后拒绝新调度，仅在停止回执与 usage 结算或无副作用回执哈希被记录后终结 Attempt；Unknown 仍必须核对。回执来源尚无 Worker/隔离器验证，此接口不能替代实际进程终止。lifecycle 事件流现在自动写版本/源事件锚点快照，重启从有效快照重放尾部事件，哈希/锚点失效时退回全流重建；Agent Registry、预算、租约和副作用流尚未纳入同一个 Run Recovery Coordinator。完整多 Agent 产品仍不可运行：P3 跨流崩溃恢复仍待实现；P4 OS 隔离/Tool Gateway/Secret Broker/Approval、P5 Worker/Verifier、CLI/MCP 尚未实现。Provider Gateway 默认没有凭据 Broker，在线调用会 fail-closed。全量 411 项测试通过；小数两位严格覆盖率 90.04%，但产品仍未达交付标准。
 
 ## 产品目标
 
@@ -80,6 +80,6 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 ## 后续设计顺序
 
 1. 完成 P0 隔离后端可行性验证并形成明确的平台支持矩阵。
-2. 按 `docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md` 继续 P3：补齐生命周期快照/失效回退、跨 Run/预算/Registry/租约的恢复协调及恢复矩阵。
+2. 按 `docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md` 继续 P3：补齐跨 Run/预算/Registry/租约/副作用的恢复协调及多进程故障矩阵。
 3. P0/P4 实现并实测 OS 隔离、Tool Gateway、Secret Broker 和 Approval 后，再启用真实 Provider 调用及 Worker/Verifier。
 4. 完成 CLI/MCP 与端到端、安全验收，形成可运行且有证据链的 V1 闭环。

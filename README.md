@@ -85,6 +85,8 @@ P3 首个控制平面切片已实现：`LifecycleController` 将 Run 配置/Regi
 
 Run 可事件化进入 `awaiting_user`，只有带请求 ID 和响应哈希的显式回应才能恢复调度；取消先进入 `cancelling`，立即阻止新节点/Attempt 接纳。调度中的 Attempt 在外部运行时出具停止回执、并完成 usage 结算或提供无副作用回执哈希后才能标记 cancelled 和释放 slot；未知结果必须 reconciliation，不能用取消绕过不确定副作用。取消/等待用户目前只有控制平面状态机，不能替代尚未实现的隔离 Worker 进程终止。
 
+Run lifecycle 在初始化、图变更、Run 状态和 Attempt 变化后写入带版本/源事件锚点的快照；重放使用通过 schema/hash/version/anchor 校验的快照并应用后续事件。快照失效或锚点不符会被忽略并从完整 lifecycle 事件流重建。Agent Registry、预算账本、租约与副作用账本的跨流恢复协调仍待实现，所以当前快照能力不是完整 Run crash recovery。
+
 仍未实现：Policy 执行入口、OS 隔离、Tool Gateway、Secret Broker、Approval、Worker、Verifier、CLI 与 MCP Server。因此当前交付仍是可验证的控制与基础库切片，不是可执行的多 Agent 产品。
 
 ### 预算生命周期
