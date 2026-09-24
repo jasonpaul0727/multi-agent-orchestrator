@@ -119,6 +119,8 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 建议新增包：`orchestrator/isolation`、`orchestrator/tools`、`orchestrator/approvals`、`orchestrator/secrets`。
 
+2026-09-23 部分进展：已通过实测 `SystemdReadOnlyLauncher` 将 `orchestrator.tools.ToolGateway` 的固定只读命令接入候选安全事件流。Gateway 只在冻结 `PolicyManifest` 判定 allow 后消费一次性 capability；启动前重验 fencing/策略版本，运行中监视权限并取消，审计只记输入/输出摘要；真机集成测试覆盖 SQLite 审计→systemd 执行。该切片不能勾销后面列出的整体 P4 验收项：没有 workspace-write/原子变更应用、Approval Service、Secret Broker、Worker/Scheduler 接线，也没有 Tool effect 的崩溃对账。
+
 - [ ] 实现平台隔离适配器和能力指纹；工作区、控制目录、`.git`、策略、密钥和 Artifact 路径之间有明确边界。无法达到节点安全契约时失败关闭。
 - [ ] 实现安全路径解析及打开时二次校验；覆盖 traversal、symlink/junction/reparse point、挂载点、硬链接、大小写别名和 TOCTOU 风险；记录可恢复写入清单/快照。
 - [ ] 实现受限进程树、CPU/内存/时长/进程/输出限制、私有临时目录、取消与清理；取消/租约丢失先关 Gateway 动作再停止进程，不能确认停止时保留未知占用。
