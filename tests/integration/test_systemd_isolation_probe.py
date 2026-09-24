@@ -184,6 +184,12 @@ def test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits(
         validate_overlay_candidate(lower, diff)
         observed["export_entries"] = [entry.path for entry in diff.entries]
         observed["export_hash"] = diff.manifest_hash
+        observed["diff"] = {
+            "candidate_root": str(diff.candidate_root),
+            "entries": [entry.__dict__ for entry in diff.entries],
+            "total_bytes": diff.total_bytes,
+            "manifest_hash": diff.manifest_hash,
+        }
         print(json.dumps(observed, sort_keys=True))
         """
     )
@@ -244,6 +250,7 @@ def test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits(
     assert result.returncode == 0, result.stdout + result.stderr
     observed = json.loads(result.stdout.strip())
     export_hash = observed.pop("export_hash")
+    diff_payload = observed.pop("diff")
     assert observed == {
         "cpu_max": "50000 100000",
         "export_entries": ["file.txt"],
@@ -254,6 +261,32 @@ def test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits(
         "pids_max": "4",
     }
     assert export_hash.startswith("sha256:")
+
+    # The untrusted process only produces a private candidate. A separate host
+    # process acquires the fenced workspace lease and performs the journaled
+    # publication after revalidating the exported manifest.
+    from orchestrator.isolation import acquire_workspace_write_lease, publish_workspace_diff
+    from orchestrator.isolation.workspace import WorkspaceDiff, WorkspaceDiffEntry
+
+    diff = WorkspaceDiff(
+        candidate_root=Path(diff_payload["candidate_root"]),
+        entries=tuple(WorkspaceDiffEntry(**entry) for entry in diff_payload["entries"]),
+        total_bytes=diff_payload["total_bytes"],
+        manifest_hash=diff_payload["manifest_hash"],
+    )
+    workspace = tmp_path / "host-workspace"
+    workspace.mkdir()
+    (workspace / "file.txt").write_text("base\n", encoding="utf-8")
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir(mode=0o700)
+    journal_root = tmp_path / "journal"
+    journal_root.mkdir(mode=0o700)
+    with acquire_workspace_write_lease(workspace, lease_root) as lease:
+        receipt = publish_workspace_diff(lower, workspace, diff, lease, journal_root)
+
+    assert receipt.entries_published == 1
+    assert receipt.manifest_hash == export_hash
+    assert (workspace / "file.txt").read_text(encoding="utf-8") == "scope-change\n"
     assert (lower / "file.txt").read_text(encoding="utf-8") == "base\n"
 
 

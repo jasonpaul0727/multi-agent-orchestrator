@@ -80,5 +80,9 @@ directory rollback, and the hard-link/temp-unlink window. Lease/conflict tests
 cover cross-process exclusion, generation replay, partial journal-tail
 recovery, corrupt-journal rejection, root/file symlink boundaries,
 permissions, root replacement, mount identity, and uncertain persistence.
-These are unit and filesystem evidence for the primitives, not end-to-end
-Approval/Gateway/Worker integration or a platform-support claim.
+The live `test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits`
+integration test additionally creates and validates a candidate inside a real
+systemd/OverlayFS scope, then invokes the host-side publisher and checks the
+published workspace plus unchanged lower tree. This is still not
+end-to-end Approval/Gateway/Worker integration or a product platform-support
+claim.

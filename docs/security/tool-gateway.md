@@ -53,11 +53,14 @@ Only the Ubuntu 24.04/WSL2 systemd read-only profile in
 [`platform-support.md`](platform-support.md) has live evidence. There is no
 enabled workspace-write support, Approval service, Secret Broker, Worker, CLI,
 or MCP wiring. A host-side lease-bound Overlay candidate publisher and
-crash-recovery journal now exist and have unit/subprocess-crash evidence, but
-they have not been live-tested through the supported systemd/OverlayFS-to-host
-path and are not integrated with this Gateway, approval, audit, or attempt
-ownership. Thus these primitives are not evidence that the complete P4/P5
-execution path or the V1 product is deliverable.
+crash-recovery journal now exist with unit/subprocess-crash evidence. The live
+`test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits`
+probe also sends a candidate created in a real systemd/OverlayFS scope through
+the host publisher. This remains a primitive-only path: it is not integrated
+with this Gateway, approval, audit, or attempt ownership, and it does not run
+an untrusted Worker through the publisher. Thus these primitives are not
+evidence that the complete P4/P5 execution path or the V1 product is
+deliverable.
 
 ## Verification
 
