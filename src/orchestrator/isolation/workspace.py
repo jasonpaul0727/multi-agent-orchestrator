@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
 import stat
+from typing import Literal
 
 
 class WorkspaceBoundaryError(RuntimeError):
@@ -21,6 +24,28 @@ class WorkspaceInspection:
     regular_files: int
     directories: int
     symlinks: int
+
+
+@dataclass(frozen=True)
+class WorkspaceDiffEntry:
+    """One validated staged change exported from an OverlayFS upper layer."""
+
+    path: str
+    operation: Literal["add", "modify"]
+    kind: Literal["file", "directory", "symlink"]
+    mode: int
+    size: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class WorkspaceDiff:
+    """Bounded candidate tree and deterministic manifest; never applied implicitly."""
+
+    candidate_root: Path
+    entries: tuple[WorkspaceDiffEntry, ...]
+    total_bytes: int
+    manifest_hash: str
 
 
 def snapshot_workspace(
@@ -221,6 +246,357 @@ def snapshot_workspace(
         directories=directory_count,
         symlinks=symlink_count,
     )
+
+
+def export_overlay_diff(
+    lower_root: str | Path,
+    upper_root: str | Path,
+    candidate_root: str | Path,
+    *,
+    max_entries: int = 100_000,
+    max_bytes: int = 1024 * 1024 * 1024,
+    max_depth: int = 256,
+) -> WorkspaceDiff:
+    """Safely export OverlayFS additions/updates without touching the workspace.
+
+    The exporter fails closed on whiteouts/deletions, opaque or xattr-bearing
+    upper entries, special files, nested mounts, hard links, control-directory
+    paths, symlink traversal through the lower tree, and limit violations.
+    Only a private candidate tree is produced; the caller must separately
+    approve, audit, serialize, and apply it.
+    """
+
+    for name, value in (
+        ("max_entries", max_entries),
+        ("max_bytes", max_bytes),
+        ("max_depth", max_depth),
+    ):
+        minimum = 0 if name == "max_bytes" else 1
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise WorkspaceBoundaryError(f"{name} must be a valid bound")
+
+    lower = Path(lower_root)
+    upper = Path(upper_root)
+    target = Path(candidate_root)
+    try:
+        lower_stat = lower.lstat()
+        upper_stat = upper.lstat()
+        if not stat.S_ISDIR(lower_stat.st_mode) or stat.S_ISLNK(lower_stat.st_mode):
+            raise WorkspaceBoundaryError("overlay lower root must be a real directory")
+        if not stat.S_ISDIR(upper_stat.st_mode) or stat.S_ISLNK(upper_stat.st_mode):
+            raise WorkspaceBoundaryError("overlay upper root must be a real directory")
+        lower_path = lower.resolve(strict=True)
+        upper_path = upper.resolve(strict=True)
+        target_parent = target.parent.resolve(strict=True)
+        target_path = target_parent / target.name
+        if target.exists() or target.is_symlink():
+            raise WorkspaceBoundaryError("candidate destination must not already exist")
+        if any(
+            _is_within(candidate, boundary)
+            for candidate in (target_path,)
+            for boundary in (lower_path, upper_path)
+        ):
+            raise WorkspaceBoundaryError("candidate destination overlaps an OverlayFS input")
+        lower_fd = os.open(
+            lower, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        try:
+            upper_fd = os.open(
+                upper, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
+        except BaseException:
+            os.close(lower_fd)
+            raise
+    except WorkspaceBoundaryError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise WorkspaceBoundaryError("OverlayFS roots cannot be opened safely") from exc
+
+    if (os.fstat(lower_fd).st_dev, os.fstat(lower_fd).st_ino) != (
+        lower_stat.st_dev,
+        lower_stat.st_ino,
+    ) or (os.fstat(upper_fd).st_dev, os.fstat(upper_fd).st_ino) != (
+        upper_stat.st_dev,
+        upper_stat.st_ino,
+    ):
+        os.close(lower_fd)
+        os.close(upper_fd)
+        raise WorkspaceBoundaryError("OverlayFS roots changed while opening")
+
+    try:
+        target.mkdir(mode=0o700)
+    except BaseException:
+        os.close(lower_fd)
+        os.close(upper_fd)
+        raise
+    entries: list[WorkspaceDiffEntry] = []
+    total_bytes = 0
+    try:
+        source_mount_id = _descriptor_mount_id(upper_fd)
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
+        os.close(lower_fd)
+        os.close(upper_fd)
+        raise
+    entry_count = 0
+
+    def add_entry() -> None:
+        nonlocal entry_count
+        entry_count += 1
+        if entry_count > max_entries:
+            raise WorkspaceBoundaryError("OverlayFS diff exceeds the entry limit")
+
+    def copy_directory(
+        source_fd: int,
+        destination: Path,
+        relative: tuple[str, ...],
+        depth: int,
+    ) -> None:
+        nonlocal total_bytes
+        if depth > max_depth:
+            raise WorkspaceBoundaryError("OverlayFS diff exceeds the depth limit")
+        _reject_xattrs(source_fd)
+        try:
+            names = sorted(os.listdir(source_fd))
+        except OSError as exc:
+            raise WorkspaceBoundaryError("OverlayFS upper directory cannot be read") from exc
+        for name in names:
+            if name in (".", "..") or "/" in name or "\x00" in name:
+                raise WorkspaceBoundaryError("OverlayFS upper contains an invalid path component")
+            if not relative and name in (".git", ".maestro"):
+                raise WorkspaceBoundaryError("OverlayFS diff targets a protected control directory")
+            try:
+                before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise WorkspaceBoundaryError("OverlayFS upper changed during export") from exc
+            add_entry()
+            child = (*relative, name)
+            relative_path = "/".join(child)
+            lower_kind = _lower_entry_kind(lower_fd, child)
+            mode = stat.S_IMODE(before.st_mode) & 0o777
+            if stat.S_ISDIR(before.st_mode):
+                if lower_kind not in (None, "directory"):
+                    raise WorkspaceBoundaryError("OverlayFS upper changes a path's file type")
+                try:
+                    child_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=source_fd,
+                    )
+                except OSError as exc:
+                    raise WorkspaceBoundaryError("OverlayFS upper directory changed during export") from exc
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                        raise WorkspaceBoundaryError("OverlayFS upper directory changed during export")
+                    if _descriptor_mount_id(child_fd) != source_mount_id:
+                        raise WorkspaceBoundaryError("OverlayFS upper contains a nested mount")
+                    _reject_xattrs(child_fd)
+                    output = destination / name
+                    output.mkdir(mode=0o700)
+                    copy_directory(child_fd, output, child, depth + 1)
+                finally:
+                    os.close(child_fd)
+                entries.append(
+                    WorkspaceDiffEntry(
+                        relative_path,
+                        "modify" if lower_kind == "directory" else "add",
+                        "directory",
+                        mode,
+                        0,
+                        _manifest_digest("directory", mode, 0),
+                    )
+                )
+                continue
+            if stat.S_ISREG(before.st_mode):
+                if before.st_nlink != 1:
+                    raise WorkspaceBoundaryError("OverlayFS upper contains a hard-linked file")
+                if lower_kind not in (None, "file"):
+                    raise WorkspaceBoundaryError("OverlayFS upper changes a path's file type")
+                if before.st_size > max_bytes - total_bytes:
+                    raise WorkspaceBoundaryError("OverlayFS diff exceeds the byte limit")
+                try:
+                    file_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                        dir_fd=source_fd,
+                    )
+                except OSError as exc:
+                    raise WorkspaceBoundaryError("OverlayFS upper file changed during export") from exc
+                digest = hashlib.sha256()
+                size = 0
+                output = destination / name
+                try:
+                    opened = os.fstat(file_fd)
+                    if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+                        before.st_dev,
+                        before.st_ino,
+                    ):
+                        raise WorkspaceBoundaryError("OverlayFS upper file changed during export")
+                    _reject_xattrs(file_fd)
+                    with output.open("xb") as output_file:
+                        while True:
+                            chunk = os.read(file_fd, 1024 * 1024)
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            total_bytes += len(chunk)
+                            if total_bytes > max_bytes:
+                                raise WorkspaceBoundaryError("OverlayFS diff exceeds the byte limit")
+                            digest.update(chunk)
+                            output_file.write(chunk)
+                    output.chmod(0o600)
+                except OSError as exc:
+                    raise WorkspaceBoundaryError("OverlayFS upper file could not be exported") from exc
+                finally:
+                    os.close(file_fd)
+                if size != before.st_size:
+                    raise WorkspaceBoundaryError("OverlayFS upper file changed while reading")
+                entries.append(
+                    WorkspaceDiffEntry(
+                        relative_path,
+                        "modify" if lower_kind == "file" else "add",
+                        "file",
+                        mode,
+                        size,
+                        "sha256:" + digest.hexdigest(),
+                    )
+                )
+                continue
+            if stat.S_ISLNK(before.st_mode):
+                if lower_kind not in (None, "symlink"):
+                    raise WorkspaceBoundaryError("OverlayFS upper changes a path's file type")
+                try:
+                    link = os.readlink(name, dir_fd=source_fd)
+                    after = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+                except OSError as exc:
+                    raise WorkspaceBoundaryError("OverlayFS upper symlink changed during export") from exc
+                if (before.st_dev, before.st_ino, before.st_mode) != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_mode,
+                ):
+                    raise WorkspaceBoundaryError("OverlayFS upper symlink changed during export")
+                _validate_relative_symlink(relative, link)
+                encoded = os.fsencode(link)
+                total_bytes += len(encoded)
+                if total_bytes > max_bytes:
+                    raise WorkspaceBoundaryError("OverlayFS diff exceeds the byte limit")
+                os.symlink(link, destination / name)
+                entries.append(
+                    WorkspaceDiffEntry(
+                        relative_path,
+                        "modify" if lower_kind == "symlink" else "add",
+                        "symlink",
+                        0o777,
+                        len(encoded),
+                        "sha256:" + hashlib.sha256(encoded).hexdigest(),
+                    )
+                )
+                continue
+            raise WorkspaceBoundaryError("OverlayFS upper contains a whiteout or special file")
+
+    try:
+        copy_directory(upper_fd, target, (), 0)
+        entries.sort(key=lambda entry: entry.path)
+        canonical = json.dumps(
+            [
+                {
+                    "path": entry.path,
+                    "operation": entry.operation,
+                    "kind": entry.kind,
+                    "mode": entry.mode,
+                    "size": entry.size,
+                    "digest": entry.digest,
+                }
+                for entry in entries
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return WorkspaceDiff(
+            candidate_root=target,
+            entries=tuple(entries),
+            total_bytes=total_bytes,
+            manifest_hash="sha256:" + hashlib.sha256(canonical).hexdigest(),
+        )
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+    finally:
+        os.close(lower_fd)
+        os.close(upper_fd)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _manifest_digest(kind: str, mode: int, size: int) -> str:
+    value = f"{kind}:{mode:o}:{size}".encode("ascii")
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _reject_xattrs(descriptor: int) -> None:
+    try:
+        attributes = os.listxattr(descriptor)
+    except OSError as exc:
+        raise WorkspaceBoundaryError("OverlayFS metadata cannot be inspected") from exc
+    if attributes:
+        raise WorkspaceBoundaryError("OverlayFS upper contains unsupported extended attributes")
+
+
+def _lower_entry_kind(lower_fd: int, path: tuple[str, ...]) -> str | None:
+    current_fd = os.dup(lower_fd)
+    try:
+        for component in path[:-1]:
+            try:
+                info = os.stat(component, dir_fd=current_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            if stat.S_ISLNK(info.st_mode):
+                raise WorkspaceBoundaryError("OverlayFS path traverses a lower symlink")
+            if not stat.S_ISDIR(info.st_mode):
+                raise WorkspaceBoundaryError("OverlayFS path traverses a non-directory lower entry")
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        try:
+            info = os.stat(path[-1], dir_fd=current_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISREG(info.st_mode):
+            return "file"
+        if stat.S_ISDIR(info.st_mode):
+            return "directory"
+        if stat.S_ISLNK(info.st_mode):
+            return "symlink"
+        return "special"
+    finally:
+        os.close(current_fd)
+
+
+def _validate_relative_symlink(relative_parent: tuple[str, ...], link: str) -> None:
+    if not link or os.path.isabs(link):
+        raise WorkspaceBoundaryError("OverlayFS diff only allows relative symlinks")
+    parts = list(relative_parent)
+    for component in link.split("/"):
+        if component in ("", "."):
+            continue
+        if component == "..":
+            if not parts:
+                raise WorkspaceBoundaryError("OverlayFS symlink escapes its declared root")
+            parts.pop()
+        else:
+            parts.append(component)
 
 
 def _descriptor_mount_id(descriptor: int) -> int:

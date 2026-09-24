@@ -2,7 +2,10 @@
 
 from .workspace import (
     WorkspaceBoundaryError,
+    WorkspaceDiff,
+    WorkspaceDiffEntry,
     WorkspaceInspection,
+    export_overlay_diff,
     inspect_workspace,
     snapshot_workspace,
 )
@@ -39,7 +42,10 @@ __all__ = [
     "READ_EXECUTE",
     "WORKSPACE_WRITE",
     "WorkspaceBoundaryError",
+    "WorkspaceDiff",
+    "WorkspaceDiffEntry",
     "WorkspaceInspection",
+    "export_overlay_diff",
     "inspect_workspace",
     "snapshot_workspace",
     "landlock_abi",

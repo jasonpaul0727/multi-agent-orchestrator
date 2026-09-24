@@ -132,6 +132,130 @@ def test_transient_unit_enforces_cgroup_and_rlimit_values():
     }
 
 
+def test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits(
+    tmp_path: Path,
+):
+    """Measure the pre-exec user-namespace route for a future write profile.
+
+    Unlike a transient service with PrivateUsers=yes, this starts a user/mount/
+    network/pid namespace inside a systemd scope, before the untrusted command
+    starts. The command must see the overlay and systemd cgroup limits. This
+    probe alone does not qualify a writable sandbox.
+    """
+
+    lower = tmp_path / "lower"
+    upper = tmp_path / "upper"
+    work = tmp_path / "work"
+    merged = tmp_path / "merged"
+    lower.mkdir()
+    (lower / "file.txt").write_text("base\n", encoding="utf-8")
+    unit = f"maestro-overlay-scope-{uuid.uuid4().hex}.scope"
+    worker_code = textwrap.dedent(
+        """
+        import json
+        from pathlib import Path
+        import socket
+        import sys
+
+        path = Path(sys.argv[1])
+        lower = Path(sys.argv[2])
+        upper = Path(sys.argv[3])
+        candidate = Path(sys.argv[4])
+        cgroup_path = Path("/proc/self/cgroup").read_text().strip().split("::", 1)[1]
+        cgroup = (Path("/sys/fs/cgroup") / cgroup_path.lstrip("/")).resolve()
+        network_blocked = False
+        try:
+            socket.create_connection(("1.1.1.1", 443), timeout=0.2)
+        except OSError:
+            network_blocked = True
+        observed = {
+            "memory_max": (cgroup / "memory.max").read_text().strip(),
+            "pids_max": (cgroup / "pids.max").read_text().strip(),
+            "cpu_max": (cgroup / "cpu.max").read_text().strip(),
+            "network_blocked": network_blocked,
+            "overlay_before": path.read_text(encoding="utf-8").strip(),
+        }
+        path.write_text("scope-change\\n", encoding="utf-8")
+        observed["overlay_after"] = path.read_text(encoding="utf-8").strip()
+        sys.path.insert(0, sys.argv[5])
+        from orchestrator.isolation import export_overlay_diff
+
+        diff = export_overlay_diff(lower, upper, candidate)
+        observed["export_entries"] = [entry.path for entry in diff.entries]
+        observed["export_hash"] = diff.manifest_hash
+        print(json.dumps(observed, sort_keys=True))
+        """
+    )
+    bootstrap = textwrap.dedent(
+        """
+        set -eu
+        root=$1
+        mount --make-rprivate /
+        mkdir -p "$root/upper" "$root/work" "$root/merged"
+        mount -t overlay overlay -o "lowerdir=$root/lower,upperdir=$root/upper,workdir=$root/work" "$root/merged"
+        cleanup() {
+            umount "$root/merged" 2>/dev/null || true
+            if [ -d "$root/work/work" ]; then
+                chmod u+rwx "$root/work/work" 2>/dev/null || true
+                rmdir "$root/work/work" 2>/dev/null || true
+            fi
+        }
+        trap cleanup EXIT
+        /usr/bin/python3 -c "$2" "$root/merged/file.txt" "$root/lower" "$root/upper" "$root/candidate" "$3"
+        test "$(cat "$root/merged/file.txt")" = scope-change
+        test "$(cat "$root/lower/file.txt")" = base
+        test "$(cat "$root/candidate/file.txt")" = scope-change
+        """
+    )
+    command = [
+        "timeout",
+        "25s",
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        f"--unit={unit}",
+        "--property=MemoryMax=67108864",
+        "--property=TasksMax=4",
+        "--property=CPUQuota=50%",
+        "--property=RuntimeMaxSec=20s",
+        "--",
+        "unshare",
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--net",
+        "--pid",
+        "--fork",
+        "--mount-proc=/proc",
+        "bash",
+        "-c",
+        bootstrap,
+        "overlay-probe",
+        str(tmp_path),
+        worker_code,
+        str(Path(__file__).resolve().parents[2] / "src"),
+    ]
+    result = subprocess.run(
+        command, text=True, capture_output=True, check=False, timeout=30
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = json.loads(result.stdout.strip())
+    export_hash = observed.pop("export_hash")
+    assert observed == {
+        "cpu_max": "50000 100000",
+        "export_entries": ["file.txt"],
+        "memory_max": "67108864",
+        "network_blocked": True,
+        "overlay_after": "scope-change",
+        "overlay_before": "base",
+        "pids_max": "4",
+    }
+    assert export_hash.startswith("sha256:")
+    assert (lower / "file.txt").read_text(encoding="utf-8") == "base\n"
+
+
 def test_transient_unit_kills_worker_when_memory_limit_is_exceeded():
     code = "payload = bytearray(128 * 1024 * 1024); payload[::4096] = b'x' * (len(payload) // 4096); print('allocated')"
     result = _run_unit(
