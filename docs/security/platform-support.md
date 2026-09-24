@@ -7,7 +7,7 @@ full security acceptance suite are integrated and pass.
 
 | Platform | Observed runtime | Read-only command profile | Workspace-write profile | Product support |
 | --- | --- | --- | --- | --- |
-| Ubuntu 24.04 under WSL2 | Microsoft kernel `6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17` | Live-tested through `SystemdReadOnlyLauncher`; each launch uses a descriptor-anchored no-follow snapshot, requires exact cgroup/rlimit values, Landlock, private network/tmp/home, and read-only bind mounts. Any mismatch fails closed. | Still unsupported. A bounded Overlay upper-to-private-candidate exporter and read-only candidate validator have unit coverage and a live systemd-scope/OverlayFS probe. They reject deletions/whiteouts, xattrs, special files, hard links, permissive candidate modes, protected paths, lower symlink traversal, undeclared candidate entries, and bound violations; modified-file/symlink entries bind a digest of their lower baseline. They do not compare the live host workspace for conflicts or atomically publish changes to it. | Candidate only; not a complete V1 execution platform. |
+| Ubuntu 24.04 under WSL2 | Microsoft kernel `6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17` | Live-tested through `SystemdReadOnlyLauncher`; each launch uses a descriptor-anchored no-follow snapshot, requires exact cgroup/rlimit values, Landlock, private network/tmp/home, and read-only bind mounts. Any mismatch fails closed. | Still unsupported. A bounded Overlay upper-to-private-candidate exporter and read-only candidate validator have unit coverage and a live systemd-scope/OverlayFS probe. They reject deletions/whiteouts, xattrs, special files, hard links, permissive candidate modes, protected paths, lower symlink traversal, undeclared candidate entries, and bound violations; modified-file/symlink entries bind a digest of their lower baseline. A standalone read-only helper reports conflicts against touched live paths, but does not acquire a write lease or atomically publish changes. | Candidate only; not a complete V1 execution platform. |
 | Other Linux distributions | Not measured | Unverified; do not infer support from the presence of systemd. | Unsupported | Unsupported/unverified. |
 | Windows and macOS | Not measured | Unsupported by this backend | Unsupported | Unsupported. |
 
@@ -21,10 +21,12 @@ path rewrite.
 internal, opt-in read-only command path. A separate `export_overlay_diff`
 primitive can copy a bounded upper layer into a private candidate tree, and
 `validate_overlay_candidate` rechecks its private-only modes, no-follow
-inventory, bytes, manifest, and lower snapshot baselines; a live namespace test confirms this works with
-the measured WSL OverlayFS metadata. This is not an approval, live-host
-conflict check, diff-review, or publication path, and does not enable
-workspace-write. The Tool Gateway evaluates a frozen
+inventory, bytes, manifest, and lower snapshot baselines, while
+`check_workspace_publish_conflicts` reports stale/occupied touched paths
+without mutation. A live namespace test confirms candidate export with the
+measured WSL OverlayFS metadata. Neither helper is an approval, write lease,
+diff-review, or publication path, and neither enables workspace-write. The
+Tool Gateway evaluates a frozen
 `PolicyManifest`, records `PolicyDecision` and a one-use capability in the
 security event stream, checks an injected attempt/fencing authority before and
 during execution, and logs only output digests and lengths. A live integration

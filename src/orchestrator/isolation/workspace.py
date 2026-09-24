@@ -50,6 +50,31 @@ class WorkspaceDiff:
     manifest_hash: str
 
 
+@dataclass(frozen=True)
+class WorkspaceConflict:
+    """Non-sensitive description of one stale or unsafe publish target."""
+
+    path: str
+    reason: Literal[
+        "added_path_exists",
+        "entry_type_changed",
+        "baseline_changed",
+        "unsafe_path",
+    ]
+
+
+@dataclass(frozen=True)
+class WorkspaceConflictReport:
+    """Read-only live-workspace comparison; not a write lease or commit token."""
+
+    checked_entries: int
+    conflicts: tuple[WorkspaceConflict, ...]
+
+    @property
+    def is_conflicted(self) -> bool:
+        return bool(self.conflicts)
+
+
 def snapshot_workspace(
     root: str | Path,
     destination: str | Path,
@@ -862,6 +887,109 @@ def validate_overlay_candidate(
         close_roots()
 
 
+def check_workspace_publish_conflicts(
+    lower_root: str | Path,
+    workspace_root: str | Path,
+    diff: WorkspaceDiff,
+    *,
+    max_bytes: int = 1024 * 1024 * 1024,
+) -> WorkspaceConflictReport:
+    """Compare touched live paths with the run's frozen lower snapshot.
+
+    The check is read-only and fail-closed for unsafe roots. It only reports
+    paths touched by the candidate: added paths must still be absent, modified
+    files/symlinks must still match their captured lower digest, and modified
+    directories must still be directories. This does not acquire a write lease
+    and must never be treated as authorization to publish; an eventual writer
+    must repeat the comparison under its exclusive fencing lease.
+    """
+
+    validate_overlay_candidate(lower_root, diff, max_bytes=max_bytes)
+    workspace = Path(workspace_root)
+    lower = Path(lower_root)
+    candidate = Path(diff.candidate_root)
+    workspace_fd: int | None = None
+    try:
+        workspace_info = workspace.lstat()
+        if not stat.S_ISDIR(workspace_info.st_mode) or stat.S_ISLNK(workspace_info.st_mode):
+            raise WorkspaceBoundaryError("live workspace root must be a real directory")
+        workspace_path = workspace.resolve(strict=True)
+        lower_path = lower.resolve(strict=True)
+        candidate_path = candidate.resolve(strict=True)
+        if (
+            _is_within(workspace_path, lower_path)
+            or _is_within(lower_path, workspace_path)
+            or _is_within(workspace_path, candidate_path)
+            or _is_within(candidate_path, workspace_path)
+        ):
+            raise WorkspaceBoundaryError("live workspace overlaps snapshot or candidate roots")
+        workspace_fd = os.open(
+            workspace,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        opened = os.fstat(workspace_fd)
+        if (opened.st_dev, opened.st_ino) != (workspace_info.st_dev, workspace_info.st_ino):
+            os.close(workspace_fd)
+            raise WorkspaceBoundaryError("live workspace root changed while opening")
+    except WorkspaceBoundaryError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        if workspace_fd is not None:
+            os.close(workspace_fd)
+        raise WorkspaceBoundaryError("live workspace root cannot be opened safely") from exc
+
+    assert workspace_fd is not None
+    try:
+        workspace_mount_id = _descriptor_mount_id(workspace_fd)
+    except BaseException:
+        os.close(workspace_fd)
+        raise
+    conflicts: list[WorkspaceConflict] = []
+    try:
+        for entry in diff.entries:
+            parts = tuple(entry.path.split("/"))
+            try:
+                live_kind = _lower_entry_kind(
+                    workspace_fd,
+                    parts,
+                    expected_mount_id=workspace_mount_id,
+                )
+            except (WorkspaceBoundaryError, OSError):
+                conflicts.append(WorkspaceConflict(entry.path, "unsafe_path"))
+                continue
+
+            expected_kind = None if entry.operation == "add" else entry.kind
+            if live_kind != expected_kind:
+                reason = "added_path_exists" if entry.operation == "add" else "entry_type_changed"
+                conflicts.append(WorkspaceConflict(entry.path, reason))
+                continue
+            if entry.baseline_digest is None:
+                continue
+            try:
+                digest = _lower_content_digest(
+                    workspace_fd,
+                    parts,
+                    entry.kind,
+                    max_bytes,
+                    expected_mount_id=workspace_mount_id,
+                )
+            except (WorkspaceBoundaryError, OSError):
+                conflicts.append(WorkspaceConflict(entry.path, "unsafe_path"))
+                continue
+            if digest != entry.baseline_digest:
+                conflicts.append(WorkspaceConflict(entry.path, "baseline_changed"))
+
+        try:
+            current = workspace.lstat()
+        except OSError as exc:
+            raise WorkspaceBoundaryError("live workspace root changed during conflict checking") from exc
+        if (current.st_dev, current.st_ino) != (workspace_info.st_dev, workspace_info.st_ino):
+            raise WorkspaceBoundaryError("live workspace root changed during conflict checking")
+    finally:
+        os.close(workspace_fd)
+    return WorkspaceConflictReport(len(diff.entries), tuple(conflicts))
+
+
 def _is_within(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -904,7 +1032,12 @@ def _reject_xattrs(descriptor: int) -> None:
         raise WorkspaceBoundaryError("OverlayFS upper contains unsupported extended attributes")
 
 
-def _lower_entry_kind(lower_fd: int, path: tuple[str, ...]) -> str | None:
+def _lower_entry_kind(
+    lower_fd: int,
+    path: tuple[str, ...],
+    *,
+    expected_mount_id: int | None = None,
+) -> str | None:
     current_fd = os.dup(lower_fd)
     try:
         for component in path[:-1]:
@@ -921,6 +1054,13 @@ def _lower_entry_kind(lower_fd: int, path: tuple[str, ...]) -> str | None:
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                 dir_fd=current_fd,
             )
+            if expected_mount_id is not None:
+                try:
+                    if _descriptor_mount_id(next_fd) != expected_mount_id:
+                        raise WorkspaceBoundaryError("OverlayFS path traverses a nested mount")
+                except BaseException:
+                    os.close(next_fd)
+                    raise
             os.close(current_fd)
             current_fd = next_fd
         try:
@@ -928,12 +1068,27 @@ def _lower_entry_kind(lower_fd: int, path: tuple[str, ...]) -> str | None:
         except FileNotFoundError:
             return None
         if stat.S_ISREG(info.st_mode):
-            return "file"
-        if stat.S_ISDIR(info.st_mode):
-            return "directory"
-        if stat.S_ISLNK(info.st_mode):
+            kind = "file"
+        elif stat.S_ISDIR(info.st_mode):
+            kind = "directory"
+        elif stat.S_ISLNK(info.st_mode):
             return "symlink"
-        return "special"
+        else:
+            return "special"
+        if expected_mount_id is not None:
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+            if kind == "directory":
+                flags |= os.O_DIRECTORY
+            descriptor = os.open(path[-1], flags, dir_fd=current_fd)
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise WorkspaceBoundaryError("OverlayFS path changed during mount validation")
+                if _descriptor_mount_id(descriptor) != expected_mount_id:
+                    raise WorkspaceBoundaryError("OverlayFS path is on a nested mount")
+            finally:
+                os.close(descriptor)
+        return kind
     finally:
         os.close(current_fd)
 
@@ -943,6 +1098,8 @@ def _lower_content_digest(
     path: tuple[str, ...],
     kind: Literal["file", "symlink"],
     max_bytes: int,
+    *,
+    expected_mount_id: int | None = None,
 ) -> str:
     """Hash a modified lower entry through no-follow directory descriptors."""
 
@@ -967,6 +1124,15 @@ def _lower_content_digest(
             if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
                 os.close(next_fd)
                 raise WorkspaceBoundaryError("Overlay baseline path changed during hashing")
+            if expected_mount_id is not None:
+                try:
+                    mount_id = _descriptor_mount_id(next_fd)
+                except BaseException:
+                    os.close(next_fd)
+                    raise
+                if mount_id != expected_mount_id:
+                    os.close(next_fd)
+                    raise WorkspaceBoundaryError("Overlay baseline path traverses a nested mount")
             os.close(parent_fd)
             parent_fd = next_fd
 
@@ -1005,6 +1171,8 @@ def _lower_content_digest(
             raise WorkspaceBoundaryError("Overlay baseline file changed during hashing") from exc
         try:
             opened = os.fstat(descriptor)
+            if expected_mount_id is not None and _descriptor_mount_id(descriptor) != expected_mount_id:
+                raise WorkspaceBoundaryError("Overlay baseline file is on a nested mount")
             if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
                 before.st_dev,
                 before.st_ino,

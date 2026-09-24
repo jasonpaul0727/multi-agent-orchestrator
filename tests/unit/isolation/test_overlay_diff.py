@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import pytest
 
 from orchestrator.isolation import (
     WorkspaceBoundaryError,
+    check_workspace_publish_conflicts,
     export_overlay_diff,
     validate_overlay_candidate,
 )
@@ -850,4 +852,257 @@ def test_validate_overlay_candidate_reports_candidate_listing_failure(
     monkeypatch.setattr(workspace_module.os, "listdir", denied)
     with pytest.raises(WorkspaceBoundaryError, match="directory cannot be read safely"):
         validate_overlay_candidate(lower, diff)
+
+
+def test_check_workspace_publish_conflicts_detects_stale_baselines_and_additions(
+    tmp_path: Path,
+) -> None:
+    lower, upper, candidate = _roots(tmp_path)
+    diff = export_overlay_diff(lower, upper, candidate)
+    workspace = tmp_path / "workspace"
+    shutil.copytree(lower, workspace)
+
+    clean = check_workspace_publish_conflicts(lower, workspace, diff)
+    assert clean.checked_entries == len(diff.entries)
+    assert not clean.is_conflicted
+    assert clean.conflicts == ()
+
+    (workspace / "changed.txt").write_text("edited elsewhere\n", encoding="utf-8")
+    (workspace / "new-dir").mkdir()
+    (workspace / "new-dir" / "new.txt").write_text("occupied\n", encoding="utf-8")
+    conflicted = check_workspace_publish_conflicts(lower, workspace, diff)
+    assert conflicted.is_conflicted
+    assert ("changed.txt", "baseline_changed") in {
+        (item.path, item.reason) for item in conflicted.conflicts
+    }
+    assert ("new-dir", "added_path_exists") in {
+        (item.path, item.reason) for item in conflicted.conflicts
+    }
+    assert (workspace / "changed.txt").read_text(encoding="utf-8") == "edited elsewhere\n"
+
+
+def test_check_workspace_publish_conflicts_detects_type_and_unsafe_parent_changes(
+    tmp_path: Path,
+) -> None:
+    lower, upper, candidate = _roots(tmp_path)
+    diff = export_overlay_diff(lower, upper, candidate)
+    workspace = tmp_path / "workspace"
+    shutil.copytree(lower, workspace)
+    (workspace / "changed.txt").unlink()
+    (workspace / "changed.txt").symlink_to("kept.txt")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "new-dir").symlink_to(outside, target_is_directory=True)
+
+    report = check_workspace_publish_conflicts(lower, workspace, diff)
+    by_path = {item.path: item.reason for item in report.conflicts}
+    assert by_path["changed.txt"] == "entry_type_changed"
+    assert by_path["new-dir/new.txt"] == "unsafe_path"
+
+
+def test_check_workspace_publish_conflicts_rejects_unsafe_roots(tmp_path: Path) -> None:
+    lower, upper, candidate = _roots(tmp_path)
+    diff = export_overlay_diff(lower, upper, candidate)
+    not_a_directory = tmp_path / "workspace-file"
+    not_a_directory.write_text("not a workspace", encoding="utf-8")
+    with pytest.raises(WorkspaceBoundaryError, match="real directory"):
+        check_workspace_publish_conflicts(lower, not_a_directory, diff)
+
+    alias = tmp_path / "workspace-alias"
+    alias.symlink_to(lower, target_is_directory=True)
+    with pytest.raises(WorkspaceBoundaryError, match="real directory"):
+        check_workspace_publish_conflicts(lower, alias, diff)
+
+
+def test_check_workspace_publish_conflicts_rejects_overlaps_and_root_races(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lower, upper, candidate = _roots(tmp_path)
+    diff = export_overlay_diff(lower, upper, candidate)
+    with pytest.raises(WorkspaceBoundaryError, match="overlaps"):
+        check_workspace_publish_conflicts(lower, lower, diff)
+    with pytest.raises(WorkspaceBoundaryError, match="overlaps"):
+        check_workspace_publish_conflicts(lower, candidate, diff)
+
+    workspace = tmp_path / "workspace"
+    shutil.copytree(lower, workspace)
+    real_open = os.open
+    real_fstat = os.fstat
+    workspace_fds: list[int] = []
+
+    def record_workspace_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == workspace:
+            workspace_fds.append(descriptor)
+        return descriptor
+
+    def replace_workspace_identity(descriptor: int):
+        info = real_fstat(descriptor)
+        if descriptor in workspace_fds:
+            return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino + 1)
+        return info
+
+    monkeypatch.setattr(workspace_module.os, "open", record_workspace_open)
+    monkeypatch.setattr(workspace_module.os, "fstat", replace_workspace_identity)
+    with pytest.raises(WorkspaceBoundaryError, match="changed while opening"):
+        check_workspace_publish_conflicts(lower, workspace, diff)
+    assert len(workspace_fds) == 1
+    with pytest.raises(OSError):
+        real_fstat(workspace_fds[0])
+
+
+def test_check_workspace_publish_conflicts_fails_closed_on_mount_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lower, upper, candidate = _roots(tmp_path)
+    diff = export_overlay_diff(lower, upper, candidate)
+    workspace = tmp_path / "workspace"
+    shutil.copytree(lower, workspace)
+    nested = workspace / "new-dir"
+    nested.mkdir()
+    root_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        root_mount_id = workspace_module._descriptor_mount_id(root_fd)
+    finally:
+        os.close(root_fd)
+    nested_info = nested.stat()
+    real_mount_id = workspace_module._descriptor_mount_id
+
+    def forged_mount_id(descriptor: int) -> int:
+        info = os.fstat(descriptor)
+        if (info.st_dev, info.st_ino) == (nested_info.st_dev, nested_info.st_ino):
+            return root_mount_id + 1
+        return real_mount_id(descriptor)
+
+    monkeypatch.setattr(workspace_module, "_descriptor_mount_id", forged_mount_id)
+    report = check_workspace_publish_conflicts(lower, workspace, diff)
+    assert ("new-dir", "unsafe_path") in {
+        (item.path, item.reason) for item in report.conflicts
+    }
+
+
+def test_check_workspace_publish_conflicts_closes_root_if_mount_identity_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lower, upper, candidate = _roots(tmp_path)
+    diff = export_overlay_diff(lower, upper, candidate)
+    workspace = tmp_path / "workspace"
+    shutil.copytree(lower, workspace)
+    real_open = os.open
+    real_fstat = os.fstat
+    real_mount_id = workspace_module._descriptor_mount_id
+    workspace_fds: list[int] = []
+
+    def record_workspace_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == workspace:
+            workspace_fds.append(descriptor)
+        return descriptor
+
+    def fail_workspace_mount_id(descriptor: int) -> int:
+        info = os.fstat(descriptor)
+        if (info.st_dev, info.st_ino) == (workspace.stat().st_dev, workspace.stat().st_ino):
+            raise WorkspaceBoundaryError("mount id unavailable")
+        return real_mount_id(descriptor)
+
+    monkeypatch.setattr(workspace_module.os, "open", record_workspace_open)
+    monkeypatch.setattr(workspace_module, "_descriptor_mount_id", fail_workspace_mount_id)
+    with pytest.raises(WorkspaceBoundaryError, match="mount id unavailable"):
+        check_workspace_publish_conflicts(lower, workspace, diff)
+    assert len(workspace_fds) == 1
+    with pytest.raises(OSError):
+        real_fstat(workspace_fds[0])
+
+
+@pytest.mark.parametrize("failure_at", ("open", "fstat"))
+def test_check_workspace_publish_conflicts_fails_closed_on_root_io_races(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_at: str
+) -> None:
+    lower, upper, candidate = _roots(tmp_path)
+    diff = export_overlay_diff(lower, upper, candidate)
+    workspace = tmp_path / "workspace"
+    shutil.copytree(lower, workspace)
+    real_open = os.open
+    real_fstat = os.fstat
+    workspace_fds: list[int] = []
+
+    def fail_root_open(path, flags, *args, **kwargs):
+        if failure_at == "open" and Path(path) == workspace:
+            raise PermissionError("workspace unavailable")
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == workspace:
+            workspace_fds.append(descriptor)
+        return descriptor
+
+    def fail_root_fstat(descriptor: int):
+        if failure_at == "fstat" and descriptor in workspace_fds:
+            raise OSError("root changed during stat")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(workspace_module.os, "open", fail_root_open)
+    monkeypatch.setattr(workspace_module.os, "fstat", fail_root_fstat)
+    with pytest.raises(WorkspaceBoundaryError, match="cannot be opened safely"):
+        check_workspace_publish_conflicts(lower, workspace, diff)
+    if failure_at == "fstat":
+        assert len(workspace_fds) == 1
+        with pytest.raises(OSError):
+            real_fstat(workspace_fds[0])
+
+
+def test_check_workspace_publish_conflicts_reports_unreadable_baseline_as_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lower, upper, candidate = _roots(tmp_path)
+    diff = export_overlay_diff(lower, upper, candidate)
+    workspace = tmp_path / "workspace"
+    shutil.copytree(lower, workspace)
+    workspace_info = workspace.stat()
+    real_digest = workspace_module._lower_content_digest
+
+    def deny_live_hash(root_fd, path, kind, max_bytes, *, expected_mount_id=None):
+        info = os.fstat(root_fd)
+        if (info.st_dev, info.st_ino) == (workspace_info.st_dev, workspace_info.st_ino):
+            raise WorkspaceBoundaryError("live file became unreadable")
+        return real_digest(
+            root_fd,
+            path,
+            kind,
+            max_bytes,
+            expected_mount_id=expected_mount_id,
+        )
+
+    monkeypatch.setattr(workspace_module, "_lower_content_digest", deny_live_hash)
+    report = check_workspace_publish_conflicts(lower, workspace, diff)
+    assert ("changed.txt", "unsafe_path") in {
+        (item.path, item.reason) for item in report.conflicts
+    }
+
+
+def test_check_workspace_publish_conflicts_detects_root_replacement_during_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lower, upper, candidate = _roots(tmp_path)
+    diff = export_overlay_diff(lower, upper, candidate)
+    workspace = tmp_path / "workspace"
+    shutil.copytree(lower, workspace)
+    workspace_info = workspace.stat()
+    moved_workspace = tmp_path / "workspace-moved"
+    real_mount_id = workspace_module._descriptor_mount_id
+    replaced = False
+
+    def replace_root_after_open(descriptor: int) -> int:
+        nonlocal replaced
+        info = os.fstat(descriptor)
+        if not replaced and (info.st_dev, info.st_ino) == (
+            workspace_info.st_dev,
+            workspace_info.st_ino,
+        ):
+            os.rename(workspace, moved_workspace)
+            workspace.mkdir()
+            replaced = True
+        return real_mount_id(descriptor)
+
+    monkeypatch.setattr(workspace_module, "_descriptor_mount_id", replace_root_after_open)
+    with pytest.raises(WorkspaceBoundaryError, match="changed during conflict checking"):
+        check_workspace_publish_conflicts(lower, workspace, diff)
 
