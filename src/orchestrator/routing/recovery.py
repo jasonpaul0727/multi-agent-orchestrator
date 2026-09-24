@@ -6,7 +6,7 @@ import hashlib
 import json
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, model_validator
 
 from orchestrator.config.effective import EffectiveConfig, RecoveryAction, RoleName
 from orchestrator.config.models import ModelRegistryManifest
@@ -29,7 +29,14 @@ class RecoveryEvidence(_RecoveryModel):
     retry_level: StrictInt = Field(ge=0)
     retry_safe: StrictBool = False
     failed_model_unavailable: StrictBool = False
+    outcome_unknown: StrictBool = False
     exhausted_model_ids: tuple[StrictStr, ...] = ()
+
+    @model_validator(mode="after")
+    def reject_unsafe_unknown_retry(self) -> "RecoveryEvidence":
+        if self.outcome_unknown and self.retry_safe:
+            raise ValueError("an unknown outcome cannot be marked retry-safe")
+        return self
 
 
 class RecoveryPlan(_RecoveryModel):
@@ -65,6 +72,8 @@ class RecoveryController:
             or source_decision.registry_hash != registry.content_hash
         ):
             return _blocked("stale_recovery_source")
+        if evidence.outcome_unknown:
+            return _blocked("unknown_outcome_requires_reconciliation")
         preset = config.presets.get(config.active_preset)
         profile = None if preset is None else preset.roles.get(contract.role)
         if profile is None:

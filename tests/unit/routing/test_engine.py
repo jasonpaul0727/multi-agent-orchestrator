@@ -530,6 +530,41 @@ def test_recovery_controller_bounds_retries_and_same_tier_fallback():
     assert repair.action is None
 
 
+def test_recovery_controller_never_falls_back_for_unknown_outcome_even_after_retry_budget():
+    args = inputs()
+    original = route(args)
+    _request, config, registry, contract, _eligibility, _policy, _tokens, _fx = args
+
+    plan = RecoveryController().plan(
+        source_decision=original,
+        contract=contract,
+        config=config,
+        registry=registry,
+        evidence=RecoveryEvidence(
+            failure_category="transient",
+            evidence_hash=HASH,
+            retry_level=100,
+            failed_model_unavailable=True,
+            outcome_unknown=True,
+        ),
+    )
+
+    assert plan.outcome == "blocked"
+    assert plan.reason == "unknown_outcome_requires_reconciliation"
+    assert plan.action is None
+
+
+def test_recovery_evidence_cannot_mark_unknown_outcome_retry_safe():
+    with pytest.raises(ValueError, match="unknown outcome cannot be marked retry-safe"):
+        RecoveryEvidence(
+            failure_category="transient",
+            evidence_hash=HASH,
+            retry_level=0,
+            retry_safe=True,
+            outcome_unknown=True,
+        )
+
+
 def test_capability_escalation_uses_declared_tier_and_probe_lease_scope():
     args = inputs()
     request, config, reg, old_contract, eligibility, policy, tokens, fx = args
