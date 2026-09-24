@@ -13,9 +13,17 @@ from orchestrator.agents import AgentRegistry
 from orchestrator.artifacts import ArtifactStore
 from orchestrator.budget import BudgetLedger, BudgetReservation, RunLimit, UsageRecord
 from orchestrator.config.runtime import RunConfigSnapshot
-from orchestrator.models import AcceptedModelRoute
+from orchestrator.models import AcceptedModelRoute, ModelGatewayFailure
 from orchestrator.persistence import EventDraft, SQLiteEventStore, StoredEvent
-from orchestrator.routing import RoutingDecision, RoutingRequest
+from orchestrator.routing import (
+    FailureClassification,
+    RecoveryController,
+    RecoveryPlan,
+    RoutingDecision,
+    RoutingRequest,
+    classify_gateway_failure,
+)
+from orchestrator.routing.planning import PlanningNodeContract
 from orchestrator.recovery.run import RunRecoveryCoordinator, RunRecoveryError
 from orchestrator.validation import revalidate_model
 
@@ -168,6 +176,16 @@ class Scheduler:
                 raise StaleRoutingDecision("blocked routing decisions cannot be accepted")
             if decision.policy_manifest_hash != request.policy_manifest_hash:
                 raise StaleRoutingDecision("route policy version does not match its request")
+            if request.recovery_action == "initial" and (
+                request.failure_category is not None
+                or request.retry_level != 0
+                or request.exhausted_model_ids
+            ):
+                raise StaleRoutingDecision("initial route cannot carry recovery counters")
+            if request.recovery_action not in {"initial", "health_probe"}:
+                _verify_persisted_recovery_authorization(
+                    events, request=request, decision=decision
+                )
             assessment = next(
                 (item for item in decision.candidate_assessments
                  if item.model_id == decision.selected_model_id),
@@ -290,10 +308,19 @@ class Scheduler:
                 "tool_ids": list(node.spec.tool_ids),
                 "request_hash": request.request_hash,
                 "decision_hash": decision.decision_hash,
+                "failure_category": request.failure_category,
+                "retry_level": request.retry_level,
+                "exhausted_model_ids": list(request.exhausted_model_ids),
                 "accepted_route": route.model_dump(mode="json"),
                 "reservation_id": reservation.reservation_id,
                 "accepted_at": accepted_at.isoformat(),
                 "lease_expires_at": lease_expires_at.isoformat(),
+                "recovery_action": request.recovery_action,
+                "prior_decision_hash": request.prior_decision_hash,
+                "recovery_authorization_hash": (
+                    None if request.recovery_authorization is None
+                    else request.recovery_authorization.authorization_hash
+                ),
             }
             return [
                 EventDraft(
@@ -326,6 +353,224 @@ class Scheduler:
             ),
             lease_expires_at=lease_expires_at,
         )
+
+    def plan_attempt_recovery(
+        self,
+        *,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        fencing_generation: int,
+        source_decision: RoutingDecision,
+        contract: PlanningNodeContract,
+        failure: ModelGatewayFailure,
+    ) -> RecoveryPlan:
+        """Persist sanitized failure evidence and its bounded recovery plan.
+
+        This method never executes a retry. A later route acceptance must
+        consume the exact persisted authorization once; unknown provider
+        outcomes remain blocked until reconciliation.
+        """
+
+        source_decision = revalidate_model(RoutingDecision, source_decision)
+        contract = revalidate_model(PlanningNodeContract, contract)
+        failure = revalidate_model(ModelGatewayFailure, failure)
+        if (
+            source_decision.run_id != run_id
+            or source_decision.node_id != node_id
+            or source_decision.attempt_id != attempt_id
+            or source_decision.fencing_generation != fencing_generation
+            or contract.run_id != run_id
+            or contract.node_id != node_id
+            or contract.contract_hash != source_decision.planning_contract_hash
+        ):
+            raise StaleRoutingDecision("failure recovery inputs do not match the source attempt")
+        attempt_ref = _attempt_ref(run_id, node_id, attempt_id)
+        idempotency_key = f"recovery-plan:{attempt_ref}"
+        result: dict[str, object] = {}
+
+        def decide(events: list[StoredEvent], version: int):
+            try:
+                self.recovery.recover(run_id)
+            except RunRecoveryError as exc:
+                raise SchedulerError("Run recovery consistency check failed") from exc
+            accepted = next(
+                (
+                    event for event in events
+                    if event.event_type == "RoutingDecisionAccepted"
+                    and event.payload.get("attempt_ref") == attempt_ref
+                ),
+                None,
+            )
+            if (
+                accepted is None
+                or accepted.payload.get("decision_hash") != source_decision.decision_hash
+                or accepted.payload.get("request_hash") != source_decision.request_hash
+                or accepted.fencing_generation != fencing_generation
+                or accepted.payload.get("run_id") != run_id
+                or accepted.payload.get("node_id") != node_id
+                or accepted.payload.get("attempt_id") != attempt_id
+            ):
+                raise StaleRoutingDecision("failure evidence is not bound to the persisted accepted route")
+            accepted_route = AcceptedModelRoute.model_validate(accepted.payload["accepted_route"])
+            if (
+                source_decision.outcome != "selected"
+                or source_decision.selected_model_id != accepted_route.model_id
+                or source_decision.selected_provider_id != accepted_route.provider_id
+                or source_decision.registry_hash != accepted_route.registry_manifest_hash
+            ):
+                raise StaleRoutingDecision("failure source decision disagrees with its accepted route")
+            snapshot = self.lifecycle.config_snapshot(run_id)
+            state = self.lifecycle.replay(run_id)
+            node = state.node(node_id)
+            if (
+                node.spec.planning_contract_hash != contract.contract_hash
+                or node.spec.role != contract.role
+                or contract.config_hash != snapshot.effective_config_hash
+                or contract.registry_hash != snapshot.registry_manifest_hash
+            ):
+                raise StaleRoutingDecision("failure contract differs from the frozen Run node")
+            terminal = next(
+                (
+                    event for event in events
+                    if event.payload.get("attempt_ref") == attempt_ref
+                    and event.event_type in {"AttemptSlotReleased", "AttemptOutcomeUnknown"}
+                ),
+                None,
+            )
+            if terminal is None:
+                raise SchedulerError("failure recovery requires a durably ended Attempt")
+            if failure.outcome in {"unknown", "known_success"}:
+                if terminal.event_type != "AttemptOutcomeUnknown":
+                    raise SchedulerError("unresolved Gateway outcome is not persisted as OutcomeUnknown")
+            elif terminal.event_type != "AttemptSlotReleased" or terminal.payload.get("outcome") != "failed":
+                raise SchedulerError("known Gateway failure requires a durably failed Attempt")
+
+            prior_failures: set[str] = set()
+            recorded_exhausted = accepted.payload.get("exhausted_model_ids", [])
+            retry_level = accepted.payload.get("retry_level", fencing_generation - 1)
+            if (
+                type(retry_level) is not int
+                or retry_level < 0
+                or not isinstance(recorded_exhausted, list)
+                or any(not isinstance(item, str) for item in recorded_exhausted)
+            ):
+                raise SchedulerError("accepted route has invalid persisted recovery counters")
+            prior_failures.update(recorded_exhausted)
+            accepted_by_ref = {
+                event.payload.get("attempt_ref"): event
+                for event in events
+                if event.event_type == "RoutingDecisionAccepted"
+                and event.payload.get("run_id") == run_id
+                and event.payload.get("node_id") == node_id
+                and event.fencing_generation < fencing_generation
+            }
+            for prior_event in events:
+                prior_ref = prior_event.payload.get("attempt_ref")
+                prior_acceptance = accepted_by_ref.get(prior_ref)
+                if (
+                    prior_acceptance is not None
+                    and prior_event.event_type == "AttemptSlotReleased"
+                    and prior_event.payload.get("outcome") == "failed"
+                ):
+                    prior_failures.add(
+                        AcceptedModelRoute.model_validate(
+                            prior_acceptance.payload["accepted_route"]
+                        ).model_id
+                    )
+            classification = classify_gateway_failure(
+                failure,
+                source_decision=source_decision,
+                retry_level=retry_level,
+                exhausted_model_ids=tuple(sorted(prior_failures)),
+            )
+            if classification.evidence is None:
+                plan = _blocked_recovery_plan(classification.reason)
+            else:
+                plan = RecoveryController().plan(
+                    source_decision=source_decision,
+                    contract=contract,
+                    config=snapshot.resolved_config.config,
+                    registry=snapshot.registry_manifest,
+                    evidence=classification.evidence,
+                )
+            classification_payload = classification.model_dump(mode="json")
+            plan_payload = plan.model_dump(mode="json")
+            failure_summary = {
+                "code": failure.code,
+                "phase": failure.phase,
+                "outcome": failure.outcome,
+                "retryable": failure.retryable,
+                "http_status": failure.http_status,
+                "retry_after_ms": failure.retry_after_ms,
+            }
+            classified_payload = {
+                "run_id": run_id,
+                "node_id": node_id,
+                "attempt_id": attempt_id,
+                "fencing_generation": fencing_generation,
+                "attempt_ref": attempt_ref,
+                "decision_hash": source_decision.decision_hash,
+                "failure": failure_summary,
+                "provider_code_hash": (
+                    None if failure.provider_code is None
+                    else _hash({"provider_code": failure.provider_code})
+                ),
+                "classification": classification_payload,
+            }
+            plan_event_payload = {
+                "run_id": run_id,
+                "node_id": node_id,
+                "attempt_id": attempt_id,
+                "fencing_generation": fencing_generation,
+                "attempt_ref": attempt_ref,
+                "decision_hash": source_decision.decision_hash,
+                "evidence_hash": (
+                    None if classification.evidence is None
+                    else classification.evidence.evidence_hash
+                ),
+                "plan": plan_payload,
+            }
+            prior_operation = [event for event in events if event.idempotency_key == idempotency_key]
+            if prior_operation:
+                if (
+                    len(prior_operation) != 2
+                    or prior_operation[0].event_type != "AttemptFailureClassified"
+                    or prior_operation[0].payload != classified_payload
+                    or prior_operation[1].event_type != "RecoveryPlanCreated"
+                    or prior_operation[1].payload != plan_event_payload
+                ):
+                    raise SchedulerError("failure recovery idempotency key was reused")
+                result["plan"] = plan
+                return None
+            result["plan"] = plan
+            return [
+                EventDraft(
+                    "AttemptFailureClassified",
+                    classified_payload,
+                    run_id=run_id,
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                    fencing_generation=fencing_generation,
+                    correlation_id=run_id,
+                    causation_id=source_decision.decision_hash,
+                ),
+                EventDraft(
+                    "RecoveryPlanCreated",
+                    plan_event_payload,
+                    run_id=run_id,
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                    fencing_generation=fencing_generation,
+                    correlation_id=run_id,
+                    causation_id=source_decision.decision_hash,
+                ),
+            ]
+
+        self.event_store.append_checked(
+            _SCHEDULER_STREAM, _SCHEDULER_ID, idempotency_key, decide
+        )
+        return RecoveryPlan.model_validate(result["plan"])
 
     def finish_attempt(
         self,
@@ -749,6 +994,95 @@ def _run_concurrency_limit(snapshot: RunConfigSnapshot, limits: ConcurrencyLimit
 def _attempt_ref(run_id: str, node_id: str, attempt_id: str) -> str:
     value = json.dumps((run_id, node_id, attempt_id), ensure_ascii=False, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _blocked_recovery_plan(reason: str) -> RecoveryPlan:
+    return RecoveryPlan(
+        outcome="blocked",
+        action=None,
+        authorization=None,
+        target_role=None,
+        authorized_model_ids=(),
+        reason=reason,
+    )
+
+
+def _verify_persisted_recovery_authorization(
+    events: list[StoredEvent], *, request: RoutingRequest, decision: RoutingDecision
+) -> None:
+    authorization = request.recovery_authorization
+    if authorization is None:
+        raise StaleRoutingDecision("recovery authorization is missing")
+    if request.recovery_action not in {
+        "same_model_retry", "same_tier_fallback", "capability_escalation"
+    }:
+        raise SchedulerError("recovery action requires graph or health-control integration")
+    plan_event = next(
+        (
+            event for event in events
+            if event.event_type == "RecoveryPlanCreated"
+            and event.run_id == request.run_id
+            and event.payload.get("decision_hash") == request.prior_decision_hash
+            and event.payload.get("plan", {}).get("authorization") == authorization.model_dump(mode="json")
+        ),
+        None,
+    )
+    if plan_event is None:
+        raise StaleRoutingDecision("recovery authorization was not persisted by Scheduler")
+    plan = RecoveryPlan.model_validate_json(json.dumps(plan_event.payload.get("plan")))
+    if (
+        plan.outcome != "authorized"
+        or plan.action != request.recovery_action
+        or decision.selected_model_id not in plan.authorized_model_ids
+    ):
+        raise StaleRoutingDecision("recovery route is not allowed by its persisted plan")
+    classified_event = next(
+        (
+            event for event in events
+            if event.event_type == "AttemptFailureClassified"
+            and event.payload.get("attempt_ref") == plan_event.payload.get("attempt_ref")
+            and event.payload.get("decision_hash") == request.prior_decision_hash
+        ),
+        None,
+    )
+    if classified_event is None:
+        raise StaleRoutingDecision("persisted recovery plan has no failure evidence")
+    classification = FailureClassification.model_validate_json(
+        json.dumps(classified_event.payload.get("classification"))
+    )
+    evidence = classification.evidence
+    if evidence is None or (
+        request.failure_category != evidence.failure_category
+        or request.retry_level != evidence.retry_level + 1
+        or request.exhausted_model_ids != evidence.exhausted_model_ids
+    ):
+        raise StaleRoutingDecision("recovery request counters differ from persisted failure evidence")
+    source = next(
+        (
+            event for event in events
+            if event.event_type == "RoutingDecisionAccepted"
+            and event.payload.get("decision_hash") == request.prior_decision_hash
+            and event.payload.get("run_id") == request.run_id
+        ),
+        None,
+    )
+    if source is None:
+        raise StaleRoutingDecision("recovery plan source attempt is missing")
+    if (
+        plan.action in {"same_model_retry", "same_tier_fallback", "capability_escalation"}
+        and (
+            source.payload.get("node_id") != request.node_id
+            or request.fencing_generation != source.fencing_generation + 1
+        )
+    ):
+        raise StaleRoutingDecision("same-node recovery must use the next fencing generation")
+    consumed = any(
+        event.event_type == "RoutingDecisionAccepted"
+        and event.payload.get("recovery_authorization_hash") == authorization.authorization_hash
+        for event in events
+    )
+    if consumed:
+        raise StaleRoutingDecision("recovery authorization was already consumed")
 
 
 def _policy_action_hash(

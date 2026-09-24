@@ -56,9 +56,15 @@ sanitized failure facts into `RecoveryEvidence`: retryable known failures may
 enter bounded planning; output/capability failures retain their repair class;
 unknown outcomes require reconciliation; nonrecoverable preflight failures
 and known-success settlement failures are blocked. Its evidence hash omits
-provider request IDs and never stores raw provider bodies. This classifier is
-not yet persisted with the Run event stream or wired into a Worker/Scheduler
-retry loop.
+provider request IDs and never stores raw provider bodies. `Scheduler` can
+persist the classification and `RecoveryPlanCreated` together after the source
+Attempt has durably failed or entered `OutcomeUnknown`. Before a same-node
+retry/fallback/escalation is accepted, it verifies that the authorization is
+persisted, matches the source plan, is consumed once, and that retry level,
+failure class, and exhausted-model counters exactly match the evidence. Run
+replay checks those bindings again. This is a bounded recovery-control API, not
+an automatic Worker retry loop; the host still has to decide to call it and
+route the next Attempt.
 
 The cross-process interruption matrix, real Worker/OS termination receipt,
 bounded retry integration, provider-side effect reconciliation, and

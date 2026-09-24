@@ -16,8 +16,9 @@ from orchestrator.artifacts import ArtifactRecord, ArtifactStore
 from orchestrator.budget import BudgetBalance, BudgetLedger, RunLimit
 from orchestrator.lifecycle import LifecycleController, LifecycleError
 from orchestrator.lifecycle.models import AttemptState, RunLifecycleState
-from orchestrator.models import AcceptedModelRoute
+from orchestrator.models import AcceptedModelRoute, ModelGatewayFailure
 from orchestrator.persistence import SQLiteEventStore, StoredEvent
+from orchestrator.routing import FailureClassification, RecoveryPlan
 
 
 class RunRecoveryError(RuntimeError):
@@ -400,6 +401,11 @@ class RunRecoveryCoordinator:
     ) -> tuple[dict[tuple[str, str], dict[str, object]], dict[str, dict[str, object]]]:
         attempts: dict[tuple[str, str], dict[str, object]] = {}
         by_ref: dict[str, dict[str, object]] = {}
+        classifications: dict[str, tuple[StoredEvent, FailureClassification]] = {}
+        recovery_plan_sources: set[str] = set()
+        plans_by_authorization: dict[str, tuple[StoredEvent, RecoveryPlan]] = {}
+        consumed_authorizations: set[str] = set()
+        accepted_events_by_ref: dict[str, StoredEvent] = {}
         events = self.event_store.read_stream("scheduler", "global")
         for event in events:
             payload = event.payload
@@ -428,6 +434,59 @@ class RunRecoveryCoordinator:
                     route = AcceptedModelRoute.model_validate(payload.get("accepted_route"))
                 except (TypeError, ValueError) as exc:
                     raise RunRecoveryError("scheduler accepted route is invalid") from exc
+                authorization_hash = payload.get("recovery_authorization_hash")
+                recovery_action = payload.get("recovery_action", "initial")
+                prior_decision_hash = payload.get("prior_decision_hash")
+                if authorization_hash is None:
+                    if recovery_action != "initial" or prior_decision_hash is not None:
+                        raise RunRecoveryError("initial route has inconsistent recovery context")
+                else:
+                    persisted = plans_by_authorization.get(authorization_hash)
+                    if persisted is None:
+                        raise RunRecoveryError("accepted recovery route has no persisted plan")
+                    plan_event, plan = persisted
+                    if (
+                        plan_event.run_id != run_id
+                        or plan_event.payload.get("decision_hash") != prior_decision_hash
+                        or plan.action != recovery_action
+                        or route.model_id not in plan.authorized_model_ids
+                        or authorization_hash in consumed_authorizations
+                    ):
+                        raise RunRecoveryError("accepted recovery route disagrees with its persisted plan")
+                    source_classification = classifications.get(
+                        plan_event.payload.get("attempt_ref")
+                    )
+                    evidence = (
+                        None if source_classification is None
+                        else source_classification[1].evidence
+                    )
+                    if (
+                        evidence is None
+                        or node_id != plan_event.node_id
+                        or event.fencing_generation != plan_event.fencing_generation + 1
+                        or payload.get("failure_category") != evidence.failure_category
+                        or payload.get("retry_level") != evidence.retry_level + 1
+                        or payload.get("exhausted_model_ids", []) != list(evidence.exhausted_model_ids)
+                    ):
+                        raise RunRecoveryError(
+                            "accepted recovery route counters disagree with persisted failure evidence"
+                        )
+                    source_acceptance = accepted_events_by_ref.get(
+                        plan_event.payload.get("attempt_ref")
+                    )
+                    if source_acceptance is None:
+                        raise RunRecoveryError("accepted recovery plan source route is missing")
+                    if (
+                        recovery_action not in {
+                            "same_model_retry", "same_tier_fallback", "capability_escalation"
+                        }
+                        or source_acceptance.payload.get("node_id") != node_id
+                        or event.fencing_generation != source_acceptance.fencing_generation + 1
+                    ):
+                        raise RunRecoveryError(
+                            "accepted recovery route is outside the supported same-node boundary"
+                        )
+                    consumed_authorizations.add(authorization_hash)
                 accepted_at = _parse_aware_timestamp(payload.get("accepted_at"))
                 lease_expires_at = _parse_aware_timestamp(payload.get("lease_expires_at"))
                 if lease_expires_at <= accepted_at:
@@ -453,6 +512,7 @@ class RunRecoveryCoordinator:
                 }
                 attempts[key] = record
                 by_ref[attempt_ref] = record
+                accepted_events_by_ref[attempt_ref] = event
                 continue
 
             record = by_ref.get(attempt_ref)
@@ -479,6 +539,65 @@ class RunRecoveryCoordinator:
                     raise RunRecoveryError("released scheduler lease has no valid terminal outcome")
                 record["status"] = "released"
                 record["terminal_outcome"] = outcome
+            elif event.event_type == "AttemptFailureClassified":
+                if record["status"] not in {"released", "outcome_unknown"}:
+                    raise RunRecoveryError("failure classification precedes a durable Attempt outcome")
+                if payload.get("decision_hash") != record.get("decision_hash"):
+                    raise RunRecoveryError("failure classification is bound to a different route")
+                try:
+                    classification = FailureClassification.model_validate_json(
+                        json.dumps(payload.get("classification"))
+                    )
+                    failure = ModelGatewayFailure.model_validate(payload.get("failure"))
+                except (TypeError, ValueError) as exc:
+                    raise RunRecoveryError("persisted failure classification is invalid") from exc
+                if failure.outcome == "unknown":
+                    if record["status"] != "outcome_unknown" or classification.disposition != "reconciliation_required":
+                        raise RunRecoveryError("unknown Gateway outcome lost its reconciliation gate")
+                elif failure.outcome == "known_success":
+                    if record["status"] != "outcome_unknown" or classification.disposition != "blocked":
+                        raise RunRecoveryError("known-success settlement failure is not blocked")
+                elif record.get("terminal_outcome") != "failed":
+                    raise RunRecoveryError("known Gateway failure has no failed Attempt outcome")
+                if attempt_ref in classifications:
+                    raise RunRecoveryError("Attempt has duplicate failure classifications")
+                classifications[attempt_ref] = (event, classification)
+            elif event.event_type == "RecoveryPlanCreated":
+                classified = classifications.get(attempt_ref)
+                if classified is None:
+                    raise RunRecoveryError("RecoveryPlan has no preceding failure classification")
+                if attempt_ref in recovery_plan_sources:
+                    raise RunRecoveryError("Attempt has duplicate RecoveryPlan events")
+                classification_event, classification = classified
+                if (
+                    payload.get("decision_hash") != record.get("decision_hash")
+                    or classification_event.payload.get("decision_hash") != payload.get("decision_hash")
+                    or payload.get("evidence_hash") != (
+                        None if classification.evidence is None else classification.evidence.evidence_hash
+                    )
+                ):
+                    raise RunRecoveryError("RecoveryPlan is not bound to its failure evidence")
+                try:
+                    plan = RecoveryPlan.model_validate_json(json.dumps(payload.get("plan")))
+                except (TypeError, ValueError) as exc:
+                    raise RunRecoveryError("persisted RecoveryPlan is invalid") from exc
+                authorization = plan.authorization
+                if plan.outcome == "authorized":
+                    if (
+                        authorization is None
+                        or authorization.source_decision_hash != record.get("decision_hash")
+                        or authorization.evidence_hash != payload.get("evidence_hash")
+                        or plan.action != authorization.action
+                        or tuple(sorted(plan.authorized_model_ids))
+                        != authorization.authorized_model_ids
+                    ):
+                        raise RunRecoveryError("persisted recovery authorization is inconsistent")
+                    if authorization.authorization_hash in plans_by_authorization:
+                        raise RunRecoveryError("recovery authorization is persisted more than once")
+                    plans_by_authorization[authorization.authorization_hash] = (event, plan)
+                elif authorization is not None:
+                    raise RunRecoveryError("non-authorized RecoveryPlan carries an authorization")
+                recovery_plan_sources.add(attempt_ref)
             else:
                 raise RunRecoveryError("scheduler Run event type is unsupported during recovery")
         return attempts, by_ref

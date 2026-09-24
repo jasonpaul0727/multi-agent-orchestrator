@@ -38,8 +38,15 @@ from orchestrator.lifecycle import (
     validate_graph_append,
 )
 from orchestrator.lifecycle.models import AttemptState, NodeState, RunLifecycleState
+from orchestrator.models import ModelGatewayFailure
 from orchestrator.persistence import EventDraft, SQLiteEventStore
-from orchestrator.routing import CandidateAssessment, RoutingDecision, RoutingRequest
+from orchestrator.routing import (
+    CandidateAssessment,
+    RecoveryAuthorization,
+    RoutingDecision,
+    RoutingRequest,
+    compile_node_contract,
+)
 from orchestrator.recovery import RunRecoveryCoordinator, RunRecoveryError
 from orchestrator.scheduler import (
     ConcurrencyLimitExceeded,
@@ -48,6 +55,7 @@ from orchestrator.scheduler import (
     SchedulerError,
     StaleRoutingDecision,
 )
+from orchestrator.scheduler.core import _verify_persisted_recovery_authorization
 from orchestrator.security import PolicyAuthority, PolicyEngine, PolicyManifest, PolicyRequest
 
 
@@ -175,6 +183,49 @@ def run_setup(
     return reg, resolved.config, controller, manifest
 
 
+def run_setup_with_frozen_contract(store, *, max_attempts=3):
+    reg = registry()
+    resolved = effective_config(reg)
+    manifest = PolicyManifest(
+        authorities=(
+            PolicyAuthority(
+                source="system",
+                max_permission="read-only",
+                allowed_actions={"model_invoke"},
+                allowed_tools={"model:model-1"},
+            ),
+        )
+    )
+    contract = compile_node_contract(
+        run_id="run-1",
+        node_id="node-1",
+        role="coder",
+        task_text="implement a small change",
+        config=resolved.config,
+        registry=reg,
+        policy_manifest=manifest,
+        context_tokens=1_000,
+        max_output_tokens=500,
+        required_capabilities=("text",),
+    )
+    ConfigManager(ConfigCandidate(resolved=resolved, registry=reg)).start_run("run-1", store)
+    lifecycle = LifecycleController(store)
+    lifecycle.initialize_run("run-1")
+    lifecycle.append_nodes(
+        "run-1",
+        (NodeSpec(
+            node_id="node-1",
+            role="coder",
+            planning_contract_hash=contract.contract_hash,
+            max_attempts=max_attempts,
+        ),),
+        expected_graph_version=0,
+        idempotency_key="initial-graph",
+    )
+    lifecycle.start_run("run-1")
+    return reg, resolved.config, lifecycle, manifest, contract
+
+
 def routed_pair(
     reg,
     config,
@@ -185,6 +236,13 @@ def routed_pair(
     role="coder",
     attempt=1,
     contract_hash=HASH,
+    recovery_action="initial",
+    recovery_authorization=None,
+    prior_decision_hash=None,
+    previous_model_id=None,
+    failure_category=None,
+    retry_level=0,
+    exhausted_model_ids=(),
 ):
     request = RoutingRequest(
         request_id=f"request-{node_id}-{attempt}",
@@ -197,6 +255,13 @@ def routed_pair(
         planning_contract_hash=contract_hash,
         policy_manifest_hash=manifest.content_hash,
         routing_as_of_event_time=NOW,
+        prior_decision_hash=prior_decision_hash,
+        previous_model_id=previous_model_id,
+        recovery_action=recovery_action,
+        recovery_authorization=recovery_authorization,
+        failure_category=failure_category,
+        retry_level=retry_level,
+        exhausted_model_ids=exhausted_model_ids,
     )
     normalized_policy_hash = "sha256:" + hashlib.sha256(
         json.dumps(
@@ -767,6 +832,564 @@ def test_run_recovery_reconstructs_active_and_settled_control_plane_state(tmp_pa
     assert recovered.active_attempts == ()
 
 
+def test_scheduler_persists_recovery_evidence_and_consumes_retry_authorization_once(tmp_path):
+    store = SQLiteEventStore(tmp_path / "persisted-recovery.db")
+    reg, config, _lifecycle, manifest, contract = run_setup_with_frozen_contract(store)
+    control = scheduler(store)
+    first_request, first_decision = routed_pair(
+        reg, config, manifest, contract_hash=contract.contract_hash
+    )
+    accepted = accept(control, first_request, first_decision)
+    control.finish_attempt(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=first_request.attempt_id,
+        fencing_generation=1,
+        completed_at=NOW + timedelta(seconds=5),
+        outcome="failed",
+        known_no_effect=True,
+    )
+    failure = ModelGatewayFailure(
+        code="rate_limited",
+        phase="provider",
+        outcome="known_failure",
+        retryable=True,
+        http_status=429,
+        provider_request_id="must-not-be-persisted",
+    )
+    plan = control.plan_attempt_recovery(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=first_request.attempt_id,
+        fencing_generation=1,
+        source_decision=first_decision,
+        contract=contract,
+        failure=failure,
+    )
+
+    assert plan.outcome == "authorized"
+    assert plan.action == "same_model_retry"
+    assert plan.authorization is not None
+    assert control.plan_attempt_recovery(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=first_request.attempt_id,
+        fencing_generation=1,
+        source_decision=first_decision,
+        contract=contract,
+        failure=failure.model_copy(update={"provider_request_id": "different-request-id"}),
+    ) == plan
+    persisted = store.read_stream("scheduler", "global")
+    classified_event = next(item for item in persisted if item.event_type == "AttemptFailureClassified")
+    assert classified_event.payload["classification"]["evidence"]["retry_safe"] is True
+    assert "provider_request_id" not in json.dumps(classified_event.payload)
+    assert sum(item.event_type == "RecoveryPlanCreated" for item in persisted) == 1
+
+    forged = RecoveryAuthorization.create(
+        action="same_model_retry",
+        source_decision_hash=first_decision.decision_hash,
+        previous_model_id="model-1",
+        authorized_model_ids=("model-1",),
+        policy_manifest_hash=manifest.content_hash,
+        evidence_hash=HASH,
+    )
+    forged_request, forged_decision = routed_pair(
+        reg,
+        config,
+        manifest,
+        attempt=2,
+        contract_hash=contract.contract_hash,
+        recovery_action="same_model_retry",
+        recovery_authorization=forged,
+        prior_decision_hash=first_decision.decision_hash,
+        previous_model_id="model-1",
+        failure_category="transient",
+        retry_level=1,
+    )
+    with pytest.raises(StaleRoutingDecision, match="not persisted"):
+        accept(control, forged_request, forged_decision)
+
+    lowered_counter_request, lowered_counter_decision = routed_pair(
+        reg,
+        config,
+        manifest,
+        attempt=2,
+        contract_hash=contract.contract_hash,
+        recovery_action="same_model_retry",
+        recovery_authorization=plan.authorization,
+        prior_decision_hash=first_decision.decision_hash,
+        previous_model_id="model-1",
+        failure_category="transient",
+        retry_level=0,
+    )
+    with pytest.raises(StaleRoutingDecision, match="counters differ"):
+        accept(control, lowered_counter_request, lowered_counter_decision)
+
+    retry_request, retry_decision = routed_pair(
+        reg,
+        config,
+        manifest,
+        attempt=2,
+        contract_hash=contract.contract_hash,
+        recovery_action="same_model_retry",
+        recovery_authorization=plan.authorization,
+        prior_decision_hash=first_decision.decision_hash,
+        previous_model_id="model-1",
+        failure_category="transient",
+        retry_level=1,
+    )
+    retried = accept(control, retry_request, retry_decision)
+    assert retried.accepted_route.model_id == "model-1"
+    persisted_recovery_events = store.read_stream("scheduler", "global")
+    with pytest.raises(StaleRoutingDecision, match="not allowed by its persisted plan"):
+        _verify_persisted_recovery_authorization(
+            persisted_recovery_events,
+            request=retry_request.model_copy(update={"recovery_action": "same_tier_fallback"}),
+            decision=retry_decision,
+        )
+    with pytest.raises(StaleRoutingDecision, match="no failure evidence"):
+        _verify_persisted_recovery_authorization(
+            [
+                event for event in persisted_recovery_events
+                if event.event_type != "AttemptFailureClassified"
+            ],
+            request=retry_request,
+            decision=retry_decision,
+        )
+    with pytest.raises(StaleRoutingDecision, match="source attempt is missing"):
+        _verify_persisted_recovery_authorization(
+            [
+                event for event in persisted_recovery_events
+                if not (
+                    event.event_type == "RoutingDecisionAccepted"
+                    and event.payload.get("attempt_id") == first_request.attempt_id
+                )
+            ],
+            request=retry_request,
+            decision=retry_decision,
+        )
+    with pytest.raises(StaleRoutingDecision, match="next fencing generation"):
+        _verify_persisted_recovery_authorization(
+            persisted_recovery_events,
+            request=retry_request.model_copy(update={"node_id": "child-node"}),
+            decision=retry_decision,
+        )
+    with pytest.raises(StaleRoutingDecision, match="already consumed"):
+        _verify_persisted_recovery_authorization(
+            persisted_recovery_events, request=retry_request, decision=retry_decision
+        )
+    recovered = RunRecoveryCoordinator(store).recover("run-1")
+    assert len(recovered.active_attempts) == 1
+    assert recovered.active_attempts[0].attempt_id == "attempt-node-1-2"
+    assert recovered.active_attempts[0].fencing_generation == 2
+    accepted_retry = next(
+        item for item in store.read_stream("scheduler", "global")
+        if item.event_type == "RoutingDecisionAccepted"
+        and item.payload.get("attempt_id") == retry_request.attempt_id
+    )
+    assert accepted_retry.payload["recovery_authorization_hash"] == plan.authorization.authorization_hash
+
+    retried_reservation = retried.reservation
+    control.finish_attempt(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=retry_request.attempt_id,
+        fencing_generation=2,
+        completed_at=NOW + timedelta(seconds=10),
+        outcome="failed",
+        known_no_effect=True,
+    )
+    fallback_plan = control.plan_attempt_recovery(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=retry_request.attempt_id,
+        fencing_generation=2,
+        source_decision=retry_decision,
+        contract=contract,
+        failure=ModelGatewayFailure(
+            code="provider_unavailable",
+            phase="provider",
+            outcome="known_failure",
+            retryable=False,
+            http_status=503,
+        ),
+    )
+    assert fallback_plan.outcome == "blocked"
+    persisted_after_fallback = store.read_stream("scheduler", "global")
+    second_classification = next(
+        item for item in persisted_after_fallback
+        if item.event_type == "AttemptFailureClassified"
+        and item.payload.get("attempt_id") == retry_request.attempt_id
+    )
+    assert second_classification.payload["classification"]["evidence"]["exhausted_model_ids"] == ["model-1"]
+    assert retried_reservation.reserved_minor == 20
+
+    class ReadOnlySchedulerEvents:
+        def __init__(self, events):
+            self.events = events
+
+        def read_stream(self, stream_type, stream_id):
+            assert (stream_type, stream_id) == ("scheduler", "global")
+            return self.events
+
+    replay_events = store.read_stream("scheduler", "global")
+    tampered_retry_payload = dict(accepted_retry.payload)
+    tampered_retry_payload["retry_level"] = 0
+    tampered_events = [
+        event.model_copy(update={"payload": tampered_retry_payload})
+        if event.event_id == accepted_retry.event_id else event
+        for event in replay_events
+    ]
+    with pytest.raises(RunRecoveryError, match="counters disagree"):
+        RunRecoveryCoordinator(ReadOnlySchedulerEvents(tampered_events))._scheduler_state("run-1")
+    without_plans = [
+        event for event in replay_events if event.event_type != "RecoveryPlanCreated"
+    ]
+    with pytest.raises(RunRecoveryError, match="no persisted plan"):
+        RunRecoveryCoordinator(ReadOnlySchedulerEvents(without_plans))._scheduler_state("run-1")
+    wrong_source_payload = dict(accepted_retry.payload)
+    wrong_source_payload["prior_decision_hash"] = HASH
+    wrong_source_events = [
+        event.model_copy(update={"payload": wrong_source_payload})
+        if event.event_id == accepted_retry.event_id else event
+        for event in replay_events
+    ]
+    with pytest.raises(RunRecoveryError, match="disagrees with its persisted plan"):
+        RunRecoveryCoordinator(ReadOnlySchedulerEvents(wrong_source_events))._scheduler_state("run-1")
+    first_plan_event = next(
+        event for event in replay_events
+        if event.event_type == "RecoveryPlanCreated"
+        and event.payload.get("attempt_id") == first_request.attempt_id
+    )
+    first_classification = next(
+        event for event in replay_events
+        if event.event_type == "AttemptFailureClassified"
+        and event.payload.get("attempt_id") == first_request.attempt_id
+    )
+    source_acceptance = next(
+        event for event in replay_events
+        if event.event_type == "RoutingDecisionAccepted"
+        and event.payload.get("attempt_id") == first_request.attempt_id
+    )
+    source_release = next(
+        event for event in replay_events
+        if event.event_type == "AttemptSlotReleased"
+        and event.payload.get("attempt_id") == first_request.attempt_id
+    )
+
+    def parse_scheduler_events(events):
+        return RunRecoveryCoordinator(ReadOnlySchedulerEvents(events))._scheduler_state("run-1")
+
+    with pytest.raises(RunRecoveryError, match="precedes a durable Attempt outcome"):
+        parse_scheduler_events([source_acceptance, first_classification])
+    bad_classification_hash = first_classification.model_copy(update={
+        "payload": {**first_classification.payload, "decision_hash": HASH},
+    })
+    with pytest.raises(RunRecoveryError, match="bound to a different route"):
+        parse_scheduler_events([source_acceptance, source_release, bad_classification_hash])
+    malformed_classification = first_classification.model_copy(update={
+        "payload": {**first_classification.payload, "classification": {"invalid": True}},
+    })
+    with pytest.raises(RunRecoveryError, match="persisted failure classification is invalid"):
+        parse_scheduler_events([source_acceptance, source_release, malformed_classification])
+    success_release = source_release.model_copy(update={
+        "payload": {**source_release.payload, "outcome": "succeeded"},
+    })
+    with pytest.raises(RunRecoveryError, match="no failed Attempt outcome"):
+        parse_scheduler_events([source_acceptance, success_release, first_classification])
+    duplicate_classification = first_classification.model_copy(update={
+        "event_id": "duplicate-failure-classification",
+        "stream_version": first_classification.stream_version + 1,
+    })
+    with pytest.raises(RunRecoveryError, match="duplicate failure classifications"):
+        parse_scheduler_events([
+            source_acceptance, source_release, first_classification, duplicate_classification
+        ])
+    bad_plan_evidence = first_plan_event.model_copy(update={
+        "payload": {**first_plan_event.payload, "evidence_hash": HASH},
+    })
+    with pytest.raises(RunRecoveryError, match="not bound to its failure evidence"):
+        parse_scheduler_events([
+            source_acceptance, source_release, first_classification, bad_plan_evidence
+        ])
+    duplicate_plan = first_plan_event.model_copy(update={
+        "event_id": "duplicate-recovery-plan",
+        "stream_version": first_plan_event.stream_version + 1,
+    })
+    with pytest.raises(RunRecoveryError, match="duplicate RecoveryPlan events"):
+        parse_scheduler_events([
+            source_acceptance, source_release, first_classification,
+            first_plan_event, duplicate_plan,
+        ])
+
+    evidence_hash = first_classification.payload["classification"]["evidence"]["evidence_hash"]
+    reviewer_authorization = RecoveryAuthorization.create(
+        action="reviewer_node",
+        source_decision_hash=first_decision.decision_hash,
+        previous_model_id="model-1",
+        authorized_model_ids=("model-1",),
+        policy_manifest_hash=manifest.content_hash,
+        evidence_hash=evidence_hash,
+    )
+    reviewer_plan_payload = dict(first_plan_event.payload)
+    reviewer_plan = dict(reviewer_plan_payload["plan"])
+    reviewer_plan["action"] = "reviewer_node"
+    reviewer_plan["authorization"] = reviewer_authorization.model_dump(mode="json")
+    reviewer_plan_payload["plan"] = reviewer_plan
+    reviewer_retry_payload = dict(accepted_retry.payload)
+    reviewer_retry_payload["recovery_action"] = "reviewer_node"
+    reviewer_retry_payload["recovery_authorization_hash"] = reviewer_authorization.authorization_hash
+    reviewer_events = [
+        event.model_copy(update={"payload": reviewer_plan_payload})
+        if event.event_id == first_plan_event.event_id
+        else event.model_copy(update={"payload": reviewer_retry_payload})
+        if event.event_id == accepted_retry.event_id
+        else event
+        for event in replay_events
+    ]
+    with pytest.raises(RunRecoveryError, match="supported same-node boundary"):
+        RunRecoveryCoordinator(ReadOnlySchedulerEvents(reviewer_events))._scheduler_state("run-1")
+
+    mismatched_evidence_authorization = RecoveryAuthorization.create(
+        action=plan.action,
+        source_decision_hash=first_decision.decision_hash,
+        previous_model_id="model-1",
+        authorized_model_ids=plan.authorized_model_ids,
+        policy_manifest_hash=manifest.content_hash,
+        evidence_hash=HASH,
+    )
+    invalid_plan = dict(first_plan_event.payload["plan"])
+    invalid_plan["authorization"] = mismatched_evidence_authorization.model_dump(mode="json")
+    invalid_plan_payload = dict(first_plan_event.payload)
+    invalid_plan_payload["plan"] = invalid_plan
+    invalid_plan_events = [
+        event.model_copy(update={"payload": invalid_plan_payload})
+        if event.event_id == first_plan_event.event_id else event
+        for event in replay_events
+        if event.stream_version <= first_plan_event.stream_version
+    ]
+    with pytest.raises(RunRecoveryError, match="authorization is inconsistent"):
+        RunRecoveryCoordinator(ReadOnlySchedulerEvents(invalid_plan_events))._scheduler_state("run-1")
+
+def test_scheduler_persists_unknown_failure_as_reconciliation_only(tmp_path):
+    store = SQLiteEventStore(tmp_path / "unknown-recovery-plan.db")
+    reg, config, _lifecycle, manifest, contract = run_setup_with_frozen_contract(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest, contract_hash=contract.contract_hash)
+    accept(control, request, decision)
+    control.finish_attempt(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=request.attempt_id,
+        fencing_generation=1,
+        completed_at=NOW + timedelta(seconds=5),
+        outcome="outcome_unknown",
+    )
+
+    plan = control.plan_attempt_recovery(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=request.attempt_id,
+        fencing_generation=1,
+        source_decision=decision,
+        contract=contract,
+        failure=ModelGatewayFailure(
+            code="timeout",
+            phase="transport",
+            outcome="unknown",
+            retryable=False,
+        ),
+    )
+
+    assert plan.outcome == "blocked"
+    assert plan.reason == "unknown_outcome_requires_reconciliation"
+    events = store.read_stream("scheduler", "global")
+    classified = next(item for item in events if item.event_type == "AttemptFailureClassified")
+    assert classified.payload["classification"]["disposition"] == "reconciliation_required"
+    assert sum(item.event_type == "RecoveryPlanCreated" for item in events) == 1
+    recovered = RunRecoveryCoordinator(store).recover("run-1")
+    assert recovered.active_attempts[0].status == "outcome_unknown"
+
+
+def test_scheduler_recovery_requires_accepted_and_durably_ended_source(tmp_path):
+    store = SQLiteEventStore(tmp_path / "recovery-source-boundary.db")
+    reg, config, _lifecycle, manifest, contract = run_setup_with_frozen_contract(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest, contract_hash=contract.contract_hash)
+    failure = ModelGatewayFailure(
+        code="rate_limited",
+        phase="provider",
+        outcome="known_failure",
+        retryable=True,
+    )
+
+    with pytest.raises(StaleRoutingDecision, match="source attempt"):
+        control.plan_attempt_recovery(
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id=request.attempt_id,
+            fencing_generation=1,
+            source_decision=decision.model_copy(update={"attempt_id": "other-attempt"}),
+            contract=contract,
+            failure=failure,
+        )
+    with pytest.raises(StaleRoutingDecision, match="persisted accepted route"):
+        control.plan_attempt_recovery(
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id=request.attempt_id,
+            fencing_generation=1,
+            source_decision=decision,
+            contract=contract,
+            failure=failure,
+        )
+
+    accept(control, request, decision)
+    with pytest.raises(SchedulerError, match="durably ended Attempt"):
+        control.plan_attempt_recovery(
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id=request.attempt_id,
+            fencing_generation=1,
+            source_decision=decision,
+            contract=contract,
+            failure=failure,
+        )
+
+    control.finish_attempt(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=request.attempt_id,
+        fencing_generation=1,
+        completed_at=NOW + timedelta(seconds=5),
+        outcome="failed",
+        known_no_effect=True,
+    )
+    with pytest.raises(SchedulerError, match="OutcomeUnknown"):
+        control.plan_attempt_recovery(
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id=request.attempt_id,
+            fencing_generation=1,
+            source_decision=decision,
+            contract=contract,
+            failure=ModelGatewayFailure(
+                code="timeout", phase="transport", outcome="unknown", retryable=False
+            ),
+        )
+
+
+def test_scheduler_recovery_rejects_known_failure_after_success(tmp_path):
+    store = SQLiteEventStore(tmp_path / "recovery-success-mismatch.db")
+    reg, config, _lifecycle, manifest, contract = run_setup_with_frozen_contract(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest, contract_hash=contract.contract_hash)
+    accepted = accept(control, request, decision)
+    control.finish_attempt(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=request.attempt_id,
+        fencing_generation=1,
+        completed_at=NOW + timedelta(seconds=5),
+        outcome="succeeded",
+        usage=UsageRecord(
+            reservation_id=accepted.reservation.reservation_id,
+            run_id="run-1",
+            settlement_key="recovery-success-mismatch",
+            currency="USD",
+            input_tokens=1,
+            output_tokens=1,
+            cost_minor=1,
+        ),
+    )
+    with pytest.raises(SchedulerError, match="durably failed Attempt"):
+        control.plan_attempt_recovery(
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id=request.attempt_id,
+            fencing_generation=1,
+            source_decision=decision,
+            contract=contract,
+            failure=ModelGatewayFailure(
+                code="rate_limited", phase="provider", outcome="known_failure", retryable=True
+            ),
+        )
+
+
+def test_recovery_authorizer_rejects_missing_or_unintegrated_graph_authorizations():
+    reg = registry()
+    config = effective_config(reg).config
+    manifest = PolicyManifest(
+        authorities=(PolicyAuthority(
+            source="system",
+            max_permission="read-only",
+            allowed_actions={"model_invoke"},
+            allowed_tools={"model:model-1"},
+        ),)
+    )
+    request, decision = routed_pair(reg, config, manifest)
+    with pytest.raises(StaleRoutingDecision, match="authorization is missing"):
+        _verify_persisted_recovery_authorization([], request=request, decision=decision)
+
+    authorization = RecoveryAuthorization.create(
+        action="reviewer_node",
+        source_decision_hash=decision.decision_hash,
+        previous_model_id="model-1",
+        authorized_model_ids=("model-1",),
+        policy_manifest_hash=manifest.content_hash,
+        evidence_hash=HASH,
+    )
+    reviewer_request, reviewer_decision = routed_pair(
+        reg,
+        config,
+        manifest,
+        attempt=2,
+        recovery_action="reviewer_node",
+        recovery_authorization=authorization,
+        prior_decision_hash=decision.decision_hash,
+        previous_model_id="model-1",
+    )
+    with pytest.raises(SchedulerError, match="graph or health-control integration"):
+        _verify_persisted_recovery_authorization(
+            [], request=reviewer_request, decision=reviewer_decision
+        )
+
+
+def test_scheduler_recovery_keeps_success_settlement_failure_blocked(tmp_path):
+    store = SQLiteEventStore(tmp_path / "recovery-settlement-blocked.db")
+    reg, config, _lifecycle, manifest, contract = run_setup_with_frozen_contract(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest, contract_hash=contract.contract_hash)
+    accept(control, request, decision)
+    control.finish_attempt(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=request.attempt_id,
+        fencing_generation=1,
+        completed_at=NOW + timedelta(seconds=5),
+        outcome="outcome_unknown",
+    )
+
+    plan = control.plan_attempt_recovery(
+        run_id="run-1",
+        node_id="node-1",
+        attempt_id=request.attempt_id,
+        fencing_generation=1,
+        source_decision=decision,
+        contract=contract,
+        failure=ModelGatewayFailure(
+            code="usage_unavailable",
+            phase="settlement",
+            outcome="known_success",
+            retryable=False,
+        ),
+    )
+
+    assert plan.outcome == "blocked"
+    assert plan.reason == "successful_call_requires_settlement"
+    assert RunRecoveryCoordinator(store).recover("run-1").active_attempts[0].status == "outcome_unknown"
+
+
 def test_run_recovery_classifies_effect_intent_as_unknown_until_receipt(tmp_path):
     store = SQLiteEventStore(tmp_path / "run-recovery-effect.db")
     reg, config, _lifecycle, manifest = run_setup(store)
@@ -1166,6 +1789,8 @@ def test_run_recovery_scheduler_event_parser_fails_closed_on_corrupt_sequences(t
         "AttemptOutcomeUnknown", event_id="stale-generation", stream_version=2,
         fencing_generation=2,
     )
+    inconsistent_recovery_payload = dict(payload)
+    inconsistent_recovery_payload["recovery_action"] = "same_model_retry"
 
     cases = (
         ([accepted, duplicate_acceptance], "duplicates a route acceptance"),
@@ -1180,6 +1805,8 @@ def test_run_recovery_scheduler_event_parser_fails_closed_on_corrupt_sequences(t
         ([event("RoutingDecisionAccepted", event_id="expired-time", stream_version=1,
                 payload_override={**payload, "lease_expires_at": payload["accepted_at"]})],
          "expires before route acceptance"),
+        ([event("RoutingDecisionAccepted", event_id="inconsistent-recovery", stream_version=1,
+                payload_override=inconsistent_recovery_payload)], "inconsistent recovery context"),
         ([bad_identity], "invalid Run execution identity"),
         ([event("AttemptOutcomeUnknown", event_id="unknown-ref", stream_version=1,
                payload_override=unknown_attempt_payload, node_id=missing_node,
