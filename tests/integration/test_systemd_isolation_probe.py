@@ -178,9 +178,10 @@ def test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits(
         path.write_text("scope-change\\n", encoding="utf-8")
         observed["overlay_after"] = path.read_text(encoding="utf-8").strip()
         sys.path.insert(0, sys.argv[5])
-        from orchestrator.isolation import export_overlay_diff
+        from orchestrator.isolation import export_overlay_diff, validate_overlay_candidate
 
         diff = export_overlay_diff(lower, upper, candidate)
+        validate_overlay_candidate(lower, diff)
         observed["export_entries"] = [entry.path for entry in diff.entries]
         observed["export_hash"] = diff.manifest_hash
         print(json.dumps(observed, sort_keys=True))

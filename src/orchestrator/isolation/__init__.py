@@ -8,6 +8,7 @@ from .workspace import (
     export_overlay_diff,
     inspect_workspace,
     snapshot_workspace,
+    validate_overlay_candidate,
 )
 from .launcher import (
     InvalidSandboxRequest,
@@ -48,6 +49,7 @@ __all__ = [
     "export_overlay_diff",
     "inspect_workspace",
     "snapshot_workspace",
+    "validate_overlay_candidate",
     "landlock_abi",
     "restrict_current_process",
 ]

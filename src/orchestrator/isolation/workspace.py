@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 from typing import Literal
@@ -527,27 +528,11 @@ def export_overlay_diff(
     try:
         copy_directory(upper_fd, target, (), 0)
         entries.sort(key=lambda entry: entry.path)
-        canonical = json.dumps(
-            [
-                {
-                    "path": entry.path,
-                    "operation": entry.operation,
-                    "kind": entry.kind,
-                    "mode": entry.mode,
-                    "size": entry.size,
-                    "digest": entry.digest,
-                    "baseline_digest": entry.baseline_digest,
-                }
-                for entry in entries
-            ],
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
         return WorkspaceDiff(
             candidate_root=target,
             entries=tuple(entries),
             total_bytes=total_bytes,
-            manifest_hash="sha256:" + hashlib.sha256(canonical).hexdigest(),
+            manifest_hash=_workspace_diff_hash(entries),
         )
     except BaseException:
         shutil.rmtree(target, ignore_errors=True)
@@ -555,6 +540,326 @@ def export_overlay_diff(
     finally:
         os.close(lower_fd)
         os.close(upper_fd)
+
+
+def validate_overlay_candidate(
+    lower_root: str | Path,
+    diff: WorkspaceDiff,
+    *,
+    max_entries: int = 100_000,
+    max_bytes: int = 1024 * 1024 * 1024,
+    max_depth: int = 256,
+) -> None:
+    """Revalidate candidate bytes, tree shape, manifest, and frozen lower bases.
+
+    This operation is read-only. It does not publish the candidate or assert
+    that the live host workspace still matches the lower snapshot.
+    """
+
+    for name, value in (
+        ("max_entries", max_entries),
+        ("max_bytes", max_bytes),
+        ("max_depth", max_depth),
+    ):
+        minimum = 0 if name == "max_bytes" else 1
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise WorkspaceBoundaryError(f"{name} must be a valid bound")
+    if not isinstance(diff, WorkspaceDiff):
+        raise WorkspaceBoundaryError("candidate manifest has an invalid type")
+    if (
+        isinstance(diff.total_bytes, bool)
+        or not isinstance(diff.total_bytes, int)
+        or diff.total_bytes < 0
+        or diff.total_bytes > max_bytes
+        or not isinstance(diff.entries, tuple)
+        or len(diff.entries) > max_entries
+        or not isinstance(diff.manifest_hash, str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", diff.manifest_hash)
+    ):
+        raise WorkspaceBoundaryError("candidate manifest exceeds limits or is malformed")
+
+    lower = Path(lower_root)
+    candidate = Path(diff.candidate_root)
+    try:
+        lower_info = lower.lstat()
+        candidate_info = candidate.lstat()
+        if not stat.S_ISDIR(lower_info.st_mode) or stat.S_ISLNK(lower_info.st_mode):
+            raise WorkspaceBoundaryError("overlay lower root must be a real directory")
+        if not stat.S_ISDIR(candidate_info.st_mode) or stat.S_ISLNK(candidate_info.st_mode):
+            raise WorkspaceBoundaryError("candidate root must be a real directory")
+        if stat.S_IMODE(candidate_info.st_mode) != 0o700:
+            raise WorkspaceBoundaryError("candidate root permissions are not private")
+        lower_path = lower.resolve(strict=True)
+        candidate_path = candidate.resolve(strict=True)
+        if _is_within(candidate_path, lower_path) or _is_within(lower_path, candidate_path):
+            raise WorkspaceBoundaryError("candidate root overlaps its lower input")
+        lower_fd = os.open(lower, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            candidate_fd = os.open(
+                candidate,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+        except BaseException:
+            os.close(lower_fd)
+            raise
+    except WorkspaceBoundaryError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise WorkspaceBoundaryError("candidate or lower root cannot be opened safely") from exc
+
+    roots_closed = False
+
+    def close_roots() -> None:
+        nonlocal roots_closed
+        if not roots_closed:
+            roots_closed = True
+            os.close(lower_fd)
+            os.close(candidate_fd)
+
+    try:
+        lower_opened = os.fstat(lower_fd)
+        candidate_opened = os.fstat(candidate_fd)
+    except BaseException:
+        close_roots()
+        raise
+    if (lower_opened.st_dev, lower_opened.st_ino) != (
+        lower_info.st_dev,
+        lower_info.st_ino,
+    ) or (candidate_opened.st_dev, candidate_opened.st_ino) != (
+        candidate_info.st_dev,
+        candidate_info.st_ino,
+    ) or stat.S_IMODE(candidate_opened.st_mode) != 0o700:
+        close_roots()
+        raise WorkspaceBoundaryError("candidate or lower root changed while opening")
+
+    entries_by_path: dict[str, WorkspaceDiffEntry] = {}
+    declared_bytes = 0
+    for entry in diff.entries:
+        if not isinstance(entry, WorkspaceDiffEntry):
+            raise WorkspaceBoundaryError("candidate manifest contains an invalid entry")
+        parts = entry.path.split("/") if isinstance(entry.path, str) else []
+        if (
+            not parts
+            or any(part in ("", ".", "..") or "\\" in part for part in parts)
+            or (parts and parts[0] in (".git", ".maestro"))
+            or entry.path in entries_by_path
+            or isinstance(entry.size, bool)
+            or not isinstance(entry.size, int)
+            or entry.size < 0
+            or isinstance(entry.mode, bool)
+            or not isinstance(entry.mode, int)
+            or entry.mode < 0
+            or entry.mode > 0o777
+            or not isinstance(entry.digest, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", entry.digest)
+            or (
+                entry.baseline_digest is not None
+                and (
+                    not isinstance(entry.baseline_digest, str)
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", entry.baseline_digest)
+                )
+            )
+            or len(parts) > max_depth
+        ):
+            close_roots()
+            raise WorkspaceBoundaryError("candidate manifest contains an invalid path or value")
+        if entry.operation == "add":
+            if entry.baseline_digest is not None:
+                close_roots()
+                raise WorkspaceBoundaryError("added candidate entry cannot have a lower baseline")
+        elif entry.operation == "modify":
+            if entry.kind in ("file", "symlink") and entry.baseline_digest is None:
+                close_roots()
+                raise WorkspaceBoundaryError("modified candidate entry requires a lower baseline")
+            if entry.kind == "directory" and entry.baseline_digest is not None:
+                close_roots()
+                raise WorkspaceBoundaryError("directory candidate baseline must be structural")
+        else:
+            close_roots()
+            raise WorkspaceBoundaryError("candidate manifest has an unsupported operation")
+        if entry.kind not in ("file", "directory", "symlink"):
+            close_roots()
+            raise WorkspaceBoundaryError("candidate manifest has an unsupported entry kind")
+        if entry.kind == "directory" and (
+            entry.size != 0 or entry.digest != _manifest_digest("directory", entry.mode, 0)
+        ):
+            close_roots()
+            raise WorkspaceBoundaryError("candidate directory metadata does not match the manifest")
+        relative = tuple(parts)
+        try:
+            lower_kind = _lower_entry_kind(lower_fd, relative)
+        except BaseException:
+            close_roots()
+            raise
+        expected_base_kind = None if entry.operation == "add" else entry.kind
+        if lower_kind != expected_base_kind:
+            close_roots()
+            raise WorkspaceBoundaryError("candidate operation does not match the lower snapshot")
+        if entry.baseline_digest is not None:
+            try:
+                digest = _lower_content_digest(lower_fd, relative, entry.kind, max_bytes)
+            except BaseException:
+                close_roots()
+                raise
+            if digest != entry.baseline_digest:
+                close_roots()
+                raise WorkspaceBoundaryError("candidate lower baseline digest is stale")
+        entries_by_path[entry.path] = entry
+        declared_bytes += entry.size
+
+    if declared_bytes != diff.total_bytes or _workspace_diff_hash(diff.entries) != diff.manifest_hash:
+        close_roots()
+        raise WorkspaceBoundaryError("candidate manifest digest or byte count does not match")
+
+    seen: set[str] = set()
+    total_bytes = 0
+    try:
+        candidate_mount_id = _descriptor_mount_id(candidate_fd)
+    except BaseException:
+        close_roots()
+        raise
+
+    def inspect_directory(
+        directory_fd: int,
+        relative: tuple[str, ...],
+        depth: int,
+    ) -> None:
+        nonlocal total_bytes
+        if depth > max_depth:
+            raise WorkspaceBoundaryError("candidate tree exceeds the depth limit")
+        _reject_xattrs(directory_fd)
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError as exc:
+            raise WorkspaceBoundaryError("candidate directory cannot be read safely") from exc
+        for name in names:
+            if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+                raise WorkspaceBoundaryError("candidate tree contains an invalid path component")
+            path_parts = (*relative, name)
+            path = "/".join(path_parts)
+            entry = entries_by_path.get(path)
+            if entry is None or path in seen:
+                raise WorkspaceBoundaryError("candidate tree has an undeclared or duplicate entry")
+            if (path_parts and path_parts[0] in (".git", ".maestro")):
+                raise WorkspaceBoundaryError("candidate tree includes a protected control path")
+            try:
+                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise WorkspaceBoundaryError("candidate tree changed during validation") from exc
+            if stat.S_ISDIR(before.st_mode):
+                if entry.kind != "directory":
+                    raise WorkspaceBoundaryError("candidate tree entry kind differs from its manifest")
+                if stat.S_IMODE(before.st_mode) != 0o700:
+                    raise WorkspaceBoundaryError("candidate directory permissions are not private")
+                try:
+                    child_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    raise WorkspaceBoundaryError("candidate directory changed during validation") from exc
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                        raise WorkspaceBoundaryError("candidate directory changed during validation")
+                    if stat.S_IMODE(opened.st_mode) != 0o700:
+                        raise WorkspaceBoundaryError("candidate directory permissions are not private")
+                    if _descriptor_mount_id(child_fd) != candidate_mount_id:
+                        raise WorkspaceBoundaryError("candidate tree contains a nested mount")
+                    seen.add(path)
+                    inspect_directory(child_fd, path_parts, depth + 1)
+                    after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_ctime_ns) != (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    ):
+                        raise WorkspaceBoundaryError("candidate directory changed during validation")
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(before.st_mode):
+                if entry.kind != "file" or before.st_nlink != 1:
+                    raise WorkspaceBoundaryError("candidate file kind or link count is invalid")
+                if stat.S_IMODE(before.st_mode) != 0o600:
+                    raise WorkspaceBoundaryError("candidate file permissions are not private")
+                try:
+                    descriptor = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    raise WorkspaceBoundaryError("candidate file changed during validation") from exc
+                try:
+                    opened = os.fstat(descriptor)
+                    if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+                        before.st_dev,
+                        before.st_ino,
+                    ) or opened.st_nlink != 1 or opened.st_size != before.st_size or (
+                        opened.st_mtime_ns,
+                        opened.st_ctime_ns,
+                    ) != (before.st_mtime_ns, before.st_ctime_ns):
+                        raise WorkspaceBoundaryError("candidate file changed during validation")
+                    if stat.S_IMODE(opened.st_mode) != 0o600:
+                        raise WorkspaceBoundaryError("candidate file permissions are not private")
+                    _reject_xattrs(descriptor)
+                    digest = hashlib.sha256()
+                    size = 0
+                    while True:
+                        chunk = os.read(descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            raise WorkspaceBoundaryError("candidate tree exceeds the byte limit")
+                        digest.update(chunk)
+                    after = os.fstat(descriptor)
+                    path_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if (
+                        size != entry.size
+                        or "sha256:" + digest.hexdigest() != entry.digest
+                        or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                        or (before.st_dev, before.st_ino) != (path_after.st_dev, path_after.st_ino)
+                    ):
+                        raise WorkspaceBoundaryError("candidate file bytes do not match the manifest")
+                finally:
+                    os.close(descriptor)
+                seen.add(path)
+            elif stat.S_ISLNK(before.st_mode):
+                if entry.kind != "symlink":
+                    raise WorkspaceBoundaryError("candidate tree entry kind differs from its manifest")
+                try:
+                    link = os.readlink(name, dir_fd=directory_fd)
+                    after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError as exc:
+                    raise WorkspaceBoundaryError("candidate symlink changed during validation") from exc
+                if (before.st_dev, before.st_ino, before.st_mode) != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_mode,
+                ):
+                    raise WorkspaceBoundaryError("candidate symlink changed during validation")
+                _validate_relative_symlink(relative, link)
+                encoded = os.fsencode(link)
+                total_bytes += len(encoded)
+                if total_bytes > max_bytes or len(encoded) != entry.size:
+                    raise WorkspaceBoundaryError("candidate symlink exceeds its manifest bounds")
+                if "sha256:" + hashlib.sha256(encoded).hexdigest() != entry.digest:
+                    raise WorkspaceBoundaryError("candidate symlink target differs from the manifest")
+                seen.add(path)
+            else:
+                raise WorkspaceBoundaryError("candidate tree contains a special file")
+
+    try:
+        inspect_directory(candidate_fd, (), 0)
+        if seen != set(entries_by_path) or total_bytes != diff.total_bytes:
+            raise WorkspaceBoundaryError("candidate tree inventory does not match the manifest")
+    finally:
+        close_roots()
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -568,6 +873,26 @@ def _is_within(path: Path, root: Path) -> bool:
 def _manifest_digest(kind: str, mode: int, size: int) -> str:
     value = f"{kind}:{mode:o}:{size}".encode("ascii")
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _workspace_diff_hash(entries: tuple[WorkspaceDiffEntry, ...] | list[WorkspaceDiffEntry]) -> str:
+    canonical = json.dumps(
+        [
+            {
+                "path": entry.path,
+                "operation": entry.operation,
+                "kind": entry.kind,
+                "mode": entry.mode,
+                "size": entry.size,
+                "digest": entry.digest,
+                "baseline_digest": entry.baseline_digest,
+            }
+            for entry in sorted(entries, key=lambda item: item.path)
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
 def _reject_xattrs(descriptor: int) -> None:
