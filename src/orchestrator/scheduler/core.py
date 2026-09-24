@@ -15,6 +15,7 @@ from orchestrator.config.runtime import RunConfigSnapshot
 from orchestrator.models import AcceptedModelRoute
 from orchestrator.persistence import EventDraft, SQLiteEventStore, StoredEvent
 from orchestrator.routing import RoutingDecision, RoutingRequest
+from orchestrator.recovery.run import RunRecoveryCoordinator, RunRecoveryError
 from orchestrator.validation import revalidate_model
 
 from orchestrator.lifecycle.controller import (
@@ -86,6 +87,7 @@ class Scheduler:
         self.limits = limits
         self.lifecycle = LifecycleController(event_store)
         self.agents = AgentRegistry(event_store)
+        self.recovery = RunRecoveryCoordinator(event_store)
 
     def accept_routing(
         self,
@@ -110,6 +112,10 @@ class Scheduler:
         idempotency_key = f"accept:{request.request_id}"
 
         def decide(events: list[StoredEvent], version: int):
+            try:
+                self.recovery.recover(request.run_id)
+            except RunRecoveryError as exc:
+                raise SchedulerError("Run recovery consistency check failed") from exc
             prior = next(
                 (item for item in events if item.idempotency_key == idempotency_key), None
             )
@@ -487,6 +493,7 @@ class Scheduler:
             "node_id": node_id,
             "attempt_id": attempt_id,
             "fencing_generation": fencing_generation,
+            "outcome": "cancelled",
             "stopped_at": stopped_at.isoformat(),
             "stop_receipt_hash": stop_receipt_hash,
             "usage_hash": None if usage is None else _hash(usage.model_dump(mode="json")),

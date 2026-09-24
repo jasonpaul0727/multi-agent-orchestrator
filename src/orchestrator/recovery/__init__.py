@@ -14,6 +14,7 @@ from .bootstrap import (
     recover,
     recover_aggregate,
 )
+from .run import RecoveredAttemptLease, RecoveredRun, RunRecoveryCoordinator, RunRecoveryError
 
 __all__ = [
     "BudgetFailure",
@@ -23,6 +24,10 @@ __all__ = [
     "RecoveryBootstrap",
     "RecoveryFailure",
     "RecoveryResult",
+    "RecoveredAttemptLease",
+    "RecoveredRun",
+    "RunRecoveryCoordinator",
+    "RunRecoveryError",
     "SecurityFailure",
     "SecurityInvariantFailure",
     "bootstrap_recovery",

@@ -37,6 +37,7 @@ from orchestrator.lifecycle import (
 from orchestrator.lifecycle.models import AttemptState, NodeState, RunLifecycleState
 from orchestrator.persistence import EventDraft, SQLiteEventStore
 from orchestrator.routing import CandidateAssessment, RoutingDecision, RoutingRequest
+from orchestrator.recovery import RunRecoveryCoordinator, RunRecoveryError
 from orchestrator.scheduler import (
     ConcurrencyLimitExceeded,
     ConcurrencyLimits,
@@ -727,6 +728,224 @@ def test_route_acceptance_atomically_reserves_budget_slots_and_fences_attempt(tm
     balance = BudgetLedger(store).available("run-1")
     assert balance.used_minor == 24
     assert balance.reserved_minor == 0
+
+
+def test_run_recovery_reconstructs_active_and_settled_control_plane_state(tmp_path):
+    store = SQLiteEventStore(tmp_path / "run-recovery.db")
+    reg, config, lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accepted = accept(control, request, decision)
+
+    recovered = RunRecoveryCoordinator(store).recover("run-1")
+    assert recovered.lifecycle.status == "running"
+    assert recovered.agents.total_created == recovered.agents.active_count == 1
+    assert recovered.budget.reserved_minor == accepted.reservation.reserved_minor
+    assert len(recovered.active_attempts) == 1
+    assert recovered.active_attempts[0].attempt_id == request.attempt_id
+    assert recovered.active_attempts[0].status == "active"
+
+    control.finish_attempt(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, completed_at=NOW + timedelta(seconds=5),
+        outcome="succeeded",
+        usage=UsageRecord(
+            reservation_id=accepted.reservation.reservation_id,
+            run_id="run-1", settlement_key="run-recovery-success", currency="USD",
+            input_tokens=1, output_tokens=1, cost_minor=1,
+        ),
+    )
+    recovered = RunRecoveryCoordinator(store).recover("run-1")
+    assert recovered.lifecycle.status == "succeeded"
+    assert recovered.agents.active_count == 0
+    assert recovered.budget.reserved_minor == recovered.budget.unknown_minor == 0
+    assert recovered.budget.used_minor == 1
+    assert recovered.active_attempts == ()
+
+
+def test_run_recovery_restores_cancelled_attempt_with_terminal_evidence(tmp_path):
+    store = SQLiteEventStore(tmp_path / "run-recovery-cancelled.db")
+    reg, config, lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accepted = accept(control, request, decision)
+    lifecycle.request_cancel("run-1", reason_code="recover_cancel")
+    control.acknowledge_cancellation(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, stopped_at=NOW + timedelta(seconds=5),
+        stop_receipt_hash="sha256:" + "f" * 64,
+        no_effect_receipt_hash="sha256:" + "a" * 64,
+    )
+
+    recovered = RunRecoveryCoordinator(store).recover("run-1")
+    assert recovered.lifecycle.status == "cancelled"
+    assert recovered.agents.for_attempt(request.attempt_id).status == "cancelled"
+    assert recovered.budget.reserved_minor == recovered.budget.unknown_minor == 0
+    assert recovered.active_attempts == ()
+
+
+def test_run_recovery_scheduler_event_parser_fails_closed_on_corrupt_sequences(tmp_path):
+    store = SQLiteEventStore(tmp_path / "run-recovery-parser.db")
+    reg, config, _, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accept(control, request, decision)
+    accepted = store.read_stream("scheduler", "global")[0]
+    payload = dict(accepted.payload)
+
+    def event(event_type, *, event_id, stream_version, payload_override=None,
+              node_id=None, attempt_id=None, run_id="run-1", fencing_generation=1):
+        return accepted.model_copy(update={
+            "event_id": event_id,
+            "stream_version": stream_version,
+            "event_type": event_type,
+            "idempotency_key": f"test:{event_id}",
+            "payload": payload if payload_override is None else payload_override,
+            "node_id": accepted.node_id if node_id is None else node_id,
+            "attempt_id": accepted.attempt_id if attempt_id is None else attempt_id,
+            "run_id": run_id,
+            "fencing_generation": fencing_generation,
+        })
+
+    unknown_payload = dict(payload)
+    unknown_payload["outcome"] = "outcome_unknown"
+    unknown = event(
+        "AttemptOutcomeUnknown", event_id="test-unknown", stream_version=2,
+        payload_override=unknown_payload,
+    )
+    released_payload = dict(payload)
+    released_payload["outcome"] = "failed"
+    released = event(
+        "AttemptSlotReleased", event_id="test-released", stream_version=3,
+        payload_override=released_payload,
+    )
+    unrelated_payload = dict(payload)
+    unrelated_payload["run_id"] = "another-run"
+    unrelated = event(
+        "UnexpectedSchedulerEvent", event_id="unrelated-run", stream_version=4,
+        payload_override=unrelated_payload, run_id="another-run",
+    )
+
+    class ReadOnlySchedulerEvents:
+        def __init__(self, events):
+            self.events = events
+
+        def read_stream(self, stream_type, stream_id):
+            assert (stream_type, stream_id) == ("scheduler", "global")
+            return self.events
+
+    valid = RunRecoveryCoordinator(
+        ReadOnlySchedulerEvents([accepted, unknown, released, unrelated])
+    )
+    attempts, by_ref = valid._scheduler_state("run-1")
+    assert attempts[(request.node_id, request.attempt_id)]["status"] == "released"
+    assert by_ref[payload["attempt_ref"]]["terminal_outcome"] == "failed"
+
+    def parser(events):
+        return RunRecoveryCoordinator(ReadOnlySchedulerEvents(events))._scheduler_state("run-1")
+
+    duplicate_acceptance = accepted.model_copy(update={
+        "event_id": "duplicate-accepted", "stream_version": 2,
+        "idempotency_key": "test:duplicate-accepted",
+    })
+    bad_route_payload = dict(payload)
+    bad_route_payload["accepted_route"] = {"model_id": "invalid"}
+    missing_attempt = "attempt-not-accepted"
+    missing_node = "node-not-accepted"
+    missing_attempt_ref = "sha256:" + hashlib.sha256(
+        json.dumps(("run-1", missing_node, missing_attempt), separators=(",", ":"))
+        .encode("utf-8")
+    ).hexdigest()
+    unknown_attempt_payload = dict(unknown_payload)
+    unknown_attempt_payload.update({
+        "attempt_ref": missing_attempt_ref,
+        "node_id": missing_node,
+        "attempt_id": missing_attempt,
+    })
+    bad_identity = event(
+        "UnexpectedSchedulerEvent", event_id="bad-identity", stream_version=2,
+        run_id=None,
+    )
+    stale_generation = event(
+        "AttemptOutcomeUnknown", event_id="stale-generation", stream_version=2,
+        fencing_generation=2,
+    )
+
+    cases = (
+        ([accepted, duplicate_acceptance], "duplicates a route acceptance"),
+        ([event("RoutingDecisionAccepted", event_id="bad-route", stream_version=1,
+               payload_override=bad_route_payload)], "accepted route is invalid"),
+        ([event("RoutingDecisionAccepted", event_id="bad-time", stream_version=1,
+                payload_override={**payload, "accepted_at": "not-a-time"})],
+         "timestamp is invalid"),
+        ([event("RoutingDecisionAccepted", event_id="naive-time", stream_version=1,
+                payload_override={**payload, "accepted_at": "2026-09-23T12:00:00"})],
+         "lacks a timezone"),
+        ([event("RoutingDecisionAccepted", event_id="expired-time", stream_version=1,
+                payload_override={**payload, "lease_expires_at": payload["accepted_at"]})],
+         "expires before route acceptance"),
+        ([bad_identity], "invalid Run execution identity"),
+        ([event("AttemptOutcomeUnknown", event_id="unknown-ref", stream_version=1,
+               payload_override=unknown_attempt_payload, node_id=missing_node,
+               attempt_id=missing_attempt)], "unknown accepted Attempt"),
+        ([accepted, event("AttemptOutcomeUnknown", event_id="stale-context", stream_version=2,
+                          node_id="other-node")], "invalid Run execution identity"),
+        ([accepted, unknown, unknown.model_copy(update={"event_id": "unknown-again",
+                                                       "stream_version": 3})], "out of order"),
+        ([accepted, released, released.model_copy(update={"event_id": "release-again",
+                                                          "stream_version": 3})], "out of order"),
+        ([accepted, event("AttemptSlotReleased", event_id="no-outcome", stream_version=2,
+                          payload_override=payload)], "no valid terminal outcome"),
+        ([accepted, event("UnexpectedSchedulerEvent", event_id="unsupported", stream_version=2)],
+         "unsupported during recovery"),
+        ([accepted, stale_generation], "stale execution context"),
+    )
+    for events, message in cases:
+        with pytest.raises(RunRecoveryError, match=message):
+            parser(events)
+
+
+def test_run_recovery_sanitizes_unexpected_storage_failures(tmp_path, monkeypatch):
+    store = SQLiteEventStore(tmp_path / "run-recovery-storage-failure.db")
+
+    def fail_read(*_args, **_kwargs):
+        raise RuntimeError("secret-token-and-provider-payload")
+
+    monkeypatch.setattr(store, "read_stream_with_version", fail_read)
+    with pytest.raises(RunRecoveryError, match="durable-state invariant") as error:
+        RunRecoveryCoordinator(store).recover("run-1")
+    assert "secret-token" not in str(error.value)
+
+
+def test_route_acceptance_fails_closed_when_replayed_streams_disagree(tmp_path):
+    store = SQLiteEventStore(tmp_path / "run-recovery-mismatch.db")
+    nodes = (
+        NodeSpec(node_id="node-1", role="coder", planning_contract_hash=HASH),
+        NodeSpec(node_id="node-2", role="coder", planning_contract_hash=HASH),
+    )
+    reg, config, lifecycle, manifest = run_setup(store, nodes=nodes)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest, node_id="node-1")
+    accepted = accept(control, request, decision)
+
+    # Simulate a partial cross-stream write: the Agent transition exists, but
+    # no matching scheduler/lifecycle/budget completion was committed.
+    control.agents.complete_attempt(
+        "run-1", node_id="node-1", attempt_id=request.attempt_id,
+        agent_instance_id=accepted.agent_instance_id, fencing_generation=1,
+        causation_id=decision.decision_hash, outcome="failed",
+    )
+    second_request, second_decision = routed_pair(
+        reg, config, manifest, node_id="node-2"
+    )
+    before_scheduler = len(store.read_stream("scheduler", "global"))
+    before_budget = len(store.read_stream("budget", "run-1"))
+    with pytest.raises(SchedulerError, match="recovery consistency check failed"):
+        accept(control, second_request, second_decision)
+    assert len(store.read_stream("scheduler", "global")) == before_scheduler
+    assert len(store.read_stream("budget", "run-1")) == before_budget
+    with pytest.raises(RunRecoveryError, match="states disagree"):
+        RunRecoveryCoordinator(store).recover("run-1")
 
 
 def test_unknown_result_keeps_resources_until_explicit_reconciliation(tmp_path):
