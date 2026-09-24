@@ -93,7 +93,7 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 ## P3：生命周期状态机、事件驱动 DAG 与控制平面
 
-状态：Run/Node/Attempt + Scheduler + Agent Registry 首个垂直切片已实现；生命周期检查点/尾部重放和只读跨流一致性协调已加入；本 Phase 仍未完成。跨进程中断矩阵、artifact/effect 投影恢复、Worker 对接及失败分类/重试控制仍缺失，不得视作 P3 完成或可交付产品。Agent 记录冻结路由的 reasoning effort，Gateway accepted route 校验请求与所选 effort 一致。
+状态：Run/Node/Attempt + Scheduler + Agent Registry 首个垂直切片已实现；生命周期检查点/尾部重放和只读跨流一致性协调已加入。2026-09-23 又将 EffectIntent/Receipt 与 ArtifactPublished 元数据/对象完整性检查接入恢复 admission；无回执副作用保持 outcome_unknown，终态 Attempt 仍有未决副作用时 fail-closed。本 Phase 仍未完成：跨进程 Worker 中断矩阵、Provider reconciliation、真实 Worker/OS 终止回执、孤儿 artifact 清点、失败分类/有界重试及 Worker 对接仍缺失，不得视作 P3 完成或可交付产品。Agent 记录冻结路由的 reasoning effort，Gateway accepted route 校验请求与所选 effort 一致。
 
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 
@@ -109,7 +109,8 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 - [x] 实现 Run 取消门控：先拒绝新调度；只有活动 Attempt 收到停止回执且预算已结算/证明无副作用后才可释放；OutcomeUnknown 仍要求核对。
 - [x] lifecycle 初始化/图/Run/Attempt 边界自动检查点；重启优先校验快照 hash/schema/version/source-event anchor，再重放尾部；失效快照回退完整事件流。
 - [x] 增加只读 Run Recovery Coordinator，重放并交叉核对生命周期、Agent Registry、预算预留、scheduler lease/结果；新路由接纳前先运行一致性检查，发现分裂状态即 fail-closed。真实子进程中分别在接纳事务提交前、提交后丢响应并重开数据库，验证完整回滚、确定性重建和幂等重放。恢复器只返回活动/未知 lease，不猜测结果、不释放资源、不重派工作。
-- [ ] 将 effect/artifact stream 纳入统一 Run Recovery Coordinator，并扩展多进程中断矩阵覆盖每个跨流事务/副作用窗口；接入能验证进程终止回执的真实 Worker/OS 终止器。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
+- [x] 将 effect intent/receipt 与 ArtifactPublished stream 纳入统一 Run Recovery Coordinator；恢复时将缺回执的外部 effect 保持为 outcome_unknown、拒绝终态 Attempt 上的未决 effect，并验证有发布事件的 ArtifactStore 对象 digest/size 与可用 attempt provenance。只读恢复结果不重放副作用或暴露 artifact bytes。
+- [ ] 扩展多进程中断矩阵覆盖每个跨流事务/副作用窗口；接入能验证进程终止回执的真实 Worker/OS 终止器，并实现 Provider reconciliation 与 orphan-artifact 清点。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
 - [ ] 实现失败分类/指纹、与 Recovery Controller 集成的有界重试阶梯和熔断。
 - [x] 实现 `OutcomeUnknown`/`AwaitingReconciliation`，显式对账前不释放预算与并发资源。
 

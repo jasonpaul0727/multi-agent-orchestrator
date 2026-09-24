@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from orchestrator.agents import AgentRegistry
+from orchestrator.artifacts import ArtifactStore
 from orchestrator.budget import BudgetLedger, BudgetReservation, RunLimit, UsageRecord
 from orchestrator.config.runtime import RunConfigSnapshot
 from orchestrator.models import AcceptedModelRoute
@@ -82,12 +83,18 @@ class Scheduler:
     database transaction.
     """
 
-    def __init__(self, event_store: SQLiteEventStore, *, limits: ConcurrencyLimits) -> None:
+    def __init__(
+        self,
+        event_store: SQLiteEventStore,
+        *,
+        limits: ConcurrencyLimits,
+        artifact_store: ArtifactStore | None = None,
+    ) -> None:
         self.event_store = event_store
         self.limits = limits
         self.lifecycle = LifecycleController(event_store)
         self.agents = AgentRegistry(event_store)
-        self.recovery = RunRecoveryCoordinator(event_store)
+        self.recovery = RunRecoveryCoordinator(event_store, artifact_store=artifact_store)
 
     def accept_routing(
         self,

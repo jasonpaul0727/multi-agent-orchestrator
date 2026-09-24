@@ -72,6 +72,21 @@ def test_publish_returns_content_hash_and_is_atomic(tmp_path):
     assert not list((tmp_path / "artifacts").glob(".tmp-*"))
 
 
+def test_recovery_artifact_verification_fails_closed_without_stream_enumeration(tmp_path):
+    artifacts = _store(tmp_path / "artifacts", event_store=object())
+
+    with pytest.raises(ArtifactMetadataError, match="cannot enumerate artifact publications"):
+        artifacts.verify_run_artifacts("run-1")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="opening a directory as a file is POSIX-specific")
+def test_streamed_recovery_verifier_rejects_non_regular_artifact(tmp_path):
+    digest = "sha256:" + hashlib.sha256(b"unused").hexdigest()
+
+    with pytest.raises(ArtifactIntegrityError, match="not a regular file"):
+        ArtifactStore._verify_file_and_size(tmp_path, digest)
+
+
 def test_publish_rejects_modified_content_after_hashing(tmp_path):
     artifacts = _store(tmp_path / "artifacts")
     record = artifacts.publish_bytes(b"result", source={"run_id": "run-1"})

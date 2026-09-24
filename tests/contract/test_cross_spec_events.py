@@ -125,6 +125,27 @@ def test_approval_effect_intent_must_precede_consumption_and_match_fencing(tmp_p
         store.append("security", "run-1", 0, [wrong_fence, consumed], "wrong-fence")
 
 
+def test_approval_effect_intent_cannot_be_committed_without_matching_consumption(tmp_path):
+    store = SQLiteEventStore(tmp_path / "approval-effect-missing-consume.db")
+    intent = _domain_event(
+        "EffectIntentRecorded",
+        {"effect_id": "effect-1", "approval_grant_id": "grant-1"},
+    )
+    with pytest.raises(EventContractError, match="requires a later matching"):
+        store.append("budget", "run-1", 0, [intent], "missing-consume")
+
+
+def test_duplicate_effect_intents_and_receipts_are_rejected(tmp_path):
+    store = SQLiteEventStore(tmp_path / "duplicate-effects.db")
+    intent = _domain_event("EffectIntentRecorded", {"effect_id": "effect-1"})
+    with pytest.raises(EventContractError, match="cannot duplicate effect_id"):
+        store.append("run", "run-1", 0, [intent, intent], "duplicate-intent")
+
+    receipt = _domain_event("EffectReceiptRecorded", {"effect_id": "effect-1", "receipt_id": "r1"})
+    with pytest.raises(EventContractError, match="cannot duplicate effect_id"):
+        store.append("run", "run-1", 0, [intent, receipt, receipt], "duplicate-receipt")
+
+
 def test_approval_gated_reservation_requires_consumption_and_matching_fence(tmp_path):
     store = SQLiteEventStore(tmp_path / "approval-fence.db")
     reservation_payload = {

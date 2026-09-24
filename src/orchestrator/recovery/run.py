@@ -6,11 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from orchestrator.agents import AgentRegistry, AgentRegistryState
+from orchestrator.artifacts import ArtifactRecord, ArtifactStore
 from orchestrator.budget import BudgetBalance, BudgetLedger, RunLimit
 from orchestrator.lifecycle import LifecycleController, LifecycleError
 from orchestrator.lifecycle.models import AttemptState, RunLifecycleState
@@ -36,13 +38,43 @@ class RecoveredAttemptLease(BaseModel):
 
 
 @dataclass(frozen=True)
+class RecoveredEffect:
+    """External effect state; an intent without receipt is never replay-safe."""
+
+    effect_id: str
+    node_id: str
+    attempt_id: str
+    fencing_generation: int
+    recovery_class: Literal["idempotent", "queryable", "manual_only"]
+    status: Literal["outcome_unknown", "applied", "not_applied"]
+    intent_event_id: str
+    receipt_event_id: str | None
+    provider_idempotency_key_hash: str | None
+
+
+@dataclass(frozen=True)
+class RecoveredArtifact:
+    """Verified artifact publication metadata with no content bytes."""
+
+    digest: str
+    publication_id: str
+    size: int
+    artifact_type: str
+    lifecycle_state: str
+    node_id: str | None
+    attempt_id: str | None
+
+
+@dataclass(frozen=True)
 class RecoveredRun:
-    """Consistent lifecycle, Agent, budget, and scheduler projections."""
+    """Consistent lifecycle, Agent, budget, effect, artifact, and scheduler views."""
 
     lifecycle: RunLifecycleState
     agents: AgentRegistryState
     budget: BudgetBalance
     active_attempts: tuple[RecoveredAttemptLease, ...]
+    effects: tuple[RecoveredEffect, ...] = ()
+    artifacts: tuple[RecoveredArtifact, ...] = ()
 
 
 class RunRecoveryCoordinator:
@@ -52,8 +84,14 @@ class RunRecoveryCoordinator:
     settles a reservation, or guesses the outcome of an interrupted call.
     """
 
-    def __init__(self, event_store: SQLiteEventStore) -> None:
+    def __init__(
+        self,
+        event_store: SQLiteEventStore,
+        *,
+        artifact_store: ArtifactStore | None = None,
+    ) -> None:
         self.event_store = event_store
+        self.artifact_store = artifact_store
 
     def recover(self, run_id: str) -> RecoveredRun:
         try:
@@ -92,6 +130,14 @@ class RunRecoveryCoordinator:
             raise RunRecoveryError("scheduler and lifecycle Attempt inventories disagree")
         if len(agents.instances) != len(attempts):
             raise RunRecoveryError("Agent Registry and lifecycle Attempt counts disagree")
+        effects = self._recover_effects(run_id, attempts)
+        for effect in effects:
+            attempt = attempts[(effect.node_id, effect.attempt_id)]
+            if effect.status == "outcome_unknown" and attempt.status in {
+                "succeeded", "failed", "cancelled"
+            }:
+                raise RunRecoveryError("terminal Attempt has an unresolved external effect")
+        artifacts = self._recover_artifacts(run_id, attempts)
 
         active_attempts: list[RecoveredAttemptLease] = []
         expected_agent_status = {
@@ -182,7 +228,172 @@ class RunRecoveryCoordinator:
             agents=agents,
             budget=balance,
             active_attempts=tuple(sorted(active_attempts, key=lambda item: item.attempt_ref)),
+            effects=effects,
+            artifacts=artifacts,
         )
+
+    def _recover_effects(
+        self,
+        run_id: str,
+        attempts: dict[tuple[str, str], AttemptState],
+    ) -> tuple[RecoveredEffect, ...]:
+        events = self.event_store.read_stream("budget", run_id)
+        intents: dict[str, StoredEvent] = {}
+        receipts: dict[str, StoredEvent] = {}
+        consumed: dict[tuple[str, str], StoredEvent] = {}
+        for event in events:
+            payload = event.payload
+            if event.event_type == "ApprovalGrantConsumed":
+                grant_id = payload.get("approval_grant_id")
+                effect_id = payload.get("effect_id")
+                if isinstance(grant_id, str) and isinstance(effect_id, str):
+                    consumed[(grant_id, effect_id)] = event
+                continue
+            if event.event_type == "EffectIntentRecorded":
+                effect_id = payload.get("effect_id")
+                if not isinstance(effect_id, str) or not effect_id.strip() or effect_id in intents:
+                    raise RunRecoveryError("external effect intent identity is invalid or duplicated")
+                key = (event.node_id, event.attempt_id)
+                attempt = attempts.get(key)
+                if (
+                    attempt is None
+                    or event.run_id != run_id
+                    or event.fencing_generation != attempt.fencing_generation
+                ):
+                    raise RunRecoveryError("external effect intent references an unknown or stale Attempt")
+                grant_id = payload.get("approval_grant_id")
+                if grant_id is not None and (not isinstance(grant_id, str) or not grant_id.strip()):
+                    raise RunRecoveryError("approved effect intent has an invalid grant reference")
+                intents[effect_id] = event
+                continue
+            if event.event_type == "EffectReceiptRecorded":
+                effect_id = payload.get("effect_id")
+                intent = intents.get(effect_id) if isinstance(effect_id, str) else None
+                if intent is None or effect_id in receipts:
+                    raise RunRecoveryError("external effect receipt is orphaned or duplicated")
+                if (
+                    event.node_id != intent.node_id
+                    or event.attempt_id != intent.attempt_id
+                    or event.fencing_generation != intent.fencing_generation
+                ):
+                    raise RunRecoveryError("external effect receipt is bound to a stale Attempt")
+                outcome = payload.get("outcome")
+                if outcome is None and (payload.get("receipt_id") or payload.get("receipt_hash")):
+                    outcome = "applied"  # compatibility with older receipt envelopes
+                if outcome not in {"applied", "not_applied"}:
+                    raise RunRecoveryError("external effect receipt has no valid outcome")
+                receipt_hash = payload.get("receipt_hash")
+                receipt_id = payload.get("receipt_id")
+                has_receipt_evidence = (
+                    isinstance(receipt_hash, str)
+                    and re.fullmatch(r"sha256:[0-9a-f]{64}", receipt_hash) is not None
+                ) or (isinstance(receipt_id, str) and bool(receipt_id.strip()))
+                if not has_receipt_evidence:
+                    raise RunRecoveryError("external effect receipt has no valid evidence reference")
+                receipts[effect_id] = event
+
+        recovered: list[RecoveredEffect] = []
+        for effect_id, intent in intents.items():
+            payload = intent.payload
+            grant_id = payload.get("approval_grant_id")
+            if grant_id is not None:
+                consumed_event = consumed.get((grant_id, effect_id))
+                if (
+                    consumed_event is None
+                    or consumed_event.stream_version <= intent.stream_version
+                    or consumed_event.attempt_id != intent.attempt_id
+                    or consumed_event.fencing_generation != intent.fencing_generation
+                ):
+                    raise RunRecoveryError("approved effect intent has no matching grant consumption")
+            recovery_class = payload.get("recovery_class", "manual_only")
+            if recovery_class not in {"idempotent", "queryable", "manual_only"}:
+                raise RunRecoveryError("external effect has an unsupported recovery class")
+            key_hash = payload.get("provider_idempotency_key_hash")
+            if key_hash is None and isinstance(payload.get("provider_idempotency_key"), str):
+                # Legacy events stored the key itself. Never copy it into the
+                # recovered projection; expose only a one-way digest.
+                key_hash = _sha256(payload["provider_idempotency_key"])
+            if key_hash is not None and (
+                not isinstance(key_hash, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", key_hash) is None
+            ):
+                raise RunRecoveryError("external effect idempotency-key hash is invalid")
+            receipt = receipts.get(effect_id)
+            status = "outcome_unknown" if receipt is None else receipt.payload.get("outcome")
+            if status is None and receipt is not None:
+                status = "applied"
+            recovered.append(
+                RecoveredEffect(
+                    effect_id=effect_id,
+                    node_id=intent.node_id,
+                    attempt_id=intent.attempt_id,
+                    fencing_generation=intent.fencing_generation or 0,
+                    recovery_class=recovery_class,
+                    status=status,
+                    intent_event_id=intent.event_id,
+                    receipt_event_id=None if receipt is None else receipt.event_id,
+                    provider_idempotency_key_hash=key_hash,
+                )
+            )
+        return tuple(sorted(recovered, key=lambda item: item.effect_id))
+
+    def _recover_artifacts(
+        self,
+        run_id: str,
+        attempts: dict[tuple[str, str], AttemptState],
+    ) -> tuple[RecoveredArtifact, ...]:
+        has_publication = False
+        for digest in self.event_store.stream_ids("artifact"):
+            for event in self.event_store.read_stream("artifact", digest):
+                source = event.payload.get("source")
+                if (
+                    event.event_type == "ArtifactPublished"
+                    and isinstance(source, dict)
+                    and source.get("run_id") == run_id
+                ):
+                    has_publication = True
+                    break
+            if has_publication:
+                break
+        if self.artifact_store is None:
+            if has_publication:
+                raise RunRecoveryError("Run has artifact publications but no artifact verifier is configured")
+            return ()
+        if getattr(self.artifact_store, "_event_store", None) is not self.event_store:
+            raise RunRecoveryError("artifact verifier is bound to a different event store")
+        records: list[ArtifactRecord] = self.artifact_store.verify_run_artifacts(run_id)
+        recovered: list[RecoveredArtifact] = []
+        for record in records:
+            source = record.source
+            node_id = source.get("node_id")
+            attempt_id = source.get("attempt_id")
+            generation = source.get("fencing_generation")
+            if generation is not None and attempt_id is None:
+                raise RunRecoveryError("artifact provenance has a fencing generation without an Attempt")
+            if attempt_id is not None:
+                if not isinstance(node_id, str) or not isinstance(attempt_id, str):
+                    raise RunRecoveryError("artifact provenance has an incomplete Attempt identity")
+                attempt = attempts.get((node_id, attempt_id))
+                if attempt is None:
+                    raise RunRecoveryError("artifact provenance references an unknown Attempt")
+                if generation is not None and (
+                    not isinstance(generation, str)
+                    or not generation.isdecimal()
+                    or int(generation) != attempt.fencing_generation
+                ):
+                    raise RunRecoveryError("artifact provenance has a stale fencing generation")
+            recovered.append(
+                RecoveredArtifact(
+                    digest=record.digest,
+                    publication_id=record.publication_id,
+                    size=record.size,
+                    artifact_type=record.artifact_type,
+                    lifecycle_state=record.lifecycle_state,
+                    node_id=node_id if isinstance(node_id, str) else None,
+                    attempt_id=attempt_id if isinstance(attempt_id, str) else None,
+                )
+            )
+        return tuple(recovered)
 
     def _scheduler_state(
         self, run_id: str
@@ -297,6 +508,10 @@ def _attempt_ref(run_id: str, node_id: str, attempt_id: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _sha256(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _parse_aware_timestamp(value: object) -> datetime:
     if not isinstance(value, str):
         raise RunRecoveryError("scheduler event timestamp is invalid")
@@ -309,4 +524,11 @@ def _parse_aware_timestamp(value: object) -> datetime:
     return parsed
 
 
-__all__ = ["RecoveredAttemptLease", "RecoveredRun", "RunRecoveryCoordinator", "RunRecoveryError"]
+__all__ = [
+    "RecoveredArtifact",
+    "RecoveredAttemptLease",
+    "RecoveredEffect",
+    "RecoveredRun",
+    "RunRecoveryCoordinator",
+    "RunRecoveryError",
+]

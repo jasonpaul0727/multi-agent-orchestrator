@@ -8,6 +8,7 @@ from threading import Barrier
 
 import pytest
 
+from orchestrator.artifacts import ArtifactStore
 from orchestrator.budget import BudgetExhausted, BudgetLedger, CostEstimate, UsageRecord
 from orchestrator.agents import (
     AgentConcurrencyLimitExceeded,
@@ -277,7 +278,7 @@ def routed_pair(
     return request, decision
 
 
-def scheduler(store, *, system=8, run=8, provider=8, tool=8):
+def scheduler(store, *, system=8, run=8, provider=8, tool=8, artifact_store=None):
     return Scheduler(
         store,
         limits=ConcurrencyLimits(
@@ -286,6 +287,7 @@ def scheduler(store, *, system=8, run=8, provider=8, tool=8):
             provider_active_attempts=provider,
             tool_active_attempts=tool,
         ),
+        artifact_store=artifact_store,
     )
 
 
@@ -763,6 +765,298 @@ def test_run_recovery_reconstructs_active_and_settled_control_plane_state(tmp_pa
     assert recovered.budget.reserved_minor == recovered.budget.unknown_minor == 0
     assert recovered.budget.used_minor == 1
     assert recovered.active_attempts == ()
+
+
+def test_run_recovery_classifies_effect_intent_as_unknown_until_receipt(tmp_path):
+    store = SQLiteEventStore(tmp_path / "run-recovery-effect.db")
+    reg, config, _lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accepted = accept(control, request, decision)
+    intent = EventDraft(
+        "EffectIntentRecorded",
+        {
+            "effect_id": "effect-1",
+            "recovery_class": "queryable",
+            "provider_idempotency_key": "provider-key-must-not-escape",
+        },
+        run_id=request.run_id,
+        node_id=request.node_id,
+        attempt_id=request.attempt_id,
+        fencing_generation=request.fencing_generation,
+        causation_id=decision.decision_hash,
+    )
+    [stored_intent] = store.append(
+        "budget",
+        request.run_id,
+        store.current_version("budget", request.run_id),
+        [intent],
+        "effect-intent-1",
+    )
+
+    recovered = RunRecoveryCoordinator(store).recover(request.run_id)
+    [effect] = recovered.effects
+    assert effect.status == "outcome_unknown"
+    assert effect.recovery_class == "queryable"
+    assert effect.intent_event_id == stored_intent.event_id
+    assert effect.receipt_event_id is None
+    assert effect.provider_idempotency_key_hash == "sha256:" + hashlib.sha256(
+        b"provider-key-must-not-escape"
+    ).hexdigest()
+    assert "provider-key-must-not-escape" not in repr(effect)
+    assert recovered.active_attempts[0].attempt_id == accepted.accepted_route.attempt_id
+
+    receipt = EventDraft(
+        "EffectReceiptRecorded",
+        {"effect_id": "effect-1", "outcome": "applied", "receipt_hash": HASH},
+        run_id=request.run_id,
+        node_id=request.node_id,
+        attempt_id=request.attempt_id,
+        fencing_generation=request.fencing_generation,
+        causation_id=stored_intent.event_id,
+    )
+    [stored_receipt] = store.append(
+        "budget",
+        request.run_id,
+        store.current_version("budget", request.run_id),
+        [receipt],
+        "effect-receipt-1",
+    )
+    recovered = RunRecoveryCoordinator(store).recover(request.run_id)
+    assert recovered.effects[0].status == "applied"
+    assert recovered.effects[0].receipt_event_id == stored_receipt.event_id
+
+
+@pytest.mark.parametrize(
+    ("effect_metadata", "error"),
+    [
+        ({"recovery_class": "automatic-anything"}, "unsupported recovery class"),
+        ({"provider_idempotency_key_hash": "not-a-sha256"}, "idempotency-key hash is invalid"),
+    ],
+)
+def test_run_recovery_rejects_invalid_effect_recovery_metadata(tmp_path, effect_metadata, error):
+    store = SQLiteEventStore(tmp_path / "run-recovery-invalid-effect.db")
+    reg, config, _lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accept(control, request, decision)
+    store.append(
+        "budget",
+        request.run_id,
+        store.current_version("budget", request.run_id),
+        [
+            EventDraft(
+                "EffectIntentRecorded",
+                {"effect_id": "effect-invalid", **effect_metadata},
+                run_id=request.run_id,
+                node_id=request.node_id,
+                attempt_id=request.attempt_id,
+                fencing_generation=request.fencing_generation,
+                causation_id=decision.decision_hash,
+            )
+        ],
+        "effect-invalid-metadata",
+    )
+
+    with pytest.raises(RunRecoveryError, match=error):
+        RunRecoveryCoordinator(store).recover(request.run_id)
+
+
+@pytest.mark.parametrize(
+    ("receipt_payload", "error"),
+    [
+        ({"effect_id": "effect-1", "outcome": None}, "no valid outcome"),
+        ({"effect_id": "effect-1", "outcome": "applied"}, "no valid evidence reference"),
+    ],
+)
+def test_run_recovery_rejects_receipt_without_outcome_or_evidence(tmp_path, receipt_payload, error):
+    store = SQLiteEventStore(tmp_path / "run-recovery-invalid-receipt.db")
+    reg, config, _lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accept(control, request, decision)
+    intent = EventDraft(
+        "EffectIntentRecorded",
+        {"effect_id": "effect-1"},
+        run_id=request.run_id,
+        node_id=request.node_id,
+        attempt_id=request.attempt_id,
+        fencing_generation=request.fencing_generation,
+        causation_id=decision.decision_hash,
+    )
+    store.append(
+        "budget",
+        request.run_id,
+        store.current_version("budget", request.run_id),
+        [intent],
+        "effect-intent-for-invalid-receipt",
+    )
+    receipt = EventDraft(
+        "EffectReceiptRecorded",
+        receipt_payload,
+        run_id=request.run_id,
+        node_id=request.node_id,
+        attempt_id=request.attempt_id,
+        fencing_generation=request.fencing_generation,
+        causation_id="effect-1",
+    )
+    store.append(
+        "budget",
+        request.run_id,
+        store.current_version("budget", request.run_id),
+        [receipt],
+        "effect-invalid-receipt",
+    )
+
+    with pytest.raises(RunRecoveryError, match=error):
+        RunRecoveryCoordinator(store).recover(request.run_id)
+
+
+def test_run_recovery_treats_legacy_receipt_id_as_applied(tmp_path):
+    store = SQLiteEventStore(tmp_path / "run-recovery-legacy-receipt.db")
+    reg, config, _lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accept(control, request, decision)
+    intent = EventDraft(
+        "EffectIntentRecorded",
+        {"effect_id": "effect-legacy"},
+        run_id=request.run_id,
+        node_id=request.node_id,
+        attempt_id=request.attempt_id,
+        fencing_generation=request.fencing_generation,
+        causation_id=decision.decision_hash,
+    )
+    store.append(
+        "budget",
+        request.run_id,
+        store.current_version("budget", request.run_id),
+        [intent],
+        "effect-intent-legacy-receipt",
+    )
+    receipt = EventDraft(
+        "EffectReceiptRecorded",
+        {"effect_id": "effect-legacy", "receipt_id": "legacy-receipt"},
+        run_id=request.run_id,
+        node_id=request.node_id,
+        attempt_id=request.attempt_id,
+        fencing_generation=request.fencing_generation,
+        causation_id="effect-legacy",
+    )
+    store.append(
+        "budget",
+        request.run_id,
+        store.current_version("budget", request.run_id),
+        [receipt],
+        "effect-legacy-receipt",
+    )
+
+    assert RunRecoveryCoordinator(store).recover(request.run_id).effects[0].status == "applied"
+
+
+def test_run_recovery_refuses_terminal_attempt_with_unresolved_effect(tmp_path):
+    store = SQLiteEventStore(tmp_path / "run-recovery-effect-terminal.db")
+    reg, config, _lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accepted = accept(control, request, decision)
+    store.append(
+        "budget",
+        request.run_id,
+        store.current_version("budget", request.run_id),
+        [
+            EventDraft(
+                "EffectIntentRecorded",
+                {"effect_id": "effect-pending", "recovery_class": "manual_only"},
+                run_id=request.run_id,
+                node_id=request.node_id,
+                attempt_id=request.attempt_id,
+                fencing_generation=request.fencing_generation,
+                causation_id=decision.decision_hash,
+            )
+        ],
+        "effect-intent-pending",
+    )
+    control.finish_attempt(
+        run_id=request.run_id,
+        node_id=request.node_id,
+        attempt_id=request.attempt_id,
+        fencing_generation=request.fencing_generation,
+        completed_at=NOW + timedelta(seconds=5),
+        outcome="succeeded",
+        usage=UsageRecord(
+            reservation_id=accepted.reservation.reservation_id,
+            run_id=request.run_id,
+            settlement_key="effect-terminal-settlement",
+            currency="USD",
+            input_tokens=1,
+            output_tokens=1,
+            cost_minor=1,
+        ),
+    )
+    with pytest.raises(RunRecoveryError, match="terminal Attempt has an unresolved external effect"):
+        RunRecoveryCoordinator(store).recover(request.run_id)
+
+
+def test_run_recovery_verifies_run_artifact_metadata_and_content(tmp_path):
+    database = tmp_path / "run-recovery-artifact.db"
+    store = SQLiteEventStore(database)
+    run_setup(store, nodes=())
+    artifact_root = tmp_path / "private-artifacts"
+    artifacts = ArtifactStore(artifact_root, event_store=store)
+    record = artifacts.publish_bytes(
+        b"recovery evidence",
+        source={"run_id": "run-1", "node_id": "node-1"},
+        artifact_type="verification-report",
+    )
+
+    with pytest.raises(RunRecoveryError, match="no artifact verifier"):
+        RunRecoveryCoordinator(store).recover("run-1")
+
+    store.close()
+    reopened = SQLiteEventStore(database)
+    restarted_artifacts = ArtifactStore(artifact_root, event_store=reopened)
+    recovered = RunRecoveryCoordinator(reopened, artifact_store=restarted_artifacts).recover("run-1")
+    assert len(recovered.artifacts) == 1
+    assert recovered.artifacts[0].digest == record.digest
+    assert recovered.artifacts[0].publication_id == record.publication_id
+    assert recovered.artifacts[0].size == len(b"recovery evidence")
+
+    (artifact_root / record.digest.removeprefix("sha256:")).write_bytes(b"tampered")
+    with pytest.raises(RunRecoveryError, match="durable-state invariant"):
+        RunRecoveryCoordinator(reopened, artifact_store=restarted_artifacts).recover("run-1")
+
+
+def test_scheduler_recovery_admission_accepts_artifacts_with_configured_verifier(tmp_path):
+    store = SQLiteEventStore(tmp_path / "scheduler-artifact-admission.db")
+    reg, config, _lifecycle, manifest = run_setup(store)
+    artifacts = ArtifactStore(tmp_path / "scheduler-artifact-root", event_store=store)
+    record = artifacts.publish_bytes(
+        b"already published",
+        source={"run_id": "run-1"},
+        artifact_type="worker-output",
+    )
+    control = scheduler(store, artifact_store=artifacts)
+    request, decision = routed_pair(reg, config, manifest)
+
+    accepted = accept(control, request, decision)
+
+    assert accepted.accepted_route.attempt_id == request.attempt_id
+    assert control.recovery.recover(request.run_id).artifacts[0].digest == record.digest
+
+
+def test_run_recovery_rejects_artifact_fencing_without_attempt_provenance(tmp_path):
+    store = SQLiteEventStore(tmp_path / "run-recovery-artifact-fencing.db")
+    run_setup(store, nodes=())
+    artifacts = ArtifactStore(tmp_path / "artifact-fencing", event_store=store)
+    artifacts.publish_bytes(
+        b"bad provenance",
+        source={"run_id": "run-1", "node_id": "node-1", "fencing_generation": "1"},
+        artifact_type="verification-report",
+    )
+
+    with pytest.raises(RunRecoveryError, match="fencing generation without an Attempt"):
+        RunRecoveryCoordinator(store, artifact_store=artifacts).recover("run-1")
 
 
 def test_run_recovery_restores_cancelled_attempt_with_terminal_evidence(tmp_path):

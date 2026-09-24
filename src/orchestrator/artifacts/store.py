@@ -804,6 +804,36 @@ class ArtifactStore:
             raise ArtifactAccessDenied("metadata")
         return self.list_publications(digest, grant, access_grant=access_grant)
 
+    def verify_run_artifacts(self, run_id: str) -> list[ArtifactRecord]:
+        """Verify bytes/metadata referenced by one Run for recovery admission.
+
+        This is a trusted control-plane operation, not a worker read API: it
+        returns metadata only and never returns artifact bytes. Every
+        publication is still checked against its content digest and declared
+        size before being admitted as recoverable evidence.
+        """
+
+        run_id = _validate_text(run_id, "run_id")
+        stream_ids = getattr(self._event_store, "stream_ids", None)
+        if not callable(stream_ids):
+            raise ArtifactMetadataError("event store cannot enumerate artifact publications for recovery")
+        recovered: list[ArtifactRecord] = []
+        try:
+            digests = stream_ids("artifact")
+        except Exception as exc:
+            raise ArtifactMetadataError("unable to enumerate artifact publications for recovery") from exc
+        for digest in digests:
+            publications = self._load_records(digest)
+            matching = [record for record in publications if record.source.get("run_id") == run_id]
+            if not matching:
+                continue
+            path = self._require_artifact_path(digest)
+            verified_size = self._verify_file_and_size(path, digest)
+            if any(verified_size != record.size for record in matching):
+                raise ArtifactIntegrityError(digest, "artifact metadata size mismatch")
+            recovered.extend(matching)
+        return sorted(recovered, key=lambda record: (record.created_at, record.publication_id))
+
     def _record_metadata(self, record: ArtifactRecord) -> ArtifactRecord:
         """Append a unique provenance event; never use digest as idempotency key."""
 
@@ -1071,6 +1101,40 @@ class ArtifactStore:
         if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
             raise ArtifactIntegrityError(digest, "artifact path is not a regular file")
         return path
+
+    @staticmethod
+    def _verify_file_and_size(path: Path, digest: str) -> int:
+        """Stream-verify an artifact without allocating its full contents."""
+
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(path, flags)
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ArtifactIntegrityError(digest, "artifact is not a regular file")
+            stream = os.fdopen(descriptor, "rb")
+            descriptor = None  # the file object now owns the descriptor
+            with stream as artifact:
+                hasher = hashlib.sha256()
+                size = 0
+                while chunk := artifact.read(1024 * 1024):
+                    hasher.update(chunk)
+                    size += len(chunk)
+        except ArtifactIntegrityError:
+            raise
+        except FileNotFoundError as exc:
+            raise ArtifactNotFound(digest) from exc
+        except OSError as exc:
+            raise ArtifactFilesystemError("unable to verify artifact") from exc
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if not hmac.compare_digest(hasher.hexdigest(), digest.removeprefix("sha256:")):
+            raise ArtifactIntegrityError(digest)
+        return size
 
     def _path_for_digest(self, digest: str) -> Path:
         digest = _validate_digest(digest)

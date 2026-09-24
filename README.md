@@ -84,11 +84,11 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 
 `orchestrator.security` 的 Policy Engine 对冻结策略版本作 deny 优先判定，按权限/工具 allowlist 交集处理并返回 scope-bound `PolicyDecision`。`orchestrator.routing` 以固定本地分类器生成不含原文的标签/哈希，Planning 阶段将 GuardRule、预算和角色限制冻结进节点契约；Router 对候选执行授权、能力、健康、凭据和最坏成本过滤，并按成本/配置顺位/模型 ID 稳定排序。Health Controller 将 provider/model 健康变化写入独立 SQLite event streams；跨聚合 ProbeLease 使用控制器 stream 与 aggregate stream 的同一 SQLite 事务完成版本 CAS，可按记录的事件时间重放/过期。Recovery Controller 仅生成有界的重试、同层 fallback、升级或独立角色节点计划；未知调用结果会要求先对账。
 
-P3 控制平面已实现：`LifecycleController` 将 Run 配置/Registry 哈希冻结到生命周期流，确定性重放 Run/Node/Attempt 状态，校验有界 append-only DAG 和图版本；`Scheduler` 重验路由与 Policy scope，在同一 SQLite 事务里接纳决策、预留预算、占用系统/Run/provider/tool 并发 slot、创建 attempt/fencing lease 和对应 Agent 实例。Agent 累计计数以 `AgentInstanceCreated` 事件重放，结束/重试不扣减；子 Agent 深度由冻结节点上的父实例 ID 派生，创建来源、父关系与深度也在重放时复核；`Active`/`OutcomeUnknown` 均占活动上限。等待用户、Run/Attempt 取消门控、生命周期 checkpoint/replay 与只读 Run Recovery Coordinator 已实现；恢复 admission 校验生命周期/Agent/预算/lease 四流，并 fail-closed。它仍不重启 Worker，也不恢复 artifact/effect 外部副作用；完整多进程中断矩阵、失败分类/有界重试、Worker 接入未完成。
+P3 控制平面已实现：`LifecycleController` 将 Run 配置/Registry 哈希冻结到生命周期流，确定性重放 Run/Node/Attempt 状态，校验有界 append-only DAG 和图版本；`Scheduler` 重验路由与 Policy scope，在同一 SQLite 事务里接纳决策、预留预算、占用系统/Run/provider/tool 并发 slot、创建 attempt/fencing lease 和对应 Agent 实例。Agent 累计计数以 `AgentInstanceCreated` 事件重放，结束/重试不扣减；子 Agent 深度由冻结节点上的父实例 ID 派生，创建来源、父关系与深度也在重放时复核；`Active`/`OutcomeUnknown` 均占活动上限。等待用户、Run/Attempt 取消门控、生命周期 checkpoint/replay 与只读 Run Recovery Coordinator 已实现；恢复 admission 校验生命周期/Agent/预算/lease/effect/artifact。无 EffectReceipt 的 intent 一律恢复为 `outcome_unknown`，不会隐式重放；终态 Attempt 若仍有未决外部 effect 会拒绝恢复；配置了同一事件存储的 ArtifactStore 时，Run 发布记录、对象 digest/size 和可用的 attempt provenance 会被复核。它仍不重启/杀死 Worker，不向外部 Provider 自动 reconciliation，也不发现无元数据的孤儿 blob；完整多进程中断矩阵、失败分类/有界重试、Worker 接入未完成。
 
 Run 可事件化进入 `awaiting_user`，只有带请求 ID 和响应哈希的显式回应才能恢复调度；取消先进入 `cancelling`，立即阻止新节点/Attempt 接纳。调度中的 Attempt 在外部运行时出具停止回执、并完成 usage 结算或提供无副作用回执哈希后才能标记 cancelled 和释放 slot；未知结果必须 reconciliation，不能用取消绕过不确定副作用。取消/等待用户目前只有控制平面状态机，不能替代尚未实现的隔离 Worker 进程终止。
 
-Run lifecycle 在初始化、图变更、Run 状态和 Attempt 变化后写入带版本/源事件锚点的快照；重放使用通过 schema/hash/version/anchor 校验的快照并应用后续事件。只读 Run Recovery Coordinator 已交叉核对 lifecycle、Agent Registry、budget 和 scheduler lease streams；event/effect/artifact 结果及 live process 的完整重启协调仍待实现，所以当前能力不是完整 Run crash recovery。
+Run lifecycle 在初始化、图变更、Run 状态和 Attempt 变化后写入带版本/源事件锚点的快照；重放使用通过 schema/hash/version/anchor 校验的快照并应用后续事件。只读 Run Recovery Coordinator 交叉核对 lifecycle、Agent Registry、budget、scheduler lease、effect intent/receipt 与 ArtifactPublished 元数据/内容哈希；无收据副作用保持未知且终态不一致时 fail-closed。它不会自行查询外部 Provider、重新派发 effect、恢复 worker 进程，也无法归属未写 ArtifactPublished 事件的孤儿对象，所以目前仍不是完整自动 Run crash recovery。
 
 仍未实现：workspace-write 安全变更发布、ApprovalService 到 ToolGateway/Worker 的执行接线、独立进程 Secret Broker/Worker 边界、Worker、独立 Verifier、CLI、MCP Server、跨流完整崩溃恢复与性能基准证据。因此当前交付仍不是可完整运行的多 Agent 产品。
 
@@ -139,11 +139,12 @@ python -m build
 - [只读 Tool Gateway 当前边界](docs/security/tool-gateway.md)：只读命令垂直切片的授权、审计、撤销行为和未实现能力。
 - [ApprovalService 当前边界](docs/security/approvals.md)：原子审批控制面原语的 scope、一次性消费和未集成能力。
 - [Secret Broker 当前边界](docs/security/secrets.md)：按 Run/provider/ref/endpoint/purpose 限定并审计的进程内凭据代理原型及其限制。
+- [Run crash recovery 当前边界](docs/security/run-recovery.md)：副作用 intent/receipt 的未知态与 ArtifactStore 验证边界。
 - [持久化、成本统计、可观测性与测试](docs/superpowers/specs/2026-09-14-persistence-cost-observability-testing-design.md)：已于 2026-09-14 确认并完成书面审阅。
 - [持久化底座实施计划](docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md)：Task 1–9 已完成。
 - [完整 V1 产品实施计划](docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md)：P0–P7 分阶段实施与验收路线；当前继续补 P3 跨流恢复、P4 Approval/Secret Broker/写隔离和 P5–P7，Worker 执行硬门仍未解除。
 
 ## 下一步
 
-1. 继续完成 P3：跨流 effect/artifact 恢复、完整中断矩阵及失败分类/有限重试。
+1. 继续完成 P3：跨进程中断矩阵、真实 Worker 终止确认、失败分类/有限重试以及 ArtifactStore 孤儿发布清点。
 2. P4 继续补 workspace-write/安全变更发布、独立进程隔离、ApprovalService 到 ToolGateway 的消费接线和 Scheduler/Worker 集成；当前 ApprovalService/Secret Broker 均为内部原语，不解除执行硬门。

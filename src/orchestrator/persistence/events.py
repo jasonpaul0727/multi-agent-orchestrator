@@ -128,6 +128,7 @@ def validate_event_contract(events: list[Any]) -> None:
     """
 
     intents: dict[str, Any] = {}
+    receipts: set[str] = set()
     consumed_grants: dict[str, Any] = {}
     for event in events:
         event_type = event.event_type
@@ -136,6 +137,8 @@ def validate_event_contract(events: list[Any]) -> None:
             effect_id = payload.get("effect_id")
             if not isinstance(effect_id, str) or not effect_id.strip():
                 raise EventContractError("EffectIntentRecorded requires effect_id")
+            if effect_id in intents:
+                raise EventContractError("EffectIntentRecorded cannot duplicate effect_id")
             intents[effect_id] = event
         elif event_type == "EffectReceiptRecorded":
             effect_id = payload.get("effect_id")
@@ -151,6 +154,9 @@ def validate_event_contract(events: list[Any]) -> None:
                 raise EventContractError(
                     "effect receipt attempt and fencing generation must match its intent"
                 )
+            if effect_id in receipts:
+                raise EventContractError("EffectReceiptRecorded cannot duplicate effect_id")
+            receipts.add(effect_id)
         elif event_type == "ApprovalGrantConsumed":
             grant_id = payload.get("approval_grant_id") or payload.get("grant_id")
             if not isinstance(grant_id, str) or not grant_id.strip():
@@ -208,6 +214,26 @@ def validate_event_contract(events: list[Any]) -> None:
                 raise EventContractError(
                     "ApprovalGrantConsumed and EffectIntentRecorded must share attempt_id and fencing_generation"
                 )
+    for effect_id, intent in intents.items():
+        grant_id = intent.payload.get("approval_grant_id")
+        if grant_id is None:
+            continue
+        consumed = consumed_grants.get(grant_id)
+        if (
+            consumed is None
+            or consumed.stream_version <= intent.stream_version
+            or consumed.payload.get("effect_id") != effect_id
+        ):
+            raise EventContractError(
+                "approval-gated EffectIntentRecorded requires a later matching ApprovalGrantConsumed"
+            )
+        if (
+            consumed.attempt_id != intent.attempt_id
+            or consumed.fencing_generation != intent.fencing_generation
+        ):
+            raise EventContractError(
+                "ApprovalGrantConsumed and EffectIntentRecorded must share attempt_id and fencing_generation"
+            )
 
 
 def _validate_execution_context(model: Any, *, event_type: str) -> None:
