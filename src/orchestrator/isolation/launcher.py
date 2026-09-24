@@ -228,31 +228,36 @@ class SandboxSession:
         self._started = time.monotonic()
         self._cancel_requested = threading.Event()
         self._cancel_signal_accepted = False
+        self._cancel_lock = threading.Lock()
         self._wait_lock = threading.Lock()
         self._result: SandboxResult | None = None
 
     def cancel(self) -> bool:
         """Request SIGKILL for the entire unit; wait() supplies stop confirmation."""
 
-        if self._process.poll() is not None:
-            return False
-        self._cancel_requested.set()
-        try:
-            result = subprocess.run(
-                [self._systemctl, "--user", "kill", "--kill-whom=all", "--signal=SIGKILL", self.unit_name],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=self._client_env,
-                check=False,
-                timeout=3,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        accepted = result.returncode == 0
-        if accepted:
-            self._cancel_signal_accepted = True
-        return accepted
+        # The collector retries cancellation while draining the systemd-run
+        # pipe. Serialize those retries with the caller's initial signal so the
+        # child cannot return a result before the accepted signal is recorded.
+        with self._cancel_lock:
+            if self._process.poll() is not None:
+                return False
+            self._cancel_requested.set()
+            try:
+                result = subprocess.run(
+                    [self._systemctl, "--user", "kill", "--kill-whom=all", "--signal=SIGKILL", self.unit_name],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=self._client_env,
+                    check=False,
+                    timeout=3,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            accepted = result.returncode == 0
+            if accepted:
+                self._cancel_signal_accepted = True
+            return accepted
 
     def wait(self) -> SandboxResult:
         """Drain capped output until exit, runtime deadline, or cancellation."""
@@ -324,6 +329,8 @@ class SandboxSession:
             and elapsed >= self._timeout_seconds
         ):
             timed_out = True
+        with self._cancel_lock:
+            cancel_signal_accepted = self._cancel_signal_accepted
         return SandboxResult(
             unit_name=self.unit_name,
             returncode=returncode,
@@ -331,7 +338,7 @@ class SandboxSession:
             stderr=bytes(streams[self._process.stderr]),
             elapsed_seconds=elapsed,
             termination_confirmed=self._process.returncode is not None,
-            cancelled=self._cancel_signal_accepted and not timed_out and not output_limited,
+            cancelled=cancel_signal_accepted and not timed_out and not output_limited,
             timed_out=timed_out,
             output_limited=output_limited,
         )

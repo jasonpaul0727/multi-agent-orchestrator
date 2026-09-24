@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import tempfile
+import threading
+import time
 
 import pytest
 
@@ -9,6 +12,7 @@ from orchestrator.isolation.launcher import (
     InvalidSandboxRequest,
     IsolationUnavailable,
     SandboxLimits,
+    SandboxSession,
     SystemdReadOnlyLauncher,
     _systemd_path_supported,
     _create_staging,
@@ -201,6 +205,54 @@ def test_launcher_cleans_staging_when_bind_targets_cannot_be_created(monkeypatch
         SystemdReadOnlyLauncher(systemd_run="systemd-run", systemctl="systemctl").launch(
             workspace, ["/bin/true"]
         )
+
+
+def test_cancel_acceptance_is_visible_before_collector_returns(monkeypatch) -> None:
+    import orchestrator.isolation.launcher as module
+
+    process = subprocess.Popen(
+        ["/usr/bin/python3", "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    signal_sent = threading.Event()
+    allow_return = threading.Event()
+
+    def slow_but_accepted_signal(*args, **kwargs):
+        process.kill()
+        signal_sent.set()
+        assert allow_return.wait(timeout=3)
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr(module.subprocess, "run", slow_but_accepted_signal)
+    session = SandboxSession(
+        process=process,
+        unit_name="test-attempt.service",
+        systemctl="systemctl",
+        client_env={"PATH": "/usr/bin:/bin"},
+        output_limit=1024,
+        timeout_seconds=30,
+        staging=tempfile.TemporaryDirectory(),
+    )
+    results = []
+    waiter = threading.Thread(target=lambda: results.append(session.wait()), daemon=True)
+    waiter.start()
+    time.sleep(0.05)
+    cancel_results = []
+    canceller = threading.Thread(target=lambda: cancel_results.append(session.cancel()), daemon=True)
+    canceller.start()
+    assert signal_sent.wait(timeout=3)
+    time.sleep(0.05)
+    allow_return.set()
+    canceller.join(timeout=3)
+    waiter.join(timeout=3)
+
+    assert not canceller.is_alive()
+    assert not waiter.is_alive()
+    assert cancel_results == [True]
+    assert results and results[0].cancelled
+    assert results[0].termination_confirmed
 
 
 def test_systemd_client_environment_requires_runtime_directory(monkeypatch) -> None:
