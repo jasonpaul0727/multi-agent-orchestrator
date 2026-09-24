@@ -36,6 +36,7 @@ class WorkspaceDiffEntry:
     mode: int
     size: int
     digest: str
+    baseline_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -405,6 +406,7 @@ def export_overlay_diff(
                         mode,
                         0,
                         _manifest_digest("directory", mode, 0),
+                        None,
                     )
                 )
                 continue
@@ -431,7 +433,10 @@ def export_overlay_diff(
                     if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
                         before.st_dev,
                         before.st_ino,
-                    ):
+                    ) or opened.st_nlink != 1 or opened.st_size != before.st_size or (
+                        opened.st_mtime_ns,
+                        opened.st_ctime_ns,
+                    ) != (before.st_mtime_ns, before.st_ctime_ns):
                         raise WorkspaceBoundaryError("OverlayFS upper file changed during export")
                     _reject_xattrs(file_fd)
                     with output.open("xb") as output_file:
@@ -445,13 +450,26 @@ def export_overlay_diff(
                                 raise WorkspaceBoundaryError("OverlayFS diff exceeds the byte limit")
                             digest.update(chunk)
                             output_file.write(chunk)
+                    after = os.fstat(file_fd)
+                    if size != before.st_size or (
+                        opened.st_dev,
+                        opened.st_ino,
+                        opened.st_size,
+                        opened.st_mtime_ns,
+                        opened.st_ctime_ns,
+                    ) != (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    ):
+                        raise WorkspaceBoundaryError("OverlayFS upper file changed while reading")
                     output.chmod(0o600)
                 except OSError as exc:
                     raise WorkspaceBoundaryError("OverlayFS upper file could not be exported") from exc
                 finally:
                     os.close(file_fd)
-                if size != before.st_size:
-                    raise WorkspaceBoundaryError("OverlayFS upper file changed while reading")
                 entries.append(
                     WorkspaceDiffEntry(
                         relative_path,
@@ -460,6 +478,11 @@ def export_overlay_diff(
                         mode,
                         size,
                         "sha256:" + digest.hexdigest(),
+                        (
+                            _lower_content_digest(lower_fd, child, "file", max_bytes)
+                            if lower_kind == "file"
+                            else None
+                        ),
                     )
                 )
                 continue
@@ -491,6 +514,11 @@ def export_overlay_diff(
                         0o777,
                         len(encoded),
                         "sha256:" + hashlib.sha256(encoded).hexdigest(),
+                        (
+                            _lower_content_digest(lower_fd, child, "symlink", max_bytes)
+                            if lower_kind == "symlink"
+                            else None
+                        ),
                     )
                 )
                 continue
@@ -508,6 +536,7 @@ def export_overlay_diff(
                     "mode": entry.mode,
                     "size": entry.size,
                     "digest": entry.digest,
+                    "baseline_digest": entry.baseline_digest,
                 }
                 for entry in entries
             ],
@@ -582,6 +611,115 @@ def _lower_entry_kind(lower_fd: int, path: tuple[str, ...]) -> str | None:
         return "special"
     finally:
         os.close(current_fd)
+
+
+def _lower_content_digest(
+    lower_fd: int,
+    path: tuple[str, ...],
+    kind: Literal["file", "symlink"],
+    max_bytes: int,
+) -> str:
+    """Hash a modified lower entry through no-follow directory descriptors."""
+
+    parent_fd = os.dup(lower_fd)
+    try:
+        for component in path[:-1]:
+            try:
+                before = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise WorkspaceBoundaryError("Overlay baseline path changed during hashing") from exc
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise WorkspaceBoundaryError("Overlay baseline path is not a safe directory")
+            try:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
+                )
+            except OSError as exc:
+                raise WorkspaceBoundaryError("Overlay baseline path changed during hashing") from exc
+            opened = os.fstat(next_fd)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                os.close(next_fd)
+                raise WorkspaceBoundaryError("Overlay baseline path changed during hashing")
+            os.close(parent_fd)
+            parent_fd = next_fd
+
+        leaf = path[-1]
+        try:
+            before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise WorkspaceBoundaryError("Overlay baseline entry disappeared during hashing") from exc
+        if kind == "symlink":
+            if not stat.S_ISLNK(before.st_mode):
+                raise WorkspaceBoundaryError("Overlay baseline entry changed type during hashing")
+            try:
+                value = os.fsencode(os.readlink(leaf, dir_fd=parent_fd))
+                after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise WorkspaceBoundaryError("Overlay baseline symlink changed during hashing") from exc
+            if (before.st_dev, before.st_ino, before.st_mode) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+            ):
+                raise WorkspaceBoundaryError("Overlay baseline symlink changed during hashing")
+            if len(value) > max_bytes:
+                raise WorkspaceBoundaryError("Overlay baseline symlink exceeds the byte limit")
+            return "sha256:" + hashlib.sha256(value).hexdigest()
+
+        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+            raise WorkspaceBoundaryError("Overlay baseline file exceeds the byte limit")
+        try:
+            descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise WorkspaceBoundaryError("Overlay baseline file changed during hashing") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+                before.st_dev,
+                before.st_ino,
+            ) or opened.st_nlink != 1 or opened.st_size != before.st_size or (
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            ) != (before.st_mtime_ns, before.st_ctime_ns):
+                raise WorkspaceBoundaryError("Overlay baseline file changed during hashing")
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise WorkspaceBoundaryError("Overlay baseline file exceeds the byte limit")
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            if size != before.st_size or (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                raise WorkspaceBoundaryError("Overlay baseline file changed during hashing")
+            return "sha256:" + digest.hexdigest()
+        except OSError as exc:
+            raise WorkspaceBoundaryError("Overlay baseline file could not be hashed") from exc
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
 
 
 def _validate_relative_symlink(relative_parent: tuple[str, ...], link: str) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +42,10 @@ def test_export_overlay_diff_creates_deterministic_private_candidate(tmp_path: P
         ("new-dir", "add", "directory"),
         ("new-dir/new.txt", "add", "file"),
     ]
+    changed = next(item for item in result.entries if item.path == "changed.txt")
+    added = next(item for item in result.entries if item.path == "new-dir/new.txt")
+    assert changed.baseline_digest == "sha256:" + hashlib.sha256(b"before\n").hexdigest()
+    assert added.baseline_digest is None
     assert result.total_bytes == len(b"after\nnew\n") + len(b"new-dir/new.txt")
     assert result.manifest_hash.startswith("sha256:")
     assert result.candidate_root == candidate
@@ -257,6 +262,7 @@ def test_export_overlay_diff_handles_changed_directory_and_parent_relative_symli
 ) -> None:
     lower, upper, candidate = _roots(tmp_path)
     (lower / "existing-dir").mkdir()
+    (lower / "existing-dir" / "relative-link").symlink_to("old.txt")
     (upper / "existing-dir").mkdir()
     (upper / "existing-dir" / "file.txt").write_text("new", encoding="utf-8")
     (upper / "existing-dir" / "relative-link").symlink_to("../changed.txt")
@@ -267,6 +273,9 @@ def test_export_overlay_diff_handles_changed_directory_and_parent_relative_symli
     assert directory.operation == "modify"
     assert directory.kind == "directory"
     assert os.readlink(candidate / "existing-dir" / "relative-link") == "../changed.txt"
+    link = next(item for item in result.entries if item.path == "existing-dir/relative-link")
+    assert link.operation == "modify"
+    assert link.baseline_digest == "sha256:" + hashlib.sha256(b"old.txt").hexdigest()
 
 
 def test_overlay_helpers_report_special_lower_entries_and_validate_mount_ids(
@@ -292,6 +301,94 @@ def test_overlay_helpers_report_special_lower_entries_and_validate_mount_ids(
     monkeypatch.setattr(Path, "read_text", lambda _path, **_kwargs: "pos:\t1\n")
     with pytest.raises(WorkspaceBoundaryError, match="mount identity"):
         workspace_module._descriptor_mount_id(123)
+
+
+def test_lower_baseline_digest_rejects_stale_stat_sample_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lower = tmp_path / "lower"
+    lower.mkdir()
+    source = lower / "changed.txt"
+    source.write_text("base", encoding="utf-8")
+    lower_fd = os.open(lower, os.O_RDONLY | os.O_DIRECTORY)
+    original_stat = os.stat
+
+    def stale_stat(path, *args, **kwargs):
+        info = original_stat(path, *args, **kwargs)
+        if path == "changed.txt" and kwargs.get("dir_fd") is not None:
+            return SimpleNamespace(
+                st_mode=info.st_mode,
+                st_dev=info.st_dev,
+                st_ino=info.st_ino,
+                st_size=info.st_size,
+                st_mtime_ns=info.st_mtime_ns - 1,
+                st_ctime_ns=info.st_ctime_ns - 1,
+            )
+        return info
+
+    monkeypatch.setattr(workspace_module.os, "stat", stale_stat)
+    try:
+        with pytest.raises(WorkspaceBoundaryError, match="changed during hashing"):
+            workspace_module._lower_content_digest(
+                lower_fd, ("changed.txt",), "file", 1024
+            )
+    finally:
+        os.close(lower_fd)
+
+
+def test_lower_baseline_digest_rejects_missing_or_unsafe_parent_paths(
+    tmp_path: Path,
+) -> None:
+    lower = tmp_path / "lower"
+    lower.mkdir()
+    (lower / "regular-file").write_text("data", encoding="utf-8")
+    (lower / "directory-link").symlink_to(tmp_path, target_is_directory=True)
+    lower_fd = os.open(lower, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(WorkspaceBoundaryError, match="path changed during hashing"):
+            workspace_module._lower_content_digest(
+                lower_fd, ("missing-parent", "leaf"), "file", 64
+            )
+        with pytest.raises(WorkspaceBoundaryError, match="safe directory"):
+            workspace_module._lower_content_digest(
+                lower_fd, ("directory-link", "leaf"), "file", 64
+            )
+        with pytest.raises(WorkspaceBoundaryError, match="safe directory"):
+            workspace_module._lower_content_digest(
+                lower_fd, ("regular-file", "leaf"), "file", 64
+            )
+        with pytest.raises(WorkspaceBoundaryError, match="disappeared during hashing"):
+            workspace_module._lower_content_digest(
+                lower_fd, ("missing-leaf",), "file", 64
+            )
+    finally:
+        os.close(lower_fd)
+
+
+def test_lower_baseline_digest_bounds_and_validates_symlink_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lower = tmp_path / "lower"
+    lower.mkdir()
+    (lower / "file").write_text("data", encoding="utf-8")
+    (lower / "link").symlink_to("long-target")
+    lower_fd = os.open(lower, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(WorkspaceBoundaryError, match="changed type"):
+            workspace_module._lower_content_digest(lower_fd, ("file",), "symlink", 64)
+        with pytest.raises(WorkspaceBoundaryError, match="file exceeds the byte limit"):
+            workspace_module._lower_content_digest(lower_fd, ("link",), "file", 64)
+        with pytest.raises(WorkspaceBoundaryError, match="symlink exceeds the byte limit"):
+            workspace_module._lower_content_digest(lower_fd, ("link",), "symlink", 2)
+
+        def failed_readlink(_path, *, dir_fd):
+            raise OSError("link unavailable")
+
+        monkeypatch.setattr(workspace_module.os, "readlink", failed_readlink)
+        with pytest.raises(WorkspaceBoundaryError, match="symlink changed during hashing"):
+            workspace_module._lower_content_digest(lower_fd, ("link",), "symlink", 64)
+    finally:
+        os.close(lower_fd)
 
 
 def test_export_overlay_diff_closes_pinned_roots_on_open_and_identity_failures(
@@ -381,5 +478,44 @@ def test_export_overlay_diff_rejects_symlink_replacement_during_read(
     monkeypatch.setattr(workspace_module.os, "stat", race_link)
     with pytest.raises(WorkspaceBoundaryError, match="symlink changed during export"):
         export_overlay_diff(lower, upper, candidate)
+    assert not candidate.exists()
+
+
+def test_export_overlay_diff_rejects_file_metadata_change_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lower, upper, candidate = _roots(tmp_path)
+    real_open = os.open
+    real_fstat = os.fstat
+    file_descriptor: int | None = None
+    file_stat_count = 0
+
+    def track_upper_file(path, flags, *args, **kwargs):
+        nonlocal file_descriptor
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if path == "changed.txt" and kwargs.get("dir_fd") is not None:
+            file_descriptor = descriptor
+        return descriptor
+
+    def mutate_metadata(descriptor: int):
+        nonlocal file_stat_count
+        info = real_fstat(descriptor)
+        if descriptor == file_descriptor:
+            file_stat_count += 1
+            if file_stat_count == 2:
+                return SimpleNamespace(
+                    st_dev=info.st_dev,
+                    st_ino=info.st_ino,
+                    st_size=info.st_size,
+                    st_mtime_ns=info.st_mtime_ns + 1,
+                    st_ctime_ns=info.st_ctime_ns,
+                )
+        return info
+
+    monkeypatch.setattr(workspace_module.os, "open", track_upper_file)
+    monkeypatch.setattr(workspace_module.os, "fstat", mutate_metadata)
+    with pytest.raises(WorkspaceBoundaryError, match="file changed while reading"):
+        export_overlay_diff(lower, upper, candidate)
+    assert file_stat_count >= 2
     assert not candidate.exists()
 
