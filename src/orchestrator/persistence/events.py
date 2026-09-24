@@ -76,6 +76,13 @@ _CAUSAL_EVENT_TYPES = frozenset(
         "AttemptReconciled",
         "AttemptOutcomeUnknown",
         "AttemptSlotReleased",
+        "AgentInstanceCreated",
+        "AgentStarted",
+        "AgentCompleted",
+        "AgentFailed",
+        "AgentOutcomeUnknown",
+        "AgentReconciled",
+        "AgentCancelled",
         "EffectIntentRecorded",
         "EffectReceiptRecorded",
     }

@@ -19,7 +19,7 @@ from orchestrator.config.effective import (
     SelectorRule,
     SelectorTarget,
 )
-from orchestrator.config.models import ModelRegistryManifest, ModelSpec, ProviderSpec
+from orchestrator.config.models import ModelRegistryManifest, ModelSpec, ProviderSpec, ReasoningEffort
 from orchestrator.models import (
     CostingDataUnavailable,
     FXSnapshot,
@@ -357,6 +357,7 @@ class RoutingDecision(_RoutingModel):
     matched_selector_rule_id: StrictStr | None
     candidate_assessments: tuple[CandidateAssessment, ...]
     eligible_order: tuple[StrictStr, ...]
+    reasoning_effort: ReasoningEffort
     outcome: Literal["selected", "blocked"]
     selected_model_id: StrictStr | None
     selected_provider_id: StrictStr | None
@@ -577,6 +578,7 @@ class ModelRouter:
             matched_selector_rule_id=None if selected_rule is None else selected_rule.id,
             candidate_assessments=tuple(assessments),
             eligible_order=eligible_order,
+            reasoning_effort=reasoning_effort,
             outcome="selected" if selected is not None else "blocked",
             selected_model_id=None if selected is None else selected.model_id,
             selected_provider_id=None if selected is None else selected.provider_id,

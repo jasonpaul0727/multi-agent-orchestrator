@@ -111,6 +111,7 @@ class AcceptedModelRoute(_GatewayModel):
     budget_reservation_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER.pattern)
     model_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER.pattern)
     provider_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER.pattern)
+    reasoning_effort: ReasoningEffort
     registry_manifest_hash: StrictStr
 
     @field_validator("registry_manifest_hash")
@@ -160,8 +161,9 @@ class ModelRequest(_GatewayModel):
             or route.fencing_generation != self.fencing_generation
             or route.budget_reservation_id != self.budget_reservation_id
             or route.model_id != self.model_id
+            or route.reasoning_effort != self.reasoning_effort
         ):
-            raise ValueError("model request does not match its accepted route scope")
+            raise ValueError("model request does not match its accepted route scope or effort")
         if route.registry_manifest_hash != self.cost_snapshots.registry_manifest_hash:
             raise ValueError("accepted route and request must use the same registry snapshot")
         if self.cost_snapshots.price_snapshot_id != route.registry_manifest_hash:

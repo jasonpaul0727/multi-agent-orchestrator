@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-持久化、预算、观测与验证底座及 P1 配置阶段已完成；P2 Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件驱动健康熔断/ProbeLease CAS、Recovery Controller、三种 Provider codec 与受限 HTTPS transport 已实现。P3 首个控制平面切片已实现：Run/Node/Attempt 事件重放、追加式 DAG/版本校验，以及将路由决策、预算预留、并发 slot、fencing lease 原子接纳；过期 attempt 进入 OutcomeUnknown 并要求显式对账。完整多 Agent 产品仍不可运行：P3 Agent Registry、累计 Agent 上限、取消/等待用户/检查点与完整崩溃恢复仍待实现；P4 OS 隔离/Tool Gateway/Secret Broker/Approval、P5 Worker/Verifier、CLI/MCP 尚未实现。Provider Gateway 默认没有凭据 Broker，在线调用会 fail-closed。全量测试及覆盖率以本次验收记录为准，尚未达到产品交付状态。
+持久化、预算、观测与验证底座及 P1 配置阶段已完成；P2 Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件驱动健康熔断/ProbeLease CAS、Recovery Controller、三种 Provider codec 与受限 HTTPS transport 已实现。P3 首个控制平面切片已实现：Run/Node/Attempt 事件重放、追加式 DAG/版本校验、Agent Registry 累计数量/父子深度/活动与未知状态计数，以及将路由决策、预算预留、Agent 实例、并发 slot、fencing lease 原子接纳；路由决定中的 reasoning effort 会绑定到 Attempt、Agent 实例和 Gateway accepted route；过期 attempt 进入 OutcomeUnknown 并要求显式对账。完整多 Agent 产品仍不可运行：P3 取消/等待用户/检查点与完整崩溃恢复仍待实现；P4 OS 隔离/Tool Gateway/Secret Broker/Approval、P5 Worker/Verifier、CLI/MCP 尚未实现。Provider Gateway 默认没有凭据 Broker，在线调用会 fail-closed。全量测试 402 项通过；精度两位的小数覆盖率为 90.19%，但仍未达到产品交付状态。
 
 ## 产品目标
 
@@ -53,8 +53,9 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 - Health Controller 将 provider/model aggregate 变化写入 event streams，基于持久化事件时间重放滑动失败窗口、degraded/open/half-open 状态；ProbeLease 覆盖 provider/model 所有 open aggregate，通过 SQLite 单事务 CAS，重启后可复原，过期探测会被记录为失败并重新打开熔断。
 - `orchestrator.models` 已实现三种协议 codec 和 bounded HTTPS transport。Gateway 强制检查 Registry/provider/model/accepted-route verifier，再向注入的 Secret Broker 获取凭据；默认 Broker 无法交付凭据，避免环境变量回退。真实 Provider 在线请求和凭据管理仍由 P4 Secret Broker 前置阻挡；P3 已把模型路由预算预留/结算接入 attempt lifecycle，但 Tool Gateway、Worker 执行期集成尚未实现。
 - `orchestrator.lifecycle` / `orchestrator.scheduler` 首个 P3 切片：冻结 Run 配置与 Registry 哈希，事件重放 Run/Node/Attempt；append-only DAG 以 graph version CAS、节点数和深度界限校验。Scheduler 在共享 SQLiteEventStore 的事务内校验路由与 Policy scope，原子写入预算预留、生命周期 Attempt、全局并发 slot 和 lease；用 fencing generation 拒绝迟到结果，未知结果保留资源直到 reconciliation。已覆盖失败回滚、多连接容量竞争、租约过期与显式对账。此切片不包含 Agent Registry、累计 Agent/深度执行配额、cancel/wait-user/checkpoint、完整 crash-restart 控制或 Worker。
+- `orchestrator.agents` 已接入 P3 Scheduler：每个模型 Attempt 有确定性 AgentInstance ID；创建与 Attempt/预算/slot 同事务，记录 parent、深度、角色、模型、provider、决策和策略哈希。累计数量按创建事件计数且永不退款；深度从已完成父实例派生；活动与未知结果均占 Agent 并发上限；终结/对账和状态重放也与预算及 slot 更新原子提交。
 - 权限、安全规格已于 2026-09-22 获用户书面批准。当前 WSL2 只列为隔离后端候选；namespace、Landlock 与 `prlimit` 原语探测通过，但 cgroup 未委派，完整执行隔离尚未验证，不能宣称平台已支持。
-- 本次 P3 验收：全量 385 项测试通过，coverage 门槛 90% 通过；编译、`pip check` 与 sdist/wheel 打包通过。Maestro 的 `$18 → $7` 单功能费用、`90M → 40M` Token 和约 65% 重复工作下降均只是待固定工作集测量的目标，尚非项目结果。
+- 本次 Agent Registry 验收：全量 402 项测试通过；`coverage report --precision=2 --fail-under=90` 精确覆盖率 90.19% 通过；编译、`pip check` 与 sdist/wheel 打包通过。Maestro 的 `$18 → $7` 单功能费用、`90M → 40M` Token 和约 65% 重复工作下降均只是待固定工作集测量的目标，尚非项目结果。
 
 ## 已确认的设计部分
 
@@ -79,6 +80,6 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 ## 后续设计顺序
 
 1. 完成 P0 隔离后端可行性验证并形成明确的平台支持矩阵。
-2. 按 `docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md` 继续 P3：补齐 Agent Registry 与累计 Agent/深度限制、取消/等待用户/检查点、完整崩溃恢复和验收矩阵。
+2. 按 `docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md` 继续 P3：补齐取消/等待用户/检查点、完整崩溃恢复和验收矩阵。
 3. P0/P4 实现并实测 OS 隔离、Tool Gateway、Secret Broker 和 Approval 后，再启用真实 Provider 调用及 Worker/Verifier。
 4. 完成 CLI/MCP 与端到端、安全验收，形成可运行且有证据链的 V1 闭环。

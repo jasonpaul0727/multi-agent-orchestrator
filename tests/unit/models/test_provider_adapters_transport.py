@@ -68,6 +68,7 @@ def model_request(registry):
         budget_reservation_id="reservation-1",
         model_id="model-1",
         provider_id="primary",
+        reasoning_effort="low",
         registry_manifest_hash=registry.content_hash,
     )
     return ModelRequest(

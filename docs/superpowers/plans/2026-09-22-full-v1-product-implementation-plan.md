@@ -88,17 +88,18 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 ## P3：生命周期状态机、事件驱动 DAG 与控制平面
 
-状态：Run/Node/Attempt + Scheduler 首个垂直切片已实现；本 Phase 仍未完成。首切片没有 Agent Registry、Worker、检查点/取消或完整崩溃恢复，不得视作 P3 完成。2026-09-23 验收时全量 385 项测试通过，coverage 门槛为 90%。
+状态：Run/Node/Attempt + Scheduler + Agent Registry 首个垂直切片已实现；本 Phase 仍未完成。首切片没有 Worker、检查点/取消或完整崩溃恢复，不得视作 P3 完成。Agent 记录冻结路由的 reasoning effort，Gateway accepted route 校验请求与所选 effort 一致。
 
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 
 - [x] 建立 Run/Node/Attempt/Graph 生命周期投影；实现基础状态机与非法转换拒绝。
-- [ ] 建立 Agent 实例 aggregate 和 Agent Registry；累计计数与并发/未知结果上限见后续项。
+- [x] 建立 Agent 实例 aggregate 和 Agent Registry；每个模型 attempt 在调度接纳时创建事件化实例。
 - [ ] 实现 Intake/Planning 与完整节点契约集成。
 - [x] 实现 DAG/依赖无环校验、有界追加式扩展和图版本；执行历史不可改写，修复须作为新节点表达。
 - [x] 实现 Scheduler 的系统、Run、provider、tool 并发额度与 fencing generation；过期租约转未知结果并保留 slot，不假定旧 Worker 已停止。
 - [x] 在一个 SQLite 事务边界内接纳 RoutingDecision、预算最坏情况预留、并发 slot、attempt lease 与节点运行转换；失败注入验证回滚，多连接 CAS 验证互斥。
-- [ ] 实现 Agent Registry 的累计 Agent 数、父子深度、活动/未知结果计数和上限；重试/改名/结束不得重置累计限制。
+- [x] 实现 Agent Registry 的累计 Agent 数、父子深度、活动/未知结果计数和上限；重试/改名/结束不得重置累计限制。
+- [x] 将所选 reasoning effort 纳入路由决策、Attempt、Agent 实例和 Gateway accepted route 的完整性绑定。
 - [x] 实现 Run 暂停/恢复、事件重放及 terminal Run 状态派生。
 - [ ] 实现取消、等待用户、检查点、快照失效回退、崩溃恢复及 terminal Run 的全部控制限制。
 - [ ] 实现失败分类/指纹、与 Recovery Controller 集成的有界重试阶梯和熔断。

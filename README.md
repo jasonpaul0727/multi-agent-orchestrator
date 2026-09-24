@@ -5,7 +5,7 @@
 > **当前状态：P1/P2 已实现，P3 首个生命周期与调度控制平面垂直切片已实现；完整编排系统仍不可运行。**
 > 实施计划 Task 1–9 已完成，涵盖事件存储、快照恢复、Artifact Store、预算账本、脱敏投影、跨规格事件契约、崩溃/并发测试及打包验收。
 > 已完成严格四层配置及 Run 快照、Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件存储驱动的健康熔断/ProbeLease、Recovery Controller，以及三种 Provider codec 和受限 HTTPS transport。
-> P3 尚未完整：Agent Registry、累计 Agent 上限、取消/等待用户/检查点与崩溃恢复控制仍待实现。P4 Tool/Isolation/Secret Broker/Approval、P5 Worker 执行和 CLI/MCP 尚未实现；Provider 在线请求默认因无 Secret Broker 而拒绝。
+> P3 尚未完整：取消/等待用户/检查点与崩溃恢复控制仍待实现。P4 Tool/Isolation/Secret Broker/Approval、P5 Worker 执行和 CLI/MCP 尚未实现；Provider 在线请求默认因无 Secret Broker 而拒绝。
 > 本项目**不具备生产就绪状态**。
 
 ## V1 目标
@@ -71,6 +71,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | `orchestrator.budget` | Token 与费用的预留、结算、对账 | `BudgetLedger` · `RunLimit` · `CostEstimate` · `BudgetReservation` · `UsageRecord` · `BudgetBalance` |
 | `orchestrator.lifecycle` | Run/Node/Attempt 状态投影、事件重放、追加式 DAG 与图版本校验 | `LifecycleController` · `RunLifecycleState` · `NodeSpec` · `AttemptState` |
 | `orchestrator.scheduler` | 路由接纳、最坏成本预留、并发 slot、fencing lease 与未知结果对账 | `Scheduler` · `AcceptedAttempt` · `ConcurrencyLimits` |
+| `orchestrator.agents` | 每个模型 attempt 的事件化 Agent 实例、累计数量/深度/活动上限和状态重放 | `AgentRegistry` · `AgentInstance` · `AgentRegistryState` |
 | `orchestrator.recovery` | 确定性恢复与不变式校验 | `bootstrap_recovery()` · `recover()` · `recover_aggregate()` |
 | `orchestrator.observability` | fail-closed 脱敏观测与只读投影 | `ObservationSink` · `Redactor` · Run/Budget/Cost/Approval/Audit projections |
 
@@ -80,7 +81,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 
 `orchestrator.security` 的 Policy Engine 对冻结策略版本作 deny 优先判定，按权限/工具 allowlist 交集处理并返回 scope-bound `PolicyDecision`。`orchestrator.routing` 以固定本地分类器生成不含原文的标签/哈希，Planning 阶段将 GuardRule、预算和角色限制冻结进节点契约；Router 对候选执行授权、能力、健康、凭据和最坏成本过滤，并按成本/配置顺位/模型 ID 稳定排序。Health Controller 将 provider/model 健康变化写入独立 SQLite event streams；跨聚合 ProbeLease 使用控制器 stream 与 aggregate stream 的同一 SQLite 事务完成版本 CAS，可按记录的事件时间重放/过期。Recovery Controller 仅生成有界的重试、同层 fallback、升级或独立角色节点计划；未知调用结果会要求先对账。
 
-P3 首个控制平面切片已实现：`LifecycleController` 将 Run 配置/Registry 哈希冻结到生命周期流，确定性重放 Run/Node/Attempt 状态，校验有界 append-only DAG 和图版本；`Scheduler` 重验路由与 Policy scope，在同一 SQLite 事务里接纳决策、预留预算、占用系统/Run/provider/tool 并发 slot、创建 attempt/fencing lease。租约过期转成 `OutcomeUnknown` 但不释放资源；仅显式 reconciliation 结算/释放并允许有界重试。该切片已有原子回滚、多连接竞争、迟到结果与事件重放测试，但尚未实现 Agent Registry、累计 Agent 数/深度执行控制、取消/等待用户/检查点、完整崩溃恢复及 Worker 集成。
+P3 首个控制平面切片已实现：`LifecycleController` 将 Run 配置/Registry 哈希冻结到生命周期流，确定性重放 Run/Node/Attempt 状态，校验有界 append-only DAG 和图版本；`Scheduler` 重验路由与 Policy scope，在同一 SQLite 事务里接纳决策、预留预算、占用系统/Run/provider/tool 并发 slot、创建 attempt/fencing lease 和对应 Agent 实例。Agent 累计计数以 `AgentInstanceCreated` 事件重放，结束/重试不扣减；子 Agent 深度由冻结节点上的父实例 ID 派生，创建来源、父关系与深度也在重放时复核；`Active`/`OutcomeUnknown` 均占活动上限。确定性路由选出的 reasoning effort 会绑定到 Attempt、Agent 实例和 Gateway accepted route，避免 Gateway 请求改变已批准等级。租约过期转成 `OutcomeUnknown` 但不释放资源；仅显式 reconciliation 结算/释放并允许有界重试。原子回滚、多连接竞争、迟到结果、Agent 数/深度/活动上限与状态重放均有测试；取消/等待用户/检查点、完整崩溃恢复及 Worker 集成仍未实现。
 
 仍未实现：Policy 执行入口、OS 隔离、Tool Gateway、Secret Broker、Approval、Worker、Verifier、CLI 与 MCP Server。因此当前交付仍是可验证的控制与基础库切片，不是可执行的多 Agent 产品。
 

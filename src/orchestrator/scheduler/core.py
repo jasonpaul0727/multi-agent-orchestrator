@@ -9,6 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
+from orchestrator.agents import AgentRegistry
 from orchestrator.budget import BudgetLedger, BudgetReservation, RunLimit, UsageRecord
 from orchestrator.config.runtime import RunConfigSnapshot
 from orchestrator.models import AcceptedModelRoute
@@ -60,6 +61,7 @@ class AcceptedAttempt(BaseModel):
     routing_decision: RoutingDecision
     accepted_route: AcceptedModelRoute
     reservation: BudgetReservation
+    agent_instance_id: str
     lease_expires_at: datetime
 
     @field_validator("lease_expires_at")
@@ -83,6 +85,7 @@ class Scheduler:
         self.event_store = event_store
         self.limits = limits
         self.lifecycle = LifecycleController(event_store)
+        self.agents = AgentRegistry(event_store)
 
     def accept_routing(
         self,
@@ -238,12 +241,18 @@ class Scheduler:
                 budget_reservation_id=reservation.reservation_id,
                 model_id=decision.selected_model_id,
                 provider_id=decision.selected_provider_id,
+                reasoning_effort=decision.reasoning_effort,
                 registry_manifest_hash=decision.registry_hash,
             )
             attempt = AttemptState(
                 attempt_id=request.attempt_id,
+                agent_instance_id=AgentRegistry.agent_id_for_attempt(
+                    request.run_id, request.attempt_id
+                ),
                 fencing_generation=request.fencing_generation,
                 decision_hash=decision.decision_hash,
+                policy_manifest_hash=request.policy_manifest_hash,
+                reasoning_effort=decision.reasoning_effort,
                 model_id=route.model_id,
                 provider_id=route.provider_id,
                 reservation_id=reservation.reservation_id,
@@ -257,11 +266,13 @@ class Scheduler:
                 decision_hash=decision.decision_hash,
                 causation_id=decision.decision_hash,
             )
+            self.agents.register_attempt(request.run_id, node=node.spec, attempt=attempt)
             payload = {
                 "attempt_ref": attempt_ref,
                 "run_id": request.run_id,
                 "node_id": request.node_id,
                 "attempt_id": request.attempt_id,
+                "agent_instance_id": attempt.agent_instance_id,
                 "provider_id": route.provider_id,
                 "tool_ids": list(node.spec.tool_ids),
                 "request_hash": request.request_hash,
@@ -297,6 +308,9 @@ class Scheduler:
             routing_decision=decision,
             accepted_route=route,
             reservation=reservation,
+            agent_instance_id=AgentRegistry.agent_id_for_attempt(
+                request.run_id, request.attempt_id
+            ),
             lease_expires_at=lease_expires_at,
         )
 
@@ -367,6 +381,15 @@ class Scheduler:
                     outcome="outcome_unknown",
                     causation_id=decision_hash,
                 )
+                self.agents.complete_attempt(
+                    run_id,
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                    agent_instance_id=accepted.payload["agent_instance_id"],
+                    fencing_generation=fencing_generation,
+                    causation_id=decision_hash,
+                    outcome="outcome_unknown",
+                )
                 return [
                     EventDraft(
                         "AttemptOutcomeUnknown",
@@ -398,6 +421,15 @@ class Scheduler:
                 fencing_generation=fencing_generation,
                 outcome=outcome,
                 causation_id=decision_hash,
+            )
+            self.agents.complete_attempt(
+                run_id,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                agent_instance_id=accepted.payload["agent_instance_id"],
+                fencing_generation=fencing_generation,
+                causation_id=decision_hash,
+                outcome=outcome,
             )
             return [
                 EventDraft(
@@ -541,6 +573,15 @@ class Scheduler:
                 fencing_generation=fencing_generation,
                 outcome=outcome,
                 causation_id=decision_hash,
+            )
+            self.agents.reconcile_attempt(
+                run_id,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                agent_instance_id=accepted.payload["agent_instance_id"],
+                fencing_generation=fencing_generation,
+                causation_id=decision_hash,
+                outcome=outcome,
             )
             return [
                 EventDraft(

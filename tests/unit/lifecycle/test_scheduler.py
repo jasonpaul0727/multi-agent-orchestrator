@@ -6,6 +6,16 @@ import json
 import pytest
 
 from orchestrator.budget import BudgetExhausted, BudgetLedger, CostEstimate, UsageRecord
+from orchestrator.agents import (
+    AgentConcurrencyLimitExceeded,
+    AgentDepthLimitExceeded,
+    AgentInstance,
+    AgentLimitExceeded,
+    AgentRegistry,
+    AgentRegistryError,
+    AgentRegistryLimits,
+    reduce_agent_registry,
+)
 from orchestrator.config import (
     ConfigCandidate,
     ConfigManager,
@@ -23,8 +33,8 @@ from orchestrator.lifecycle import (
     NodeSpec,
     validate_graph_append,
 )
-from orchestrator.lifecycle.models import AttemptState
-from orchestrator.persistence import SQLiteEventStore
+from orchestrator.lifecycle.models import AttemptState, NodeState, RunLifecycleState
+from orchestrator.persistence import EventDraft, SQLiteEventStore
 from orchestrator.routing import CandidateAssessment, RoutingDecision, RoutingRequest
 from orchestrator.scheduler import (
     ConcurrencyLimitExceeded,
@@ -59,7 +69,7 @@ def registry():
     return ModelRegistryManifest(providers=(provider,), models=(model,))
 
 
-def effective_config(reg):
+def effective_config(reg, *, max_agents=8, max_depth=4, max_concurrency=4):
     role = {
         "candidates": ["model-1"],
         "reasoning_effort": "none",
@@ -71,9 +81,9 @@ def effective_config(reg):
         "requested_budget": {
             "max_cost_minor": 100,
             "max_total_tokens": 100,
-            "max_agents": 8,
-            "max_depth": 4,
-            "max_concurrency": 4,
+            "max_agents": max_agents,
+            "max_depth": max_depth,
+            "max_concurrency": max_concurrency,
             "max_parallel_candidates": 2,
         },
         "roles": {item: dict(role) for item in ROLES},
@@ -90,9 +100,9 @@ def effective_config(reg):
                 "currency": "USD",
                 "max_cost_minor": 100,
                 "max_total_tokens": 100,
-                "max_agents": 8,
-                "max_depth": 4,
-                "max_concurrency": 4,
+                "max_agents": max_agents,
+                "max_depth": max_depth,
+                "max_concurrency": max_concurrency,
                 "allowed_models": ["model-1"],
                 "allowed_providers": ["primary"],
                 "allowed_capabilities": ["text", "tools"],
@@ -127,9 +137,13 @@ def effective_config(reg):
     return resolve_effective_config(config, registry=reg)
 
 
-def run_setup(store, *, run_id="run-1", nodes=None):
+def run_setup(
+    store, *, run_id="run-1", nodes=None, max_agents=8, max_depth=4, max_concurrency=4
+):
     reg = registry()
-    resolved = effective_config(reg)
+    resolved = effective_config(
+        reg, max_agents=max_agents, max_depth=max_depth, max_concurrency=max_concurrency
+    )
     ConfigManager(ConfigCandidate(resolved=resolved, registry=reg)).start_run(run_id, store)
     controller = LifecycleController(store)
     controller.initialize_run(run_id)
@@ -250,6 +264,7 @@ def routed_pair(
             ),
         ),
         eligible_order=("model-1",),
+        reasoning_effort="low",
         outcome="selected",
         selected_model_id="model-1",
         selected_provider_id="primary",
@@ -343,8 +358,13 @@ def test_route_acceptance_atomically_reserves_budget_slots_and_fences_attempt(tm
     accepted = accept(control, request, decision)
 
     assert accepted.accepted_route.budget_reservation_id == accepted.reservation.reservation_id
+    assert accepted.accepted_route.reasoning_effort == decision.reasoning_effort
     assert accepted.reservation.reserved_minor == 20
     assert lifecycle.replay("run-1").node("node-1").status == "running"
+    registry_state = control.agents.replay("run-1")
+    assert registry_state.total_created == registry_state.active_count == 1
+    assert registry_state.for_attempt(request.attempt_id).status == "active"
+    assert registry_state.for_attempt(request.attempt_id).reasoning_effort == decision.reasoning_effort
     assert store.read_stream("scheduler", "global")[0].event_type == "RoutingDecisionAccepted"
     repeated = accept(control, request, decision)
     assert repeated == accepted
@@ -394,6 +414,10 @@ def test_route_acceptance_atomically_reserves_budget_slots_and_fences_attempt(tm
         ),
     )
     assert lifecycle.replay("run-1").status == "succeeded"
+    registry_state = control.agents.replay("run-1")
+    assert registry_state.total_created == 2
+    assert registry_state.active_count == 0
+    assert registry_state.for_attempt(request.attempt_id).status == "completed"
     balance = BudgetLedger(store).available("run-1")
     assert balance.used_minor == 24
     assert balance.reserved_minor == 0
@@ -429,6 +453,9 @@ def test_unknown_result_keeps_resources_until_explicit_reconciliation(tmp_path):
     assert control.mark_expired_attempts_unknown(as_of=NOW + timedelta(minutes=2)) == (request.attempt_id,)
     assert control.mark_expired_attempts_unknown(as_of=NOW + timedelta(minutes=2)) == ()
     assert lifecycle.replay("run-1").node("node-1").status == "awaiting_reconciliation"
+    unknown_agents = control.agents.replay("run-1")
+    assert unknown_agents.total_created == 1
+    assert unknown_agents.active_count == unknown_agents.unknown_count == 1
     second_request, second_decision = routed_pair(reg, config, manifest, node_id="node-2")
     with pytest.raises(ConcurrencyLimitExceeded, match="system"):
         accept(control, second_request, second_decision)
@@ -444,8 +471,15 @@ def test_unknown_result_keeps_resources_until_explicit_reconciliation(tmp_path):
     )
     state = lifecycle.replay("run-1")
     assert state.node("node-1").status == "ready"
+    reconciled_agents = control.agents.replay("run-1")
+    assert reconciled_agents.total_created == 1
+    assert reconciled_agents.active_count == 0
+    assert reconciled_agents.for_attempt(request.attempt_id).status == "failed"
     retry_request, retry_decision = routed_pair(reg, config, manifest, node_id="node-1", attempt=2)
-    assert accept(control, retry_request, retry_decision).accepted_route.fencing_generation == 2
+    retry = accept(control, retry_request, retry_decision)
+    assert retry.accepted_route.fencing_generation == 2
+    assert retry.agent_instance_id != accepted.agent_instance_id
+    assert control.agents.replay("run-1").total_created == 2
     assert accepted.reservation.reservation_id != accepted.accepted_route.decision_id
 
 
@@ -625,8 +659,11 @@ def test_lifecycle_acceptance_rejects_invalid_attempt_status_and_fencing(tmp_pat
     controller = LifecycleController(store)
     invalid = AttemptState(
         attempt_id="attempt-invalid",
+        agent_instance_id="agent-invalid",
         fencing_generation=1,
         decision_hash=HASH,
+        policy_manifest_hash=HASH,
+        reasoning_effort="low",
         model_id="model-1",
         provider_id="primary",
         reservation_id="reservation-invalid",
@@ -770,3 +807,451 @@ def test_scheduler_completion_and_reconciliation_require_durable_evidence(tmp_pa
             outcome="failed", known_no_effect=True,
         )
     assert lifecycle.replay("run-1").node("node-1").status == "ready"
+
+
+def test_cumulative_agent_limit_is_not_refunded_after_a_retry(tmp_path):
+    store = SQLiteEventStore(tmp_path / "agent-total-limit.db")
+    reg, config, _, manifest = run_setup(
+        store,
+        nodes=(NodeSpec(
+            node_id="node-1", role="coder", planning_contract_hash=HASH, max_attempts=2
+        ),),
+        max_agents=1,
+    )
+    control = scheduler(store)
+    first_request, first_decision = routed_pair(reg, config, manifest)
+    first = accept(control, first_request, first_decision)
+    control.finish_attempt(
+        run_id="run-1", node_id="node-1", attempt_id=first_request.attempt_id,
+        fencing_generation=1, completed_at=NOW + timedelta(seconds=10),
+        outcome="failed", known_no_effect=True,
+    )
+    before = store.read_stream("budget", "run-1")
+    second_request, second_decision = routed_pair(reg, config, manifest, attempt=2)
+    with pytest.raises(AgentLimitExceeded, match="cumulative Agent limit"):
+        accept(control, second_request, second_decision)
+    assert store.read_stream("budget", "run-1") == before
+    assert control.agents.replay("run-1").total_created == 1
+    assert control.agents.replay("run-1").for_attempt(first_request.attempt_id).status == "failed"
+    assert first.agent_instance_id
+
+
+def test_agent_depth_is_derived_from_frozen_parent_instance(tmp_path):
+    store = SQLiteEventStore(tmp_path / "agent-depth-limit.db")
+    parent_attempt_id = "attempt-node-1-1"
+    parent_agent_id = AgentRegistry.agent_id_for_attempt("run-1", parent_attempt_id)
+    nodes = (
+        NodeSpec(node_id="node-1", role="coder", planning_contract_hash=HASH),
+        NodeSpec(
+            node_id="node-2", role="tester", planning_contract_hash=HASH,
+            parent_agent_instance_id=parent_agent_id,
+        ),
+    )
+    reg, config, _, manifest = run_setup(store, nodes=nodes, max_depth=0)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest, node_id="node-1")
+    accepted = accept(control, request, decision)
+    control.finish_attempt(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, completed_at=NOW + timedelta(seconds=10),
+        outcome="succeeded",
+        usage=UsageRecord(
+            reservation_id=accepted.reservation.reservation_id,
+            run_id="run-1", settlement_key="parent-success", currency="USD",
+            input_tokens=1, output_tokens=1, cost_minor=1,
+        ),
+    )
+    child_request, child_decision = routed_pair(
+        reg, config, manifest, node_id="node-2", role="tester"
+    )
+    with pytest.raises(AgentDepthLimitExceeded, match="depth exceeds"):
+        accept(control, child_request, child_decision)
+    assert control.agents.replay("run-1").total_created == 1
+    assert control.agents.replay("run-1").agent(parent_agent_id).depth == 0
+
+
+def test_child_agent_records_parent_attempt_as_creator(tmp_path):
+    store = SQLiteEventStore(tmp_path / "agent-parent-creator.db")
+    parent_attempt_id = "attempt-node-1-1"
+    parent_agent_id = AgentRegistry.agent_id_for_attempt("run-1", parent_attempt_id)
+    nodes = (
+        NodeSpec(node_id="node-1", role="coder", planning_contract_hash=HASH),
+        NodeSpec(
+            node_id="node-2", role="tester", planning_contract_hash=HASH,
+            parent_agent_instance_id=parent_agent_id,
+        ),
+    )
+    reg, config, _, manifest = run_setup(store, nodes=nodes, max_depth=1)
+    control = scheduler(store)
+    parent_request, parent_decision = routed_pair(reg, config, manifest, node_id="node-1")
+    parent = accept(control, parent_request, parent_decision)
+    control.finish_attempt(
+        run_id="run-1", node_id="node-1", attempt_id=parent_request.attempt_id,
+        fencing_generation=1, completed_at=NOW + timedelta(seconds=10),
+        outcome="succeeded",
+        usage=UsageRecord(
+            reservation_id=parent.reservation.reservation_id,
+            run_id="run-1", settlement_key="parent-creator-success", currency="USD",
+            input_tokens=1, output_tokens=1, cost_minor=1,
+        ),
+    )
+    child_request, child_decision = routed_pair(
+        reg, config, manifest, node_id="node-2", role="tester"
+    )
+
+    child = accept(control, child_request, child_decision)
+    instance = control.agents.replay("run-1").agent(child.agent_instance_id)
+    assert instance.parent_agent_instance_id == parent.agent_instance_id
+    assert instance.created_by_attempt_id == parent_request.attempt_id
+    assert instance.depth == 1
+
+
+def test_agent_registry_replay_and_transition_idempotency_are_fenced(tmp_path):
+    store = SQLiteEventStore(tmp_path / "agent-replay.db")
+    reg, config, lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accepted = accept(control, request, decision)
+    node_spec = lifecycle.replay("run-1").node("node-1").spec
+    attempt = lifecycle.replay("run-1").node("node-1").attempts[0]
+    with pytest.raises(AgentRegistryError, match="only an accepted model attempt"):
+        control.agents.register_attempt(
+            "run-1", node=node_spec, attempt=attempt.model_copy(update={"status": "succeeded"})
+        )
+    with pytest.raises(AgentRegistryError, match="deterministic attempt binding"):
+        control.agents.register_attempt(
+            "run-1", node=node_spec,
+            attempt=attempt.model_copy(update={"agent_instance_id": "agent-forged"}),
+        )
+    assert control.agents.register_attempt("run-1", node=node_spec, attempt=attempt).agent_instance_id == accepted.agent_instance_id
+    with pytest.raises(LifecycleConflict, match="stale or not in an allowed state"):
+        control.agents.complete_attempt(
+            "run-1", node_id="node-1", attempt_id=request.attempt_id,
+            agent_instance_id=accepted.agent_instance_id, fencing_generation=2,
+            causation_id=decision.decision_hash, outcome="succeeded",
+        )
+
+    control.finish_attempt(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, completed_at=NOW + timedelta(seconds=10),
+        outcome="succeeded",
+        usage=UsageRecord(
+            reservation_id=accepted.reservation.reservation_id,
+            run_id="run-1", settlement_key="agent-replay-success", currency="USD",
+            input_tokens=1, output_tokens=1, cost_minor=1,
+        ),
+    )
+    control.agents.complete_attempt(
+        "run-1", node_id="node-1", attempt_id=request.attempt_id,
+        agent_instance_id=accepted.agent_instance_id, fencing_generation=1,
+        causation_id=decision.decision_hash, outcome="succeeded",
+    )
+    with pytest.raises(LifecycleConflict, match="idempotency key was reused"):
+        control.agents.complete_attempt(
+            "run-1", node_id="node-1", attempt_id=request.attempt_id,
+            agent_instance_id=accepted.agent_instance_id, fencing_generation=1,
+            causation_id="sha256:" + "a" * 64, outcome="succeeded",
+        )
+    state = control.agents.replay("run-1")
+    assert state.total_created == 1
+    assert state.active_count == 0
+    with pytest.raises(KeyError):
+        state.agent("not-an-agent")
+    with pytest.raises(KeyError):
+        state.for_attempt("not-an-attempt")
+
+
+def test_agent_concurrency_cap_counts_unknown_and_active_instances(tmp_path):
+    store = SQLiteEventStore(tmp_path / "agent-active-limit.db")
+    reg, config, lifecycle, manifest = run_setup(
+        store,
+        nodes=(
+            NodeSpec(node_id="node-1", role="coder", planning_contract_hash=HASH),
+            NodeSpec(node_id="node-2", role="coder", planning_contract_hash=HASH),
+        ),
+        max_concurrency=1,
+    )
+    control = scheduler(store, system=8, run=8, provider=8, tool=8)
+    first_request, first_decision = routed_pair(reg, config, manifest, node_id="node-1")
+    accepted = accept(control, first_request, first_decision)
+    second_request, second_decision = routed_pair(reg, config, manifest, node_id="node-2")
+    second_attempt = AttemptState(
+        attempt_id=second_request.attempt_id,
+        agent_instance_id=AgentRegistry.agent_id_for_attempt("run-1", second_request.attempt_id),
+        fencing_generation=1,
+        decision_hash=second_decision.decision_hash,
+        policy_manifest_hash=second_request.policy_manifest_hash,
+        reasoning_effort=second_decision.reasoning_effort,
+        model_id="model-1",
+        provider_id="primary",
+        reservation_id="reservation-manual-agent-cap",
+        lease_expires_at=(NOW + timedelta(minutes=1)).isoformat(),
+        status="accepted",
+    )
+    lifecycle.record_attempt_accepted(
+        "run-1", node_id="node-2", attempt=second_attempt,
+        decision_hash=second_decision.decision_hash,
+        causation_id=second_decision.decision_hash,
+    )
+    with pytest.raises(AgentConcurrencyLimitExceeded, match="active/unknown Agent limit"):
+        control.agents.register_attempt(
+            "run-1", node=lifecycle.replay("run-1").node("node-2").spec,
+            attempt=second_attempt,
+        )
+    state = control.agents.replay("run-1")
+    assert state.total_created == state.active_count == 1
+    assert state.for_attempt(first_request.attempt_id).agent_instance_id == accepted.agent_instance_id
+
+
+def test_agent_registry_rejects_missing_and_unfinished_parents_atomically(tmp_path):
+    store = SQLiteEventStore(tmp_path / "agent-parent-checks.db")
+    expected_parent_id = AgentRegistry.agent_id_for_attempt(
+        "run-1", "attempt-parent-1"
+    )
+    reg, config, lifecycle, manifest = run_setup(
+        store,
+        nodes=(
+            NodeSpec(node_id="parent", role="coder", planning_contract_hash=HASH),
+            NodeSpec(
+                node_id="missing-parent-child", role="tester", planning_contract_hash=HASH,
+                parent_agent_instance_id="agent-does-not-exist",
+            ),
+            NodeSpec(
+                node_id="active-parent-child", role="tester", planning_contract_hash=HASH,
+                parent_agent_instance_id=expected_parent_id,
+            ),
+        ),
+    )
+    control = scheduler(store)
+    parent_request, parent_decision = routed_pair(
+        reg, config, manifest, node_id="parent"
+    )
+    accept(control, parent_request, parent_decision)
+    child_request, child_decision = routed_pair(
+        reg, config, manifest, node_id="missing-parent-child", role="tester"
+    )
+    budget_before = store.read_stream("budget", "run-1")
+    with pytest.raises(AgentRegistryError, match="parent Agent instance does not exist"):
+        accept(control, child_request, child_decision)
+    assert store.read_stream("budget", "run-1") == budget_before
+    assert lifecycle.replay("run-1").node("missing-parent-child").status == "ready"
+
+    active_child_request, active_child_decision = routed_pair(
+        reg, config, manifest, node_id="active-parent-child", role="tester"
+    )
+    with pytest.raises(AgentRegistryError, match="completed parent attempt"):
+        accept(control, active_child_request, active_child_decision)
+    assert lifecycle.replay("run-1").node("active-parent-child").status == "ready"
+    assert control.agents.replay("run-1").total_created == 1
+
+
+def test_lifecycle_boundary_models_reject_unstable_collections_and_ids():
+    with pytest.raises(ValueError, match="depends_on must be an array"):
+        NodeSpec.model_validate({
+            "node_id": "node", "role": "coder", "planning_contract_hash": HASH,
+            "depends_on": "not-an-array",
+        })
+    with pytest.raises(ValueError, match="unique stable node IDs"):
+        NodeSpec(
+            node_id="node", role="coder", planning_contract_hash=HASH,
+            depends_on=("parent", "parent"),
+        )
+    with pytest.raises(ValueError, match="stable agent ID"):
+        NodeSpec(
+            node_id="node", role="coder", planning_contract_hash=HASH,
+            parent_agent_instance_id="bad agent id",
+        )
+    with pytest.raises(ValueError, match="tool_ids must be an array"):
+        NodeSpec.model_validate({
+            "node_id": "node", "role": "coder", "planning_contract_hash": HASH,
+            "tool_ids": "not-an-array",
+        })
+    with pytest.raises(ValueError, match="unique stable identifiers"):
+        NodeSpec(
+            node_id="node", role="coder", planning_contract_hash=HASH,
+            tool_ids=("read_file", "read_file"),
+        )
+    with pytest.raises(ValueError, match="ISO-8601"):
+        AttemptState(
+            attempt_id="attempt", agent_instance_id="agent", fencing_generation=1,
+            decision_hash=HASH, policy_manifest_hash=HASH, reasoning_effort="low", model_id="model",
+            provider_id="provider", reservation_id="reservation", lease_expires_at="later",
+            status="accepted",
+        )
+    with pytest.raises(ValueError, match="UTC offset"):
+        AttemptState(
+            attempt_id="attempt", agent_instance_id="agent", fencing_generation=1,
+            decision_hash=HASH, policy_manifest_hash=HASH, reasoning_effort="low", model_id="model",
+            provider_id="provider", reservation_id="reservation",
+            lease_expires_at="2026-09-23T12:00:00", status="accepted",
+        )
+    with pytest.raises(ValueError, match="must be an array"):
+        NodeState(
+            spec=NodeSpec(node_id="node", role="coder", planning_contract_hash=HASH),
+            status="ready", attempts="not-an-array",
+        )
+    with pytest.raises(ValueError, match="must be an array"):
+        RunLifecycleState(
+            run_id="run", status="created", config_hash=HASH, registry_hash=HASH,
+            graph_version=0, event_version=1, nodes="not-an-array",
+        )
+    with pytest.raises(ValueError):
+        AgentRegistryLimits(max_total_agents=1, max_depth=-1, max_concurrent_agents=1)
+    with pytest.raises(ValueError):
+        AgentInstance(
+            agent_instance_id="bad id", run_id="run", node_id="node",
+            attempt_id="attempt", created_by_attempt_id="attempt", depth=0,
+            role="coder", model_id="model", provider_id="provider",
+            decision_hash=HASH, policy_manifest_hash=HASH, reasoning_effort="low", fencing_generation=1,
+            status="created",
+        )
+
+
+def _append_agent_event(
+    store, run_id, event_type, payload, *, key, event_run_id=None,
+    node_id="node", attempt_id="attempt",
+):
+    current = store.read_stream("agent_registry", run_id)
+    event = EventDraft(
+        event_type,
+        payload,
+        run_id=run_id if event_run_id is None else event_run_id,
+        node_id=node_id,
+        attempt_id=attempt_id,
+        fencing_generation=1,
+        correlation_id=run_id,
+        causation_id=HASH,
+    )
+    store.append("agent_registry", run_id, len(current), [event], key)
+
+
+def _created_agent_payload():
+    return {
+        "instance": AgentInstance(
+            agent_instance_id="agent-1",
+            run_id="run-1",
+            node_id="node",
+            attempt_id="attempt",
+            created_by_attempt_id="attempt",
+            depth=0,
+            role="coder",
+            model_id="model-1",
+            provider_id="primary",
+            decision_hash=HASH,
+            policy_manifest_hash=HASH,
+            reasoning_effort="low",
+            fencing_generation=1,
+            status="created",
+        ).model_dump(mode="json")
+    }
+
+
+def test_agent_registry_replay_rejects_corrupt_event_identity_and_duplicate_ids(tmp_path):
+    store = SQLiteEventStore(tmp_path / "agent-corrupt-events.db")
+    _append_agent_event(
+        store, "run-1", "AgentInstanceCreated", _created_agent_payload(),
+        key="create-1", event_run_id="run-other",
+    )
+    with pytest.raises(AgentRegistryError, match="identity does not match"):
+        reduce_agent_registry("run-1", store.read_stream("agent_registry", "run-1"))
+
+    duplicate_store = SQLiteEventStore(tmp_path / "agent-duplicate-events.db")
+    payload = _created_agent_payload()
+    _append_agent_event(duplicate_store, "run-1", "AgentInstanceCreated", payload, key="create-1")
+    _append_agent_event(duplicate_store, "run-1", "AgentInstanceCreated", payload, key="create-2")
+    with pytest.raises(AgentRegistryError, match="duplicated"):
+        reduce_agent_registry("run-1", duplicate_store.read_stream("agent_registry", "run-1"))
+
+
+@pytest.mark.parametrize(
+    ("parent_status", "child_depth", "child_creator", "message"),
+    (
+        ("active", 1, "attempt", "completed parent instance"),
+        ("completed", 2, "attempt", "depth or creator context"),
+        ("completed", 1, "forged-creator", "depth or creator context"),
+    ),
+)
+def test_agent_registry_replay_revalidates_parent_depth_and_creator(
+    tmp_path, parent_status, child_depth, child_creator, message
+):
+    store = SQLiteEventStore(tmp_path / f"agent-parent-replay-{parent_status}-{child_depth}.db")
+    _append_agent_event(store, "run-1", "AgentInstanceCreated", _created_agent_payload(), key="root")
+    _append_agent_event(
+        store, "run-1", "AgentStarted", {"agent_instance_id": "agent-1"}, key="root-start"
+    )
+    if parent_status == "completed":
+        _append_agent_event(
+            store, "run-1", "AgentCompleted",
+            {"agent_instance_id": "agent-1", "outcome": "succeeded"}, key="root-finish",
+        )
+    child = AgentInstance(
+        agent_instance_id="agent-2", run_id="run-1", node_id="child-node",
+        attempt_id="child-attempt", created_by_attempt_id=child_creator,
+        parent_agent_instance_id="agent-1", depth=child_depth, role="tester",
+        model_id="model-2", provider_id="primary", decision_hash=HASH,
+        policy_manifest_hash=HASH, reasoning_effort="low", fencing_generation=1, status="created",
+    )
+    _append_agent_event(
+        store, "run-1", "AgentInstanceCreated", {"instance": child.model_dump(mode="json")},
+        key="child", node_id="child-node", attempt_id="child-attempt",
+    )
+    with pytest.raises(AgentRegistryError, match=message):
+        reduce_agent_registry("run-1", store.read_stream("agent_registry", "run-1"))
+
+
+@pytest.mark.parametrize(
+    ("events", "message"),
+    (
+        ((("AgentStarted", {"agent_instance_id": "agent-1"}),), "unknown instance"),
+        (
+            (
+                ("AgentInstanceCreated", _created_agent_payload()),
+                ("AgentCompleted", {"agent_instance_id": "agent-1", "outcome": "failed"}),
+            ),
+            "must record a succeeded",
+        ),
+        (
+            (
+                ("AgentInstanceCreated", _created_agent_payload()),
+                ("AgentStarted", {"agent_instance_id": "agent-1"}),
+                ("AgentFailed", {"agent_instance_id": "agent-1", "outcome": "succeeded"}),
+            ),
+            "must record a failed",
+        ),
+        (
+            (
+                ("AgentInstanceCreated", _created_agent_payload()),
+                ("AgentStarted", {"agent_instance_id": "agent-1"}),
+                ("AgentOutcomeUnknown", {"agent_instance_id": "agent-1"}),
+                ("AgentReconciled", {"agent_instance_id": "agent-1", "outcome": "unknown"}),
+            ),
+            "must resolve an unknown",
+        ),
+        (
+            (
+                ("AgentInstanceCreated", _created_agent_payload()),
+                ("AgentStarted", {"agent_instance_id": "agent-1"}),
+                ("UnexpectedAgentEvent", {"agent_instance_id": "agent-1"}),
+            ),
+            "unsupported Agent registry event",
+        ),
+        (
+            (
+                ("AgentInstanceCreated", _created_agent_payload()),
+                ("AgentCancelled", {"agent_instance_id": "agent-1", "outcome": "cancelled"}),
+            ),
+            None,
+        ),
+    ),
+)
+def test_agent_registry_replay_enforces_instance_state_machine(tmp_path, events, message):
+    store = SQLiteEventStore(tmp_path / f"agent-state-machine-{len(events)}.db")
+    for index, (event_type, payload) in enumerate(events):
+        _append_agent_event(store, "run-1", event_type, payload, key=f"event-{index}")
+    if message is None:
+        assert reduce_agent_registry(
+            "run-1", store.read_stream("agent_registry", "run-1")
+        ).agent("agent-1").status == "cancelled"
+    else:
+        with pytest.raises(AgentRegistryError, match=message):
+            reduce_agent_registry("run-1", store.read_stream("agent_registry", "run-1"))

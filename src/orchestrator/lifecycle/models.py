@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
 from orchestrator.config.effective import RoleName
+from orchestrator.config.models import ReasoningEffort
 
 
 _HASH = r"^sha256:[0-9a-f]{64}$"
@@ -26,6 +27,7 @@ class NodeSpec(_LifecycleModel):
     role: RoleName
     planning_contract_hash: StrictStr = Field(pattern=_HASH)
     depends_on: tuple[StrictStr, ...] = ()
+    parent_agent_instance_id: StrictStr | None = None
     tool_ids: tuple[StrictStr, ...] = ()
     max_attempts: StrictInt = Field(default=1, ge=1, le=100)
 
@@ -42,6 +44,13 @@ class NodeSpec(_LifecycleModel):
         if len(value) != len(set(value)) or any(not _valid_identifier(item) for item in value):
             raise ValueError("dependencies must be unique stable node IDs")
         return tuple(sorted(value))
+
+    @field_validator("parent_agent_instance_id")
+    @classmethod
+    def validate_parent_agent(cls, value: str | None) -> str | None:
+        if value is not None and not _valid_identifier(value):
+            raise ValueError("parent_agent_instance_id must be a stable agent ID")
+        return value
 
     @field_validator("tool_ids", mode="before")
     @classmethod
@@ -60,8 +69,11 @@ class NodeSpec(_LifecycleModel):
 
 class AttemptState(_LifecycleModel):
     attempt_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER)
+    agent_instance_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER)
     fencing_generation: StrictInt = Field(gt=0)
     decision_hash: StrictStr = Field(pattern=_HASH)
+    policy_manifest_hash: StrictStr = Field(pattern=_HASH)
+    reasoning_effort: ReasoningEffort
     model_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER)
     provider_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER)
     reservation_id: StrictStr = Field(min_length=1, pattern=_IDENTIFIER)

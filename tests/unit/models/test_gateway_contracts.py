@@ -42,6 +42,7 @@ def request(**updates):
             budget_reservation_id="reservation-1",
             model_id="model-1",
             provider_id="primary",
+            reasoning_effort="medium",
             registry_manifest_hash=HASH,
         ),
         "messages": (ModelMessage(role="user", content="hello"),),
@@ -66,6 +67,9 @@ def test_model_request_binds_attempt_route_limits_and_cost_snapshots():
     assert call.accepted_routing_decision_id == "decision-1"
     assert call.fencing_generation == 2
     assert call.cost_snapshots.fx_snapshot_id == HASH
+    forged_route = call.accepted_route.model_copy(update={"reasoning_effort": "low"})
+    with pytest.raises(ValidationError, match="accepted route scope or effort"):
+        request(accepted_route=forged_route)
     with pytest.raises(ValidationError):
         request(api_key="must-never-enter-the-gateway-contract")
     with pytest.raises(ValidationError, match="tool messages require"):
@@ -108,6 +112,7 @@ def test_gateway_preflight_matches_registry_provider_model_and_generation():
         budget_reservation_id="reservation-1",
         model_id="model-1",
         provider_id="primary",
+        reasoning_effort="medium",
         registry_manifest_hash=registry.content_hash,
     )
     call = request(model_id="model-1", accepted_route=route, cost_snapshots=cost_refs)
