@@ -32,6 +32,7 @@ from orchestrator.models.gateway import (
     ModelGatewayFailure,
     ModelRequest,
     ModelResponse,
+    SecretAccessContext,
     resolve_provider_url,
     validate_gateway_request,
     validate_gateway_response,
@@ -54,9 +55,16 @@ class ProviderCredential:
 
     header_name: str
     value: str = field(repr=False)
+    provider_id: str
+    endpoint: str
+    purpose: str
 
     def __repr__(self) -> str:
-        return f"ProviderCredential(header_name={self.header_name!r}, value=<redacted>)"
+        return (
+            f"ProviderCredential(header_name={self.header_name!r}, "
+            f"provider_id={self.provider_id!r}, endpoint={self.endpoint!r}, "
+            f"purpose={self.purpose!r}, value=<redacted>)"
+        )
 
 
 class SecretBroker(Protocol):
@@ -67,6 +75,7 @@ class SecretBroker(Protocol):
         provider: ProviderSpec,
         endpoint: str,
         purpose: str,
+        context: SecretAccessContext,
     ) -> ProviderCredential | None: ...
 
 
@@ -196,7 +205,7 @@ class UrllibHTTPSTransport:
 
 
 class UnavailableSecretBroker:
-    """Safe default until the audited Secret Broker is implemented."""
+    """Safe default when the host application has not configured a broker."""
 
     async def acquire_provider_credential(
         self,
@@ -205,6 +214,7 @@ class UnavailableSecretBroker:
         provider: ProviderSpec,
         endpoint: str,
         purpose: str,
+        context: SecretAccessContext,
     ) -> ProviderCredential | None:
         return None
 
@@ -264,14 +274,36 @@ class ProviderModelGateway:
                 provider=provider,
                 endpoint=provider.effective_endpoint,
                 purpose="model_inference",
+                context=SecretAccessContext(
+                    request_id=request.request_id,
+                    run_id=request.run_id,
+                    node_id=request.node_id,
+                    attempt_id=request.attempt_id,
+                    fencing_generation=request.fencing_generation,
+                    accepted_route_id=request.accepted_route.decision_id,
+                    budget_reservation_id=request.budget_reservation_id,
+                ),
             )
         except Exception:
             credential = None
         if credential is None:
             self._fail("credential_delivery_unsupported", "preflight", "not_sent", False)
+        if (
+            not isinstance(credential, ProviderCredential)
+            or not isinstance(credential.header_name, str)
+            or not isinstance(credential.value, str)
+            or not isinstance(credential.provider_id, str)
+            or not isinstance(credential.endpoint, str)
+            or not isinstance(credential.purpose, str)
+        ):
+            self._fail("credential_unavailable", "preflight", "not_sent", False)
         auth_header = credential.header_name.lower()
         if (
             auth_header != _ALLOWED_AUTH_HEADERS[provider.adapter]
+            or not credential.value.isascii()
+            or credential.provider_id != provider.id
+            or credential.endpoint != provider.effective_endpoint
+            or credential.purpose != "model_inference"
             or not credential.value
             or len(credential.value) > 4_096
             or not _is_header_value(credential.value)

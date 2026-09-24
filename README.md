@@ -5,7 +5,7 @@
 > **当前状态：P1/P2 已实现；P3 控制平面与 P4 只读隔离/ToolGateway 内部切片已实现；完整编排系统仍不可运行。**
 > 实施计划 Task 1–9 已完成，涵盖事件存储、快照恢复、Artifact Store、预算账本、脱敏投影、跨规格事件契约、崩溃/并发测试及打包验收。
 > 已完成严格四层配置及 Run 快照、Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件存储驱动的健康熔断/ProbeLease、Recovery Controller，以及三种 Provider codec 和受限 HTTPS transport。
-> P3 尚未完整：跨生命周期/预算/Agent Registry/租约/副作用的完整崩溃恢复及有界失败恢复仍缺。P4 有实测 Linux/systemd 只读隔离 profile、内部 `ToolGateway` 只读命令垂直切片，以及未接入 Worker 的 Approval 控制面原语（精确 scope、一次性 grant、effect intent/消费/预算原子追加）；workspace-write、Overlay 安全变更发布、真实身份服务、Secret Broker 与 Scheduler/Worker 集成仍未完成。P5 Worker/Verifier、P6 CLI/MCP、P7 完整 E2E/安全验收和可复现性能基准仍未完成；Provider 在线请求默认因无 Secret Broker 而拒绝。
+> P3 尚未完整：跨生命周期/预算/Agent Registry/租约/副作用的完整崩溃恢复及有界失败恢复仍缺。P4 有实测 Linux/systemd 只读隔离 profile、内部 `ToolGateway` 只读命令垂直切片、未接入 Worker 的 Approval 控制面原语，以及仅供显式 host 组装的进程内 Secret Broker 原型；workspace-write、Overlay 安全变更发布、真实身份服务、独立 Worker 进程边界与完整 Scheduler/Worker 集成仍未完成。P5 Worker/Verifier、P6 CLI/MCP、P7 完整 E2E/安全验收和可复现性能基准仍未完成；默认 Provider broker 仍 fail-closed。
 > 本项目**不具备生产就绪状态**。
 
 ## V1 目标
@@ -63,6 +63,8 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | --- | --- | --- |
 | `orchestrator.config` | 严格有效配置、四层覆盖/来源追踪、原子 reload 与 Run 配置快照 | `EffectiveConfig` · `ResolvedConfig` · `ConfigManager` · `RunConfigSnapshot` · `ModelRegistryManifest` |
 | `orchestrator.models` | Tokenizer/FX 成本快照、确定性成本估算、三种 Provider codec 和 fail-closed HTTPS Gateway | `TokenizerSnapshot` · `FXSnapshot` · `ProviderModelGateway` · `OpenAIResponsesAdapter` · `AnthropicMessagesAdapter` · `OpenAICompatibleAdapter` |
+| `orchestrator.secrets` | Run/provider/ref/endpoint/purpose scope-bound Secret Broker 原型与脱敏审计 | `AuditedSecretBroker` · `SecretAccessRule` · `EnvironmentSecretStore` |
+| `orchestrator.approvals` | 精确 scope、one-shot grant、effect intent 与预算原子消费原语 | `ApprovalService` · `ApprovalRequest` · `EffectIntentSpec` |
 | `orchestrator.security` | Policy manifest 与确定性权限判定 | `PolicyManifest` · `PolicyEngine` · `PolicyDecision` |
 | `orchestrator.tools` | 基于 attempt fencing 的固定只读命令 Tool Gateway | `ToolGateway` · `ToolRequest` · `ToolExecutionResult` |
 | `orchestrator.routing` | TaskClassifier、Planning 节点契约、确定性路由、事件驱动健康熔断和恢复授权 | `TaskClassifier` · `PlanningNodeContract` · `ModelRouter` · `HealthController` · `RecoveryController` |
@@ -78,7 +80,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 
 `orchestrator.config` 已实现完整配置 schema、system default → user global → project → Run 四层解析、逐字段来源追踪、Policy Envelope 单调收紧、selector tombstone/guard 累加、安全 YAML loaders 和 JSON Schema。`ConfigManager` 会先完整构造并验证候选，再以单次原子切换替换活动配置；校验失败保留原配置。Run 启动时将有效配置、注册表及哈希、字段来源和来源标签冻结到 `RunCreated` 事件，并以校验快照作恢复加速；重启时从事件重放原始快照，不受配置文件后续变化影响。并发 reload、Run 启动竞争、重复 Run 创建、失败重试和重启恢复均有测试。当前尚未接入完整生命周期执行。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
 
-`orchestrator.models` 增加版本化 Tokenizer/FX snapshots：都以规范化内容生成稳定 SHA-256 ID，并在调用事件时间验证有效期；汇率用整数有理数表示，转换与费用估算均向上取整。三种 codec 已实现 Responses、Anthropic Messages 和 OpenAI-compatible Chat Completions 的请求/响应转换、工具提案、usage 和失败归一化。`UrllibHTTPSTransport` 使用注册 endpoint、关闭环境代理、拒绝重定向并限制响应大小；`ProviderModelGateway` 要求已接受路由验证器与凭据 Broker。当前未实现 P4 Secret Broker，因此默认 Broker fail-closed，不能读取环境变量或发出在线 Provider 请求；mock transport 契约测试不代表在线验收。P3 已把模型预算预留/结算接入 attempt lifecycle。新增内部 `orchestrator.tools.ToolGateway` 只支持只读命令，通过冻结策略、一次性 CapabilityGrant、attempt fencing 与真实 systemd 隔离后端；`orchestrator.approvals.ApprovalService` 将 hash-scoped 请求、一次性 grant 绑定、effect intent、grant 消费与预算预留原子持久化。两者都尚未连接 Worker/Scheduler application service；ApprovalService 还没有生产身份提供方、CLI/MCP 入口或 Gateway 消费接线。
+`orchestrator.models` 增加版本化 Tokenizer/FX snapshots：都以规范化内容生成稳定 SHA-256 ID，并在调用事件时间验证有效期；汇率用整数有理数表示，转换与费用估算均向上取整。三种 codec 已实现 Responses、Anthropic Messages 和 OpenAI-compatible Chat Completions 的请求/响应转换、工具提案、usage 和失败归一化。`UrllibHTTPSTransport` 使用注册 endpoint、关闭环境代理、拒绝重定向并限制响应大小；`ProviderModelGateway` 要求已接受路由验证器与凭据 Broker。默认 broker 是 fail-closed；`orchestrator.secrets.AuditedSecretBroker` 仅在 host 明确提供按 Run/provider/ref/endpoint/purpose 绑定的 allowlist 和 SecretValueStore 时，才写脱敏 SQLite 审计并返回绑定 audience 的短期凭据。这个切片尚未形成独立进程边界或在线 Provider 验收。P3 已把模型预算预留/结算接入 attempt lifecycle。新增内部 `orchestrator.tools.ToolGateway` 只支持只读命令，通过冻结策略、一次性 CapabilityGrant、attempt fencing 与真实 systemd 隔离后端；`orchestrator.approvals.ApprovalService` 将 hash-scoped 请求、一次性 grant 绑定、effect intent、grant 消费与预算预留原子持久化。ToolGateway、ApprovalService 和 Secret Broker 都尚未连接 Worker/Scheduler application service；ApprovalService 还没有生产身份提供方、CLI/MCP 入口或 Gateway 消费接线。
 
 `orchestrator.security` 的 Policy Engine 对冻结策略版本作 deny 优先判定，按权限/工具 allowlist 交集处理并返回 scope-bound `PolicyDecision`。`orchestrator.routing` 以固定本地分类器生成不含原文的标签/哈希，Planning 阶段将 GuardRule、预算和角色限制冻结进节点契约；Router 对候选执行授权、能力、健康、凭据和最坏成本过滤，并按成本/配置顺位/模型 ID 稳定排序。Health Controller 将 provider/model 健康变化写入独立 SQLite event streams；跨聚合 ProbeLease 使用控制器 stream 与 aggregate stream 的同一 SQLite 事务完成版本 CAS，可按记录的事件时间重放/过期。Recovery Controller 仅生成有界的重试、同层 fallback、升级或独立角色节点计划；未知调用结果会要求先对账。
 
@@ -88,7 +90,7 @@ Run 可事件化进入 `awaiting_user`，只有带请求 ID 和响应哈希的�
 
 Run lifecycle 在初始化、图变更、Run 状态和 Attempt 变化后写入带版本/源事件锚点的快照；重放使用通过 schema/hash/version/anchor 校验的快照并应用后续事件。只读 Run Recovery Coordinator 已交叉核对 lifecycle、Agent Registry、budget 和 scheduler lease streams；event/effect/artifact 结果及 live process 的完整重启协调仍待实现，所以当前能力不是完整 Run crash recovery。
 
-仍未实现：workspace-write 安全变更发布、ApprovalService 到 ToolGateway/Worker 的执行接线、Secret Broker、Worker、独立 Verifier、CLI、MCP Server、跨流完整崩溃恢复与性能基准证据。因此当前交付仍不是可完整运行的多 Agent 产品。
+仍未实现：workspace-write 安全变更发布、ApprovalService 到 ToolGateway/Worker 的执行接线、独立进程 Secret Broker/Worker 边界、Worker、独立 Verifier、CLI、MCP Server、跨流完整崩溃恢复与性能基准证据。因此当前交付仍不是可完整运行的多 Agent 产品。
 
 ### 预算生命周期
 
@@ -136,6 +138,7 @@ python -m build
 - [权限、安全、隔离与审批](docs/superpowers/specs/2026-09-13-permissions-security-isolation-approval-design.md)：已于 2026-09-22 获书面批准；只读隔离/ToolGateway 候选切片已实测，完整执行闭环仍未实现。
 - [只读 Tool Gateway 当前边界](docs/security/tool-gateway.md)：只读命令垂直切片的授权、审计、撤销行为和未实现能力。
 - [ApprovalService 当前边界](docs/security/approvals.md)：原子审批控制面原语的 scope、一次性消费和未集成能力。
+- [Secret Broker 当前边界](docs/security/secrets.md)：按 Run/provider/ref/endpoint/purpose 限定并审计的进程内凭据代理原型及其限制。
 - [持久化、成本统计、可观测性与测试](docs/superpowers/specs/2026-09-14-persistence-cost-observability-testing-design.md)：已于 2026-09-14 确认并完成书面审阅。
 - [持久化底座实施计划](docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md)：Task 1–9 已完成。
 - [完整 V1 产品实施计划](docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md)：P0–P7 分阶段实施与验收路线；当前继续补 P3 跨流恢复、P4 Approval/Secret Broker/写隔离和 P5–P7，Worker 执行硬门仍未解除。
@@ -143,4 +146,4 @@ python -m build
 ## 下一步
 
 1. 继续完成 P3：跨流 effect/artifact 恢复、完整中断矩阵及失败分类/有限重试。
-2. P4 继续补 workspace-write/安全变更发布、Secret Broker、ApprovalService 到 ToolGateway 的消费接线和 Scheduler/Worker 集成；当前 ApprovalService 仅是内部原语，不解除执行硬门。
+2. P4 继续补 workspace-write/安全变更发布、独立进程隔离、ApprovalService 到 ToolGateway 的消费接线和 Scheduler/Worker 集成；当前 ApprovalService/Secret Broker 均为内部原语，不解除执行硬门。

@@ -123,12 +123,14 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 2026-09-23 ApprovalService 切片：新增内部 `orchestrator.approvals` API，以请求/动作/目标哈希约束 grant；注入式认证和权限检查；grant 只能绑定到新 attempt；在一个共享 SQLite 事务中记录 EffectIntent、单次 grant 消费和预算预留，并要求 effect receipt 绑定同一 attempt。定向测试覆盖过期、撤销、scope 变化、失败认证、并发双消费和回执重放。该切片**未**接入 ToolGateway/Worker，不含真实身份服务、CLI/MCP 入口、Secret Broker，也不触发外部动作；它不解除 P4/P5 硬门。细节：`docs/security/approvals.md`。
 
+2026-09-23 Secret Broker 切片：新增 `AuditedSecretBroker` 与 `EnvironmentSecretStore`，由宿主显式 allowlist 精确绑定 Run/provider/secret ref/HTTPS endpoint/用途；授权/拒绝决定先以哈希字段写 SQLite security stream，再按一次性 request ID 解析凭据并交给 ProviderModelGateway；secret store 不可用另记 `SecretCredentialUnavailable`。Gateway 核验凭据 provider/endpoint/purpose/header scope。环境变量引用仅由显式 store 读取，默认 `UnavailableSecretBroker` 仍 fail-closed。此为进程内原型：尚无独立 Worker/Gateway 进程边界、keyring/plugin 实际实现、动态撤销、在线 Provider E2E 或运行平台安全验收；细节：`docs/security/secrets.md`。
+
 - [ ] 实现平台隔离适配器和能力指纹；工作区、控制目录、`.git`、策略、密钥和 Artifact 路径之间有明确边界。无法达到节点安全契约时失败关闭。
 - [ ] 实现安全路径解析及打开时二次校验；覆盖 traversal、symlink/junction/reparse point、挂载点、硬链接、大小写别名和 TOCTOU 风险；记录可恢复写入清单/快照。
 - [ ] 实现受限进程树、CPU/内存/时长/进程/输出限制、私有临时目录、取消与清理；取消/租约丢失先关 Gateway 动作再停止进程，不能确认停止时保留未知占用。
 - [ ] 实现 Tool Gateway，作为文件、受限命令、Git、managed web read 和外部工具的唯一入口；执行前重验 Grant、目标/参数哈希、fencing、隔离指纹、撤销版本及策略版本。
 - [ ] 完成端到端一次性精确 ApprovalRequest/ApprovalGrant：将已有内部 ApprovalService 原语接入可信身份/Authority Envelope、ToolGateway 和 Worker；覆盖绑定 effect intent、原子单次消费、过期/撤销及授权后创建新 attempt；批准只令阻塞节点重新就绪，不恢复旧 attempt 或复用旧 RoutingDecision。
-- [ ] 实现 Secret Broker：仅 Gateway 在指定端点/用途内使用 secret ref；密钥不进入 Agent/Worker/Shell、环境变量、命令行、提示、事件、日志、Artifact 或审批预览。
+- [ ] 完成 Secret Broker 端到端安全边界：将现有进程内 allowlist/audit 原型接入独立可信 Gateway/Worker 进程布局、宿主身份/密钥后端与策略撤销；实测密钥不进入 Worker/Shell、环境变量继承、命令行、提示、事件、日志、Artifact 或审批预览。
 - [ ] 外部副作用严格按 intent -> grant consume -> execute -> receipt/reconcile；结果不明禁止自动重试。managed web 代理阻止认证信息、上传、私网/localhost/metadata、重定向绕过和 DNS 重绑定。
 - [ ] Git/worktree 写入采用串行共享工作区写租约或独立 worktree 并行；合并作为独立验证节点。
 

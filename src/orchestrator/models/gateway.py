@@ -122,6 +122,18 @@ class AcceptedModelRoute(_GatewayModel):
         return value
 
 
+class SecretAccessContext(_GatewayModel):
+    """Least-data, attempt-bound audience context for one broker lookup."""
+
+    request_id: StrictStr = Field(min_length=1, max_length=128, pattern=_IDENTIFIER.pattern)
+    run_id: StrictStr = Field(min_length=1, max_length=128, pattern=_IDENTIFIER.pattern)
+    node_id: StrictStr = Field(min_length=1, max_length=128, pattern=_IDENTIFIER.pattern)
+    attempt_id: StrictStr = Field(min_length=1, max_length=128, pattern=_IDENTIFIER.pattern)
+    fencing_generation: StrictInt = Field(ge=0)
+    accepted_route_id: StrictStr = Field(min_length=1, max_length=128, pattern=_IDENTIFIER.pattern)
+    budget_reservation_id: StrictStr = Field(min_length=1, max_length=128, pattern=_IDENTIFIER.pattern)
+
+
 class ModelRequest(_GatewayModel):
     """Attempt-scoped call envelope; credentials and endpoints are not caller data."""
 
@@ -483,6 +495,7 @@ __all__ = [
     "ModelResponse",
     "ModelToolCall",
     "ModelToolDefinition",
+    "SecretAccessContext",
     "TokenUsage",
     "resolve_provider_url",
     "validate_gateway_request",

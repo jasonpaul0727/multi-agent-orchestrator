@@ -21,6 +21,7 @@ from orchestrator.models import (
     OpenAIResponsesAdapter,
     ProviderCredential,
     ProviderModelGateway,
+    SecretAccessContext,
     UnavailableSecretBroker,
 )
 from orchestrator.models.transport import (
@@ -30,6 +31,8 @@ from orchestrator.models.transport import (
     HTTPTransportTimedOut,
     UrllibHTTPSTransport,
 )
+from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
+from orchestrator.secrets import AuditedSecretBroker, EnvironmentSecretStore, SecretAccessRule
 
 
 HASH = "sha256:" + "a" * 64
@@ -338,11 +341,21 @@ class _Verifier:
 
 
 class _Broker:
-    async def acquire_provider_credential(self, *, secret_ref, provider, endpoint, purpose):
+    def __init__(self):
+        self.contexts = []
+
+    async def acquire_provider_credential(self, *, secret_ref, provider, endpoint, purpose, context):
         assert secret_ref == "env:MODEL_KEY"
         assert endpoint == "https://api.openai.com/v1"
         assert purpose == "model_inference"
-        return ProviderCredential(header_name="Authorization", value="secret-value")
+        self.contexts.append(context)
+        return ProviderCredential(
+            header_name="Authorization",
+            value="secret-value",
+            provider_id=provider.id,
+            endpoint=endpoint,
+            purpose=purpose,
+        )
 
 
 class _FakeTransport:
@@ -381,10 +394,11 @@ def test_gateway_never_reads_secrets_and_uses_only_verified_route_and_broker():
     assert failure.value.failure.code == "credential_delivery_unsupported"
     assert transport.calls == []
 
+    broker = _Broker()
     gateway = ProviderModelGateway(
         registry=registry,
         accepted_route_verifier=_Verifier(),
-        secret_broker=_Broker(),
+        secret_broker=broker,
         transport=transport,
     )
     response = asyncio.run(gateway.invoke(call))
@@ -393,7 +407,72 @@ def test_gateway_never_reads_secrets_and_uses_only_verified_route_and_broker():
     assert sent["url"] == "https://api.openai.com/v1/responses"
     assert ("Authorization", "Bearer secret-value") in sent["headers"]
     assert ("Idempotency-Key", call.idempotency_key) in sent["headers"]
-    assert "secret-value" not in repr(ProviderCredential("authorization", "secret-value"))
+    assert broker.contexts == [
+        SecretAccessContext(
+            request_id="request-1",
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id="attempt-1",
+            fencing_generation=1,
+            accepted_route_id="decision-1",
+            budget_reservation_id="reservation-1",
+        )
+    ]
+    assert "secret-value" not in repr(
+        ProviderCredential("authorization", "secret-value", "primary", "https://api.openai.com/v1", "model_inference")
+    )
+
+
+def test_provider_gateway_uses_only_audited_explicit_secret_broker(tmp_path):
+    registry = model_registry()
+    call = model_request(registry)
+    provider = registry.providers[0]
+    audit = SQLiteEventStore(tmp_path / "gateway-secret.db")
+    secret_store = EnvironmentSecretStore(
+        allowed_secret_refs={provider.secret_ref},
+        environ={"MODEL_KEY": "integration-secret"},
+    )
+    broker = AuditedSecretBroker(
+        event_store=audit,
+        value_store=secret_store,
+        rules=(
+            SecretAccessRule(
+                provider_id=provider.id,
+                secret_ref=provider.secret_ref,
+                endpoint=provider.effective_endpoint,
+                purpose="model_inference",
+                allowed_run_ids=frozenset({call.run_id}),
+            ),
+        ),
+    )
+    transport = _FakeTransport(
+        HTTPTransportResponse(
+            status=200,
+            headers=(),
+            body=json.dumps(
+                {
+                    "id": "resp_secret_broker",
+                    "status": "completed",
+                    "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            ).encode(),
+        )
+    )
+    gateway = ProviderModelGateway(
+        registry=registry,
+        accepted_route_verifier=_Verifier(),
+        secret_broker=broker,
+        transport=transport,
+    )
+
+    response = asyncio.run(gateway.invoke(call))
+
+    assert response.output_text == "ok"
+    assert ("authorization", "Bearer integration-secret") in transport.calls[0]["headers"]
+    [event] = audit.read_stream("security", call.run_id)
+    assert event.event_type == "SecretAccessGranted"
+    assert "integration-secret" not in repr(event.payload)
 
 
 def test_gateway_normalizes_rate_limits_without_exposing_provider_body():
@@ -472,9 +551,31 @@ def test_gateway_fails_closed_for_route_broker_headers_and_cancellation():
     bad_credential = ProviderModelGateway(
         registry=registry,
         accepted_route_verifier=_Verifier(),
-        secret_broker=_StaticBroker(ProviderCredential("x-api-key", "bad-header")),
+        secret_broker=_StaticBroker(
+            ProviderCredential(
+                "x-api-key", "bad-header", "primary", "https://api.openai.com/v1", "model_inference"
+            )
+        ),
     )
     assert _gateway_error(bad_credential, call).code == "credential_unavailable"
+
+    wrong_audience = ProviderModelGateway(
+        registry=registry,
+        accepted_route_verifier=_Verifier(),
+        secret_broker=_StaticBroker(
+            ProviderCredential(
+                "Authorization", "value", "another-provider", "https://api.openai.com/v1", "model_inference"
+            )
+        ),
+    )
+    assert _gateway_error(wrong_audience, call).code == "credential_unavailable"
+
+    malformed_broker = ProviderModelGateway(
+        registry=registry,
+        accepted_route_verifier=_Verifier(),
+        secret_broker=_StaticBroker(object()),
+    )
+    assert _gateway_error(malformed_broker, call).code == "credential_unavailable"
 
     pre_cancelled = _Cancellation(cancelled=True)
     assert _gateway_error(denied_route, call, cancellation=pre_cancelled).code == "cancelled"
