@@ -5,7 +5,7 @@
 > **当前状态：P1/P2 已实现；P3 控制平面与 P4 只读隔离/ToolGateway 内部切片已实现；完整编排系统仍不可运行。**
 > 实施计划 Task 1–9 已完成，涵盖事件存储、快照恢复、Artifact Store、预算账本、脱敏投影、跨规格事件契约、崩溃/并发测试及打包验收。
 > 已完成严格四层配置及 Run 快照、Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件存储驱动的健康熔断/ProbeLease、Recovery Controller，以及三种 Provider codec 和受限 HTTPS transport。
-> P3 尚未完整：跨生命周期/预算/Agent Registry/租约/副作用的完整崩溃恢复及有界失败恢复仍缺。P4 有实测 Linux/systemd 只读隔离 profile、内部 `ToolGateway` 只读命令垂直切片、未接入 Worker 的 Approval 控制面原语，以及仅供显式 host 组装的进程内 Secret Broker 原型；workspace-write、Overlay 安全变更发布、真实身份服务、独立 Worker 进程边界与完整 Scheduler/Worker 集成仍未完成。P5 Worker/Verifier、P6 CLI/MCP、P7 完整 E2E/安全验收和可复现性能基准仍未完成；默认 Provider broker 仍 fail-closed。
+> P3 尚未完整：全量跨流/Worker 崩溃矩阵、Provider 侧结果查询与回执验证、真实 Worker 终止确认和自动恢复循环仍缺；Scheduler 已持久化脱敏失败证据/有界计划并验证单次路由授权，但目前由 host service 显式驱动。P4 有实测 Linux/systemd 只读隔离 profile、内部 `ToolGateway` 只读命令垂直切片、未接入 Worker 的 Approval 控制面原语，以及仅供显式 host 组装的进程内 Secret Broker 原型；workspace-write、Overlay 安全变更发布、真实身份服务、独立 Worker 进程边界与完整 Scheduler/Worker 集成仍未完成。P5 Worker/Verifier、P6 CLI/MCP、P7 完整 E2E/安全验收和可复现性能基准仍未完成；默认 Provider broker 仍 fail-closed。
 > 本项目**不具备生产就绪状态**。
 
 ## V1 目标
@@ -140,11 +140,12 @@ python -m build
 - [ApprovalService 当前边界](docs/security/approvals.md)：原子审批控制面原语的 scope、一次性消费和未集成能力。
 - [Secret Broker 当前边界](docs/security/secrets.md)：按 Run/provider/ref/endpoint/purpose 限定并审计的进程内凭据代理原型及其限制。
 - [Run crash recovery 当前边界](docs/security/run-recovery.md)：副作用 intent/receipt 的未知态与 ArtifactStore 验证边界。
+- [V1 控制面架构决策](docs/superpowers/specs/2026-09-23-v1-control-plane-architecture-decisions.md)：事件归属、事务边界、提案/接受、未知结果和平台硬门。
 - [持久化、成本统计、可观测性与测试](docs/superpowers/specs/2026-09-14-persistence-cost-observability-testing-design.md)：已于 2026-09-14 确认并完成书面审阅。
 - [持久化底座实施计划](docs/superpowers/plans/2026-09-14-persistence-cost-observability-testing-implementation-plan.md)：Task 1–9 已完成。
 - [完整 V1 产品实施计划](docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md)：P0–P7 分阶段实施与验收路线；当前继续补 P3 跨流恢复、P4 Approval/Secret Broker/写隔离和 P5–P7，Worker 执行硬门仍未解除。
 
 ## 下一步
 
-1. 继续完成 P3：跨进程中断矩阵、真实 Worker 终止确认、将 Gateway 失败证据持久化并接入有界重试，以及 Run 级 ArtifactStore 孤儿归属。
+1. 继续完成 P3：跨进程中断矩阵、真实 Worker 终止确认、Provider 侧 reconciliation，以及 Run 级 ArtifactStore 孤儿归属。
 2. P4 继续补 workspace-write/安全变更发布、独立进程隔离、ApprovalService 到 ToolGateway 的消费接线和 Scheduler/Worker 集成；当前 ApprovalService/Secret Broker 均为内部原语，不解除执行硬门。

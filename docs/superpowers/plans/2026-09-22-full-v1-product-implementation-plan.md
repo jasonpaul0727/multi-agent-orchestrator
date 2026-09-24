@@ -47,13 +47,13 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 ## P0：解除设计和安全前置阻塞
 
 - [x] 用户于 2026-09-22 书面批准 `docs/superpowers/specs/2026-09-13-permissions-security-isolation-approval-design.md`；如后续实现发现规格冲突，先更新规格和接口，再开始相关安全实现。
-- [ ] 建立完整 V1 的接口/架构决策记录：Run/节点/attempt 标识，事件类型归属，stream/CAS 边界，GraphExpansion、PolicyDecision、RoutingDecision、ToolRequest、候选结果、验证证据及统一错误分类。
+- [x] 建立完整 V1 的接口/架构决策记录：Run/节点/attempt 标识，事件类型归属，stream/CAS 边界，GraphExpansion、PolicyDecision、RoutingDecision、ToolRequest、候选结果、验证证据及统一错误分类（`docs/superpowers/specs/2026-09-23-v1-control-plane-architecture-decisions.md`）。
 - [x] 做隔离原语可行性 spike，逐项以 live tests 验证工作区文件边界、符号链接/挂载逃逸、进程树终止、资源限制、原始网络阻断、私有临时目录和 Git worktree。
 - [x] 将已测原语接入真实 `SystemdReadOnlyLauncher`：每次启动核验 cgroup/rlimit，bind 只读 workspace/runtime，隐藏 Home、Git/控制和主机凭证路径，限制网络/临时目录/filesystem、资源、时长和输出；停止通过 systemd unit wait 收据确认。
 - [x] 记录隔离平台矩阵与边界：`docs/security/platform-support.md` 只把 Ubuntu 24.04/WSL2/systemd 255 的只读 profile 列为已测候选，不宣称完整 V1 支持。
 - [ ] 完成 workspace-write 的安全路径操作、Overlay 差异导出/验证/原子应用及 Worker/Gateway 接入；在这些闭环前 WSL2 仍不是完整 V1 支持平台。
 - [ ] 若某平台没有满足规格的可验证后端，将该平台/能力标记为不支持并返回 `Blocked(isolation_unavailable)`；禁止无隔离 fallback。记录 Secret Broker 的密钥来源、生命周期、端点绑定方式和 MCP 调用者身份信任边界。
-- [ ] 将 V1 最小交付平台及必要用户决策写入 README/ADR；没有获得书面终审或安全能力证据时，停止安全执行层和 Worker 的合并。
+- [x] 在 README/ADR 明确平台准入状态与边界：目前没有产品支持的执行平台，Ubuntu 24.04/WSL2/systemd 仅是已测只读候选；workspace-write、身份信任和端到端安全门通过前不宣称完整平台支持，也不启用不满足隔离要求的 Worker。
 
 2026-09-22 首轮探测记录：当前 Ubuntu 24.04 / WSL2（kernel `6.6.87.2-microsoft-standard-WSL2`）支持组合 user/mount/PID/network namespace；新 network namespace 仅有 loopback 且无路由；私有 mount namespace 内 tmpfs mount 成功；Landlock ABI 3 的白名单读取/越界拒绝已通过一次性实测；`prlimit` 的 CPU、地址空间、NPROC、文件大小和打开文件数限制在子进程中可见，`NPROC=1` 时 fork 实测被内核拒绝。当时未安装 bubblewrap，且用户不能直接写 cgroup v2 根目录。
 
