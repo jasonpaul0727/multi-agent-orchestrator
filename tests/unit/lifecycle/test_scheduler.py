@@ -8,7 +8,7 @@ from threading import Barrier
 
 import pytest
 
-from orchestrator.artifacts import ArtifactStore
+from orchestrator.artifacts import ArtifactRecord, ArtifactStore
 from orchestrator.budget import BudgetExhausted, BudgetLedger, CostEstimate, UsageRecord
 from orchestrator.agents import (
     AgentConcurrencyLimitExceeded,
@@ -2098,6 +2098,122 @@ def test_run_recovery_verifies_artifact_after_publisher_process_death(tmp_path):
     assert len(recovered.artifacts) == 1
     assert recovered.artifacts[0].size == len(b"durably published before worker process death")
     reopened.close()
+
+
+def test_run_recovery_attributes_interrupted_artifact_publications(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("the crash-injection harness currently requires fork")
+
+    def interrupt_publication(database, artifact_root, crash_point):
+        child_store = SQLiteEventStore(database)
+        artifacts = ArtifactStore(artifact_root, event_store=child_store)
+        if crash_point == "after_intent":
+            record_intent = artifacts._record_intent
+
+            def intent_then_die(record):
+                record_intent(record)
+                os._exit(79)
+
+            artifacts._record_intent = intent_then_die
+        else:
+            def metadata_then_die(_record):
+                os._exit(80)
+
+            artifacts._record_metadata = metadata_then_die
+        artifacts.publish_bytes(
+            b"candidate interrupted during artifact publication",
+            source={"run_id": "run-1", "node_id": "node-1"},
+            artifact_type="worker-output",
+        )
+        os._exit(81)
+
+    for crash_point, expected_state, expected_exit in (
+        ("after_intent", "missing", 79),
+        ("after_blob", "orphaned_blob", 80),
+    ):
+        database = tmp_path / f"run-artifact-intent-{crash_point}.db"
+        artifact_root = tmp_path / f"run-artifact-intent-{crash_point}"
+        store = SQLiteEventStore(database)
+        run_setup(store, nodes=())
+        store.close()
+
+        process = multiprocessing.get_context("fork").Process(
+            target=interrupt_publication,
+            args=(str(database), str(artifact_root), crash_point),
+        )
+        process.start()
+        process.join(timeout=20)
+        if process.is_alive():
+            process.kill()
+            process.join()
+            pytest.fail(f"artifact publication child timed out at {crash_point}")
+        assert process.exitcode == expected_exit
+
+        reopened = SQLiteEventStore(database)
+        artifacts = ArtifactStore(artifact_root, event_store=reopened)
+        recovered = RunRecoveryCoordinator(
+            reopened, artifact_store=artifacts
+        ).recover("run-1")
+        assert recovered.artifacts == ()
+        assert len(recovered.pending_artifacts) == 1
+        assert recovered.pending_artifacts[0].content_state == expected_state
+        assert recovered.pending_artifacts[0].node_id == "node-1"
+        digest = recovered.pending_artifacts[0].digest
+        assert artifacts.find_orphan_blobs() == (
+            (digest,) if expected_state == "orphaned_blob" else ()
+        )
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    "source, expected_error",
+    [
+        (
+            {"run_id": "run-1", "fencing_generation": "1"},
+            "fencing generation without an Attempt",
+        ),
+        (
+            {
+                "run_id": "run-1", "node_id": "node-1",
+                "attempt_id": "attempt-not-accepted", "fencing_generation": "1",
+            },
+            "unknown Attempt",
+        ),
+        (
+            {
+                "run_id": "run-1", "node_id": "node-1",
+                "attempt_id": "attempt-node-1-1", "fencing_generation": "2",
+            },
+            "stale fencing generation",
+        ),
+    ],
+)
+def test_run_recovery_rejects_pending_artifact_with_invalid_attempt_provenance(
+    tmp_path, source, expected_error
+):
+    store = SQLiteEventStore(tmp_path / "invalid-pending-artifact.db")
+    _reg, _config, _lifecycle, manifest = run_setup(store)
+    request, decision = routed_pair(_reg, _config, manifest)
+    accept(scheduler(store), request, decision)
+    artifacts = ArtifactStore(tmp_path / "invalid-pending-artifacts", event_store=store)
+    content = b"unpublished candidate"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    intent = ArtifactRecord.from_metadata(
+        digest,
+        size=len(content),
+        artifact_type="worker-output",
+        media_type="application/octet-stream",
+        source=source,
+        schema_version=1,
+        redaction_state="unknown",
+        readable_scope=("run-1",),
+        references=(),
+        lifecycle_state="temporary",
+    )
+    artifacts._record_intent(intent)
+
+    with pytest.raises(RunRecoveryError, match=expected_error):
+        RunRecoveryCoordinator(store, artifact_store=artifacts).recover("run-1")
 
 
 def test_route_acceptance_fails_closed_when_replayed_streams_disagree(tmp_path):

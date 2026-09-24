@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from dataclasses import dataclass
 import hashlib
 import hmac
 import inspect
@@ -20,7 +21,7 @@ import sqlite3
 import stat
 import tempfile
 import threading
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import (
     AliasChoices,
@@ -472,6 +473,15 @@ class ArtifactRecord(BaseModel):
         }
 
 
+@dataclass(frozen=True)
+class PendingArtifactPublication:
+    """Durable publication intent not yet paired with an ArtifactPublished event."""
+
+    record: ArtifactRecord
+    intent_event_id: str
+    content_state: Literal["missing", "orphaned_blob", "already_published"]
+
+
 class ArtifactStore:
     """Private content-addressed artifact storage.
 
@@ -610,7 +620,7 @@ class ArtifactStore:
         references: Any = None,
         lifecycle_state: str = "temporary",
     ) -> ArtifactRecord:
-        """Write bytes privately, atomically publish, then append provenance."""
+        """Persist intent, atomically install bytes, then append publication metadata."""
 
         if not isinstance(content, (bytes, bytearray, memoryview)):
             raise TypeError("content must be bytes-like")
@@ -660,6 +670,7 @@ class ArtifactStore:
             assert digest is not None
             final_path = self._path_for_digest(digest)
             with self._digest_lock(digest):
+                self._record_intent(candidate)
                 try:
                     if final_path.exists() or final_path.is_symlink():
                         self._verify_file(final_path, digest)
@@ -872,6 +883,133 @@ class ArtifactStore:
                 orphan_digests.append(digest)
         return tuple(sorted(orphan_digests))
 
+    def pending_publications_for_run(
+        self, run_id: str
+    ) -> tuple[PendingArtifactPublication, ...]:
+        """Reconstruct this Run's durable, incomplete artifact publications.
+
+        A pending intent is inventory only: its content is never exposed,
+        adopted as a published Artifact, or removed by this method.
+        """
+
+        run_id = _validate_text(run_id, "run_id")
+        stream_ids = getattr(self._event_store, "stream_ids", None)
+        read_stream = getattr(self._event_store, "read_stream", None)
+        if not callable(stream_ids) or not callable(read_stream):
+            raise ArtifactMetadataError(
+                "event store cannot enumerate pending artifact publications"
+            )
+        pending: list[PendingArtifactPublication] = []
+        try:
+            digests = stream_ids("artifact")
+        except Exception as exc:
+            raise ArtifactMetadataError(
+                "unable to enumerate pending artifact publications"
+            ) from exc
+        for digest in digests:
+            with self._digest_lock(digest):
+                try:
+                    events = read_stream("artifact", digest)
+                except EventIntegrityError as exc:
+                    raise ArtifactIntegrityError(
+                        digest, "metadata event integrity failure"
+                    ) from exc
+                except Exception as exc:
+                    raise ArtifactMetadataError(
+                        "unable to inspect pending artifact publication"
+                    ) from exc
+                intents: dict[str, tuple[Any, ArtifactRecord]] = {}
+                publications: dict[str, ArtifactRecord] = {}
+                has_published_digest = False
+                for event in events:
+                    event_type = getattr(event, "event_type", None)
+                    if event_type == "ArtifactPublished":
+                        record = self._record_from_event(event, digest)
+                        if record.publication_id in publications:
+                            raise ArtifactIntegrityError(
+                                digest, "publication ID is recorded more than once"
+                            )
+                        publications[record.publication_id] = record
+                        has_published_digest = True
+                    elif event_type == "ArtifactPublicationIntent":
+                        record = self._record_from_event(event, digest)
+                        prior = intents.get(record.publication_id)
+                        if prior is not None:
+                            raise ArtifactIntegrityError(
+                                digest, "publication intent ID is recorded more than once"
+                            )
+                        intents[record.publication_id] = (event, record)
+                for publication_id, (event, record) in intents.items():
+                    publication = publications.get(publication_id)
+                    if publication is not None:
+                        if publication != record:
+                            raise ArtifactIntegrityError(
+                                digest, "published artifact differs from its durable intent"
+                            )
+                        continue
+                    if record.source.get("run_id") != run_id:
+                        continue
+                    path = self._path_for_digest(digest)
+                    content_state: Literal[
+                        "missing", "orphaned_blob", "already_published"
+                    ]
+                    try:
+                        object_stat = path.lstat()
+                    except FileNotFoundError:
+                        content_state = "missing"
+                    except OSError as exc:
+                        raise ArtifactFilesystemError(
+                            "unable to inspect pending artifact object"
+                        ) from exc
+                    else:
+                        if stat.S_ISLNK(object_stat.st_mode) or not stat.S_ISREG(object_stat.st_mode):
+                            raise ArtifactIntegrityError(
+                                digest, "pending artifact path is not a regular file"
+                            )
+                        size = self._verify_file_and_size(path, digest)
+                        if size != record.size:
+                            raise ArtifactIntegrityError(
+                                digest, "pending artifact object size differs from its intent"
+                            )
+                        content_state = (
+                            "already_published" if has_published_digest else "orphaned_blob"
+                        )
+                    pending.append(
+                        PendingArtifactPublication(
+                            record=record,
+                            intent_event_id=event.event_id,
+                            content_state=content_state,
+                        )
+                    )
+        return tuple(
+            sorted(pending, key=lambda item: (item.record.created_at, item.record.publication_id))
+        )
+
+    def _record_intent(self, record: ArtifactRecord) -> None:
+        """Durably bind intended Run provenance before installing content."""
+
+        key = f"artifact-intent:{record.publication_id}"
+        payload = record.to_event_payload()
+        try:
+            for _ in range(8):
+                expected = self._event_store.current_version("artifact", record.digest)
+                try:
+                    self._event_store.append(
+                        "artifact",
+                        record.digest,
+                        expected,
+                        [EventDraft("ArtifactPublicationIntent", payload)],
+                        key,
+                    )
+                    return
+                except StaleStream:
+                    continue
+            raise ArtifactMetadataError("concurrent artifact intent did not converge")
+        except ArtifactMetadataError:
+            raise
+        except Exception as exc:
+            raise ArtifactMetadataError("unable to record artifact publication intent") from exc
+
     def _record_metadata(self, record: ArtifactRecord) -> ArtifactRecord:
         """Append a unique provenance event; never use digest as idempotency key."""
 
@@ -921,7 +1059,12 @@ class ArtifactStore:
             events = read_stream("artifact", record.digest)
             for event in events:
                 payload = getattr(event, "payload", None)
-                if isinstance(payload, Mapping) and payload.get("publication_id") == record.publication_id:
+                if (
+                    getattr(event, "event_type", None)
+                    in {"ArtifactPublicationIntent", "ArtifactPublished"}
+                    and isinstance(payload, Mapping)
+                    and payload.get("publication_id") == record.publication_id
+                ):
                     return True
             return False
         except Exception:

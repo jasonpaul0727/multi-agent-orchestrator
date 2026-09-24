@@ -34,20 +34,33 @@ plans.
 - When publication metadata carries an attempt ID, node/attempt identity and
   any supplied fencing generation are checked against the Run replay. A
   fencing generation without an attempt is rejected.
-- Filesystem blobs with no `ArtifactPublished` event cannot be attributed to a
-  Run by this operation. `ArtifactStore.find_orphan_blobs()` separately lists
-  regular, content-address-verified files with no publication metadata. It
+- New publication attempts first append an `ArtifactPublicationIntent` with
+  their declared source (including Run/Attempt provenance when provided), then
+  install the content-addressed bytes, then append `ArtifactPublished`.
+  Recovery returns pending intent metadata and checks any present object's
+  digest/size. A pending candidate is never accepted as an artifact output,
+  adopted, or deleted automatically. Worker publishers must include Run,
+  node, and Attempt-generation source fields for Run-level attribution.
+- A process death after the intent but before byte installation is reported as
+  `missing`; death after byte installation but before `ArtifactPublished` is
+  reported as `orphaned_blob`. If the digest was later published under another
+  publication ID, the stale intent is reported as `already_published` rather
+  than claiming ownership of that publication.
+- Legacy/manual filesystem blobs with no intent remain unattributable to a
+  Run. `ArtifactStore.find_orphan_blobs()` separately lists regular,
+  content-address-verified files with no `ArtifactPublished` metadata. It
   serializes each candidate against publication using the digest lock, returns
-  digests only, and never deletes or adopts objects. This is a global inventory,
-  not a Run-level recovery action or a garbage collector.
+  digests only, and never deletes or adopts objects. This remains a global
+  inventory, not a garbage collector.
 
 ## Verification and remaining P3 work
 
 Unit/restart tests cover unknown-to-receipted effect projection, terminal
 unknown-effect rejection, missing verifier, artifact content tampering, and
 reopening the same database/artifact directory. Abrupt subprocess-death tests
-now cover durable effect-intent-only and intent-plus-receipt records as well as
-an artifact publication, followed by reopening and recovery. The Scheduler
+now cover durable effect-intent-only and intent-plus-receipt records, completed
+artifact publication, and both pending artifact publication windows, followed
+by reopening and recovery. The Scheduler
 admission transaction and the explicit attempt-reconciliation transaction are
 also tested with child-process death before commit and after commit/lost IPC
 response. Before-commit death leaves the attempt `OutcomeUnknown` with budget,
@@ -72,8 +85,9 @@ replay checks those bindings again. This is a bounded recovery-control API, not
 an automatic Worker retry loop; the host still has to decide to call it and
 route the next Attempt.
 
-The cross-process interruption matrix, real Worker/OS termination receipt,
-bounded retry integration, provider-side effect reconciliation, and
-Run-attributable orphan-artifact accounting remain unimplemented. This slice
-is not full crash recovery and does not satisfy the P3 or V1 delivery gate by
-itself.
+The complete cross-process interruption matrix, real Worker/OS termination
+receipt, bounded retry integration, and provider-side effect reconciliation
+remain unimplemented. Run-scoped artifact accounting covers only durable
+publication intents; legacy or bare filesystem orphans remain unattributable.
+This slice is not full crash recovery and does not satisfy the P3 or V1
+delivery gate by itself.

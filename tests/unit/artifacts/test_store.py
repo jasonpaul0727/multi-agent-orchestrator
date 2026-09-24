@@ -26,6 +26,7 @@ from orchestrator.artifacts import (
 from orchestrator.artifacts import store as artifact_store_module
 from orchestrator.persistence import SQLiteEventStore
 from orchestrator.persistence import EventDraft
+from orchestrator.persistence.sqlite_event_store import EventIntegrityError
 
 
 def _publish_from_process(root, database, index, queue):
@@ -107,6 +108,201 @@ def test_orphan_inventory_reports_only_valid_unpublished_artifact_blobs(tmp_path
     adopted = artifacts.publish_bytes(orphan_bytes, source={"run_id": "run-2"})
     assert adopted.digest == orphan_digest
     assert artifacts.find_orphan_blobs() == ()
+
+
+def test_pending_publication_intent_attributes_unpublished_blob_to_run(tmp_path, monkeypatch):
+    event_store = SQLiteEventStore(tmp_path / "pending-publication.db")
+    root = tmp_path / "artifacts"
+    artifacts = _store(root, event_store=event_store)
+    original_record_metadata = artifacts._record_metadata
+
+    def fail_before_publication(record):
+        raise ArtifactMetadataError("publication metadata unavailable")
+
+    monkeypatch.setattr(artifacts, "_record_metadata", fail_before_publication)
+    content = b"durable intent before publication"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    with pytest.raises(ArtifactMetadataError, match="publication metadata unavailable"):
+        artifacts.publish_bytes(
+            content,
+            source={"run_id": "run-1", "node_id": "node-1", "attempt_id": "attempt-1"},
+        )
+
+    monkeypatch.setattr(artifacts, "_record_metadata", original_record_metadata)
+    pending = artifacts.pending_publications_for_run("run-1")
+    assert len(pending) == 1
+    assert pending[0].record.digest == digest
+    assert pending[0].record.source["attempt_id"] == "attempt-1"
+    assert pending[0].intent_event_id
+    assert pending[0].content_state == "orphaned_blob"
+    assert artifacts.pending_publications_for_run("another-run") == ()
+    assert artifacts.find_orphan_blobs() == (digest,)
+    assert artifacts._load_records(digest) == []
+
+    published_elsewhere = artifacts.publish_bytes(
+        content, source={"run_id": "run-2"}
+    )
+    assert published_elsewhere.digest == digest
+    prior_run = artifacts.pending_publications_for_run("run-1")
+    assert prior_run[0].content_state == "already_published"
+    assert artifacts.pending_publications_for_run("run-2") == ()
+    assert artifacts.find_orphan_blobs() == ()
+
+
+def test_pending_inventory_fails_closed_without_event_enumeration(tmp_path):
+    artifacts = _store(tmp_path / "artifacts", event_store=object())
+
+    with pytest.raises(ArtifactMetadataError, match="cannot enumerate pending"):
+        artifacts.pending_publications_for_run("run-1")
+
+
+def test_pending_inventory_fails_closed_on_stream_read_error(tmp_path):
+    class ReadFailureStore:
+        def stream_ids(self, stream_type):
+            assert stream_type == "artifact"
+            return ("sha256:" + "a" * 64,)
+
+        def read_stream(self, stream_type, stream_id):
+            raise RuntimeError("metadata unavailable")
+
+    artifacts = _store(tmp_path / "artifacts", event_store=ReadFailureStore())
+
+    with pytest.raises(ArtifactMetadataError, match="unable to inspect pending"):
+        artifacts.pending_publications_for_run("run-1")
+
+
+def test_pending_inventory_rejects_duplicate_publication_id(tmp_path):
+    events = SQLiteEventStore(tmp_path / "duplicate-publication.db")
+    artifacts = _store(tmp_path / "artifacts", event_store=events)
+    record = artifacts.publish_bytes(b"same publication id", source={"run_id": "run-1"})
+    events.append(
+        "artifact",
+        record.digest,
+        events.current_version("artifact", record.digest),
+        [EventDraft("ArtifactPublished", record.to_event_payload())],
+        "duplicate-publication-id",
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="publication ID is recorded more than once"):
+        artifacts.pending_publications_for_run("run-1")
+
+
+def test_pending_inventory_rejects_duplicate_intent_id(tmp_path):
+    events = SQLiteEventStore(tmp_path / "duplicate-intent.db")
+    artifacts = _store(tmp_path / "artifacts", event_store=events)
+    content = b"duplicate publication intent"
+    record = ArtifactRecord.from_metadata(
+        "sha256:" + hashlib.sha256(content).hexdigest(),
+        size=len(content), artifact_type="artifact", media_type="application/octet-stream",
+        source={"run_id": "run-1"}, schema_version=1, redaction_state="unknown",
+        readable_scope=("run-1",), references=(), lifecycle_state="temporary",
+    )
+    artifacts._record_intent(record)
+    events.append(
+        "artifact", record.digest, events.current_version("artifact", record.digest),
+        [EventDraft("ArtifactPublicationIntent", record.to_event_payload())],
+        "duplicate-intent-id",
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="intent ID is recorded more than once"):
+        artifacts.pending_publications_for_run("run-1")
+
+
+def test_pending_inventory_rejects_published_metadata_that_disagrees_with_intent(tmp_path):
+    events = SQLiteEventStore(tmp_path / "mismatched-intent.db")
+    artifacts = _store(tmp_path / "artifacts", event_store=events)
+    content = b"intent publication mismatch"
+    record = ArtifactRecord.from_metadata(
+        "sha256:" + hashlib.sha256(content).hexdigest(),
+        size=len(content), artifact_type="artifact", media_type="application/octet-stream",
+        source={"run_id": "run-1"}, schema_version=1, redaction_state="unknown",
+        readable_scope=("run-1",), references=(), lifecycle_state="temporary",
+    )
+    artifacts._record_intent(record)
+    artifacts._path_for_digest(record.digest).write_bytes(content)
+    mismatched_payload = record.to_event_payload()
+    mismatched_payload["source"] = {"run_id": "run-2"}
+    events.append(
+        "artifact", record.digest, events.current_version("artifact", record.digest),
+        [EventDraft("ArtifactPublished", mismatched_payload)], "mismatched-publication",
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="differs from its durable intent"):
+        artifacts.pending_publications_for_run("run-1")
+
+
+def test_pending_inventory_surfaces_event_integrity_failure(tmp_path, monkeypatch):
+    events = SQLiteEventStore(tmp_path / "pending-integrity-failure.db")
+    artifacts = _store(tmp_path / "artifacts", event_store=events)
+    record = artifacts.publish_bytes(b"read integrity failure", source={"run_id": "run-1"})
+
+    def corrupt(_stream_type, _stream_id):
+        raise EventIntegrityError("artifact", record.digest)
+
+    monkeypatch.setattr(events, "read_stream", corrupt)
+    with pytest.raises(ArtifactIntegrityError, match="metadata event integrity failure"):
+        artifacts.pending_publications_for_run("run-1")
+
+
+def test_pending_inventory_rejects_non_regular_content_path(tmp_path):
+    events = SQLiteEventStore(tmp_path / "pending-nonfile.db")
+    artifacts = _store(tmp_path / "artifacts", event_store=events)
+    content = b"pending non-file"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    record = ArtifactRecord.from_metadata(
+        digest, size=len(content), artifact_type="artifact",
+        media_type="application/octet-stream", source={"run_id": "run-1"},
+        schema_version=1, redaction_state="unknown", readable_scope=("run-1",),
+        references=(), lifecycle_state="temporary",
+    )
+    artifacts._record_intent(record)
+    artifacts._path_for_digest(digest).mkdir()
+
+    with pytest.raises(ArtifactIntegrityError, match="not a regular file"):
+        artifacts.pending_publications_for_run("run-1")
+
+
+def test_pending_inventory_rejects_object_size_different_from_intent(tmp_path):
+    events = SQLiteEventStore(tmp_path / "pending-size-mismatch.db")
+    artifacts = _store(tmp_path / "artifacts", event_store=events)
+    content = b"pending size mismatch"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    record = ArtifactRecord.from_metadata(
+        digest, size=len(content) + 1, artifact_type="artifact",
+        media_type="application/octet-stream", source={"run_id": "run-1"},
+        schema_version=1, redaction_state="unknown", readable_scope=("run-1",),
+        references=(), lifecycle_state="temporary",
+    )
+    artifacts._record_intent(record)
+    artifacts._path_for_digest(digest).write_bytes(content)
+
+    with pytest.raises(ArtifactIntegrityError, match="size differs from its intent"):
+        artifacts.pending_publications_for_run("run-1")
+
+
+def test_pending_inventory_reports_artifact_path_inspection_errors(tmp_path, monkeypatch):
+    events = SQLiteEventStore(tmp_path / "pending-path-error.db")
+    artifacts = _store(tmp_path / "artifacts", event_store=events)
+    content = b"pending path inspection error"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    record = ArtifactRecord.from_metadata(
+        digest, size=len(content), artifact_type="artifact",
+        media_type="application/octet-stream", source={"run_id": "run-1"},
+        schema_version=1, redaction_state="unknown", readable_scope=("run-1",),
+        references=(), lifecycle_state="temporary",
+    )
+    artifacts._record_intent(record)
+    artifact_path = artifacts._path_for_digest(digest)
+    original_lstat = Path.lstat
+
+    def fail_candidate_lstat(path):
+        if path == artifact_path:
+            raise PermissionError("inaccessible candidate")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_candidate_lstat)
+    with pytest.raises(ArtifactFilesystemError, match="unable to inspect pending"):
+        artifacts.pending_publications_for_run("run-1")
 
 
 def test_orphan_inventory_fails_closed_without_metadata_reads(tmp_path):
@@ -409,9 +605,10 @@ def test_metadata_is_recorded_after_durable_publication_and_survives_reopen(tmp_
     )
 
     stored = events.read_stream("artifact", record.digest)
-    assert len(stored) == 1
-    assert stored[0].event_type == "ArtifactPublished"
-    assert stored[0].payload["digest"] == record.digest
+    assert [event.event_type for event in stored] == [
+        "ArtifactPublicationIntent", "ArtifactPublished"
+    ]
+    assert stored[-1].payload["digest"] == record.digest
     assert (root / record.digest.removeprefix("sha256:")).is_file()
 
     events.close()
@@ -860,6 +1057,10 @@ class _CommitThenFailStore:
         return self.delegate.current_version(stream_type, stream_id)
 
     def append(self, stream_type, stream_id, expected_version, events, idempotency_key):
+        if events[0].event_type != "ArtifactPublished":
+            return self.delegate.append(
+                stream_type, stream_id, expected_version, events, idempotency_key
+            )
         result = self.delegate.append(
             stream_type, stream_id, expected_version, events, idempotency_key
         )
@@ -976,7 +1177,7 @@ class _ReadFailureAfterAppendStore(_NoReadAppendFailureStore):
         raise self.error
 
 
-def test_append_failure_without_read_capability_retains_final_object(tmp_path):
+def test_unacknowledged_intent_does_not_install_artifact_bytes(tmp_path):
     artifacts = _store(tmp_path / "artifacts", _NoReadAppendFailureStore())
     content = b"unknown-commit"
     digest = "sha256:" + hashlib.sha256(content).hexdigest()
@@ -984,7 +1185,7 @@ def test_append_failure_without_read_capability_retains_final_object(tmp_path):
     with pytest.raises(ArtifactMetadataError):
         artifacts.publish_bytes(content, readable_scope=("run-1",))
 
-    assert artifacts._path_for_digest(digest).is_file()
+    assert not artifacts._path_for_digest(digest).exists()
 
 
 @pytest.mark.parametrize(
@@ -1008,4 +1209,4 @@ def test_append_failure_with_unreadable_stream_retains_final_object(
     with pytest.raises(ArtifactMetadataError):
         artifacts.publish_bytes(content, readable_scope=("run-1",))
 
-    assert artifacts._path_for_digest(digest).is_file()
+    assert not artifacts._path_for_digest(digest).exists()

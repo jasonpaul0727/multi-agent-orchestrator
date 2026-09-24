@@ -12,7 +12,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from orchestrator.agents import AgentRegistry, AgentRegistryState
-from orchestrator.artifacts import ArtifactRecord, ArtifactStore
+from orchestrator.artifacts import (
+    ArtifactRecord,
+    ArtifactStore,
+    PendingArtifactPublication,
+)
 from orchestrator.budget import BudgetBalance, BudgetLedger, RunLimit
 from orchestrator.lifecycle import LifecycleController, LifecycleError
 from orchestrator.lifecycle.models import AttemptState, RunLifecycleState
@@ -67,6 +71,18 @@ class RecoveredArtifact:
 
 
 @dataclass(frozen=True)
+class RecoveredPendingArtifact:
+    """An attributed but unpublished artifact candidate; never accepted as output."""
+
+    digest: str
+    publication_id: str
+    intent_event_id: str
+    content_state: Literal["missing", "orphaned_blob", "already_published"]
+    node_id: str | None
+    attempt_id: str | None
+
+
+@dataclass(frozen=True)
 class RecoveredRun:
     """Consistent lifecycle, Agent, budget, effect, artifact, and scheduler views."""
 
@@ -76,6 +92,7 @@ class RecoveredRun:
     active_attempts: tuple[RecoveredAttemptLease, ...]
     effects: tuple[RecoveredEffect, ...] = ()
     artifacts: tuple[RecoveredArtifact, ...] = ()
+    pending_artifacts: tuple[RecoveredPendingArtifact, ...] = ()
 
 
 class RunRecoveryCoordinator:
@@ -139,6 +156,7 @@ class RunRecoveryCoordinator:
             }:
                 raise RunRecoveryError("terminal Attempt has an unresolved external effect")
         artifacts = self._recover_artifacts(run_id, attempts)
+        pending_artifacts = self._recover_pending_artifacts(run_id, attempts)
 
         active_attempts: list[RecoveredAttemptLease] = []
         expected_agent_status = {
@@ -231,6 +249,7 @@ class RunRecoveryCoordinator:
             active_attempts=tuple(sorted(active_attempts, key=lambda item: item.attempt_ref)),
             effects=effects,
             artifacts=artifacts,
+            pending_artifacts=pending_artifacts,
         )
 
     def _recover_effects(
@@ -343,22 +362,26 @@ class RunRecoveryCoordinator:
         run_id: str,
         attempts: dict[tuple[str, str], AttemptState],
     ) -> tuple[RecoveredArtifact, ...]:
-        has_publication = False
+        has_artifact_event = False
         for digest in self.event_store.stream_ids("artifact"):
             for event in self.event_store.read_stream("artifact", digest):
                 source = event.payload.get("source")
                 if (
-                    event.event_type == "ArtifactPublished"
+                    event.event_type in {
+                        "ArtifactPublished", "ArtifactPublicationIntent"
+                    }
                     and isinstance(source, dict)
                     and source.get("run_id") == run_id
                 ):
-                    has_publication = True
+                    has_artifact_event = True
                     break
-            if has_publication:
+            if has_artifact_event:
                 break
         if self.artifact_store is None:
-            if has_publication:
-                raise RunRecoveryError("Run has artifact publications but no artifact verifier is configured")
+            if has_artifact_event:
+                raise RunRecoveryError(
+                    "Run has artifact publications or pending intents but no artifact verifier is configured"
+                )
             return ()
         if getattr(self.artifact_store, "_event_store", None) is not self.event_store:
             raise RunRecoveryError("artifact verifier is bound to a different event store")
@@ -395,6 +418,64 @@ class RunRecoveryCoordinator:
                 )
             )
         return tuple(recovered)
+
+    def _recover_pending_artifacts(
+        self,
+        run_id: str,
+        attempts: dict[tuple[str, str], AttemptState],
+    ) -> tuple[RecoveredPendingArtifact, ...]:
+        if self.artifact_store is None:
+            return ()
+        try:
+            pending: tuple[PendingArtifactPublication, ...] = (
+                self.artifact_store.pending_publications_for_run(run_id)
+            )
+        except Exception as exc:
+            raise RunRecoveryError(
+                "Run pending artifact publication inventory failed"
+            ) from exc
+        recovered: list[RecoveredPendingArtifact] = []
+        for item in pending:
+            record = item.record
+            source = record.source
+            node_id = source.get("node_id")
+            attempt_id = source.get("attempt_id")
+            generation = source.get("fencing_generation")
+            if generation is not None and attempt_id is None:
+                raise RunRecoveryError(
+                    "pending artifact provenance has a fencing generation without an Attempt"
+                )
+            if attempt_id is not None:
+                if not isinstance(node_id, str) or not isinstance(attempt_id, str):
+                    raise RunRecoveryError(
+                        "pending artifact provenance has an incomplete Attempt identity"
+                    )
+                attempt = attempts.get((node_id, attempt_id))
+                if attempt is None:
+                    raise RunRecoveryError(
+                        "pending artifact provenance references an unknown Attempt"
+                    )
+                if generation is not None and (
+                    not isinstance(generation, str)
+                    or not generation.isdecimal()
+                    or int(generation) != attempt.fencing_generation
+                ):
+                    raise RunRecoveryError(
+                        "pending artifact provenance has a stale fencing generation"
+                    )
+            recovered.append(
+                RecoveredPendingArtifact(
+                    digest=record.digest,
+                    publication_id=record.publication_id,
+                    intent_event_id=item.intent_event_id,
+                    content_state=item.content_state,
+                    node_id=node_id if isinstance(node_id, str) else None,
+                    attempt_id=attempt_id if isinstance(attempt_id, str) else None,
+                )
+            )
+        return tuple(
+            sorted(recovered, key=lambda item: (item.digest, item.publication_id))
+        )
 
     def _scheduler_state(
         self, run_id: str

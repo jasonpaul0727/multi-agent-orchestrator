@@ -8,6 +8,7 @@ from .store import (
     ArtifactIntegrityError,
     ArtifactMetadataError,
     ArtifactNotFound,
+    PendingArtifactPublication,
     ArtifactRecord,
     ArtifactStore,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "ArtifactIntegrityError",
     "ArtifactMetadataError",
     "ArtifactNotFound",
+    "PendingArtifactPublication",
     "ArtifactRecord",
     "ArtifactStore",
 ]
