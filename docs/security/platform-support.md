@@ -26,10 +26,11 @@ reports stale/occupied touched paths without mutation; and
 `acquire_workspace_write_lease` offers a private cross-process lock and
 monotonic fence. `publish_workspace_diff` binds these primitives in a
 lease-held host transaction with backups, a durable journal, per-entry atomic
-replacement, and explicit restart rollback. It is unit/subprocess-tested but
-not yet live-tested through the Systemd/OverlayFS path or wired into
-approval/audit/Worker services. Its multi-entry changes are not a single
-reader-visible atomic swap. These primitives do not enable workspace-write.
+replacement, and explicit restart rollback. A live systemd/OverlayFS probe now
+exports a candidate and publishes it through the host transaction, in addition
+to unit/subprocess interruption tests. It is not wired into approval/audit/
+Worker services. Its multi-entry changes are not a single reader-visible
+atomic swap. These primitives do not enable workspace-write.
 The Tool Gateway evaluates a frozen
 `PolicyManifest`, records `PolicyDecision` and a one-use capability in the
 security event stream, checks an injected attempt/fencing authority before and

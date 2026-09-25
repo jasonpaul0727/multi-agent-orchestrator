@@ -76,9 +76,11 @@ replay; projections never authorize work.
   Worker cannot verify its own completion; Final Review is a separate frozen
   decision over required outputs and evidence.
 
-Graph Manager, Worker, CandidateResult, VerificationEvidence, and Final Review
-application services are contracts to implement; their absence must remain an
-explicit blocker, not be filled by a direct Worker-to-EventStore shortcut.
+Graph Manager, Worker, CandidateResult, and Final Review application services
+remain to implement. Bounded Worker/Verifier message schemas now exist, but
+there is no process runtime or durable evidence-acceptance path; this absence
+must remain an explicit blocker, not be filled by a direct Worker-to-EventStore
+shortcut.
 
 ### Errors, unknown outcomes, and retries
 
@@ -126,8 +128,9 @@ end-to-end path plus platform-specific negative security tests.
 
 ## Required follow-up
 
-1. Add Graph Manager and Worker IPC contracts without giving Worker durable
-   store handles.
+1. Implement the Graph Manager application path and bind the Worker IPC
+   contracts to an isolated runtime without giving Worker durable store
+   handles.
 2. Complete a bounded, no-follow workspace-write Overlay profile, diff
    validation, concurrency fencing, and crash-safe host publication.
 3. Connect the audited Secret Broker and ApprovalService to trusted Gateway

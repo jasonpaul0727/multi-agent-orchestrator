@@ -148,6 +148,14 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 建议新增包：`orchestrator/runtime`、`orchestrator/verification`。
 
+2026-09-25 interface slice: `orchestrator.runtime.contracts` now defines
+strict bounded WorkerTask/WorkerResult and VerificationTask/VerificationEvidence
+messages, exact Attempt/hash binding, artifact digest and byte-limit checks,
+required-check-set validation, and duplicate-key-safe bounded JSON decoding.
+This is an IPC contract only: there is still no Worker process, ArtifactStore
+attestation of returned references, Gateway call loop, independent verifier
+execution, or durable evidence acceptance; the P5 checklist remains open.
+
 - [ ] Worker 仅获得当前 attempt 的最小输入、CapabilityGrant 引用和工具请求接口；不得拿到 EventStore/控制目录句柄或写最终状态。
 - [ ] 实现 Model Gateway：按 accepted RoutingDecision 调用 adapter，通过 Secret Broker 请求凭据，做超时/取消/有限重试、usage 采集、预算结算和响应脱敏。
 - [ ] 实现 Planner 生成初始 DAG、Worker 候选结果、Reviewer、Director 和文档分析 Agent 契约；模型输出只能成为提案/候选，由控制层验证后追加事件。
