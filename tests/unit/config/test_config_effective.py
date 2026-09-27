@@ -30,6 +30,7 @@ from orchestrator.config import (
 from orchestrator.persistence.events import EventDraft
 from orchestrator.persistence.snapshots import SnapshotStore
 from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
+from orchestrator.lifecycle.controller import LifecycleController
 
 
 NOW = datetime(2026, 9, 22, tzinfo=timezone.utc)
@@ -553,6 +554,30 @@ def test_config_and_snapshot_reject_registry_or_hash_mismatch(tmp_path):
     with pytest.raises(ValidationError, match="references a different registry"):
         RunConfigSnapshot.model_validate_json(json.dumps(mismatched_registry))
     store.close()
+
+
+def test_run_snapshot_freezes_workspace_identity_across_restart(tmp_path):
+    database = tmp_path / "workspace-bound-run.db"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = SQLiteEventStore(database)
+    manager = ConfigManager(runtime_candidate(registry(), 100))
+
+    created = manager.start_run("workspace-bound-run", store, workspace=workspace)
+    assert created.workspace_identity_hash is not None
+    lifecycle = LifecycleController(store).initialize_run("workspace-bound-run")
+    assert lifecycle.workspace_identity_hash == created.workspace_identity_hash
+    store.close()
+
+    restarted_store = SQLiteEventStore(database)
+    restored = ConfigManager(runtime_candidate(registry(), 300)).restore_run(
+        "workspace-bound-run", restarted_store
+    )
+    assert restored.workspace_identity_hash == created.workspace_identity_hash
+    assert LifecycleController(restarted_store).initialize_run(
+        "workspace-bound-run"
+    ).workspace_identity_hash == created.workspace_identity_hash
+    restarted_store.close()
 
 
 def test_reload_rejects_non_candidate_results_without_mutating_state():

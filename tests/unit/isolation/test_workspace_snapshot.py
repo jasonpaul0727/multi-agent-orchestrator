@@ -7,6 +7,7 @@ import stat
 import pytest
 
 from orchestrator.isolation.workspace import WorkspaceBoundaryError, snapshot_workspace
+from orchestrator.workspace_identity import workspace_identity_hash
 
 
 def test_snapshot_copies_only_safe_content_and_omits_control_directories(tmp_path: Path) -> None:
@@ -92,6 +93,34 @@ def test_snapshot_rejects_existing_target_and_symlinked_root(tmp_path: Path) -> 
     link.symlink_to(source, target_is_directory=True)
     with pytest.raises(WorkspaceBoundaryError, match="root"):
         snapshot_workspace(link, tmp_path / "other")
+
+
+def test_snapshot_rejects_workspace_replaced_after_run_binding(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    expected_identity = workspace_identity_hash(source)
+    source.rename(tmp_path / "original")
+    source.mkdir()
+
+    with pytest.raises(WorkspaceBoundaryError, match="identity"):
+        snapshot_workspace(
+            source,
+            tmp_path / "snapshot",
+            expected_identity_hash=expected_identity,
+        )
+    assert not (tmp_path / "snapshot").exists()
+
+
+def test_workspace_identity_rejects_symlink_and_filesystem_root(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    link = tmp_path / "source-link"
+    link.symlink_to(source, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="real directory"):
+        workspace_identity_hash(link)
+    with pytest.raises(ValueError, match="filesystem root"):
+        workspace_identity_hash(Path("/"))
 
 
 def test_snapshot_destination_cannot_be_inside_source(tmp_path: Path) -> None:

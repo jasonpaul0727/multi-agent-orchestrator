@@ -54,6 +54,8 @@ class LifecycleController:
             "max_nodes": _node_limit(snapshot),
             "max_depth": _depth_limit(snapshot),
         }
+        if snapshot.workspace_identity_hash is not None:
+            payload["workspace_identity_hash"] = snapshot.workspace_identity_hash
         key = f"lifecycle-init:{run_id}"
 
         def decide(events: list[StoredEvent], version: int):
@@ -591,6 +593,7 @@ def apply_lifecycle_event(
             status="created",
             config_hash=payload.get("config_hash"),
             registry_hash=payload.get("registry_hash"),
+            workspace_identity_hash=payload.get("workspace_identity_hash"),
             max_nodes=max_nodes,
             max_depth=max_depth,
             graph_version=0,
@@ -815,6 +818,7 @@ def apply_lifecycle_event(
         cancellation_request_event_id=cancellation_request_event_id,
         config_hash=state.config_hash,
         registry_hash=state.registry_hash,
+        workspace_identity_hash=state.workspace_identity_hash,
         policy_manifest_hash=policy_manifest_hash,
         max_nodes=state.max_nodes,
         max_depth=state.max_depth,

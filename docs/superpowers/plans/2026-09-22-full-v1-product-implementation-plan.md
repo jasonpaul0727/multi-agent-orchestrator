@@ -164,8 +164,12 @@ claim success. Host-side `admit_candidate_artifacts` verifies ArtifactStore
 bytes, metadata and exact Run/Node/Attempt/fence/Agent provenance for future
 candidate results, but no running Worker can yet produce or submit them.
 P5 remains open. The read-only Tool Gateway also gained host-bound workspace
-selection and an optional durable multi-stream Attempt authority; approval,
-write effects, and application-service wiring remain closed.
+selection and an optional durable multi-stream Attempt authority. Run creation
+can now freeze a privacy-preserving workspace path/device/inode identity hash;
+lifecycle replay retains it, Recovery rejects snapshot/lifecycle disagreement,
+and the durable authority rechecks the configured workspace identity on each
+request. A path replacement at the same name and Runs lacking a binding fail
+closed. Approval, write effects, and application-service wiring remain closed.
 
 - [ ] Worker 仅获得当前 attempt 的最小输入、CapabilityGrant 引用和工具请求接口；不得拿到 EventStore/控制目录句柄或写最终状态。
 - [ ] 实现 Model Gateway：按 accepted RoutingDecision 调用 adapter，通过 Secret Broker 请求凭据，做超时/取消/有限重试、usage 采集、预算结算和响应脱敏。

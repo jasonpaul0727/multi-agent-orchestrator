@@ -17,6 +17,7 @@ from orchestrator.tools import (
     ToolRequest,
     ToolRequestAlreadyUsed,
 )
+from orchestrator.workspace_identity import workspace_identity_hash
 
 
 def _manifest(*, allow: bool = True, approval: bool = False) -> PolicyManifest:
@@ -82,10 +83,19 @@ class _Session:
 class _Launcher:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[str, ...], SandboxLimits]] = []
+        self.identity_hashes: list[str] = []
         self.session = _Session()
 
-    def launch(self, workspace: str, command: tuple[str, ...], *, limits: SandboxLimits) -> _Session:
+    def launch(
+        self,
+        workspace: str,
+        command: tuple[str, ...],
+        *,
+        limits: SandboxLimits,
+        expected_workspace_identity_hash: str,
+    ) -> _Session:
         self.calls.append((workspace, command, limits))
+        self.identity_hashes.append(expected_workspace_identity_hash)
         return self.session
 
 
@@ -295,6 +305,8 @@ def test_request_id_cannot_replay_a_previously_started_tool(tmp_path: Path) -> N
     request = _request(tmp_path)
     gateway.execute(request)
 
+    assert launcher.identity_hashes == [workspace_identity_hash(tmp_path)]
+
     with pytest.raises(ToolRequestAlreadyUsed, match="already exists"):
         gateway.execute(request)
 
@@ -352,6 +364,7 @@ def test_authority_loss_during_execution_cancels_and_discards_success_status(tmp
     class BlockingLauncher(_Launcher):
         def __init__(self) -> None:
             self.calls = []
+            self.identity_hashes = []
             self.session = BlockingSession()
 
     authority = _Authority()
@@ -398,6 +411,7 @@ def test_unconfirmed_termination_is_recorded_unknown_and_output_is_discarded(tmp
     class UnconfirmedLauncher(_Launcher):
         def __init__(self) -> None:
             self.calls = []
+            self.identity_hashes = []
             self.session = UnconfirmedSession()
 
     store = SQLiteEventStore(tmp_path / "events.db")
@@ -423,6 +437,7 @@ def test_session_wait_exception_is_audited_and_requests_cancellation(tmp_path: P
     class BrokenLauncher(_Launcher):
         def __init__(self) -> None:
             self.calls = []
+            self.identity_hashes = []
             self.session = BrokenSession()
 
     store = SQLiteEventStore(tmp_path / "events.db")

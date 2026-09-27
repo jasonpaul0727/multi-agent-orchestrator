@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 import re
 import threading
 from typing import Literal
@@ -17,6 +18,7 @@ from orchestrator.config.models import ModelRegistryManifest
 from orchestrator.persistence.events import EventDraft, StoredEvent
 from orchestrator.persistence.snapshots import SnapshotStore
 from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
+from orchestrator.workspace_identity import workspace_identity_hash
 
 
 _CONTENT_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -55,6 +57,9 @@ class RunConfigSnapshot(BaseModel):
     source_details: FrozenDict[StrictStr, StrictStr] = Field(default_factory=FrozenDict)
     manager_generation: StrictInt = Field(gt=0)
     captured_at: StrictStr = Field(min_length=1)
+    workspace_identity_hash: StrictStr | None = Field(
+        default=None, min_length=71, max_length=71, pattern=_CONTENT_HASH.pattern
+    )
 
     @field_validator("run_id", "captured_at")
     @classmethod
@@ -153,6 +158,8 @@ class ConfigManager:
         run_id: str,
         event_store: SQLiteEventStore,
         snapshot_store: SnapshotStore | None = None,
+        *,
+        workspace: str | Path | None = None,
     ) -> RunConfigSnapshot:
         """Persist or return the original RunCreated config snapshot.
 
@@ -179,6 +186,9 @@ class ConfigManager:
                 source_details=candidate.source_details,
                 manager_generation=self._generation,
                 captured_at=now.isoformat(),
+                workspace_identity_hash=(
+                    workspace_identity_hash(workspace) if workspace is not None else None
+                ),
             )
 
             def decide(events: list[StoredEvent], current_version: int) -> list[EventDraft] | None:

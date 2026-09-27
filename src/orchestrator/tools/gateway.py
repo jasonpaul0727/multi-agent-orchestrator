@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, Strict
 from orchestrator.isolation import SandboxLimits, SandboxResult, SandboxSession, SystemdReadOnlyLauncher
 from orchestrator.persistence.events import EventDraft, StoredEvent
 from orchestrator.security.policy import PolicyDecision, PolicyEngine, PolicyManifest, PolicyRequest
+from orchestrator.workspace_identity import workspace_identity_hash
 
 
 READ_ONLY_COMMAND_TOOL_ID = "system.readonly-command"
@@ -193,6 +194,7 @@ class ToolGateway:
             raise ValueError("monitor interval must be between 10 ms and 1 s")
         self._run_id = run_id
         self._workspace = canonical_workspace
+        self._workspace_identity_hash = workspace_identity_hash(canonical_workspace)
         self._events = event_store
         self._manifest = policy_manifest
         self._attempt_authority = attempt_authority
@@ -258,6 +260,7 @@ class ToolGateway:
                 str(self._workspace),
                 request.command,
                 limits=self._limits,
+                expected_workspace_identity_hash=self._workspace_identity_hash,
             )
         except Exception as exc:
             self._record_terminal(request, "ToolExecutionFailed", {"reason": "launcher_unavailable"})

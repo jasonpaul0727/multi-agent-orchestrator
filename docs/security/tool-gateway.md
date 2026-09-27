@@ -51,10 +51,17 @@ Scheduler, and Agent streams from one SQLite snapshot on a fresh read-only
 connection per check. It requires the accepted-attempt event ID as causation,
 matching role/tool/fence/policy/Agent identity, an unexpired lease, and an
 active Run. This avoids using the Gateway's thread-affine writer connection
-from its revocation monitor. The workspace and policy hash are supplied by
-the host; a durable Run workspace record and full application-service wiring
-are still missing. The injected authority interface remains trusted and
-could be misconfigured by a future caller.
+from its revocation monitor. `ConfigManager.start_run(..., workspace=...)`
+freezes a privacy-preserving path/device/inode hash into `RunCreated`;
+`LifecycleController.initialize_run` copies it into lifecycle history;
+recovery rejects a mismatch. Before each authorization check the durable
+adapter rechecks that the configured directory still has the same identity.
+The launcher then compares the frozen hash against device/inode values from
+the same opened workspace directory descriptor used to build its snapshot,
+closing the authorization-to-snapshot replacement window.
+Runs without a frozen workspace binding fail closed for this adapter. The
+injected authority interface remains trusted and could be misconfigured by a
+future caller.
 
 Only the Ubuntu 24.04/WSL2 systemd read-only profile in
 [`platform-support.md`](platform-support.md) has live evidence. There is no
@@ -78,3 +85,6 @@ termination, and wait-channel failure. The live integration test
 `tests/integration/test_tool_gateway.py` sends a command through the real
 `SystemdReadOnlyLauncher` and verifies that the workspace snapshot is visible
 while a sibling secret file and raw output are absent from the durable audit.
+Unit tests also replace the bound directory at the same path and verify that
+the existing Attempt loses authority, and verify that the binding survives
+Run snapshot restoration after process restart.

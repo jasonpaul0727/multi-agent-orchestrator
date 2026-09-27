@@ -93,6 +93,7 @@ class SystemdReadOnlyLauncher:
         *,
         limits: SandboxLimits | None = None,
         input_bytes: bytes | None = None,
+        expected_workspace_identity_hash: str | None = None,
     ) -> "SandboxSession":
         """Start a command with optional bounded stdin and return a cancellable handle."""
 
@@ -135,7 +136,11 @@ class SystemdReadOnlyLauncher:
             staging.cleanup()
             raise IsolationUnavailable("sandbox mount targets cannot be staged") from exc
         try:
-            snapshot_workspace(root, workspace_snapshot)
+            snapshot_workspace(
+                root,
+                workspace_snapshot,
+                expected_identity_hash=expected_workspace_identity_hash,
+            )
         except WorkspaceBoundaryError as exc:
             staging.cleanup()
             raise InvalidSandboxRequest("workspace snapshot failed closed") from exc

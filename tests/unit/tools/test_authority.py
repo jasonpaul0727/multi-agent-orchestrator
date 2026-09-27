@@ -12,6 +12,7 @@ from orchestrator.security import PolicyAuthority, PolicyManifest
 from orchestrator.tools.authority import DurableAttemptAuthority
 from orchestrator.tools.gateway import READ_ONLY_COMMAND_TOOL_ID, PolicyState, ToolGateway, ToolRequest
 from orchestrator.tools.authority import _attempt_ref
+from orchestrator.workspace_identity import workspace_identity_hash
 
 
 _HASH = "sha256:" + "c" * 64
@@ -23,7 +24,9 @@ def _append(store: SQLiteEventStore, stream: str, stream_id: str, draft: EventDr
     return store.append(stream, stream_id, version, (draft,), key)[0]
 
 
-def _fixture(tmp_path, *, tool_ids=(READ_ONLY_COMMAND_TOOL_ID,), lease_seconds=3600):
+def _fixture(
+    tmp_path, *, tool_ids=(READ_ONLY_COMMAND_TOOL_ID,), lease_seconds=3600, workspace_bound=True
+):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "events.db"
@@ -57,10 +60,13 @@ def _fixture(tmp_path, *, tool_ids=(READ_ONLY_COMMAND_TOOL_ID,), lease_seconds=3
         lease_expires_at=lease,
         status="accepted",
     )
-    _append(store, "run_lifecycle", "run-1", EventDraft("RunInitialized", {
+    init_payload = {
         "run_id": "run-1", "config_hash": _HASH, "registry_hash": _HASH,
         "max_nodes": 2, "max_depth": 1,
-    }), "init")
+    }
+    if workspace_bound:
+        init_payload["workspace_identity_hash"] = workspace_identity_hash(workspace)
+    _append(store, "run_lifecycle", "run-1", EventDraft("RunInitialized", init_payload), "init")
     _append(store, "run_lifecycle", "run-1", EventDraft("GraphNodesAppended", {
         "graph_version": 1,
         "nodes": [node.model_dump(mode="json")],
@@ -146,6 +152,24 @@ def test_durable_authority_rejects_other_workspace_and_unlisted_tool(tmp_path) -
     store.close()
 
 
+def test_durable_authority_rejects_workspace_replaced_at_same_path(tmp_path) -> None:
+    store, authority, request, _, _ = _fixture(tmp_path)
+    workspace = tmp_path / "workspace"
+    displaced = tmp_path / "workspace-original"
+    workspace.rename(displaced)
+    workspace.mkdir()
+
+    assert not authority.is_current(request)
+    store.close()
+
+
+def test_durable_authority_rejects_run_without_frozen_workspace_binding(tmp_path) -> None:
+    store, authority, request, _, _ = _fixture(tmp_path, workspace_bound=False)
+
+    assert not authority.is_current(request)
+    store.close()
+
+
 def test_durable_authority_rejects_expired_lease_without_sweeper(tmp_path) -> None:
     store, authority, request, _, _ = _fixture(tmp_path, lease_seconds=0)
     assert not authority.is_current(request)
@@ -197,7 +221,8 @@ def test_durable_authority_can_recheck_inside_gateway_write_transaction(tmp_path
             return True
 
     class Launcher:
-        def launch(self, workspace, command, *, limits):
+        def launch(self, workspace, command, *, limits, expected_workspace_identity_hash):
+            assert expected_workspace_identity_hash == workspace_identity_hash(workspace)
             return Session()
 
     store, authority, request, manifest, _ = _fixture(tmp_path)

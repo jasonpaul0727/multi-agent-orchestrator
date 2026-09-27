@@ -138,6 +138,7 @@ class RunLifecycleState(_LifecycleModel):
     cancellation_request_event_id: StrictStr | None = None
     config_hash: StrictStr = Field(pattern=_HASH)
     registry_hash: StrictStr = Field(pattern=_HASH)
+    workspace_identity_hash: StrictStr | None = Field(default=None, pattern=_HASH)
     policy_manifest_hash: StrictStr | None = Field(default=None, pattern=_HASH)
     max_nodes: StrictInt = Field(gt=0)
     max_depth: StrictInt = Field(ge=0)

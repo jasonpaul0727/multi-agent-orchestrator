@@ -16,6 +16,7 @@ from pathlib import Path
 from orchestrator.agents.registry import AgentRegistry, reduce_agent_registry
 from orchestrator.lifecycle.controller import reduce_lifecycle
 from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
+from orchestrator.workspace_identity import workspace_identity_hash
 
 from .gateway import READ_ONLY_COMMAND_TOOL_ID, ToolRequest
 
@@ -55,6 +56,7 @@ class DurableAttemptAuthority:
             raise ValueError("policy_manifest_hash must be a SHA-256 digest")
         self._database = database.resolve(strict=True)
         self._workspace = str(canonical_workspace)
+        self._workspace_identity_hash = workspace_identity_hash(canonical_workspace)
         self._policy_manifest_hash = policy_manifest_hash
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -64,6 +66,8 @@ class DurableAttemptAuthority:
         if not isinstance(request, ToolRequest) or request.workspace != self._workspace:
             return False
         try:
+            if workspace_identity_hash(self._workspace) != self._workspace_identity_hash:
+                return False
             now = self._clock()
             if now.tzinfo is None or now.utcoffset() is None:
                 return False
@@ -88,7 +92,12 @@ class DurableAttemptAuthority:
         agent_events = streams[("agent_registry", request.run_id)]
         lifecycle = reduce_lifecycle(request.run_id, lifecycle_events)
         agents = reduce_agent_registry(request.run_id, agent_events)
-        if lifecycle.status != "running" or lifecycle.policy_manifest_hash != self._policy_manifest_hash:
+        if (
+            lifecycle.status != "running"
+            or lifecycle.policy_manifest_hash != self._policy_manifest_hash
+            or lifecycle.workspace_identity_hash is None
+            or lifecycle.workspace_identity_hash != self._workspace_identity_hash
+        ):
             return False
         node = lifecycle.node(request.node_id)
         if (

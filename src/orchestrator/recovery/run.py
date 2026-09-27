@@ -129,6 +129,8 @@ class RunRecoveryCoordinator:
 
         agents = AgentRegistry(self.event_store).replay(run_id)
         config_snapshot = lifecycle_controller.config_snapshot(run_id)
+        if lifecycle.workspace_identity_hash != config_snapshot.workspace_identity_hash:
+            raise RunRecoveryError("Run workspace binding and config snapshot disagree")
         budget = BudgetLedger(
             self.event_store,
             {run_id: _run_limit(config_snapshot)},

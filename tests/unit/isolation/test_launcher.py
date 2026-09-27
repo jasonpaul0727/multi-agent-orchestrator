@@ -116,7 +116,7 @@ def test_workspace_snapshot_failure_is_reported_as_invalid_request(monkeypatch, 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(module, "snapshot_workspace", lambda *_args: (_ for _ in ()).throw(WorkspaceBoundaryError()))
+    monkeypatch.setattr(module, "snapshot_workspace", lambda *_args, **_kwargs: (_ for _ in ()).throw(WorkspaceBoundaryError()))
     with pytest.raises(InvalidSandboxRequest, match="snapshot"):
         SystemdReadOnlyLauncher(systemd_run="systemd-run", systemctl="systemctl").launch(
             workspace, ["/bin/true"]
@@ -130,7 +130,7 @@ def test_launcher_rejects_excessive_workspace_snapshot_before_launch(monkeypatch
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(module, "snapshot_workspace", lambda *_args: (_ for _ in ()).throw(WorkspaceBoundaryError("too large")))
+    monkeypatch.setattr(module, "snapshot_workspace", lambda *_args, **_kwargs: (_ for _ in ()).throw(WorkspaceBoundaryError("too large")))
     with pytest.raises(InvalidSandboxRequest, match="snapshot"):
         SystemdReadOnlyLauncher(systemd_run="systemd-run", systemctl="systemctl").launch(
             workspace, ["/bin/true"]

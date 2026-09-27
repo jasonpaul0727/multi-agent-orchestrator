@@ -13,6 +13,8 @@ import shutil
 import stat
 from typing import Literal
 
+from orchestrator.workspace_identity import workspace_identity_hash_from_stat
+
 
 class WorkspaceBoundaryError(RuntimeError):
     """A workspace tree cannot be proven to stay inside its declared root."""
@@ -82,6 +84,7 @@ def snapshot_workspace(
     max_entries: int = 1_000_000,
     max_bytes: int = 4 * 1024 * 1024 * 1024,
     max_depth: int = 256,
+    expected_identity_hash: str | None = None,
 ) -> WorkspaceInspection:
     """Copy a bounded, no-follow workspace snapshot using directory handles.
 
@@ -124,6 +127,20 @@ def snapshot_workspace(
     if (root_stat.st_dev, root_stat.st_ino) != (initial.st_dev, initial.st_ino):
         os.close(source_fd)
         raise WorkspaceBoundaryError("workspace root changed while opening its snapshot")
+    if expected_identity_hash is not None:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_identity_hash):
+            os.close(source_fd)
+            raise WorkspaceBoundaryError("expected workspace identity is malformed")
+        try:
+            actual_identity = workspace_identity_hash_from_stat(
+                resolved_source, root_stat.st_dev, root_stat.st_ino
+            )
+        except ValueError as exc:
+            os.close(source_fd)
+            raise WorkspaceBoundaryError("workspace identity could not be verified") from exc
+        if actual_identity != expected_identity_hash:
+            os.close(source_fd)
+            raise WorkspaceBoundaryError("workspace identity does not match its Run binding")
     try:
         if target.exists() or target.is_symlink():
             raise WorkspaceBoundaryError("snapshot destination must not already exist")
