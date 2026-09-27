@@ -150,15 +150,15 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 ## P5：Worker Runtime、Model Gateway、Verifier 和 Agent 协作
 
-建议新增包：`orchestrator/runtime`、`orchestrator/verification`。
+运行时边界位于 `orchestrator/runtime`；后续节点级验收策略可在实现需要时拆分为 `orchestrator/verification`。
 
 2026-09-25 interface slice: `orchestrator.runtime.contracts` now defines
 strict bounded WorkerTask/WorkerResult and VerificationTask/VerificationEvidence
 messages, exact Attempt/hash binding, artifact digest and byte-limit checks,
 required-check-set validation, and duplicate-key-safe bounded JSON decoding.
-This is an IPC contract only: there is still no Worker process, ArtifactStore
-attestation of returned references, Gateway call loop, independent verifier
-execution, or durable evidence acceptance; the P5 checklist remains open.
+At this milestone the work was an IPC contract only: no Worker process,
+ArtifactStore attestation, Gateway call loop, independent verifier execution,
+or durable evidence acceptance existed; the P5 checklist remained open.
 
 2026-09-26 boundary follow-up: `IsolatedWorkerProcess` now proves a bounded
 stdin/stdout round trip through the measured systemd read-only profile. The
@@ -173,13 +173,23 @@ can now freeze a privacy-preserving workspace path/device/inode identity hash;
 lifecycle replay retains it, Recovery rejects snapshot/lifecycle disagreement,
 and the durable authority rechecks the configured workspace identity on each
 request. A path replacement at the same name and Runs lacking a binding fail
-closed. Approval, write effects, and application-service wiring remain closed.
+closed. The fixed read-only command now supports the ApprovalService path;
+write effects and application-service wiring remain closed.
+
+2026-09-26 isolated Verifier slice: `IsolatedVerifierProcess` revalidates
+candidate provenance against ArtifactStore and uses digest-bound access grants
+to stage bounded bytes into a private tree for a real systemd read-only child.
+The dependency-free child can produce hash/size, UTF-8, JSON and Python syntax
+evidence; the host binds the result to the exact candidate set and Attempt.
+Evidence is still only a proposal: no durable verifier event, node acceptance,
+semantic review, test-suite execution, Final Review, or Worker-produced
+candidate path exists. P5 remains open.
 
 - [ ] Worker 仅获得当前 attempt 的最小输入、CapabilityGrant 引用和工具请求接口；不得拿到 EventStore/控制目录句柄或写最终状态。
 - [ ] 实现 Model Gateway：按 accepted RoutingDecision 调用 adapter，通过 Secret Broker 请求凭据，做超时/取消/有限重试、usage 采集、预算结算和响应脱敏。
 - [ ] 实现 Planner 生成初始 DAG、Worker 候选结果、Reviewer、Director 和文档分析 Agent 契约；模型输出只能成为提案/候选，由控制层验证后追加事件。
 - [ ] 实现 Agent 动态拆分：Graph Manager 校验依赖/契约/权限/预算/深度/累计数量后追加子图；新增能力必须形成具有新安全契约的节点。
-- [ ] 实现独立 Verifier：按节点验收契约检查代码/文档产物、测试证据、Artifact hash 和版本；Worker 不能自我宣布成功。
+- [ ] 扩展独立 Verifier：现有只读进程仅覆盖 Artifact hash/size、UTF-8、JSON 和 Python 语法，不运行项目测试或语义审查；仍需按节点验收契约生成、持久化证据并由控制层决定是否接受。
 - [ ] 实现 Final Review：冻结 review graph version 与 input manifest，核验原始目标、必需产物、证据、风险、账本；repair 必须有界返工并重新审查最新 generation。
 
 验收：离线 fake-model + fake-tool 模式跑通成功、失败、重试、升级、拆分、审批等待和恢复流程；Worker 无法伪造状态/访问控制面/绕过 Gateway；Verifier 与 Final Review 的每个判定可追溯到事件和产物哈希。

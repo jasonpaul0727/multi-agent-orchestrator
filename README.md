@@ -78,7 +78,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | `orchestrator.agents` | 每个模型 attempt 的事件化 Agent 实例、累计数量/深度/活动上限和状态重放 | `AgentRegistry` · `AgentInstance` · `AgentRegistryState` |
 | `orchestrator.recovery` | 确定性恢复与不变式校验 | `bootstrap_recovery()` · `recover()` · `recover_aggregate()` |
 | `orchestrator.observability` | fail-closed 脱敏观测与只读投影 | `ObservationSink` · `Redactor` · Run/Budget/Cost/Approval/Audit projections |
-| `orchestrator.runtime` | Worker/Verifier 消息契约、只返回阻塞的隔离 IPC 烟测与宿主候选产物校验 | `WorkerTask` · `WorkerResult` · `VerificationTask` · `VerificationEvidence` |
+| `orchestrator.runtime` | Worker/Verifier 消息契约、阻塞式 Worker IPC 烟测、ArtifactStore 候选校验和独立只读 Verifier | `IsolatedWorkerProcess` · `IsolatedVerifierProcess` · `admit_candidate_artifacts()` |
 | `orchestrator.benchmarks` | 离线成对运行测量；无真实数据时不生成改善结论 | `evaluate_manifest` · `BenchmarkReport` |
 
 `orchestrator.config` 已实现完整配置 schema、system default → user global → project → Run 四层解析、逐字段来源追踪、Policy Envelope 单调收紧、selector tombstone/guard 累加、安全 YAML loaders 和 JSON Schema。`ConfigManager` 会先完整构造并验证候选，再以单次原子切换替换活动配置；校验失败保留原配置。Run 启动时将有效配置、注册表及哈希、字段来源和来源标签冻结到 `RunCreated` 事件，并以校验快照作恢复加速；重启时从事件重放原始快照，不受配置文件后续变化影响。并发 reload、Run 启动竞争、重复 Run 创建、失败重试和重启恢复均有测试。当前尚未接入完整生命周期执行。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
@@ -95,7 +95,7 @@ Run 可事件化进入 `awaiting_user`，只有带请求 ID 和响应哈希的�
 
 Run lifecycle 在初始化、图变更、Run 状态和 Attempt 变化后写入带版本/源事件锚点的快照；重放使用通过 schema/hash/version/anchor 校验的快照并应用后续事件。只读 Run Recovery Coordinator 交叉核对 lifecycle、Agent Registry、budget、scheduler lease、effect intent/receipt 与 ArtifactPublished 元数据/内容哈希；无收据副作用保持未知且终态不一致时 fail-closed。它不会自行查询外部 Provider、重新派发 effect、恢复 worker 进程，也无法归属未写 ArtifactPublished 事件的孤儿对象，所以目前仍不是完整自动 Run crash recovery。
 
-仍未实现：workspace-write 安全变更发布、ApprovalService 到 ToolGateway/Worker 的执行接线、独立进程 Secret Broker/Worker 边界、Worker、独立 Verifier、CLI、MCP Server、跨流完整崩溃恢复与性能基准证据。因此当前交付仍不是可完整运行的多 Agent 产品。
+仍未实现：workspace-write 的审批/Worker 安全发布闭环、Secret Broker 与真实 Worker 的端到端接线、能生成候选产物的功能 Worker、节点语义验收与持久化 Verifier 证据、CLI、MCP Server、Provider 权威查询和费用对账、跨流完整崩溃恢复与性能基准证据。当前内置 Verifier 只在 systemd 只读沙箱检查 ArtifactStore 精确 Attempt 产物的哈希/大小、UTF-8、JSON 或 Python 语法；它不运行项目测试、不作语义审查，也不接受 lifecycle 成功状态。因此当前交付仍不是可完整运行的多 Agent 产品。
 
 ### 预算生命周期
 
@@ -113,7 +113,7 @@ reserve ──┬──▶ commit   结算真实用量，按 settlement_key 幂�
 
 项目规划提供 `read-only`、`workspace-write` 和 `full-trust` 三档权限。文件访问以声明的工作区边界为基础；删除、安装系统软件、发布、推送和密钥访问等高风险动作可分别配置策略，并由控制层强制执行与审计。
 
-目前有实测只读 ToolGateway，并将 ApprovalService 接入该固定命令的 hash-scoped 一次性授权路径；真实身份/Authority Envelope、workspace-write、Secret Broker 独立边界、Worker 执行层和 CLI/MCP 授权入口尚未实现，三档权限模型仍未形成完整端到端安全闭环。
+目前有实测只读 ToolGateway，并将 ApprovalService 接入该固定命令的 hash-scoped 一次性授权路径；真实身份/Authority Envelope、workspace-write、Secret Broker/Worker 独立边界、功能 Worker、生产级 Verifier、CLI/MCP 授权入口尚未实现，三档权限模型仍未形成完整端到端安全闭环。
 
 ## 开发
 
@@ -145,6 +145,7 @@ python -m build
 - [ApprovalService 当前边界](docs/security/approvals.md)：固定只读命令路径的审批接线及其真实身份/Worker/CLI 缺口。
 - [Secret Broker 当前边界](docs/security/secrets.md)：按 Run/provider/ref/endpoint/purpose 限定并审计的进程内凭据代理原型及其限制。
 - [Provider 调用账本边界](docs/security/provider-call-journal.md)：Provider 派发意图、脱敏终态、重启未决项和禁止隐式重放；不等同于 Provider 侧对账。
+- [Worker/Verifier 边界](docs/security/worker-runtime.md)：阻塞式 Worker IPC、ArtifactStore 来源准入和内置独立只读格式验证器及其限制。
 - [Run crash recovery 当前边界](docs/security/run-recovery.md)：副作用 intent/receipt 的未知态与 ArtifactStore 验证边界。
 - [V1 控制面架构决策](docs/superpowers/specs/2026-09-23-v1-control-plane-architecture-decisions.md)：事件归属、事务边界、提案/接受、未知结果和平台硬门。
 - [持久化、成本统计、可观测性与测试](docs/superpowers/specs/2026-09-14-persistence-cost-observability-testing-design.md)：已于 2026-09-14 确认并完成书面审阅。
@@ -154,4 +155,6 @@ python -m build
 ## 下一步
 
 1. 继续完成 P3：跨进程中断矩阵、真实 Worker 终止确认、Provider 侧 reconciliation，以及 Run 级 ArtifactStore 孤儿归属。
-2. P4 继续补 workspace-write/安全变更发布、独立进程隔离、ApprovalService 到 ToolGateway 的消费接线和 Scheduler/Worker 集成；当前 ApprovalService/Secret Broker 均为内部原语，不解除执行硬门。
+2. P4 继续补 workspace-write/安全变更发布，以及 Secret Broker 到真实 Worker/Scheduler 的安全接线；ApprovalService 目前只连通固定只读命令路径，不解除执行硬门。
+3. P5 实现能调用 Model/Tool Gateway 并发布候选 Artifact 的功能 Worker；把只读 Verifier 的内置格式检查扩展到节点验收契约、测试证据和持久化接受决策。
+4. P6 实现共享同一 application service 的 CLI/MCP、调用方身份和 Authority Envelope，再跑完整离线 E2E 与安全矩阵。
