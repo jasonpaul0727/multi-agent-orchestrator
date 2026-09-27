@@ -156,6 +156,17 @@ This is an IPC contract only: there is still no Worker process, ArtifactStore
 attestation of returned references, Gateway call loop, independent verifier
 execution, or durable evidence acceptance; the P5 checklist remains open.
 
+2026-09-26 boundary follow-up: `IsolatedWorkerProcess` now proves a bounded
+stdin/stdout round trip through the measured systemd read-only profile. The
+child is standard-library-only and always returns a `blocked` proposal; it
+does not execute tasks, call Provider/Tool Gateway, publish artifacts, or
+claim success. Host-side `admit_candidate_artifacts` verifies ArtifactStore
+bytes, metadata and exact Run/Node/Attempt/fence/Agent provenance for future
+candidate results, but no running Worker can yet produce or submit them.
+P5 remains open. The read-only Tool Gateway also gained host-bound workspace
+selection and an optional durable multi-stream Attempt authority; approval,
+write effects, and application-service wiring remain closed.
+
 - [ ] Worker 仅获得当前 attempt 的最小输入、CapabilityGrant 引用和工具请求接口；不得拿到 EventStore/控制目录句柄或写最终状态。
 - [ ] 实现 Model Gateway：按 accepted RoutingDecision 调用 adapter，通过 Secret Broker 请求凭据，做超时/取消/有限重试、usage 采集、预算结算和响应脱敏。
 - [ ] 实现 Planner 生成初始 DAG、Worker 候选结果、Reviewer、Director 和文档分析 Agent 契约；模型输出只能成为提案/候选，由控制层验证后追加事件。
@@ -178,6 +189,12 @@ execution, or durable evidence acceptance; the P5 checklist remains open.
 验收：干净环境 `--help`/安装 smoke test、CLI 创建/跟踪/等待审批/恢复/取消全流程、MCP initialize/call/error/cancellation/身份授权协议测试通过；CLI 与 MCP 对同一 Run 展示一致状态和预算。
 
 ## P7：产品级端到端、安全验收和发布准备
+
+2026-09-26 measurement follow-up: a strict offline paired-run evaluator now
+checks local evidence-file hashes, workload/protocol/verifier/currency pairing,
+recorded usage/cost sources and failure-induced repeated-work keys. No genuine
+paired Provider traces or billing reconciliation are present, so it supplies
+no evidence for the résumé cost, token, routing-split, or rework targets.
 
 - [ ] 保留并通过已有 269 项基础库测试；新增 schema/属性/契约/多进程并发/故障注入/平台安全测试。覆盖率总门槛不低于 90%，并单独审查 Artifact Store、Budget Ledger 等关键模块未覆盖分支。
 - [ ] 建立离线端到端验收矩阵：单节点成功、多分支并行、动态细化、重试/修复/升级、Agent 上限、预算阻塞、审批等待、Final Review repair、暂停/取消、crash restart、副作用 reconciliation。

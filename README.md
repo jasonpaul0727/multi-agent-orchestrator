@@ -5,7 +5,7 @@
 > **当前状态：P1/P2 已实现；P3 控制平面与 P4 只读隔离/ToolGateway 内部切片已实现；完整编排系统仍不可运行。**
 > 实施计划 Task 1–9 已完成，涵盖事件存储、快照恢复、Artifact Store、预算账本、脱敏投影、跨规格事件契约、崩溃/并发测试及打包验收。
 > 已完成严格四层配置及 Run 快照、Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件存储驱动的健康熔断/ProbeLease、Recovery Controller，以及三种 Provider codec 和受限 HTTPS transport。
-> P3 尚未完整：全量跨流/Worker 崩溃矩阵、Provider 侧结果查询与回执验证、真实 Worker 终止确认和自动恢复循环仍缺；Scheduler 已持久化脱敏失败证据/有界计划并验证单次路由授权，但目前由 host service 显式驱动。P4 有实测 Linux/systemd 只读隔离 profile、内部 `ToolGateway` 只读命令垂直切片、未接入 Worker 的 Approval 控制面原语，以及仅供显式 host 组装的进程内 Secret Broker 原型；workspace-write、Overlay 安全变更发布、真实身份服务、独立 Worker 进程边界与完整 Scheduler/Worker 集成仍未完成。P5 Worker/Verifier、P6 CLI/MCP、P7 完整 E2E/安全验收和可复现性能基准仍未完成；默认 Provider broker 仍 fail-closed。
+> P3 尚未完整：全量跨流/Worker 崩溃矩阵、Provider 侧结果查询与回执验证、真实 Worker 终止确认和自动恢复循环仍缺；Scheduler 已持久化脱敏失败证据/有界计划并验证单次路由授权，但目前由 host service 显式驱动。P4 有实测 Linux/systemd 只读隔离 profile、宿主绑定 workspace 且可选持久化 Attempt 鉴权的内部 `ToolGateway`、未接入 Worker 的 Approval 控制面原语，以及仅供显式 host 组装的进程内 Secret Broker 原型；Overlay 候选与宿主发布有原语及实测，但 workspace-write 的审批/审计/Worker 安全闭环、真实身份服务与完整 Scheduler/Worker 集成仍缺。P5 现有隔离子进程的有界 IPC 烟测（只返回 `blocked`）和宿主 Artifact 候选来源校验，**没有真正执行任务的 Worker 或独立 Verifier**。P6 CLI/MCP、P7 完整 E2E/安全验收仍未完成；离线成对基准评估器已就位但没有真实数据，默认 Provider broker 仍 fail-closed。
 > 本项目**不具备生产就绪状态**。
 
 ## V1 目标
@@ -20,6 +20,7 @@
 - 支持 OpenAI Responses、Anthropic Messages 和通用 OpenAI-compatible 模型适配器。
 
 Maestro 的性能数字仍是待基准验证的目标，不代表当前实现或生产结果：以可重放工作集测量单功能成本约 `$18 → $7`、Token 约 `90M → 40M`、失败后重复工作减少约 `65%`，并评估约 `15%` 决策任务使用高能力模型、约 `85%` 执行任务使用低成本模型的路由组合。
+离线评估器的输入要求与证据边界见 [基准测量说明](docs/benchmarks/README.md)；它目前不能验证上述数字。
 
 ## 架构原则
 
@@ -66,7 +67,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | `orchestrator.secrets` | Run/provider/ref/endpoint/purpose scope-bound Secret Broker 原型与脱敏审计 | `AuditedSecretBroker` · `SecretAccessRule` · `EnvironmentSecretStore` |
 | `orchestrator.approvals` | 精确 scope、one-shot grant、effect intent 与预算原子消费原语 | `ApprovalService` · `ApprovalRequest` · `EffectIntentSpec` |
 | `orchestrator.security` | Policy manifest 与确定性权限判定 | `PolicyManifest` · `PolicyEngine` · `PolicyDecision` |
-| `orchestrator.tools` | 基于 attempt fencing 的固定只读命令 Tool Gateway | `ToolGateway` · `ToolRequest` · `ToolExecutionResult` |
+| `orchestrator.tools` | 宿主工作区绑定、持久化 Attempt 鉴权与固定只读命令 Tool Gateway | `ToolGateway` · `DurableAttemptAuthority` · `ToolRequest` · `ToolExecutionResult` |
 | `orchestrator.routing` | TaskClassifier、Planning 节点契约、确定性路由、事件驱动健康熔断和恢复授权 | `TaskClassifier` · `PlanningNodeContract` · `ModelRouter` · `HealthController` · `RecoveryController` |
 | `orchestrator.identifiers` | 稳定标识符生成 | `new_id()` |
 | `orchestrator.persistence` | 追加式事件存储、快照 | `EventDraft` · `StoredEvent` · `SQLiteEventStore` · `SnapshotStore` |
@@ -77,6 +78,8 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | `orchestrator.agents` | 每个模型 attempt 的事件化 Agent 实例、累计数量/深度/活动上限和状态重放 | `AgentRegistry` · `AgentInstance` · `AgentRegistryState` |
 | `orchestrator.recovery` | 确定性恢复与不变式校验 | `bootstrap_recovery()` · `recover()` · `recover_aggregate()` |
 | `orchestrator.observability` | fail-closed 脱敏观测与只读投影 | `ObservationSink` · `Redactor` · Run/Budget/Cost/Approval/Audit projections |
+| `orchestrator.runtime` | Worker/Verifier 消息契约、只返回阻塞的隔离 IPC 烟测与宿主候选产物校验 | `WorkerTask` · `WorkerResult` · `VerificationTask` · `VerificationEvidence` |
+| `orchestrator.benchmarks` | 离线成对运行测量；无真实数据时不生成改善结论 | `evaluate_manifest` · `BenchmarkReport` |
 
 `orchestrator.config` 已实现完整配置 schema、system default → user global → project → Run 四层解析、逐字段来源追踪、Policy Envelope 单调收紧、selector tombstone/guard 累加、安全 YAML loaders 和 JSON Schema。`ConfigManager` 会先完整构造并验证候选，再以单次原子切换替换活动配置；校验失败保留原配置。Run 启动时将有效配置、注册表及哈希、字段来源和来源标签冻结到 `RunCreated` 事件，并以校验快照作恢复加速；重启时从事件重放原始快照，不受配置文件后续变化影响。并发 reload、Run 启动竞争、重复 Run 创建、失败重试和重启恢复均有测试。当前尚未接入完整生命周期执行。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
 
