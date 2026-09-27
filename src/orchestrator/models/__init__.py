@@ -42,6 +42,12 @@ from .transport import (
     UnavailableSecretBroker,
     UrllibHTTPSTransport,
 )
+from .provider_calls import (
+    ProviderCallJournal,
+    ProviderCallReplayBlocked,
+    ProviderCallSnapshot,
+    SQLiteProviderCallJournal,
+)
 from .pricing import (
     CostingDataUnavailable,
     ExchangeRate,
@@ -83,7 +89,11 @@ __all__ = [
     "OpenAICompatibleAdapter",
     "OpenAIResponsesAdapter",
     "ProviderCredential",
+    "ProviderCallJournal",
+    "ProviderCallReplayBlocked",
+    "ProviderCallSnapshot",
     "ProviderModelGateway",
+    "SQLiteProviderCallJournal",
     "SecretBroker",
     "SecretAccessContext",
     "TokenUsage",

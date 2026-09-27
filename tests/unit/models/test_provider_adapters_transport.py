@@ -20,6 +20,7 @@ from orchestrator.models import (
     OpenAICompatibleAdapter,
     OpenAIResponsesAdapter,
     ProviderCredential,
+    SQLiteProviderCallJournal,
     ProviderModelGateway,
     SecretAccessContext,
     UnavailableSecretBroker,
@@ -74,6 +75,8 @@ def model_request(registry):
         reasoning_effort="low",
         registry_manifest_hash=registry.content_hash,
     )
+
+
     return ModelRequest(
         request_id="request-1",
         idempotency_key="idem-1",
@@ -106,6 +109,10 @@ def model_request(registry):
             estimator_snapshot_id=HASH,
         ),
     )
+
+
+def _provider_call_journal(tmp_path, *, name="provider-call-journal.db"):
+    return SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / name))
 
 
 def test_openai_responses_codec_encodes_tools_and_decodes_usage_and_calls():
@@ -368,7 +375,7 @@ class _FakeTransport:
         return self.response
 
 
-def test_gateway_never_reads_secrets_and_uses_only_verified_route_and_broker():
+def test_gateway_never_reads_secrets_and_uses_only_verified_route_and_broker(tmp_path):
     registry = model_registry()
     call = model_request(registry)
     success = HTTPTransportResponse(
@@ -388,6 +395,7 @@ def test_gateway_never_reads_secrets_and_uses_only_verified_route_and_broker():
         registry=registry,
         accepted_route_verifier=_Verifier(),
         transport=transport,
+        provider_call_journal=_provider_call_journal(tmp_path),
     )
     with pytest.raises(ModelGatewayError) as failure:
         asyncio.run(unavailable.invoke(call))
@@ -400,6 +408,7 @@ def test_gateway_never_reads_secrets_and_uses_only_verified_route_and_broker():
         accepted_route_verifier=_Verifier(),
         secret_broker=broker,
         transport=transport,
+        provider_call_journal=_provider_call_journal(tmp_path),
     )
     response = asyncio.run(gateway.invoke(call))
     assert response.output_text == "ok"
@@ -464,6 +473,7 @@ def test_provider_gateway_uses_only_audited_explicit_secret_broker(tmp_path):
         accepted_route_verifier=_Verifier(),
         secret_broker=broker,
         transport=transport,
+        provider_call_journal=SQLiteProviderCallJournal(audit),
     )
 
     response = asyncio.run(gateway.invoke(call))
@@ -475,7 +485,7 @@ def test_provider_gateway_uses_only_audited_explicit_secret_broker(tmp_path):
     assert "integration-secret" not in repr(event.payload)
 
 
-def test_gateway_normalizes_rate_limits_without_exposing_provider_body():
+def test_gateway_normalizes_rate_limits_without_exposing_provider_body(tmp_path):
     registry = model_registry()
     call = model_request(registry)
     transport = _FakeTransport(
@@ -490,6 +500,7 @@ def test_gateway_normalizes_rate_limits_without_exposing_provider_body():
         accepted_route_verifier=_Verifier(),
         secret_broker=_Broker(),
         transport=transport,
+        provider_call_journal=_provider_call_journal(tmp_path),
     )
     with pytest.raises(ModelGatewayError) as result:
         asyncio.run(gateway.invoke(call))
@@ -528,7 +539,7 @@ def _gateway_error(gateway, call, *, cancellation=None):
     return result.value.failure
 
 
-def test_gateway_fails_closed_for_route_broker_headers_and_cancellation():
+def test_gateway_fails_closed_for_route_broker_headers_and_cancellation(tmp_path):
     registry = model_registry()
     call = model_request(registry)
     no_verifier = ProviderModelGateway(registry=registry, secret_broker=_Broker())
@@ -545,6 +556,7 @@ def test_gateway_fails_closed_for_route_broker_headers_and_cancellation():
         registry=registry,
         accepted_route_verifier=_Verifier(),
         secret_broker=_RaisingBroker(),
+        provider_call_journal=_provider_call_journal(tmp_path),
     )
     assert _gateway_error(broker_error, call).code == "credential_delivery_unsupported"
 
@@ -556,6 +568,7 @@ def test_gateway_fails_closed_for_route_broker_headers_and_cancellation():
                 "x-api-key", "bad-header", "primary", "https://api.openai.com/v1", "model_inference"
             )
         ),
+        provider_call_journal=_provider_call_journal(tmp_path),
     )
     assert _gateway_error(bad_credential, call).code == "credential_unavailable"
 
@@ -567,6 +580,7 @@ def test_gateway_fails_closed_for_route_broker_headers_and_cancellation():
                 "Authorization", "value", "another-provider", "https://api.openai.com/v1", "model_inference"
             )
         ),
+        provider_call_journal=_provider_call_journal(tmp_path),
     )
     assert _gateway_error(wrong_audience, call).code == "credential_unavailable"
 
@@ -574,6 +588,7 @@ def test_gateway_fails_closed_for_route_broker_headers_and_cancellation():
         registry=registry,
         accepted_route_verifier=_Verifier(),
         secret_broker=_StaticBroker(object()),
+        provider_call_journal=_provider_call_journal(tmp_path),
     )
     assert _gateway_error(malformed_broker, call).code == "credential_unavailable"
 
@@ -592,7 +607,7 @@ def test_gateway_fails_closed_for_route_broker_headers_and_cancellation():
     ],
 )
 def test_gateway_normalizes_provider_statuses_without_leaking_bodies(
-    status, headers, body, expected, outcome, retryable
+    tmp_path, status, headers, body, expected, outcome, retryable
 ):
     registry = model_registry()
     gateway = ProviderModelGateway(
@@ -600,13 +615,14 @@ def test_gateway_normalizes_provider_statuses_without_leaking_bodies(
         accepted_route_verifier=_Verifier(),
         secret_broker=_Broker(),
         transport=_FakeTransport(HTTPTransportResponse(status=status, headers=headers, body=body)),
+        provider_call_journal=_provider_call_journal(tmp_path),
     )
     failure = _gateway_error(gateway, model_request(registry))
     assert (failure.code, failure.outcome, failure.retryable) == (expected, outcome, retryable)
     assert (failure.provider_code is None) is (body in (b"", b"not-json"))
 
 
-def test_gateway_maps_transport_timeout_cancel_and_malformed_response():
+def test_gateway_maps_transport_timeout_cancel_and_malformed_response(tmp_path):
     registry = model_registry()
     call = model_request(registry)
 
@@ -617,16 +633,19 @@ def test_gateway_maps_transport_timeout_cancel_and_malformed_response():
         async def post_json(self, **kwargs):
             raise self.error
 
-    for error, code in (
+    for index, (error, code) in enumerate((
         (HTTPTransportTimedOut(), "timeout"),
         (HTTPTransportCancelled(may_have_been_sent=True), "cancelled"),
         (HTTPTransportFailed(may_have_been_sent=False), "transport_error"),
-    ):
+    )):
         gateway = ProviderModelGateway(
             registry=registry,
             accepted_route_verifier=_Verifier(),
             secret_broker=_Broker(),
             transport=_RaisingTransport(error),
+            provider_call_journal=_provider_call_journal(
+                tmp_path, name=f"provider-call-journal-{index}.db"
+            ),
         )
         failure = _gateway_error(gateway, call)
         assert failure.code == code
@@ -637,6 +656,7 @@ def test_gateway_maps_transport_timeout_cancel_and_malformed_response():
         accepted_route_verifier=_Verifier(),
         secret_broker=_Broker(),
         transport=_FakeTransport(HTTPTransportResponse(status=200, headers=(), body=b"not-json")),
+        provider_call_journal=_provider_call_journal(tmp_path),
     )
     assert _gateway_error(malformed, call).code == "invalid_response"
 

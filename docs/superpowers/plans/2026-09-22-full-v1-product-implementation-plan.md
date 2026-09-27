@@ -99,6 +99,8 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 2026-09-23 P3 Planning 切片：新增可信 host-side `GraphPlanningService`，从 Run 冻结的 EffectiveConfig/Registry 和首次图追加冻结的完整 `PolicyManifest` 编译完整节点契约并与图事件一同持久化。重放校验 Run/config/Registry/policy/node/role/hash 绑定；动态规划不能改变 Run policy，任务原文不进入事件。该入口尚未接入非可信 Planner Worker 或用户 application service。
 
+2026-09-26 P3 Provider 调用日志切片：新增 `SQLiteProviderCallJournal`，Provider Gateway 在发送请求前持久化 attempt-scoped、带 fencing/route/budget/registry 绑定的请求体哈希意图；收到响应或传输错误后写入脱敏 usage/status/outcome。SQLite 事件契约校验先 intent 后单一 terminal receipt；多连接 CAS 只允许一个进程占有调用身份。重启可枚举 `dispatching`/`unknown` 项，同一身份重放 fail-closed；无 journal 时不取凭据、不发请求。凭据/提示/请求体/模型输出均不入日志。此为对账基础而不是 Provider reconciliation：尚无 Provider 查询/权威回执验证、预算自动 settlement、Scheduler/Worker 接线或自动恢复；unknown 仍保持未决。
+
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 
 - [x] 建立 Run/Node/Attempt/Graph 生命周期投影；实现基础状态机与非法转换拒绝。
@@ -113,10 +115,11 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 - [x] 实现 Run 取消门控：先拒绝新调度；只有活动 Attempt 收到停止回执且预算已结算/证明无副作用后才可释放；OutcomeUnknown 仍要求核对。
 - [x] lifecycle 初始化/图/Run/Attempt 边界自动检查点；重启优先校验快照 hash/schema/version/source-event anchor，再重放尾部；失效快照回退完整事件流。
 - [x] 增加只读 Run Recovery Coordinator，重放并交叉核对生命周期、Agent Registry、预算预留、scheduler lease/结果；新路由接纳前先运行一致性检查，发现分裂状态即 fail-closed。真实子进程中分别在接纳事务提交前、提交后丢响应并重开数据库，验证完整回滚、确定性重建和幂等重放。恢复器只返回活动/未知 lease，不猜测结果、不释放资源、不重派工作。
+- [x] 为 Provider Gateway 增加持久化调用意图/脱敏终态账本、并发单赢家、重启列出未决调用和同身份重放阻断；结果收据持久化失败时保留 unknown。Provider 侧查询/回执验证、Scheduler reconciliation 与真实 Worker 崩溃矩阵仍待完成。
 - [x] 将 effect intent/receipt 与 ArtifactPublished stream 纳入统一 Run Recovery Coordinator；恢复时将缺回执的外部 effect 保持为 outcome_unknown、拒绝终态 Attempt 上的未决 effect，并验证有发布事件的 ArtifactStore 对象 digest/size 与可用 attempt provenance。只读恢复结果不重放副作用或暴露 artifact bytes。
 - [x] 增加全局只读 orphan blob inventory：按内容寻址文件名、常规文件类型和 SHA-256 校验；对每个候选使用正常 publication digest lock 并重读事件元数据，避免把正常并发发布误报为 orphan。此操作不自动删除，也不宣称 Run 级归属。
 - [x] 在 Artifact bytes 落盘前写入 `ArtifactPublicationIntent`，随后原子发布内容寻址对象和 `ArtifactPublished` 元数据；恢复时按 Run 查询带有对应 source provenance 的未完成意图并验证已存在对象的 digest/size/provenance。子进程死亡测试覆盖 intent 后、blob 后两个窗口。Worker publisher 必须提供 Run/node/Attempt-generation source。候选只列入 pending inventory，不被自动采纳或删除。
-- [ ] 扩展多进程中断矩阵覆盖每个跨流事务/副作用窗口；接入能验证进程终止回执的真实 Worker/OS 终止器，并实现 Provider reconciliation。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
+- [ ] 扩展多进程中断矩阵覆盖每个跨流事务/副作用窗口；接入能验证进程终止回执的真实 Worker/OS 终止器，并实现基于 Provider 权威查询/回执证据的 reconciliation。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
 - [x] 实现脱敏、确定性的 Gateway 失败分类/指纹并交由 Recovery Controller 生成有界计划；Scheduler 持久化分类/计划，并在接纳恢复 Attempt 时重验 authorization、失败类别、retry level 和 exhausted model，再原子消费单次授权。未知结果保持 reconciliation 阻断。
 - [ ] 将持久化恢复计划接入 Worker/application service 自动驱动；完成 Provider reconciliation 与重启后待处理计划恢复，不得自动重放 outcome_unknown。
 - [x] 实现 `OutcomeUnknown`/`AwaitingReconciliation`，显式对账前不释放预算与并发资源。

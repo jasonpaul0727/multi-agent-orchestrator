@@ -37,6 +37,10 @@ from orchestrator.models.gateway import (
     validate_gateway_request,
     validate_gateway_response,
 )
+from orchestrator.models.provider_calls import (
+    ProviderCallJournal,
+    ProviderCallReplayBlocked,
+)
 from orchestrator.validation import revalidate_model
 
 
@@ -229,11 +233,13 @@ class ProviderModelGateway:
         accepted_route_verifier: AcceptedRouteVerifier | None = None,
         secret_broker: SecretBroker | None = None,
         transport: HTTPTransport | None = None,
+        provider_call_journal: ProviderCallJournal | None = None,
     ) -> None:
         self.registry = revalidate_model(ModelRegistryManifest, registry)
         self.accepted_route_verifier = accepted_route_verifier
         self.secret_broker = secret_broker or UnavailableSecretBroker()
         self.transport = transport or UrllibHTTPSTransport()
+        self.provider_call_journal = provider_call_journal
 
     async def invoke(
         self,
@@ -268,6 +274,14 @@ class ProviderModelGateway:
             self._fail("invalid_request", "preflight", "not_sent", False)
         if cancellation is not None and cancellation.cancelled:
             self._fail("cancelled", "preflight", "not_sent", False)
+        if self.provider_call_journal is None:
+            self._fail("provider_journal_unavailable", "preflight", "not_sent", False)
+        try:
+            prior_call = self.provider_call_journal.read(request)
+        except Exception:
+            self._fail("provider_journal_unavailable", "preflight", "not_sent", False)
+        if prior_call is not None:
+            self._fail("idempotency_conflict", "preflight", "not_sent", False)
         try:
             credential = await self.secret_broker.acquire_provider_credential(
                 secret_ref=provider.secret_ref,
@@ -310,6 +324,17 @@ class ProviderModelGateway:
         ):
             self._fail("credential_unavailable", "preflight", "not_sent", False)
 
+        try:
+            self.provider_call_journal.record_intent(
+                request,
+                provider_id=provider.id,
+                request_body=encoded.body_json.encode("utf-8"),
+            )
+        except ProviderCallReplayBlocked:
+            self._fail("idempotency_conflict", "preflight", "not_sent", False)
+        except Exception:
+            self._fail("provider_journal_unavailable", "preflight", "not_sent", False)
+
         headers = [
             ("Content-Type", "application/json"),
             ("Accept", "application/json"),
@@ -328,26 +353,49 @@ class ProviderModelGateway:
                 max_response_bytes=_MAX_RESPONSE_BYTES,
             )
         except HTTPTransportCancelled as exc:
+            outcome = "unknown" if exc.may_have_been_sent else "not_sent"
+            self._record_outcome(
+                request,
+                outcome=outcome,
+                failure_code="cancelled",
+            )
             self._fail(
                 "cancelled",
                 "transport",
-                "unknown" if exc.may_have_been_sent else "not_sent",
+                outcome,
                 False,
             )
         except HTTPTransportTimedOut:
+            self._record_outcome(request, outcome="unknown", failure_code="timeout")
             self._fail("timeout", "transport", "unknown", False)
         except Exception as exc:
             may_have_been_sent = getattr(exc, "may_have_been_sent", True)
+            outcome = "unknown" if may_have_been_sent else "not_sent"
+            self._record_outcome(
+                request,
+                outcome=outcome,
+                failure_code="transport_error",
+            )
             self._fail(
                 "transport_error",
                 "transport",
-                "unknown" if may_have_been_sent else "not_sent",
+                outcome,
                 False,
             )
 
         provider_request_id = _response_header(response.headers, {"request-id", "x-request-id"})
         if response.status < 200 or response.status >= 300:
-            self._raise_provider_status(response, provider_request_id)
+            try:
+                self._raise_provider_status(response, provider_request_id)
+            except ModelGatewayError as exc:
+                self._record_outcome(
+                    request,
+                    outcome=exc.failure.outcome,
+                    provider_request_id=exc.failure.provider_request_id,
+                    http_status=response.status,
+                    failure_code=exc.failure.code,
+                )
+                raise
         try:
             body_text = response.body.decode("utf-8", errors="strict")
             adapter_response = AdapterResponse(
@@ -360,9 +408,56 @@ class ProviderModelGateway:
                 request_id=request.request_id,
                 model_id=request.model_id,
             )
-            return validate_gateway_response(request, decoded)
+            validated = validate_gateway_response(request, decoded)
         except Exception:
+            self._record_outcome(
+                request,
+                outcome="unknown",
+                provider_request_id=provider_request_id,
+                http_status=response.status,
+                failure_code="invalid_response",
+            )
             self._fail("invalid_response", "decode", "unknown", False)
+        self._record_outcome(
+            request,
+            outcome="known_success",
+            provider_request_id=provider_request_id,
+            http_status=response.status,
+            usage=validated.usage,
+        )
+        return validated
+
+    def _record_outcome(
+        self,
+        request: ModelRequest,
+        *,
+        outcome: str,
+        provider_request_id: str | None = None,
+        http_status: int | None = None,
+        failure_code: str | None = None,
+        usage: object | None = None,
+    ) -> None:
+        if self.provider_call_journal is None:
+            self._fail("outcome_unknown", "settlement", "unknown", False)
+        try:
+            self.provider_call_journal.record_outcome(
+                request,
+                outcome=outcome,
+                provider_request_id=provider_request_id,
+                http_status=http_status,
+                failure_code=failure_code,
+                usage=usage,
+            )
+        except Exception:
+            # A result that cannot be durably settled must remain unknown. In
+            # particular, recovery must never infer that another dispatch is safe.
+            self._fail(
+                "outcome_unknown",
+                "settlement",
+                "unknown",
+                False,
+                provider_request_id=provider_request_id,
+            )
 
     def _raise_provider_status(self, response: HTTPTransportResponse, request_id: str | None) -> None:
         code = _provider_error_code(response.body)

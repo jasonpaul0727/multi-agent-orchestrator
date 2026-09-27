@@ -92,6 +92,8 @@ _CAUSAL_EVENT_TYPES = frozenset(
         "AgentCancelled",
         "EffectIntentRecorded",
         "EffectReceiptRecorded",
+        "ProviderCallIntentRecorded",
+        "ProviderCallOutcomeRecorded",
     }
 )
 _RUN_LEVEL_CAUSAL_EVENT_TYPES = frozenset(
@@ -138,6 +140,8 @@ def validate_event_contract(events: list[Any]) -> None:
     consumed_recovery_authorizations: set[str] = set()
     accepted_routes: dict[str, Any] = {}
     terminal_attempts: dict[str, tuple[str, Any]] = {}
+    provider_call_intent: Any | None = None
+    provider_call_terminal = False
     for event in events:
         event_type = event.event_type
         payload = event.payload or {}
@@ -147,7 +151,92 @@ def validate_event_contract(events: list[Any]) -> None:
             event.attempt_id,
             event.fencing_generation,
         )
-        if event_type == "AttemptFailureClassified":
+        if event_type == "ProviderCallIntentRecorded":
+            required_fields = {
+                "run_id", "node_id", "attempt_id", "fencing_generation", "request_id",
+                "idempotency_key_hash", "accepted_route_id", "provider_id", "model_id",
+                "registry_manifest_hash", "budget_reservation_id", "request_hash",
+            }
+            if (
+                provider_call_intent is not None
+                or event.stream_version != 1
+                or set(payload) != required_fields
+                or not all(execution_key)
+                or payload.get("run_id") != event.run_id
+                or payload.get("node_id") != event.node_id
+                or payload.get("attempt_id") != event.attempt_id
+                or isinstance(payload.get("fencing_generation"), bool)
+                or not isinstance(payload.get("fencing_generation"), int)
+                or payload.get("fencing_generation") != event.fencing_generation
+                or event.causation_id != payload.get("accepted_route_id")
+            ):
+                raise EventContractError("ProviderCallIntentRecorded has invalid identity or order")
+            for name in (
+                "request_id", "accepted_route_id", "provider_id", "model_id", "budget_reservation_id"
+            ):
+                try:
+                    _validate_non_blank(payload.get(name), name)
+                except ValueError as exc:
+                    raise EventContractError("ProviderCallIntentRecorded has invalid identifiers") from exc
+            for name in ("idempotency_key_hash", "registry_manifest_hash", "request_hash"):
+                value = payload.get(name)
+                if not isinstance(value, str) or not value.startswith("sha256:"):
+                    raise EventContractError("ProviderCallIntentRecorded has invalid content hashes")
+                try:
+                    _validate_sha256_hex(value[7:], name)
+                except ValueError as exc:
+                    raise EventContractError("ProviderCallIntentRecorded has invalid content hashes") from exc
+            provider_call_intent = event
+        elif event_type == "ProviderCallOutcomeRecorded":
+            required_fields = {"outcome", "provider_request_id", "http_status", "failure_code", "usage"}
+            if (
+                provider_call_intent is None
+                or provider_call_terminal
+                or event.stream_version != 2
+                or set(payload) != required_fields
+                or not all(execution_key)
+                or execution_key != (
+                    provider_call_intent.run_id,
+                    provider_call_intent.node_id,
+                    provider_call_intent.attempt_id,
+                    provider_call_intent.fencing_generation,
+                )
+                or event.causation_id != provider_call_intent.causation_id
+                or payload.get("outcome") not in {"not_sent", "known_failure", "known_success", "unknown"}
+            ):
+                raise EventContractError("ProviderCallOutcomeRecorded is orphaned, duplicated, or invalid")
+            provider_request_id = payload.get("provider_request_id")
+            if provider_request_id is not None and (
+                not isinstance(provider_request_id, str)
+                or not provider_request_id
+                or len(provider_request_id) > 256
+                or not _safe_event_text(provider_request_id)
+            ):
+                raise EventContractError("ProviderCallOutcomeRecorded has invalid provider request id")
+            http_status = payload.get("http_status")
+            if http_status is not None and (
+                isinstance(http_status, bool) or not isinstance(http_status, int)
+                or not 100 <= http_status <= 599
+            ):
+                raise EventContractError("ProviderCallOutcomeRecorded has invalid HTTP status")
+            outcome = payload.get("outcome")
+            if (
+                (outcome == "known_success" and (http_status is None or not 200 <= http_status < 300))
+                or (outcome == "known_failure" and http_status is not None and 200 <= http_status < 300)
+                or (outcome == "not_sent" and (http_status is not None or provider_request_id is not None))
+            ):
+                raise EventContractError("ProviderCallOutcomeRecorded status conflicts with outcome")
+            failure_code = payload.get("failure_code")
+            if failure_code is not None:
+                try:
+                    _validate_non_blank(failure_code, "failure_code")
+                except ValueError as exc:
+                    raise EventContractError("ProviderCallOutcomeRecorded has invalid failure code") from exc
+            usage = payload.get("usage")
+            if usage is not None:
+                _validate_provider_usage(usage)
+            provider_call_terminal = True
+        elif event_type == "AttemptFailureClassified":
             classification = payload.get("classification")
             accepted = accepted_routes.get(payload.get("attempt_ref"))
             terminal = terminal_attempts.get(payload.get("attempt_ref"))
@@ -422,6 +511,34 @@ def _validate_sha256_hex(value: Any, field_name: str = "payload_hash") -> str:
     if not isinstance(value, str) or _SHA256_HEX.fullmatch(value) is None:
         raise ValueError(f"{field_name} must be 64 lowercase ASCII hex characters")
     return value
+
+
+def _safe_event_text(value: str) -> bool:
+    return not any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+
+
+def _validate_provider_usage(value: Any) -> None:
+    allowed_fields = {
+        "status", "input_tokens", "output_tokens", "reasoning_tokens",
+        "cached_input_tokens", "provider_fee_minor",
+    }
+    if not isinstance(value, dict) or not set(value).issubset(allowed_fields):
+        raise EventContractError("ProviderCallOutcomeRecorded has invalid usage fields")
+    status = value.get("status")
+    if status not in {"reported", "estimated", "unavailable"}:
+        raise EventContractError("ProviderCallOutcomeRecorded has invalid usage status")
+    counts = {
+        "input_tokens", "output_tokens", "reasoning_tokens", "cached_input_tokens", "provider_fee_minor"
+    }
+    for name in counts.intersection(value):
+        number = value[name]
+        if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+            raise EventContractError("ProviderCallOutcomeRecorded has invalid usage count")
+    if status in {"reported", "estimated"}:
+        if "input_tokens" not in value or "output_tokens" not in value:
+            raise EventContractError("ProviderCallOutcomeRecorded usage is missing required token counts")
+    elif counts.intersection(value):
+        raise EventContractError("unavailable ProviderCall usage cannot contain counts")
 
 
 class _FrozenDict(dict[str, Any]):

@@ -270,6 +270,7 @@ GatewayFailureCode = Literal[
     "output_limit_exceeded",
     "invalid_response",
     "usage_unavailable",
+    "provider_journal_unavailable",
     "timeout",
     "cancelled",
     "transport_error",
