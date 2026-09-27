@@ -831,6 +831,13 @@ class BudgetLedger:
     ) -> BudgetReservation:
         return self._state_for(reservation_id, run_id)[0].reservation
 
+    def currency_for_run(self, run_id: str) -> str:
+        """Return the configured or persisted currency for a budgeted Run."""
+        run_id = _identifier(run_id, "run_id")
+        limit = self._limit_for(run_id, required=True)
+        assert limit is not None
+        return limit.currency
+
     def _limit_for(
         self,
         run_id: str,

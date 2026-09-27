@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -21,6 +22,17 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
 from orchestrator.isolation import SandboxLimits, SandboxResult, SandboxSession, SystemdReadOnlyLauncher
+from orchestrator.approvals import (
+    ApprovalError,
+    ApprovalInvalid,
+    ApprovalPolicyState,
+    ApprovalRequest,
+    ApprovalService,
+    ConsumedApproval,
+    EffectIntentSpec,
+    ExecutionAttempt,
+)
+from orchestrator.budget import CostEstimate
 from orchestrator.persistence.events import EventDraft, StoredEvent
 from orchestrator.security.policy import PolicyDecision, PolicyEngine, PolicyManifest, PolicyRequest
 from orchestrator.workspace_identity import workspace_identity_hash
@@ -139,6 +151,7 @@ class ToolExecutionResult:
     cancelled: bool = False
     timed_out: bool = False
     output_limited: bool = False
+    approval_request_id: str | None = None
 
 
 class ToolAuditUnavailable(RuntimeError):
@@ -176,6 +189,11 @@ class ToolGateway:
         launcher: SystemdReadOnlyLauncher | Any | None = None,
         limits: SandboxLimits | None = None,
         monitor_interval_seconds: float = 0.05,
+        approval_service: ApprovalService | None = None,
+        approval_requester: Callable[[ToolRequest], str] | None = None,
+        approval_isolation_profile_hash: str | None = None,
+        approval_now: Callable[[], datetime] | None = None,
+        approval_ttl_seconds: int = 3_600,
     ) -> None:
         if not isinstance(run_id, str) or re.fullmatch(_SAFE_IDENTIFIER, run_id) is None:
             raise ValueError("run_id must be a stable non-blank identifier")
@@ -192,6 +210,25 @@ class ToolGateway:
             raise ValueError("workspace must not be a filesystem root")
         if monitor_interval_seconds < 0.01 or monitor_interval_seconds > 1:
             raise ValueError("monitor interval must be between 10 ms and 1 s")
+        if isinstance(approval_ttl_seconds, bool) or not isinstance(approval_ttl_seconds, int):
+            raise ValueError("approval_ttl_seconds must be an integer")
+        if approval_ttl_seconds < 1 or approval_ttl_seconds > 86_400:
+            raise ValueError("approval_ttl_seconds must be between 1 second and 24 hours")
+        if approval_service is None:
+            if approval_requester is not None or approval_isolation_profile_hash is not None:
+                raise ValueError("approval requester/profile require an ApprovalService")
+        else:
+            if not approval_service.uses_event_store(event_store):
+                raise ValueError("ToolGateway and ApprovalService must share one SQLite event store")
+            if approval_requester is None:
+                raise ValueError("approval integration requires a trusted authenticated requester")
+            if (
+                not isinstance(approval_isolation_profile_hash, str)
+                or len(approval_isolation_profile_hash) != 71
+                or not approval_isolation_profile_hash.startswith("sha256:")
+                or any(char not in "0123456789abcdef" for char in approval_isolation_profile_hash[7:])
+            ):
+                raise ValueError("approval integration requires a measured isolation profile hash")
         self._run_id = run_id
         self._workspace = canonical_workspace
         self._workspace_identity_hash = workspace_identity_hash(canonical_workspace)
@@ -203,14 +240,29 @@ class ToolGateway:
         self._limits = limits or SandboxLimits()
         self._monitor_interval = monitor_interval_seconds
         self._engine = PolicyEngine()
+        self._approval_service = approval_service
+        self._approval_requester = approval_requester
+        self._approval_isolation_profile_hash = approval_isolation_profile_hash
+        self._approval_now = approval_now or (lambda: datetime.now(timezone.utc))
+        self._approval_ttl = timedelta(seconds=approval_ttl_seconds)
 
-    def execute(self, request: ToolRequest) -> ToolExecutionResult:
+    def execute(
+        self,
+        request: ToolRequest,
+        *,
+        approval_grant_id: str | None = None,
+    ) -> ToolExecutionResult:
         """Evaluate, durably reserve, and optionally execute one safe-read tool."""
 
         if not isinstance(request, ToolRequest):
             request = ToolRequest.model_validate(request)
         if request.run_id != self._run_id:
             raise PermissionError("tool request does not belong to this Run snapshot")
+        if approval_grant_id is not None and (
+            not isinstance(approval_grant_id, str)
+            or re.fullmatch(_SAFE_IDENTIFIER, approval_grant_id) is None
+        ):
+            raise ValueError("approval_grant_id must be a stable identifier")
         if request.workspace != str(self._workspace):
             self._record_block(request, "workspace_not_bound")
             raise PermissionError("tool request workspace is not the trusted Run workspace")
@@ -230,7 +282,26 @@ class ToolGateway:
         if decision.outcome == "deny":
             return ToolExecutionResult(request.request_id, "denied", decision)
         if decision.outcome == "needs_approval":
-            return ToolExecutionResult(request.request_id, "awaiting_approval", decision)
+            if self._approval_service is None:
+                if approval_grant_id is not None:
+                    self._record_block(request, "approval_service_unavailable")
+                    return ToolExecutionResult(request.request_id, "denied", decision)
+                return ToolExecutionResult(request.request_id, "awaiting_approval", decision)
+            if approval_grant_id is None:
+                try:
+                    approval_request_id = self._create_approval_request(request, decision, state)
+                except Exception as exc:
+                    self._record_block(request, "approval_request_unavailable")
+                    raise ToolAuditUnavailable("exact approval request could not be recorded") from exc
+                return ToolExecutionResult(
+                    request.request_id,
+                    "awaiting_approval",
+                    decision,
+                    approval_request_id=approval_request_id,
+                )
+        elif approval_grant_id is not None:
+            self._record_block(request, "unexpected_approval_grant")
+            return ToolExecutionResult(request.request_id, "denied", decision)
 
         # Policy and attempt authority are rechecked immediately before the
         # one-use capability is consumed and the process is launched.
@@ -245,9 +316,68 @@ class ToolGateway:
         if not self._attempt_is_current(request):
             self._record_block(request, "attempt_not_current_before_launch")
             raise PermissionError("attempt is not current")
-        self._consume_grant_and_start(request, request_hash, decision, state)
+        consumed_approval: ConsumedApproval | None = None
+        approval_attempt: ExecutionAttempt | None = None
+        if approval_grant_id is None:
+            self._consume_grant_and_start(request, request_hash, decision, state)
+        else:
+            assert self._approval_service is not None
+            assert self._approval_isolation_profile_hash is not None
+            try:
+                approval_request = self._approval_service.request_for_grant(approval_grant_id)
+                intent = self._approval_effect_intent(request, approval_request.approval_request_id)
+                if (
+                    approval_request.run_id != request.run_id
+                    or approval_request.node_id != request.node_id
+                    or approval_request.tool_id != READ_ONLY_COMMAND_TOOL_ID
+                    or approval_request.action_category != decision.request.action_category
+                    or approval_request.target_hash != intent.target_hash
+                    or approval_request.parameters_hash != intent.parameters_hash
+                    or approval_request.effect_intent_hash != intent.content_hash
+                    or approval_request.policy_manifest_hash != self._manifest.content_hash
+                    or approval_request.revocation_version != state.revocation_version
+                    or approval_request.emergency_deny_version != state.emergency_deny_version
+                ):
+                    raise ApprovalInvalid("approval scope does not match this exact tool request")
+                approval_attempt = ExecutionAttempt(
+                    run_id=request.run_id,
+                    node_id=request.node_id,
+                    attempt_id=request.attempt_id,
+                    fencing_generation=request.fencing_generation,
+                    isolation_profile_hash=self._approval_isolation_profile_hash,
+                )
+                self._approval_service.bind_to_attempt(approval_grant_id, approval_attempt)
+                consumed_approval = self._approval_service.consume_and_intend(
+                    approval_grant_id,
+                    approval_attempt,
+                    intent,
+                    CostEstimate(
+                        amount_minor=0,
+                        currency=self._approval_service.budget_currency_for_run(request.run_id),
+                        token_limit=None,
+                        tool_fee_minor=0,
+                        snapshot_id="tool-readonly-v1",
+                    ),
+                )
+                self._consume_approved_and_start(
+                    request,
+                    request_hash,
+                    decision,
+                    state,
+                    consumed_approval,
+                )
+            except ApprovalError:
+                self._record_block(request, "approval_grant_invalid")
+                return ToolExecutionResult(request.request_id, "denied", decision)
 
         if not self._authorized_now(request, state):
+            if consumed_approval is not None and approval_attempt is not None:
+                self._record_approval_receipt(
+                    consumed_approval,
+                    approval_attempt,
+                    outcome="not_applied",
+                    receipt_hash=_digest(b"authority-lost-before-launch"),
+                )
             self._record_terminal(
                 request,
                 "ToolExecutionCancelled",
@@ -263,7 +393,12 @@ class ToolGateway:
                 expected_workspace_identity_hash=self._workspace_identity_hash,
             )
         except Exception as exc:
-            self._record_terminal(request, "ToolExecutionFailed", {"reason": "launcher_unavailable"})
+            terminal = (
+                "ToolExecutionOutcomeUnknown"
+                if consumed_approval is not None
+                else "ToolExecutionFailed"
+            )
+            self._record_terminal(request, terminal, {"reason": "launcher_unavailable"})
             raise
 
         try:
@@ -289,6 +424,22 @@ class ToolGateway:
         else:
             outcome = "completed"
             terminal_type = "ToolExecutionCompleted"
+        if consumed_approval is not None and approval_attempt is not None and result.termination_confirmed:
+            try:
+                receipt_hash = _digest(json.dumps(
+                    _result_audit_payload(request, result, outcome),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"))
+                self._record_approval_receipt(
+                    consumed_approval,
+                    approval_attempt,
+                    outcome="applied",
+                    receipt_hash=receipt_hash,
+                )
+            except Exception:
+                outcome = "execution_unknown"
+                terminal_type = "ToolExecutionOutcomeUnknown"
         self._record_terminal(request, terminal_type, _result_audit_payload(request, result, outcome))
         output_authorized = outcome == "completed"
         return ToolExecutionResult(
@@ -381,7 +532,7 @@ class ToolGateway:
                         **context,
                     )
                 )
-            elif decision.outcome == "needs_approval":
+            elif decision.outcome == "needs_approval" and self._approval_service is None:
                 drafts.append(
                     EventDraft(
                         "ApprovalRequested",
@@ -402,6 +553,203 @@ class ToolGateway:
             raise ToolAuditUnavailable("tool request and policy decision were not durably audited") from exc
         if seen:
             raise ToolRequestAlreadyUsed("tool request id already exists; execution is never replayed implicitly")
+
+    def _create_approval_request(
+        self,
+        request: ToolRequest,
+        decision: PolicyDecision,
+        state: PolicyState,
+    ) -> str:
+        assert self._approval_service is not None
+        assert self._approval_requester is not None
+        if not self._attempt_is_current(request) or self._read_policy_state(request) != state:
+            raise ApprovalInvalid("attempt authority or policy changed before approval request creation")
+        approval_request_id = _approval_request_id(request)
+        intent = self._approval_effect_intent(request, approval_request_id)
+        now = self._approval_now()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("approval clock must return an aware datetime")
+        approved_request = ApprovalRequest(
+            approval_request_id=approval_request_id,
+            run_id=request.run_id,
+            node_id=request.node_id,
+            requester_id=self._approval_requester(request),
+            origin_attempt_id=request.attempt_id,
+            origin_fencing_generation=request.fencing_generation,
+            causation_id=request.causation_id,
+            action_category=decision.request.action_category,
+            tool_id=READ_ONLY_COMMAND_TOOL_ID,
+            target_hash=intent.target_hash,
+            parameters_hash=intent.parameters_hash,
+            effect_intent_hash=intent.content_hash,
+            policy_manifest_hash=self._manifest.content_hash,
+            revocation_version=state.revocation_version,
+            emergency_deny_version=state.emergency_deny_version,
+            expires_at=now.astimezone(timezone.utc) + self._approval_ttl,
+        )
+        self._approval_service.create_request(approved_request)
+        return approval_request_id
+
+    def _approval_effect_intent(
+        self,
+        request: ToolRequest,
+        approval_request_id: str,
+    ) -> EffectIntentSpec:
+        assert self._approval_isolation_profile_hash is not None
+        limits = {
+            name: getattr(self._limits, name)
+            for name in (
+                "memory_bytes", "tasks", "cpu_percent", "timeout_seconds",
+                "output_bytes", "nofile", "file_bytes",
+            )
+        }
+        target_hash = _hash_json({
+            "tool_id": READ_ONLY_COMMAND_TOOL_ID,
+            "workspace_identity_hash": self._workspace_identity_hash,
+        })
+        parameters_hash = _hash_json({
+            "command": request.command,
+            "role": request.role,
+            "limits": limits,
+            "policy_manifest_hash": self._manifest.content_hash,
+            "isolation_profile_hash": self._approval_isolation_profile_hash,
+        })
+        effect_id = "tool-effect:" + hashlib.sha256(approval_request_id.encode("utf-8")).hexdigest()[:32]
+        return EffectIntentSpec(
+            effect_id=effect_id,
+            target_hash=target_hash,
+            parameters_hash=parameters_hash,
+            provider_idempotency_key=None,
+            maximum_cost_minor=0,
+            recovery_class="manual_only",
+        )
+
+    def _consume_approved_and_start(
+        self,
+        request: ToolRequest,
+        request_hash: str,
+        decision: PolicyDecision,
+        state: PolicyState,
+        consumed: ConsumedApproval,
+    ) -> None:
+        if decision.outcome != "needs_approval":
+            raise ToolAuditUnavailable("approval grant is not attached to an approval-required action")
+        budget_events = self._events.read_stream("budget", request.run_id)
+        intent_event = next(
+            (event for event in budget_events if event.event_id == consumed.intent_event_id),
+            None,
+        )
+        consumed_event = next(
+            (event for event in budget_events if event.event_id == consumed.consumed_event_id),
+            None,
+        )
+        reservation_event = next(
+            (
+                event for event in budget_events
+                if event.event_type == "BudgetReserved"
+                and event.payload.get("reservation_id") == consumed.reservation.reservation_id
+            ),
+            None,
+        )
+        if (
+            intent_event is None
+            or consumed_event is None
+            or reservation_event is None
+            or intent_event.event_type != "EffectIntentRecorded"
+            or consumed_event.event_type != "ApprovalGrantConsumed"
+            or intent_event.payload.get("approval_grant_id") != consumed.approval_grant_id
+            or consumed_event.payload.get("approval_grant_id") != consumed.approval_grant_id
+            or intent_event.payload.get("effect_id") != consumed.effect_id
+            or consumed_event.payload.get("effect_id") != consumed.effect_id
+            or any(
+                event.run_id != request.run_id
+                or event.node_id != request.node_id
+                or event.attempt_id != request.attempt_id
+                or event.fencing_generation != request.fencing_generation
+                for event in (intent_event, consumed_event, reservation_event)
+            )
+        ):
+            raise ToolAuditUnavailable("ApprovalService did not persist a matching attempt-bound intent")
+
+        seen = False
+
+        def decide(events: list[StoredEvent], _version: int) -> Sequence[EventDraft] | None:
+            nonlocal seen
+            if not self._attempt_is_current(request):
+                raise _AuthorizationLost("attempt_not_current_in_approval_transaction")
+            try:
+                current = self._read_policy_state(request)
+            except Exception as exc:
+                raise _AuthorizationLost("policy_state_unavailable_in_approval_transaction") from exc
+            if current != state:
+                raise _AuthorizationLost("policy_state_changed_in_approval_transaction")
+            scoped = [event for event in events if event.payload.get("request_id") == request.request_id]
+            if any(
+                event.event_type in {
+                    "ToolApprovalConsumed", "ToolExecutionStarted", "ToolExecutionCompleted",
+                    "ToolExecutionCancelled", "ToolExecutionFailed", "ToolExecutionOutcomeUnknown",
+                }
+                for event in scoped
+            ):
+                seen = True
+                return None
+            context = _event_context(request, consumed.consumed_event_id)
+            return [
+                EventDraft(
+                    "ToolApprovalConsumed",
+                    {
+                        "request_id": request.request_id,
+                        "approval_request_id": consumed.approval_request_id,
+                        "approval_grant_id": consumed.approval_grant_id,
+                        "effect_id": consumed.effect_id,
+                        "effect_intent_event_id": consumed.intent_event_id,
+                        "approval_consumed_event_id": consumed.consumed_event_id,
+                        "budget_reservation_id": consumed.reservation.reservation_id,
+                        "request_hash": request_hash,
+                    },
+                    **context,
+                ),
+                EventDraft(
+                    "ToolExecutionStarted",
+                    {
+                        "request_id": request.request_id,
+                        "request_hash": request_hash,
+                        "policy_decision_hash": decision.decision_hash,
+                        "approval_grant_id": consumed.approval_grant_id,
+                        "effect_intent_event_id": consumed.intent_event_id,
+                    },
+                    **_event_context(request, consumed.intent_event_id),
+                ),
+            ]
+
+        try:
+            self._events.append_checked(
+                "security", request.run_id, f"tool-approval-start:{request.request_id}", decide
+            )
+        except _AuthorizationLost as exc:
+            self._record_block(request, exc.reason)
+            raise PermissionError("approval-bound tool authority changed before start") from exc
+        except Exception as exc:
+            raise ToolAuditUnavailable("approval-bound tool start could not be durably recorded") from exc
+        if seen:
+            raise ToolRequestAlreadyUsed("approval-bound tool request has already started")
+
+    def _record_approval_receipt(
+        self,
+        consumed: ConsumedApproval,
+        attempt: ExecutionAttempt,
+        *,
+        outcome: Literal["applied", "not_applied"],
+        receipt_hash: str,
+    ) -> None:
+        if self._approval_service is None:
+            raise ToolAuditUnavailable("ApprovalService is unavailable for effect receipt")
+        self._approval_service.record_effect_receipt(
+            consumed,
+            attempt,
+            outcome=outcome,
+            receipt_hash=receipt_hash,
+        )
 
     def _consume_grant_and_start(
         self,
@@ -627,6 +975,15 @@ def _event_context(request: ToolRequest, causation_id: str) -> dict[str, Any]:
 def _grant_id(request_id: str) -> str:
     digest = hashlib.sha256(request_id.encode()).hexdigest()[:32]
     return f"tool-grant:{digest}"
+
+
+def _approval_request_id(request: ToolRequest) -> str:
+    encoded = f"{request.run_id}\0{request.request_id}".encode("utf-8")
+    return "tool-approval:" + hashlib.sha256(encoded).hexdigest()[:32]
+
+
+def _hash_json(value: object) -> str:
+    return _digest(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
 def _digest(value: bytes) -> str:

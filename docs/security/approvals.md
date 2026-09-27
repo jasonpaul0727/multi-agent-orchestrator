@@ -1,8 +1,8 @@
 # ApprovalService 当前边界
 
-更新时间：2026-09-23
+更新时间：2026-09-26
 
-`orchestrator.approvals.ApprovalService` 是 P4 的内部控制面原语，不是已集成的用户审批功能。它以共享 `SQLiteEventStore` 作为安全事件与预算账本的单一事务边界，记录 hash-scoped 请求、审批/拒绝/撤销、grant 到新 attempt 的一次性绑定，以及外部 effect 的意图、授权消费、预算预留和结果回执。
+`orchestrator.approvals.ApprovalService` 是 P4 的内部控制面原语。2026-09-26 起，它通过 `ToolGateway` 接入仓库现有的**固定只读命令**路径：Gateway 可生成精确审批请求，批准后只能由新的 Attempt 绑定并消费 grant，最后写入 EffectReceipt。它仍不是已集成的用户审批产品：请求者身份、认证器、可信 attempt/profile 和 CLI/MCP/UI 都由 host/application 层提供。
 
 ## 已实现并由测试覆盖
 
@@ -12,15 +12,17 @@
 - 单次消费把 `EffectIntentRecorded`、`ApprovalGrantConsumed` 与 `BudgetReserved` 通过一个共享 SQLite 事务原子追加；重复/并发消费至多有一方成功。估算不得超过审批上限，EffectIntent 的完整内容哈希必须匹配。
 - 过期、Policy 版本变化、撤销、失败的 attempt authority、缺失的因果/attempt 上下文均 fail-closed。结果回执绑定到已消费的 effect/attempt，完全相同的回执幂等；不同结果拒绝覆盖。
 - 持久化只写审批理由哈希和 Provider idempotency key 哈希；测试断言这些原始值不出现在事件内容中。
+- ToolGateway 只在 ApprovalService 与自己共享同一个 SQLite event store、且 host 提供认证请求者和 profile hash 时启用接线。审批 scope 哈希绑定固定只读工具、workspace identity、命令参数、运行限制与冻结 Policy；新 Attempt 必须逐项匹配后才绑定 grant。grant 消费、effect intent、零费用预算预留、Gateway start 和终态 receipt 均有集成测试。
+- 这条垂直路径仅适用于 `system.readonly-command`，不是 workspace-write/发布/外部 Provider 的审批接线。调用者需另行通过已认证审批 API批准，并为相同 scope 调度新的已接受 Attempt；Gateway 不恢复旧 Attempt。
 
 ## 尚未实现（不能据此宣称安全审批闭环）
 
 - 未配置真实身份提供方、密钥存储、角色目录、MFA 或用户界面。传入的 authenticator 是可信系统边界；接入方必须自行保证不可伪造且能区分调用者。
-- 请求创建仍是内部 API：尚未验证请求者对来源 attempt、目标或参数的权限，也没有与 Policy Engine/ToolGateway 自动生成待审批项的接线。
-- `ApprovalService` 尚未被 `ToolGateway` 或 Worker 消费；没有 Gateway 侧批准后安全恢复/重新调度流程。它不恢复旧 `RoutingDecision` 或旧 attempt，也不执行任何 effect。
+- 请求创建仍是内部 API：Gateway 的只读命令适配器会从注入的 host 身份回调取得 requester，但请求者对来源 attempt、目标或参数的产品级权限仍要由真实身份/Authority Envelope 校验。
+- 尚未被 Worker/Scheduler application service 消费；CLI/MCP 入口、批准后的通知/队列/自动生成新 Attempt 流程仍缺。Gateway 只接受 host 显式传入 grant 与新的当前 Attempt，不恢复旧 `RoutingDecision` 或旧 attempt。
 - 尚未集成 Secret Broker、workspace-write/Overlay、CLI/MCP `Authority Envelope`、通知/审批队列或产品级审计查看器。
 - SQLite 本地事件事务不是跨主机一致性协议；此实现不构成分布式授权服务或多租户身份系统。
 
 ## 本地验证
 
-运行 `pytest tests/unit/approvals/test_service.py tests/unit/budget/test_ledger.py tests/contract/test_cross_spec_events.py -q`。该测试证明内部事件/账本契约和并发单次消费性质，不证明真实身份验证、Worker 隔离、外部 Provider 副作用、跨进程恢复或端到端 UI 流程。
+运行 `pytest tests/unit/approvals/test_service.py tests/unit/budget/test_ledger.py tests/unit/tools/test_gateway.py tests/integration/test_approval_tool_gateway.py tests/contract/test_cross_spec_events.py -q`。这些测试覆盖内部事件/账本契约、并发单次消费，以及固定只读命令的 ApprovalService→ToolGateway 路径；不证明真实身份验证、Worker 隔离、workspace-write/外部 Provider 副作用、跨进程恢复或端到端 UI 流程。

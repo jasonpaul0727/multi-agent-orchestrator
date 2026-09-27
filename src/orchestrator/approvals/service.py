@@ -211,6 +211,19 @@ class ApprovalService:
         self._policy_state = policy_state
         self._now = now or (lambda: datetime.now(timezone.utc))
 
+    def uses_event_store(self, event_store: SQLiteEventStore) -> bool:
+        """Report whether this service shares the exact transactional store."""
+        return self._events is event_store
+
+    def request_for_grant(self, approval_grant_id: str) -> ApprovalRequest:
+        """Return the immutable approved request scope for a known grant."""
+        _run_id, request, _grant = self._load_grant(approval_grant_id)
+        return request
+
+    def budget_currency_for_run(self, run_id: str) -> str:
+        """Return the authoritative budget currency for a Run's zero-cost effects."""
+        return self._budget.currency_for_run(run_id)
+
     def create_request(self, request: ApprovalRequest) -> str:
         """Durably add an exact request; request IDs are immutable/idempotent."""
 
