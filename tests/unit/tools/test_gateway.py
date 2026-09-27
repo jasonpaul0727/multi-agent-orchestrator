@@ -93,6 +93,7 @@ def _gateway(
     store: SQLiteEventStore,
     launcher: _Launcher,
     *,
+    workspace: Path,
     allow: bool = True,
     approval: bool = False,
     authority: _Authority | None = None,
@@ -100,6 +101,7 @@ def _gateway(
 ) -> ToolGateway:
     return ToolGateway(
         run_id="run-1",
+        workspace=workspace,
         event_store=store,
         policy_manifest=_manifest(allow=allow, approval=approval),
         attempt_authority=authority or _Authority(),
@@ -112,7 +114,7 @@ def _gateway(
 def test_allowed_read_only_request_is_audited_without_raw_command_or_output(tmp_path: Path) -> None:
     store = SQLiteEventStore(tmp_path / "events.db")
     launcher = _Launcher()
-    result = _gateway(store, launcher).execute(_request(tmp_path))
+    result = _gateway(store, launcher, workspace=tmp_path).execute(_request(tmp_path))
 
     assert result.outcome == "completed"
     assert result.stdout == b"private output"
@@ -141,7 +143,7 @@ def test_policy_deny_never_launches_and_is_audited(tmp_path: Path) -> None:
     store = SQLiteEventStore(tmp_path / "events.db")
     launcher = _Launcher()
 
-    result = _gateway(store, launcher, allow=False).execute(_request(tmp_path))
+    result = _gateway(store, launcher, workspace=tmp_path, allow=False).execute(_request(tmp_path))
 
     assert result.outcome == "denied"
     assert launcher.calls == []
@@ -154,7 +156,7 @@ def test_approval_required_is_not_treated_as_permission_to_execute(tmp_path: Pat
     store = SQLiteEventStore(tmp_path / "events.db")
     launcher = _Launcher()
 
-    result = _gateway(store, launcher, approval=True).execute(_request(tmp_path))
+    result = _gateway(store, launcher, workspace=tmp_path, approval=True).execute(_request(tmp_path))
 
     assert result.outcome == "awaiting_approval"
     assert launcher.calls == []
@@ -172,7 +174,7 @@ def test_stale_attempt_fails_closed_before_grant_or_launch(tmp_path: Path) -> No
     authority = _Authority(valid=False)
 
     with pytest.raises(PermissionError, match="not current"):
-        _gateway(store, launcher, authority=authority).execute(_request(tmp_path))
+        _gateway(store, launcher, workspace=tmp_path, authority=authority).execute(_request(tmp_path))
 
     assert launcher.calls == []
     events = store.read_stream("security", "run-1")
@@ -180,12 +182,36 @@ def test_stale_attempt_fails_closed_before_grant_or_launch(tmp_path: Path) -> No
     assert events[0].payload["reason"] == "attempt_not_current"
 
 
+def test_gateway_rejects_worker_selected_workspace_before_launch(tmp_path: Path) -> None:
+    bound = tmp_path / "bound-workspace"
+    bound.mkdir()
+    other = tmp_path / "other-directory"
+    other.mkdir()
+    store = SQLiteEventStore(tmp_path / "events.db")
+    launcher = _Launcher()
+
+    with pytest.raises(PermissionError, match="trusted Run workspace"):
+        _gateway(store, launcher, workspace=bound).execute(_request(other))
+
+    assert launcher.calls == []
+    events = store.read_stream("security", "run-1")
+    assert [event.event_type for event in events] == ["ToolExecutionBlocked"]
+    assert events[0].payload["reason"] == "workspace_not_bound"
+    assert str(other) not in repr(events[0].payload)
+
+
+def test_gateway_rejects_filesystem_root_as_trusted_workspace(tmp_path: Path) -> None:
+    store = SQLiteEventStore(tmp_path / "events.db")
+    with pytest.raises(ValueError, match="filesystem root"):
+        _gateway(store, _Launcher(), workspace=Path(tmp_path.anchor))
+
+
 def test_gateway_is_bound_to_one_run_snapshot(tmp_path: Path) -> None:
     store = SQLiteEventStore(tmp_path / "events.db")
     launcher = _Launcher()
 
     with pytest.raises(PermissionError, match="does not belong"):
-        _gateway(store, launcher).execute(_request(tmp_path, request_id="tool-2").model_copy(update={"run_id": "run-2"}))
+        _gateway(store, launcher, workspace=tmp_path).execute(_request(tmp_path, request_id="tool-2").model_copy(update={"run_id": "run-2"}))
 
     assert launcher.calls == []
     assert store.stream_ids("security") == []
@@ -199,7 +225,7 @@ def test_policy_state_provider_failure_fails_closed_and_is_audited(tmp_path: Pat
         raise OSError("policy projection unavailable")
 
     with pytest.raises(PermissionError, match="policy state"):
-        _gateway(store, launcher, policy_state=unavailable).execute(_request(tmp_path))
+        _gateway(store, launcher, workspace=tmp_path, policy_state=unavailable).execute(_request(tmp_path))
 
     assert launcher.calls == []
     events = store.read_stream("security", "run-1")
@@ -213,7 +239,7 @@ def test_policy_version_change_before_launch_fails_closed(tmp_path: Path) -> Non
     states = iter((PolicyState(1, 4), PolicyState(2, 4)))
 
     with pytest.raises(PermissionError, match="changed"):
-        _gateway(store, launcher, policy_state=lambda request: next(states)).execute(_request(tmp_path))
+        _gateway(store, launcher, workspace=tmp_path, policy_state=lambda request: next(states)).execute(_request(tmp_path))
 
     assert launcher.calls == []
     events = store.read_stream("security", "run-1")
@@ -221,10 +247,51 @@ def test_policy_version_change_before_launch_fails_closed(tmp_path: Path) -> Non
     assert events[-1].payload["reason"] == "policy_state_changed"
 
 
+def test_authority_change_inside_capability_transaction_does_not_consume(tmp_path: Path) -> None:
+    store = SQLiteEventStore(tmp_path / "events.db")
+    launcher = _Launcher()
+    calls = 0
+
+    class ChangingAuthority:
+        def is_current(self, request: ToolRequest) -> bool:
+            nonlocal calls
+            calls += 1
+            return calls <= 2
+
+    with pytest.raises(PermissionError, match="capability consumption"):
+        _gateway(store, launcher, workspace=tmp_path, authority=ChangingAuthority()).execute(_request(tmp_path))
+
+    assert launcher.calls == []
+    events = store.read_stream("security", "run-1")
+    assert events[-1].event_type == "ToolExecutionBlocked"
+    assert events[-1].payload["reason"] == "attempt_not_current_in_transaction"
+    assert not any(event.event_type == "ToolCapabilityConsumed" for event in events)
+
+
+def test_authority_change_after_capability_consumption_still_blocks_launch(tmp_path: Path) -> None:
+    store = SQLiteEventStore(tmp_path / "events.db")
+    launcher = _Launcher()
+    calls = 0
+
+    class ChangingAuthority:
+        def is_current(self, request: ToolRequest) -> bool:
+            nonlocal calls
+            calls += 1
+            return calls <= 3
+
+    with pytest.raises(PermissionError, match="before isolated launch"):
+        _gateway(store, launcher, workspace=tmp_path, authority=ChangingAuthority()).execute(_request(tmp_path))
+
+    assert launcher.calls == []
+    events = store.read_stream("security", "run-1")
+    assert events[-1].event_type == "ToolExecutionCancelled"
+    assert events[-1].payload["reason"] == "authority_lost_before_launch"
+
+
 def test_request_id_cannot_replay_a_previously_started_tool(tmp_path: Path) -> None:
     store = SQLiteEventStore(tmp_path / "events.db")
     launcher = _Launcher()
-    gateway = _gateway(store, launcher)
+    gateway = _gateway(store, launcher, workspace=tmp_path)
     request = _request(tmp_path)
     gateway.execute(request)
 
@@ -242,6 +309,7 @@ def test_request_audit_failure_prevents_launch(tmp_path: Path) -> None:
     launcher = _Launcher()
     gateway = ToolGateway(
         run_id="run-1",
+        workspace=tmp_path,
         event_store=BrokenStore(),
         policy_manifest=_manifest(),
         attempt_authority=_Authority(),
@@ -287,14 +355,14 @@ def test_authority_loss_during_execution_cancels_and_discards_success_status(tmp
             self.session = BlockingSession()
 
     authority = _Authority()
-    # The first two authority checks admit the request; the live monitor then
-    # observes revocation and cancels the session while its wait is in flight.
+    # Initial, pre-launch, transaction, and immediate post-transaction checks
+    # admit the request. The live monitor then observes revocation.
     calls = 0
 
     def check(request: ToolRequest) -> bool:
         nonlocal calls
         calls += 1
-        return calls <= 2
+        return calls <= 4
 
     class ChangingAuthority:
         def is_current(self, request: ToolRequest) -> bool:
@@ -302,7 +370,7 @@ def test_authority_loss_during_execution_cancels_and_discards_success_status(tmp
 
     store = SQLiteEventStore(tmp_path / "events.db")
     launcher = BlockingLauncher()
-    result = _gateway(store, launcher, authority=ChangingAuthority()).execute(_request(tmp_path))
+    result = _gateway(store, launcher, workspace=tmp_path, authority=ChangingAuthority()).execute(_request(tmp_path))
 
     assert result.outcome == "authority_lost"
     assert launcher.session.cancelled
@@ -334,7 +402,7 @@ def test_unconfirmed_termination_is_recorded_unknown_and_output_is_discarded(tmp
 
     store = SQLiteEventStore(tmp_path / "events.db")
     launcher = UnconfirmedLauncher()
-    result = _gateway(store, launcher).execute(_request(tmp_path))
+    result = _gateway(store, launcher, workspace=tmp_path).execute(_request(tmp_path))
 
     assert result.outcome == "execution_unknown"
     assert result.stdout == b""
@@ -360,7 +428,7 @@ def test_session_wait_exception_is_audited_and_requests_cancellation(tmp_path: P
     store = SQLiteEventStore(tmp_path / "events.db")
     launcher = BrokenLauncher()
     with pytest.raises(OSError, match="wait channel broke"):
-        _gateway(store, launcher).execute(_request(tmp_path))
+        _gateway(store, launcher, workspace=tmp_path).execute(_request(tmp_path))
 
     assert launcher.session.cancelled
     events = store.read_stream("security", "run-1")
@@ -376,6 +444,7 @@ def test_launcher_failure_is_terminally_audited(tmp_path: Path) -> None:
     store = SQLiteEventStore(tmp_path / "events.db")
     gateway = ToolGateway(
         run_id="run-1",
+        workspace=tmp_path,
         event_store=store,
         policy_manifest=_manifest(),
         attempt_authority=_Authority(),

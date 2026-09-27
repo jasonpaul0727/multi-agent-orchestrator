@@ -11,6 +11,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Callable
+from urllib.parse import quote
 
 from orchestrator.identifiers import new_id
 
@@ -436,6 +437,32 @@ class SQLiteEventStore:
         self._connection = _open_connection(path)
         initialize_schema(self._connection)
 
+    @classmethod
+    def open_read_only(cls, path: str | Path) -> "SQLiteEventStore":
+        """Open an existing store without schema writes or a writer lock.
+
+        Independent watcher threads can use this while another connection
+        holds a Tool Gateway write transaction. SQLite still validates every
+        decoded event through the normal read methods.
+        """
+
+        database = Path(path)
+        if not database.is_absolute() or not database.is_file() or database.is_symlink():
+            raise ValueError("read-only event store requires an existing absolute regular file")
+        uri = "file:" + quote(str(database), safe="/") + "?mode=ro"
+        connection = sqlite3.connect(
+            uri, uri=True, timeout=5.0, isolation_level=None, check_same_thread=True,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 5000")
+            instance = cls.__new__(cls)
+            instance._connection = connection
+            return instance
+        except BaseException:
+            connection.close()
+            raise
+
     def append(
         self,
         stream_type: str,
@@ -721,6 +748,50 @@ class SQLiteEventStore:
             (stream_type, stream_id, after_version),
         ).fetchall()
         return [self._row_to_event(row) for row in rows]
+
+    def read_streams_consistent(
+        self,
+        streams: Iterable[tuple[str, str]],
+    ) -> dict[tuple[str, str], list[StoredEvent]]:
+        """Read several streams from one SQLite snapshot.
+
+        Security decisions that join lifecycle, scheduler, and agent state
+        must not combine events from different committed instants. The
+        transaction also keeps nested calls safe when a trusted caller is
+        already holding a write transaction on this store instance.
+        """
+
+        keys = tuple(streams)
+        if not keys or len(keys) != len(set(keys)):
+            raise ValueError("streams must be a non-empty set of unique stream keys")
+        for key in keys:
+            if not isinstance(key, tuple) or len(key) != 2:
+                raise ValueError("each stream key must contain type and id")
+            _validate_identifier(key[0], "stream_type")
+            _validate_identifier(key[1], "stream_id")
+        connection = self._connection
+        started_transaction = not connection.in_transaction
+        savepoint = "orchestrator_multi_stream_read"
+        if started_transaction:
+            connection.execute("BEGIN")
+        else:
+            connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            result = {key: self.read_stream(*key) for key in keys}
+            if started_transaction:
+                connection.commit()
+            else:
+                connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return result
+        except BaseException:
+            if started_transaction:
+                connection.rollback()
+            else:
+                try:
+                    connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                finally:
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
 
     def read_stream_with_version(
         self,

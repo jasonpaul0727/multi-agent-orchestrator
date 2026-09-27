@@ -148,6 +148,12 @@ class ToolRequestAlreadyUsed(RuntimeError):
     """The request id already reserved or completed an execution attempt."""
 
 
+class _AuthorizationLost(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class ToolGateway:
     """A single, policy-constrained command tool using read-only isolation.
 
@@ -161,6 +167,7 @@ class ToolGateway:
         self,
         *,
         run_id: str,
+        workspace: str | Path,
         event_store: _EventStore,
         policy_manifest: PolicyManifest,
         attempt_authority: AttemptAuthority,
@@ -171,9 +178,21 @@ class ToolGateway:
     ) -> None:
         if not isinstance(run_id, str) or re.fullmatch(_SAFE_IDENTIFIER, run_id) is None:
             raise ValueError("run_id must be a stable non-blank identifier")
+        if not isinstance(workspace, (str, Path)):
+            raise TypeError("workspace must be a trusted absolute directory")
+        workspace_path = Path(workspace)
+        if not workspace_path.is_absolute() or not workspace_path.is_dir():
+            raise ValueError("workspace must be a trusted existing absolute directory")
+        try:
+            canonical_workspace = workspace_path.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError("workspace could not be resolved") from exc
+        if canonical_workspace == Path(canonical_workspace.anchor):
+            raise ValueError("workspace must not be a filesystem root")
         if monitor_interval_seconds < 0.01 or monitor_interval_seconds > 1:
             raise ValueError("monitor interval must be between 10 ms and 1 s")
         self._run_id = run_id
+        self._workspace = canonical_workspace
         self._events = event_store
         self._manifest = policy_manifest
         self._attempt_authority = attempt_authority
@@ -190,6 +209,9 @@ class ToolGateway:
             request = ToolRequest.model_validate(request)
         if request.run_id != self._run_id:
             raise PermissionError("tool request does not belong to this Run snapshot")
+        if request.workspace != str(self._workspace):
+            self._record_block(request, "workspace_not_bound")
+            raise PermissionError("tool request workspace is not the trusted Run workspace")
         if not self._attempt_is_current(request):
             self._record_block(request, "attempt_not_current")
             raise PermissionError("attempt is not current")
@@ -221,11 +243,19 @@ class ToolGateway:
         if not self._attempt_is_current(request):
             self._record_block(request, "attempt_not_current_before_launch")
             raise PermissionError("attempt is not current")
-        self._consume_grant_and_start(request, request_hash, decision)
+        self._consume_grant_and_start(request, request_hash, decision, state)
+
+        if not self._authorized_now(request, state):
+            self._record_terminal(
+                request,
+                "ToolExecutionCancelled",
+                {"outcome": "authority_lost", "reason": "authority_lost_before_launch"},
+            )
+            raise PermissionError("attempt authority changed before isolated launch")
 
         try:
             session: _Session = self._launcher.launch(
-                request.workspace,
+                str(self._workspace),
                 request.command,
                 limits=self._limits,
             )
@@ -370,11 +400,28 @@ class ToolGateway:
         if seen:
             raise ToolRequestAlreadyUsed("tool request id already exists; execution is never replayed implicitly")
 
-    def _consume_grant_and_start(self, request: ToolRequest, request_hash: str, decision: PolicyDecision) -> None:
+    def _consume_grant_and_start(
+        self,
+        request: ToolRequest,
+        request_hash: str,
+        decision: PolicyDecision,
+        state: PolicyState,
+    ) -> None:
         seen = False
 
         def decide(events: list[StoredEvent], version: int) -> Sequence[EventDraft] | None:
             nonlocal seen
+            # The security append holds SQLite's write transaction. A Run
+            # cancellation/revocation cannot commit between this check and
+            # the capability consumption that follows.
+            if not self._attempt_is_current(request):
+                raise _AuthorizationLost("attempt_not_current_in_transaction")
+            try:
+                current = self._read_policy_state(request)
+            except Exception as exc:
+                raise _AuthorizationLost("policy_state_unavailable_in_transaction") from exc
+            if current != state:
+                raise _AuthorizationLost("policy_state_changed_in_transaction")
             scoped = [event for event in events if event.payload.get("request_id") == request.request_id]
             grants = [event for event in scoped if event.event_type == "CapabilityGrant"]
             starts = [event for event in scoped if event.event_type == "ToolExecutionStarted"]
@@ -428,6 +475,9 @@ class ToolGateway:
 
         try:
             self._events.append_checked("security", request.run_id, f"tool-start:{request.request_id}", decide)
+        except _AuthorizationLost as exc:
+            self._record_block(request, exc.reason)
+            raise PermissionError("tool authority changed before capability consumption") from exc
         except Exception as exc:
             raise ToolAuditUnavailable("one-use capability could not be durably consumed") from exc
         if seen:

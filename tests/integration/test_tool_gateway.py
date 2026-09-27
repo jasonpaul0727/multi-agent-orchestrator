@@ -78,6 +78,7 @@ def test_gateway_executes_only_after_policy_and_real_isolation(tmp_path: Path) -
     )
     gateway = ToolGateway(
         run_id=request.run_id,
+        workspace=workspace,
         event_store=events,
         policy_manifest=manifest,
         attempt_authority=_CurrentAttempt(),
