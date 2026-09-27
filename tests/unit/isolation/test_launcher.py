@@ -16,6 +16,7 @@ from orchestrator.isolation.launcher import (
     SystemdReadOnlyLauncher,
     _systemd_path_supported,
     _create_staging,
+    _expand_runtime_paths,
     _validate_command,
     _validated_workspace,
 )
@@ -45,6 +46,17 @@ def test_commands_reject_ambiguous_or_invalid_arguments(command) -> None:
         _validate_command(command)
 
 
+@pytest.mark.parametrize("payload", ["not-bytes", bytearray(b"bytes"), b"x" * 1_048_577])
+def test_launcher_rejects_invalid_stdin_before_start(monkeypatch, tmp_path: Path, payload) -> None:
+    import orchestrator.isolation.launcher as module
+
+    monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    with pytest.raises(InvalidSandboxRequest, match="stdin payload"):
+        SystemdReadOnlyLauncher(systemd_run="systemd-run", systemctl="systemctl").launch(
+            tmp_path, ["/bin/true"], input_bytes=payload
+        )
+
+
 def test_workspace_must_be_absolute_real_and_existing(tmp_path: Path) -> None:
     with pytest.raises(InvalidSandboxRequest, match="absolute"):
         _validated_workspace(Path("relative"))
@@ -62,6 +74,21 @@ def test_systemd_property_paths_fail_closed_on_ambiguous_separators(tmp_path: Pa
     assert not _systemd_path_supported(tmp_path / "colon:name")
     with pytest.raises(InvalidSandboxRequest, match="size"):
         _validate_command(["x" * 32769])
+
+
+def test_trusted_runtime_token_resolves_only_existing_files_within_bind(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "worker.py").write_text("pass\n", encoding="utf-8")
+    target = tmp_path / "target"
+    assert _expand_runtime_paths(
+        ["/usr/bin/python3", "@maestro-runtime@/worker.py"], source, target
+    ) == ["/usr/bin/python3", str(target / "worker.py")]
+    for path in (
+        "@maestro-runtime@/missing.py", "@maestro-runtime@/../escape.py", "@maestro-runtime@/",
+    ):
+        with pytest.raises(InvalidSandboxRequest, match="runtime path"):
+            _expand_runtime_paths([path], source, target)
 
 
 def test_staging_refuses_a_workspace_that_covers_all_host_paths() -> None:
@@ -253,6 +280,130 @@ def test_cancel_acceptance_is_visible_before_collector_returns(monkeypatch) -> N
     assert cancel_results == [True]
     assert results and results[0].cancelled
     assert results[0].termination_confirmed
+
+
+def test_session_transmits_large_stdin_without_stdout_deadlock() -> None:
+    payload = b"p" * 262_144
+    process = subprocess.Popen(
+        [
+            "/usr/bin/python3", "-c",
+            "import sys; sys.stdout.buffer.write(b'x'*65536); sys.stdout.flush(); "
+            "data=sys.stdin.buffer.read(); print(len(data))",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    session = SandboxSession(
+        process=process,
+        unit_name="test-attempt.service",
+        systemctl="systemctl",
+        client_env={"PATH": "/usr/bin:/bin"},
+        output_limit=131_072,
+        timeout_seconds=10,
+        staging=tempfile.TemporaryDirectory(),
+        input_bytes=payload,
+    )
+    result = session.wait()
+    assert result.returncode == 0
+    assert result.input_written
+    assert result.stdout == b"x" * 65536 + b"262144\n"
+
+
+def test_session_marks_early_exit_as_incomplete_stdin() -> None:
+    process = subprocess.Popen(
+        ["/usr/bin/python3", "-c", "print('done')"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    session = SandboxSession(
+        process=process,
+        unit_name="test-attempt.service",
+        systemctl="systemctl",
+        client_env={"PATH": "/usr/bin:/bin"},
+        output_limit=1024,
+        timeout_seconds=10,
+        staging=tempfile.TemporaryDirectory(),
+        input_bytes=b"x" * 1_048_576,
+    )
+    result = session.wait()
+    assert result.returncode == 0
+    assert result.stdout == b"done\n"
+    assert not result.input_written
+
+
+def test_session_output_limit_stops_bounded_stdin(monkeypatch) -> None:
+    import orchestrator.isolation.launcher as module
+
+    process = subprocess.Popen(
+        ["/usr/bin/python3", "-c", "import sys,time; sys.stdout.buffer.write(b'x'*1048576); sys.stdout.flush(); time.sleep(30)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+
+    def kill_unit(*args, **kwargs):
+        process.kill()
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr(module.subprocess, "run", kill_unit)
+    session = SandboxSession(
+        process=process,
+        unit_name="test-attempt.service",
+        systemctl="systemctl",
+        client_env={"PATH": "/usr/bin:/bin"},
+        output_limit=1024,
+        timeout_seconds=10,
+        staging=tempfile.TemporaryDirectory(),
+        input_bytes=b"x" * 1_048_576,
+    )
+    result = session.wait()
+    assert result.output_limited
+    assert result.termination_confirmed
+    assert len(result.stdout) + len(result.stderr) <= 1024
+    assert not result.input_written
+
+
+def test_session_cancellation_stops_bounded_stdin(monkeypatch) -> None:
+    import orchestrator.isolation.launcher as module
+
+    process = subprocess.Popen(
+        ["/usr/bin/python3", "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+
+    def kill_unit(*args, **kwargs):
+        process.kill()
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr(module.subprocess, "run", kill_unit)
+    session = SandboxSession(
+        process=process,
+        unit_name="test-attempt.service",
+        systemctl="systemctl",
+        client_env={"PATH": "/usr/bin:/bin"},
+        output_limit=1024,
+        timeout_seconds=10,
+        staging=tempfile.TemporaryDirectory(),
+        input_bytes=b"x" * 1_048_576,
+    )
+    results = []
+    waiter = threading.Thread(target=lambda: results.append(session.wait()), daemon=True)
+    waiter.start()
+    time.sleep(0.1)
+    assert session.cancel()
+    waiter.join(timeout=3)
+    assert not waiter.is_alive()
+    assert results and results[0].cancelled
+    assert results[0].termination_confirmed
+    assert not results[0].input_written
 
 
 def test_systemd_client_environment_requires_runtime_directory(monkeypatch) -> None:

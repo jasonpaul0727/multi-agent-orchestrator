@@ -18,6 +18,10 @@ import uuid
 from .workspace import WorkspaceBoundaryError, snapshot_workspace
 
 
+_MAX_INPUT_BYTES = 1_048_576
+_RUNTIME_PATH_TOKEN = "@maestro-runtime@/"
+
+
 class IsolationUnavailable(RuntimeError):
     """The host cannot prove all required isolation controls for a launch."""
 
@@ -67,6 +71,7 @@ class SandboxResult:
     cancelled: bool
     timed_out: bool
     output_limited: bool
+    input_written: bool = True
 
 
 class SystemdReadOnlyLauncher:
@@ -87,14 +92,19 @@ class SystemdReadOnlyLauncher:
         command: Sequence[str],
         *,
         limits: SandboxLimits | None = None,
+        input_bytes: bytes | None = None,
     ) -> "SandboxSession":
-        """Start a command and return a handle supporting wait or cancellation."""
+        """Start a command with optional bounded stdin and return a cancellable handle."""
 
         if not platform.system().lower() == "linux":
             raise IsolationUnavailable("the systemd isolation backend is Linux-only")
         if not self._systemd_run or not self._systemctl:
             raise IsolationUnavailable("systemd-run and systemctl are required")
         _validate_command(command)
+        if input_bytes is not None and (
+            not isinstance(input_bytes, bytes) or len(input_bytes) > _MAX_INPUT_BYTES
+        ):
+            raise InvalidSandboxRequest("stdin payload must be at most 1 MiB of bytes")
         limits = limits or SandboxLimits()
         root = _validated_workspace(workspace)
         client_env = _systemd_client_environment()
@@ -158,6 +168,11 @@ class SystemdReadOnlyLauncher:
             f"MAESTRO_EXPECT_NOFILE={limits.nofile}",
             f"MAESTRO_EXPECT_FSIZE={limits.file_bytes}",
         )
+        try:
+            expanded_command = _expand_runtime_paths(command, runtime_source, runtime_target)
+        except InvalidSandboxRequest:
+            staging.cleanup()
+            raise
         exec_command = [
             "/usr/bin/env",
             "-i",
@@ -166,7 +181,7 @@ class SystemdReadOnlyLauncher:
             "-m",
             "orchestrator.isolation._exec",
             "--",
-            *command,
+            *expanded_command,
         ]
         systemd_command = [
             self._systemd_run,
@@ -183,7 +198,7 @@ class SystemdReadOnlyLauncher:
         try:
             process = subprocess.Popen(
                 systemd_command,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=client_env,
@@ -201,6 +216,7 @@ class SystemdReadOnlyLauncher:
             output_limit=limits.output_bytes,
             timeout_seconds=limits.timeout_seconds,
             staging=staging,
+            input_bytes=input_bytes,
         )
 
 
@@ -217,6 +233,7 @@ class SandboxSession:
         output_limit: int,
         timeout_seconds: int,
         staging: tempfile.TemporaryDirectory[str],
+        input_bytes: bytes | None = None,
     ) -> None:
         self.unit_name = unit_name
         self._process = process
@@ -225,6 +242,7 @@ class SandboxSession:
         self._output_limit = output_limit
         self._timeout_seconds = timeout_seconds
         self._staging = staging
+        self._input_bytes = input_bytes
         self._started = time.monotonic()
         self._cancel_requested = threading.Event()
         self._cancel_signal_accepted = False
@@ -283,6 +301,14 @@ class SandboxSession:
         for stream in streams:
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ)
+        input_stream = self._process.stdin if self._input_bytes is not None else None
+        input_offset = 0
+        if input_stream is not None:
+            if self._input_bytes:
+                os.set_blocking(input_stream.fileno(), False)
+                selector.register(input_stream, selectors.EVENT_WRITE)
+            else:
+                input_stream.close()
         cancelled = False
         timed_out = False
         output_limited = False
@@ -298,8 +324,28 @@ class SandboxSession:
                 if (cancelled or timed_out or output_limited) and now >= next_kill_retry:
                     self.cancel()
                     next_kill_retry = now + 1
+                if input_stream is not None and not input_stream.closed and (
+                    cancelled or timed_out or output_limited or self._process.poll() is not None
+                ):
+                    selector.unregister(input_stream)
+                    input_stream.close()
                 for key, _ in selector.select(timeout=0.1):
                     stream = key.fileobj
+                    if stream is input_stream:
+                        assert self._input_bytes is not None
+                        try:
+                            sent = os.write(stream.fileno(), self._input_bytes[input_offset:input_offset + 8192])
+                        except BlockingIOError:
+                            continue
+                        except OSError:
+                            selector.unregister(stream)
+                            stream.close()
+                            continue
+                        input_offset += sent
+                        if input_offset == len(self._input_bytes):
+                            selector.unregister(stream)
+                            stream.close()
+                        continue
                     try:
                         chunk = os.read(stream.fileno(), 8192)
                     except BlockingIOError:
@@ -318,6 +364,8 @@ class SandboxSession:
             self._process.wait()
         finally:
             selector.close()
+            if input_stream is not None and not input_stream.closed:
+                input_stream.close()
             for stream in streams:
                 if not stream.closed:
                     stream.close()
@@ -341,6 +389,7 @@ class SandboxSession:
             cancelled=cancel_signal_accepted and not timed_out and not output_limited,
             timed_out=timed_out,
             output_limited=output_limited,
+            input_written=self._input_bytes is None or input_offset == len(self._input_bytes),
         )
 
 
@@ -354,6 +403,31 @@ def _validate_command(command: Sequence[str]) -> None:
         total += len(value.encode("utf-8"))
     if total > 32768:
         raise InvalidSandboxRequest("command arguments exceed the supported size")
+
+
+def _expand_runtime_paths(
+    command: Sequence[str], runtime_source: Path, runtime_target: Path
+) -> list[str]:
+    """Resolve explicit trusted-runtime arguments to this unit's read-only bind."""
+
+    expanded: list[str] = []
+    source_root = runtime_source.resolve(strict=True)
+    for value in command:
+        if not value.startswith(_RUNTIME_PATH_TOKEN):
+            expanded.append(value)
+            continue
+        relative = Path(value[len(_RUNTIME_PATH_TOKEN):])
+        if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+            raise InvalidSandboxRequest("trusted runtime path is invalid")
+        try:
+            source_file = (source_root / relative).resolve(strict=True)
+            source_file.relative_to(source_root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise InvalidSandboxRequest("trusted runtime path is invalid") from exc
+        if not source_file.is_file():
+            raise InvalidSandboxRequest("trusted runtime path must reference a file")
+        expanded.append(str(runtime_target / relative))
+    return expanded
 
 
 def _validated_workspace(workspace: str | Path) -> Path:
