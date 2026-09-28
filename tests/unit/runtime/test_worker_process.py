@@ -11,6 +11,7 @@ import sys
 import pytest
 
 from orchestrator.isolation import SandboxResult
+from orchestrator.isolation.launcher import SandboxTerminationReceipt
 from orchestrator.runtime.contracts import AttemptContext, WorkerResult, WorkerTask
 from orchestrator.runtime.worker_process import IsolatedWorkerProcess, WorkerProcessError
 import orchestrator.runtime.worker_process as worker_module
@@ -51,9 +52,15 @@ def _sandbox_result(**overrides) -> SandboxResult:
         outcome="blocked",
         artifacts=(),
     ).model_dump_json().encode("utf-8")
+    unit_name = "maestro-attempt-" + "a" * 32 + ".service"
     fields = dict(
-        unit_name="unit.service", returncode=0, stdout=payload, stderr=b"",
-        elapsed_seconds=0.01, termination_confirmed=True, cancelled=False,
+        unit_name=unit_name, returncode=0, stdout=payload, stderr=b"",
+        elapsed_seconds=0.01, termination_receipt=SandboxTerminationReceipt(
+            unit_name=unit_name,
+            control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/" + unit_name,
+            active_state="inactive",
+            cgroup_empty=True,
+        ), cancelled=False,
         timed_out=False, output_limited=False, input_written=True,
     )
     fields.update(overrides)
@@ -99,7 +106,7 @@ def test_worker_process_passes_task_only_on_stdin_and_accepts_bound_blocked_resu
     [
         _sandbox_result(returncode=64),
         _sandbox_result(input_written=False),
-        _sandbox_result(termination_confirmed=False),
+        _sandbox_result(termination_receipt=None),
         _sandbox_result(cancelled=True),
         _sandbox_result(timed_out=True),
         _sandbox_result(output_limited=True),
@@ -121,6 +128,13 @@ def test_worker_process_fails_closed_on_transport_or_unauthorized_proposal(
     tmp_path: Path, result: SandboxResult
 ) -> None:
     with pytest.raises(WorkerProcessError):
+        IsolatedWorkerProcess(launcher=_Launcher(result)).execute(tmp_path, _task())
+
+
+def test_worker_rejects_clean_child_output_without_host_termination_receipt(tmp_path: Path) -> None:
+    result = _sandbox_result(termination_receipt=None)
+
+    with pytest.raises(WorkerProcessError, match="terminated=False"):
         IsolatedWorkerProcess(launcher=_Launcher(result)).execute(tmp_path, _task())
 
 

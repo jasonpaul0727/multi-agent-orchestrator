@@ -18,6 +18,7 @@ from .launcher import (
     IsolationUnavailable,
     SandboxLimits,
     SandboxResult,
+    SandboxTerminationReceipt,
     SandboxSession,
     SystemdReadOnlyLauncher,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "IsolationUnavailable",
     "SandboxLimits",
     "SandboxResult",
+    "SandboxTerminationReceipt",
     "SandboxSession",
     "SystemdReadOnlyLauncher",
     "SystemdOverlayCandidateLauncher",

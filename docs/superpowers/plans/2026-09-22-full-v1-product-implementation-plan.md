@@ -101,6 +101,20 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 2026-09-26 P3 Provider 调用日志切片：新增 `SQLiteProviderCallJournal`，Provider Gateway 在发送请求前持久化 attempt-scoped、带 fencing/route/budget/registry 绑定的请求体哈希意图；收到响应或传输错误后写入脱敏 usage/status/outcome。SQLite 事件契约校验先 intent 后单一 terminal receipt；多连接 CAS 只允许一个进程占有调用身份。重启可枚举 `dispatching`/`unknown` 项，同一身份重放 fail-closed；无 journal 时不取凭据、不发请求。凭据/提示/请求体/模型输出均不入日志。此为对账基础而不是 Provider reconciliation：尚无 Provider 查询/权威回执验证、预算自动 settlement、Scheduler/Worker 接线或自动恢复；unknown 仍保持未决。
 
+Correction as of 2026-09-28 — P3 systemd termination receipt slice: the
+read-only launcher now binds each generated transient service to its validated
+`app.slice` cgroup and creates a host-only receipt only after systemd reports
+the exact unit inactive/failed and the exact cgroup is empty
+(`cgroup.events populated 0`, or systemd has removed the stopped cgroup).
+Child PID exit and accepted cancellation alone do not qualify. Unverified
+stops retain private staging and are rejected by Worker/Verifier transport
+admission. Live integration tests passed on Ubuntu 24.04 / WSL2, kernel
+`6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17`. This
+supersedes only the earlier “real Worker/OS termination receipt missing”
+status: the complete cross-process interruption matrix, Provider-authoritative
+reconciliation, Scheduler/Worker automatic recovery, and V1 delivery gates
+remain open and unchecked.
+
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 
 - [x] 建立 Run/Node/Attempt/Graph 生命周期投影；实现基础状态机与非法转换拒绝。

@@ -8,7 +8,7 @@ from orchestrator.approvals import (
     ExecutionAttempt,
 )
 from orchestrator.budget import BudgetLedger, RunLimit
-from orchestrator.isolation import SandboxResult
+from orchestrator.isolation import SandboxResult, SandboxTerminationReceipt
 from orchestrator.persistence import SQLiteEventStore
 from orchestrator.security.policy import PolicyAuthority, PolicyManifest
 from orchestrator.tools import PolicyState, ToolGateway, ToolRequest
@@ -70,12 +70,17 @@ class _ApprovalAuthority:
 class _Session:
     def wait(self):
         return SandboxResult(
-            unit_name="maestro-approved-read.service",
+            unit_name="maestro-attempt-" + "1" * 32 + ".service",
             returncode=0,
             stdout=b"approval-scoped output",
             stderr=b"",
             elapsed_seconds=0.01,
-            termination_confirmed=True,
+            termination_receipt=SandboxTerminationReceipt(
+                unit_name="maestro-attempt-" + "1" * 32 + ".service",
+                control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/maestro-attempt-" + "1" * 32 + ".service",
+                active_state="inactive",
+                cgroup_empty=True,
+            ),
             cancelled=False,
             timed_out=False,
             output_limited=False,

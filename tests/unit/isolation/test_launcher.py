@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import orchestrator.isolation.launcher as launcher_module
+
 from pathlib import Path
 import os
 import subprocess
@@ -72,7 +74,7 @@ def test_scope_collection_has_bounded_stop_grace_even_with_held_pipes(monkeypatc
                 os.close(writer)
     assert calls and calls[0][-1] == "scope.scope"
     assert result.elapsed_seconds < 1
-    assert result.termination_confirmed is leader_exited
+    assert not result.termination_confirmed
     assert result.returncode == (0 if leader_exited else 125)
 
 
@@ -152,6 +154,7 @@ def test_workspace_snapshot_failure_is_reported_as_invalid_request(monkeypatch, 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(module, "_systemd_cgroup_parent", lambda *_args: Path("/sys/fs/cgroup/user.slice/app.slice"))
     monkeypatch.setattr(module, "snapshot_workspace", lambda *_args, **_kwargs: (_ for _ in ()).throw(WorkspaceBoundaryError()))
     with pytest.raises(InvalidSandboxRequest, match="snapshot"):
         SystemdReadOnlyLauncher(systemd_run="systemd-run", systemctl="systemctl").launch(
@@ -166,6 +169,7 @@ def test_launcher_rejects_excessive_workspace_snapshot_before_launch(monkeypatch
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(module, "_systemd_cgroup_parent", lambda *_args: Path("/sys/fs/cgroup/user.slice/app.slice"))
     monkeypatch.setattr(module, "snapshot_workspace", lambda *_args, **_kwargs: (_ for _ in ()).throw(WorkspaceBoundaryError("too large")))
     with pytest.raises(InvalidSandboxRequest, match="snapshot"):
         SystemdReadOnlyLauncher(systemd_run="systemd-run", systemctl="systemctl").launch(
@@ -206,6 +210,7 @@ def test_launcher_rejects_missing_or_ambiguous_trusted_runtime(monkeypatch, tmp_
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
     monkeypatch.setattr(module, "_systemd_client_environment", lambda: {"PATH": "/usr/bin:/bin"})
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0))
+    monkeypatch.setattr(module, "_systemd_cgroup_parent", lambda *_args: Path("/sys/fs/cgroup/user.slice/app.slice"))
     monkeypatch.setattr(
         module,
         "__file__",
@@ -237,6 +242,7 @@ def test_launcher_cleans_staging_when_systemd_client_cannot_start(monkeypatch, t
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
     monkeypatch.setattr(module, "_systemd_client_environment", lambda: {"PATH": "/usr/bin:/bin"})
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0))
+    monkeypatch.setattr(module, "_systemd_cgroup_parent", lambda *_args: Path("/sys/fs/cgroup/user.slice/app.slice"))
 
     def fail_to_start(*args, **kwargs):
         raise OSError("no process")
@@ -256,6 +262,7 @@ def test_launcher_cleans_staging_when_bind_targets_cannot_be_created(monkeypatch
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
     monkeypatch.setattr(module, "_systemd_client_environment", lambda: {"PATH": "/usr/bin:/bin"})
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0))
+    monkeypatch.setattr(module, "_systemd_cgroup_parent", lambda *_args: Path("/sys/fs/cgroup/user.slice/app.slice"))
     original_mkdir = Path.mkdir
 
     def fail_runtime_target(path: Path, *args, **kwargs):
@@ -315,7 +322,7 @@ def test_cancel_acceptance_is_visible_before_collector_returns(monkeypatch) -> N
     assert not waiter.is_alive()
     assert cancel_results == [True]
     assert results and results[0].cancelled
-    assert results[0].termination_confirmed
+    assert not results[0].termination_confirmed
 
 
 def test_session_transmits_large_stdin_without_stdout_deadlock() -> None:
@@ -399,7 +406,7 @@ def test_session_output_limit_stops_bounded_stdin(monkeypatch) -> None:
     )
     result = session.wait()
     assert result.output_limited
-    assert result.termination_confirmed
+    assert not result.termination_confirmed
     assert len(result.stdout) + len(result.stderr) <= 1024
     assert not result.input_written
 
@@ -438,7 +445,7 @@ def test_session_cancellation_stops_bounded_stdin(monkeypatch) -> None:
     waiter.join(timeout=3)
     assert not waiter.is_alive()
     assert results and results[0].cancelled
-    assert results[0].termination_confirmed
+    assert not results[0].termination_confirmed
     assert not results[0].input_written
 
 
@@ -450,3 +457,365 @@ def test_systemd_client_environment_requires_runtime_directory(monkeypatch) -> N
     with pytest.raises(IsolationUnavailable, match="XDG_RUNTIME_DIR"):
         module._systemd_client_environment()
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+
+def test_sandbox_result_derives_termination_from_host_receipt() -> None:
+    result = launcher_module.SandboxResult(
+        unit_name="maestro-attempt-" + "a" * 32 + ".service",
+        returncode=0,
+        stdout=b"",
+        stderr=b"",
+        elapsed_seconds=0.01,
+        termination_receipt=None,
+        cancelled=False,
+        timed_out=False,
+        output_limited=False,
+        input_written=True,
+    )
+    assert not result.termination_confirmed
+
+    receipt = launcher_module.SandboxTerminationReceipt(
+        unit_name=result.unit_name,
+        control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/" + result.unit_name,
+        active_state="inactive",
+        cgroup_empty=True,
+    )
+    confirmed = launcher_module.SandboxResult(
+        unit_name=result.unit_name,
+        returncode=0,
+        stdout=b"",
+        stderr=b"",
+        elapsed_seconds=0.01,
+        termination_receipt=receipt,
+        cancelled=False,
+        timed_out=False,
+        output_limited=False,
+        input_written=True,
+    )
+    assert confirmed.termination_confirmed
+    assert confirmed.termination_receipt is receipt
+
+
+@pytest.mark.parametrize(
+    ("active_state", "load_state", "control_group", "empty", "confirmed"),
+    [
+        ("inactive", "loaded", "/user.slice/user-1000.slice/user@1000.service/app.slice/maestro-attempt-" + "b" * 32 + ".service", True, True),
+        ("failed", "loaded", "/user.slice/user-1000.slice/user@1000.service/app.slice/maestro-attempt-" + "b" * 32 + ".service", True, True),
+        ("active", "loaded", "/user.slice/user-1000.slice/user@1000.service/app.slice/maestro-attempt-" + "b" * 32 + ".service", True, False),
+        ("inactive", "loaded", "/user.slice/unexpected/maestro-attempt-" + "b" * 32 + ".service", True, False),
+        ("inactive", "loaded", "/user.slice/user-1000.slice/user@1000.service/app.slice/maestro-attempt-" + "b" * 32 + ".service", False, False),
+        ("inactive", "not-found", "", True, True),
+    ],
+)
+def test_systemd_termination_receipt_requires_inactive_exact_empty_scope(
+    monkeypatch, tmp_path: Path, active_state, load_state, control_group, empty, confirmed
+) -> None:
+    unit = "maestro-attempt-" + "b" * 32 + ".service"
+    expected = Path(
+        "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice"
+    ) / unit
+    response = subprocess.CompletedProcess(
+        ["systemctl"],
+        0,
+        stdout=(
+            f"ActiveState={active_state}\n"
+            f"LoadState={load_state}\n"
+            f"ControlGroup={control_group}\n"
+        ).encode("ascii"),
+        stderr=b"",
+    )
+    monkeypatch.setattr(launcher_module.subprocess, "run", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(launcher_module, "_cgroup_is_empty", lambda _path: empty)
+
+    receipt = launcher_module._read_termination_receipt(
+        unit_name=unit,
+        expected_cgroup=expected,
+        client_env={"PATH": "/usr/bin:/bin"},
+        timeout_seconds=0.01,
+    )
+
+    assert (receipt is not None) is confirmed
+    if confirmed:
+        assert receipt.unit_name == unit
+        assert receipt.control_group == "/" + str(expected.relative_to("/sys/fs/cgroup"))
+        assert receipt.active_state == active_state
+        assert receipt.cgroup_empty
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b"ActiveState=inactive\nLoadState=loaded\n",
+        b"ActiveState=inactive\nActiveState=inactive\nLoadState=loaded\nControlGroup=/safe\n",
+        b"ActiveState=inactive\nLoadState=loaded\nControlGroup=../../escape\n",
+    ],
+)
+def test_systemd_termination_receipt_rejects_malformed_unit_evidence(
+    monkeypatch, stdout: bytes
+) -> None:
+    unit = "maestro-attempt-" + "c" * 32 + ".service"
+    expected = Path("/sys/fs/cgroup/user.slice/app.slice") / unit
+    response = subprocess.CompletedProcess(["systemctl"], 0, stdout=stdout, stderr=b"")
+    monkeypatch.setattr(launcher_module.subprocess, "run", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(launcher_module, "_cgroup_is_empty", lambda _path: True)
+
+    receipt = launcher_module._read_termination_receipt(
+        unit_name=unit,
+        expected_cgroup=expected,
+        client_env={},
+        timeout_seconds=0.01,
+    )
+
+    assert receipt is None
+
+
+def test_systemd_termination_receipt_fails_closed_when_inspection_is_unavailable(
+    monkeypatch,
+) -> None:
+    unit = "maestro-attempt-" + "d" * 32 + ".service"
+    expected = Path("/sys/fs/cgroup/user.slice/app.slice") / unit
+
+    def unavailable(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("systemctl", 1)
+
+    monkeypatch.setattr(launcher_module.subprocess, "run", unavailable)
+
+    assert launcher_module._read_termination_receipt(
+        unit_name=unit,
+        expected_cgroup=expected,
+        client_env={},
+        timeout_seconds=0.01,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("unit_name", "control_group", "active_state", "empty"),
+    [
+        ("bad.service", "/user.slice/app.slice/bad.service", "inactive", True),
+        ("maestro-attempt-" + "e" * 32 + ".service", "/user.slice/app.slice/../escaped", "inactive", True),
+        ("maestro-attempt-" + "e" * 32 + ".service", "/user.slice/other.slice/" + "maestro-attempt-" + "e" * 32 + ".service", "inactive", True),
+        ("maestro-attempt-" + "e" * 32 + ".service", "/user.slice/app.slice/" + "maestro-attempt-" + "e" * 32 + ".service", "active", True),
+        ("maestro-attempt-" + "e" * 32 + ".service", "/user.slice/app.slice/" + "maestro-attempt-" + "e" * 32 + ".service", "inactive", False),
+    ],
+)
+def test_termination_receipt_rejects_invalid_unit_or_cgroup_evidence(
+    unit_name, control_group, active_state, empty
+) -> None:
+    with pytest.raises(ValueError):
+        launcher_module.SandboxTerminationReceipt(
+            unit_name=unit_name,
+            control_group=control_group,
+            active_state=active_state,
+            cgroup_empty=empty,
+        )
+
+
+class _TrackingStaging:
+    def __init__(self) -> None:
+        self.discard_count = 0
+        self.cleanup_count = 0
+
+    def cleanup(self) -> None:
+        self.cleanup_count += 1
+
+    def discard(self) -> None:
+        self.discard_count += 1
+
+
+def _completed_process() -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        ["/usr/bin/python3", "-c", "print('done')"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+
+
+def _attempt_identity() -> tuple[str, Path]:
+    unit = "maestro-attempt-" + "f" * 32 + ".service"
+    cgroup = Path("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice") / unit
+    return unit, cgroup
+
+
+def test_session_retains_staging_and_replays_result_when_stop_is_unverified(monkeypatch) -> None:
+    unit, cgroup = _attempt_identity()
+    staging = _TrackingStaging()
+    checks = []
+    monkeypatch.setattr(
+        launcher_module, "_read_termination_receipt",
+        lambda **arguments: checks.append(arguments) or None,
+    )
+    session = SandboxSession(
+        process=_completed_process(),
+        unit_name=unit,
+        systemctl="systemctl",
+        client_env={},
+        output_limit=1024,
+        timeout_seconds=10,
+        staging=staging,
+        scope_cgroup=cgroup,
+    )
+
+    result = session.wait()
+
+    assert result.returncode == 0
+    assert not result.termination_confirmed
+    assert session.wait() is result
+    assert len(checks) == 1
+    assert checks[0]["unit_name"] == unit
+    assert checks[0]["expected_cgroup"] == cgroup
+    assert staging.discard_count == 0
+    assert staging.cleanup_count == 0
+
+
+def test_session_discards_staging_once_only_after_receipt(monkeypatch) -> None:
+    unit, cgroup = _attempt_identity()
+    staging = _TrackingStaging()
+    receipt = launcher_module.SandboxTerminationReceipt(
+        unit_name=unit,
+        control_group="/" + str(cgroup.relative_to("/sys/fs/cgroup")),
+        active_state="inactive",
+        cgroup_empty=True,
+    )
+    checks = []
+    monkeypatch.setattr(
+        launcher_module, "_read_termination_receipt",
+        lambda **arguments: checks.append(arguments) or receipt,
+    )
+    session = SandboxSession(
+        process=_completed_process(),
+        unit_name=unit,
+        systemctl="systemctl",
+        client_env={},
+        output_limit=1024,
+        timeout_seconds=10,
+        staging=staging,
+        scope_cgroup=cgroup,
+    )
+
+    result = session.wait()
+
+    assert result.termination_receipt is receipt
+    assert result.termination_confirmed
+    assert session.wait() is result
+    assert len(checks) == 1
+    assert staging.discard_count == 1
+    assert staging.cleanup_count == 0
+
+
+def test_systemd_cgroup_parent_resolves_only_verified_app_slice(monkeypatch) -> None:
+    parent = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    response = subprocess.CompletedProcess(
+        ["systemctl"], 0, stdout=f"ControlGroup={parent}\n".encode(), stderr=b"",
+    )
+    opened = []
+    monkeypatch.setattr(launcher_module.subprocess, "run", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(
+        launcher_module, "_open_cgroup_directory",
+        lambda path: opened.append(path) or os.open("/dev/null", os.O_RDONLY),
+    )
+
+    result = launcher_module._systemd_cgroup_parent("systemctl", {})
+
+    assert result == Path("/sys/fs/cgroup") / parent.lstrip("/")
+    assert opened == [result]
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"",
+        b"ControlGroup=/user.slice/app.slice/../escaped\n",
+        b"ControlGroup=/user.slice/other.slice\n",
+        b"ControlGroup=/user.slice/app.slice\nControlGroup=/user.slice/app.slice\n",
+    ],
+)
+def test_systemd_cgroup_parent_rejects_untrusted_or_malformed_path(
+    monkeypatch, output: bytes
+) -> None:
+    response = subprocess.CompletedProcess(["systemctl"], 0, stdout=output, stderr=b"")
+    monkeypatch.setattr(launcher_module.subprocess, "run", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(IsolationUnavailable, match="app.slice cgroup"):
+        launcher_module._systemd_cgroup_parent("systemctl", {})
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (b"populated 0\nfrozen 0\n", True),
+        (b"populated 1\nfrozen 0\n", False),
+        (b"populated 0\npopulated 0\n", False),
+        (b"populated yes\n", False),
+        (b"frozen 0\n", False),
+    ],
+)
+def test_cgroup_empty_requires_a_strict_populated_zero_witness(
+    monkeypatch, tmp_path: Path, payload: bytes, expected: bool
+) -> None:
+    (tmp_path / "cgroup.events").write_bytes(payload)
+    monkeypatch.setattr(
+        launcher_module, "_open_cgroup_directory",
+        lambda _path: os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY),
+    )
+
+    assert launcher_module._cgroup_is_empty(Path("/sys/fs/cgroup/user.slice/app.slice/unit")) is expected
+
+
+def test_termination_receipt_polling_bounds_each_systemctl_call(monkeypatch) -> None:
+    unit = "maestro-attempt-" + "9" * 32 + ".service"
+    expected = Path("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice") / unit
+    response = subprocess.CompletedProcess(
+        ["systemctl"], 0,
+        stdout=(
+            "ActiveState=active\nLoadState=loaded\n"
+            "ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/" + unit + "\n"
+        ).encode(),
+        stderr=b"",
+    )
+    timeouts = []
+
+    def show(*_args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return response
+
+    monkeypatch.setattr(launcher_module.subprocess, "run", show)
+    monkeypatch.setattr(launcher_module.time, "sleep", lambda _duration: None)
+
+    result = launcher_module._read_termination_receipt(
+        unit_name=unit,
+        expected_cgroup=expected,
+        client_env={},
+        timeout_seconds=0.01,
+    )
+
+    assert result is None
+    assert timeouts
+    assert all(0 < timeout <= 0.01 for timeout in timeouts)
+
+
+def test_scoped_session_detaches_temporary_directory_finalizer_until_verified_stop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    unit, cgroup = _attempt_identity()
+    temporary = tempfile.TemporaryDirectory(dir=tmp_path)
+    staging_path = Path(temporary.name)
+    (staging_path / "marker").write_text("must remain", encoding="utf-8")
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", lambda **_arguments: None)
+    session = SandboxSession(
+        process=_completed_process(),
+        unit_name=unit,
+        systemctl="systemctl",
+        client_env={},
+        output_limit=1024,
+        timeout_seconds=10,
+        staging=temporary,
+        scope_cgroup=cgroup,
+    )
+
+    assert temporary._finalizer.peek() is None
+    result = session.wait()
+
+    assert not result.termination_confirmed
+    assert (staging_path / "marker").read_text(encoding="utf-8") == "must remain"
+    temporary.cleanup()

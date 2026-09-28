@@ -155,6 +155,8 @@ class SystemdOverlayCandidateLauncher:
             output_limit=limits.output_bytes, timeout_seconds=limits.timeout_seconds,
             staging=retained, input_bytes=input_bytes,
             cancel_after_transport_exit=True, stop_grace_seconds=5,
+            scope_cgroup=scope_cgroup,
+            cleanup_on_termination=False,
         )
         return OverlayCandidateSession(transport, retained, stage, environment,
                                        self._candidate_entries, self._candidate_bytes,
@@ -202,7 +204,8 @@ class OverlayCandidateSession:
                 return self._result
             execution = self._transport.wait()
             stopped = execution.termination_confirmed and _scope_stopped(self.unit_name, self._environment, self._scope_cgroup)
-            execution = replace(execution, termination_confirmed=bool(stopped))
+            if not stopped:
+                execution = replace(execution, termination_receipt=None)
             diff = None
             error = "execution_failed"
             if not stopped:

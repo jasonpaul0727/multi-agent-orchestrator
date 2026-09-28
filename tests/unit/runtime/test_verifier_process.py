@@ -12,6 +12,7 @@ from orchestrator.runtime import verifier_process
 
 from orchestrator.artifacts import ArtifactAccessGrant, ArtifactStore
 from orchestrator.isolation import SandboxResult
+from orchestrator.isolation.launcher import SandboxTerminationReceipt
 from orchestrator.persistence import SQLiteEventStore
 from orchestrator.runtime.contracts import (
     ArtifactRef,
@@ -43,7 +44,8 @@ def _context(*, attempt_id="attempt-1"):
 
 
 class _ChildLauncher:
-    def __init__(self):
+    def __init__(self, *, receipt: bool = True):
+        self.receipt = receipt
         self.calls = []
 
     def launch(self, workspace, command, *, limits, input_bytes):
@@ -52,8 +54,15 @@ class _ChildLauncher:
         self.calls.append((Path(workspace), tuple(command), limits, input_bytes))
         payload = _verification_child_result(Path(workspace), input_bytes)
         result = SandboxResult(
-            unit_name="maestro-verifier-test.service", returncode=0, stdout=payload,
-            stderr=b"", elapsed_seconds=0.01, termination_confirmed=True,
+            unit_name="maestro-attempt-" + "b" * 32 + ".service", returncode=0, stdout=payload,
+            stderr=b"", elapsed_seconds=0.01, termination_receipt=(
+                SandboxTerminationReceipt(
+                    unit_name="maestro-attempt-" + "b" * 32 + ".service",
+                    control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/maestro-attempt-" + "b" * 32 + ".service",
+                    active_state="inactive",
+                    cgroup_empty=True,
+                ) if self.receipt else None
+            ),
             cancelled=False, timed_out=False, output_limited=False, input_written=True,
         )
         return type("Session", (), {"wait": lambda _self: result})()
@@ -133,6 +142,32 @@ def _evidence(task):
     )
 
 
+def _sandbox_result(
+    stdout: bytes, *, returncode: int = 0, receipt: bool = True, cancelled: bool = False,
+    timed_out: bool = False, output_limited: bool = False, input_written: bool = True,
+    stderr: bytes = b"",
+) -> SandboxResult:
+    unit_name = "maestro-attempt-" + "c" * 32 + ".service"
+    termination_receipt = SandboxTerminationReceipt(
+        unit_name=unit_name,
+        control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/" + unit_name,
+        active_state="inactive",
+        cgroup_empty=True,
+    ) if receipt else None
+    return SandboxResult(
+        unit_name=unit_name,
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+        elapsed_seconds=0.01,
+        termination_receipt=termination_receipt,
+        cancelled=cancelled,
+        timed_out=timed_out,
+        output_limited=output_limited,
+        input_written=input_written,
+    )
+
+
 def _fixed_result_launcher(result=None, *, launch_error=None, wait_error=None):
     class FixedLauncher:
         def launch(self, workspace, command, *, limits, input_bytes):
@@ -172,6 +207,18 @@ def test_isolated_verifier_checks_host_published_candidate_in_separate_process_c
     assert len(launcher.calls) == 1
     assert b"def answer" not in launcher.calls[0][3]
     assert events.read_stream("security", "run-1") == []
+
+
+def test_verifier_rejects_clean_child_output_without_host_termination_receipt(tmp_path):
+    _events, store, record = _artifact_store(tmp_path)
+    verifier = runtime.IsolatedVerifierProcess(launcher=_ChildLauncher(receipt=False))
+
+    with pytest.raises(runtime.VerifierProcessError, match="transport"):
+        verifier.verify(
+            _task(record),
+            store,
+            grant_for_digest=lambda digest: _grant(record),
+        )
 
 
 @pytest.mark.skipif(not hasattr(runtime, "IsolatedVerifierProcess"), reason="isolated Verifier is not implemented")
@@ -455,13 +502,13 @@ def test_verifier_rejects_launch_failure_transport_failure_and_invalid_evidence(
 
     valid = _evidence(task).model_dump_json().encode()
     transport_results = (
-        SandboxResult("unit", 0, valid, b"", 0.01, False, False, False, False, True),
-        SandboxResult("unit", 1, valid, b"", 0.01, True, False, False, False, True),
-        SandboxResult("unit", 0, valid, b"", 0.01, True, True, False, False, True),
-        SandboxResult("unit", 0, valid, b"", 0.01, True, False, True, False, True),
-        SandboxResult("unit", 0, valid, b"", 0.01, True, False, False, True, True),
-        SandboxResult("unit", 0, valid, b"", 0.01, True, False, False, False, False),
-        SandboxResult("unit", 0, valid, b"diagnostic", 0.01, True, False, False, False, True),
+        _sandbox_result(valid, receipt=False),
+        _sandbox_result(valid, returncode=1),
+        _sandbox_result(valid, cancelled=True),
+        _sandbox_result(valid, timed_out=True),
+        _sandbox_result(valid, output_limited=True),
+        _sandbox_result(valid, input_written=False),
+        _sandbox_result(valid, stderr=b"diagnostic"),
     )
     for transport in transport_results:
         verifier = runtime.IsolatedVerifierProcess(launcher=_fixed_result_launcher(transport))
@@ -470,17 +517,16 @@ def test_verifier_rejects_launch_failure_transport_failure_and_invalid_evidence(
 
     for output in (b"not-json", b"{}"):
         verifier = runtime.IsolatedVerifierProcess(
-            launcher=_fixed_result_launcher(SandboxResult("unit", 0, output, b"", 0.01, True, False, False, False, True)),
+            launcher=_fixed_result_launcher(_sandbox_result(output)),
         )
         with pytest.raises(runtime.VerifierProcessError, match="invalid evidence"):
             verifier.verify(task, store, grant_for_digest=lambda digest: _grant(record))
 
     rejected_claim = _evidence(task).model_copy(update={"inspected_digests": ()})
     verifier = runtime.IsolatedVerifierProcess(
-        launcher=_fixed_result_launcher(SandboxResult(
-            "unit", 0, rejected_claim.model_dump_json().encode(), b"", 0.01,
-            True, False, False, False, True,
-        )),
+        launcher=_fixed_result_launcher(
+            _sandbox_result(rejected_claim.model_dump_json().encode()),
+        ),
     )
     with pytest.raises(runtime.VerifierProcessError, match="invalid evidence"):
         verifier.verify(task, store, grant_for_digest=lambda digest: _grant(record))

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.isolation import SandboxLimits, SandboxResult
+from orchestrator.isolation import SandboxLimits, SandboxResult, SandboxTerminationReceipt
 from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
 from orchestrator.security.policy import PolicyAuthority, PolicyManifest
 from orchestrator.tools import (
@@ -18,6 +18,18 @@ from orchestrator.tools import (
     ToolRequestAlreadyUsed,
 )
 from orchestrator.workspace_identity import workspace_identity_hash
+
+
+_TEST_UNIT = "maestro-attempt-" + "3" * 32 + ".service"
+
+
+def _test_receipt() -> SandboxTerminationReceipt:
+    return SandboxTerminationReceipt(
+        unit_name=_TEST_UNIT,
+        control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/" + _TEST_UNIT,
+        active_state="inactive",
+        cgroup_empty=True,
+    )
 
 
 def _manifest(*, allow: bool = True, approval: bool = False) -> PolicyManifest:
@@ -64,12 +76,12 @@ class _Session:
 
     def wait(self) -> SandboxResult:
         return SandboxResult(
-            unit_name="maestro-test.service",
+            unit_name=_TEST_UNIT,
             returncode=0,
             stdout=b"private output",
             stderr=b"",
             elapsed_seconds=0.01,
-            termination_confirmed=True,
+            termination_receipt=_test_receipt(),
             cancelled=False,
             timed_out=False,
             output_limited=False,
@@ -350,7 +362,7 @@ def test_authority_loss_during_execution_cancels_and_discards_success_status(tmp
                 stdout=base.stdout,
                 stderr=base.stderr,
                 elapsed_seconds=base.elapsed_seconds,
-                termination_confirmed=True,
+                termination_receipt=base.termination_receipt,
                 cancelled=self.cancelled,
                 timed_out=False,
                 output_limited=False,
@@ -402,7 +414,7 @@ def test_unconfirmed_termination_is_recorded_unknown_and_output_is_discarded(tmp
                 stdout=result.stdout,
                 stderr=result.stderr,
                 elapsed_seconds=result.elapsed_seconds,
-                termination_confirmed=False,
+                termination_receipt=None,
                 cancelled=False,
                 timed_out=False,
                 output_limited=False,

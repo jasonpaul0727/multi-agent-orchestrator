@@ -6,7 +6,7 @@ import pytest
 
 from orchestrator.agents.registry import AgentInstance, AgentRegistry
 from orchestrator.lifecycle.models import AttemptState, NodeSpec
-from orchestrator.isolation import SandboxResult
+from orchestrator.isolation import SandboxResult, SandboxTerminationReceipt
 from orchestrator.persistence import EventDraft, SQLiteEventStore
 from orchestrator.security import PolicyAuthority, PolicyManifest
 from orchestrator.tools.authority import DurableAttemptAuthority
@@ -223,8 +223,14 @@ def test_durable_authority_can_recheck_inside_gateway_write_transaction(tmp_path
     class Session:
         def wait(self) -> SandboxResult:
             return SandboxResult(
-                unit_name="test.service", returncode=0, stdout=b"ok", stderr=b"",
-                elapsed_seconds=0.01, termination_confirmed=True, cancelled=False,
+                unit_name="maestro-attempt-" + "2" * 32 + ".service",
+                returncode=0, stdout=b"ok", stderr=b"",
+                elapsed_seconds=0.01, termination_receipt=SandboxTerminationReceipt(
+                    unit_name="maestro-attempt-" + "2" * 32 + ".service",
+                    control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/maestro-attempt-" + "2" * 32 + ".service",
+                    active_state="inactive",
+                    cgroup_empty=True,
+                ), cancelled=False,
                 timed_out=False, output_limited=False,
             )
 

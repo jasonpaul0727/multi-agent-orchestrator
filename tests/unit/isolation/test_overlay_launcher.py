@@ -11,7 +11,7 @@ import tempfile
 
 import pytest
 
-from orchestrator.isolation import InvalidSandboxRequest, IsolationUnavailable, SandboxLimits, SandboxResult
+from orchestrator.isolation import InvalidSandboxRequest, IsolationUnavailable, SandboxLimits, SandboxResult, SandboxTerminationReceipt
 from orchestrator.isolation import overlay_launcher as module
 from orchestrator.isolation._overlay_bootstrap import _write_completion
 from orchestrator.isolation.workspace import export_overlay_diff
@@ -29,12 +29,19 @@ def _candidate(root: Path):
 
 
 def _execution(**updates):
-    return replace(SandboxResult("candidate.scope", 0, b"untrusted stdout", b"", 0.01,
-                                 True, False, False, False), **updates)
+    unit = "maestro-candidate-" + "d" * 32 + ".scope"
+    receipt = SandboxTerminationReceipt(
+        unit_name=unit,
+        control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/" + unit,
+        active_state="inactive",
+        cgroup_empty=True,
+    )
+    return replace(SandboxResult(unit, 0, b"untrusted stdout", b"", 0.01,
+                                 receipt, False, False, False), **updates)
 
 
 class _Transport:
-    unit_name = "candidate.scope"
+    unit_name = "maestro-candidate-" + "d" * 32 + ".scope"
 
     def __init__(self, result):
         self.result = result
