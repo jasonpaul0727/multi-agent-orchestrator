@@ -17,7 +17,7 @@ import re
 import secrets
 import shutil
 import stat
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from .workspace import (
     WorkspaceBoundaryError,
@@ -59,6 +59,17 @@ class WorkspacePublishReceipt:
     manifest_hash: str
     entries_published: int
     lease_generation: int
+
+
+@dataclass(frozen=True)
+class WorkspacePublicationRecovery:
+    """A journal transaction whose final effect was proven during recovery."""
+
+    transaction_id: str
+    outcome: Literal["not_started", "rolled_back", "committed"]
+    manifest_hash: str | None = None
+    entries_published: int = 0
+    lease_generation: int | None = None
 
 
 def publish_workspace_diff(
@@ -114,6 +125,7 @@ def publish_workspace_diff(
         raise WorkspacePublishError("transaction_id must be a 128-bit lowercase hexadecimal value")
     transaction_name = f"publish-{transaction_id}"
     transaction_fd: int | None = None
+    committed_receipt: WorkspacePublishReceipt | None = None
     try:
         _assert_roots_disjoint(roots)
         lease.assert_current()
@@ -174,7 +186,7 @@ def publish_workspace_diff(
         _require_publish_authority(authorize)
         os.fsync(roots.workspace_fd)
         _write_journal(transaction_fd, {**payload, "status": "committed"})
-        receipt = WorkspacePublishReceipt(
+        committed_receipt = WorkspacePublishReceipt(
             transaction_id=transaction_id,
             manifest_hash=diff.manifest_hash,
             entries_published=len(records),
@@ -182,15 +194,29 @@ def publish_workspace_diff(
         )
         os.close(transaction_fd)
         transaction_fd = None
-        _remove_transaction(roots.journal_fd, transaction_name)
-        return receipt
+        try:
+            _remove_transaction(roots.journal_fd, transaction_name)
+        except Exception:
+            # The durable committed marker proves the workspace effect. Cleanup
+            # is recoverable and must not turn an applied write into an unknown
+            # result merely because removing its journal failed.
+            pass
+        return committed_receipt
     except WorkspaceBoundaryError:
+        if committed_receipt is not None:
+            return committed_receipt
         raise
     except OSError as exc:
+        if committed_receipt is not None:
+            return committed_receipt
         raise WorkspacePublishError("workspace candidate publication failed") from exc
     finally:
         if transaction_fd is not None:
-            os.close(transaction_fd)
+            try:
+                os.close(transaction_fd)
+            except OSError:
+                if committed_receipt is None:
+                    raise
         roots.close()
 
 
@@ -217,9 +243,30 @@ def recover_workspace_publications(
     hard stop and remains on disk for operator investigation.
     """
 
+    return tuple(
+        recovery.transaction_id
+        for recovery in recover_workspace_publications_with_outcomes(
+            workspace_root, lease, journal_root
+        )
+    )
+
+
+def recover_workspace_publications_with_outcomes(
+    workspace_root: str | Path,
+    lease: WorkspaceWriteLease,
+    journal_root: str | Path,
+) -> tuple[WorkspacePublicationRecovery, ...]:
+    """Recover pending journals and report only outcomes proven by the journal.
+
+    An incomplete ``prepared`` transaction is rolled back; a durable
+    ``committed`` transaction is retained as applied. A transaction directory
+    with no durable prepared journal is known not to have mutated the workspace.
+    Invalid or conflicting state remains on disk and raises instead.
+    """
+
     _verify_lease_for_workspace(lease, workspace_root)
     roots = _open_roots(None, workspace_root, None, journal_root)
-    recovered: list[str] = []
+    recovered: list[WorkspacePublicationRecovery] = []
     try:
         _assert_roots_disjoint(roots)
         lease.assert_current()
@@ -251,7 +298,10 @@ def recover_workspace_publications(
                     os.close(transaction_fd)
                     transaction_fd = -1
                     _remove_transaction(roots.journal_fd, name)
-                    recovered.append(name.removeprefix("publish-"))
+                    recovered.append(WorkspacePublicationRecovery(
+                        transaction_id=name.removeprefix("publish-"),
+                        outcome="not_started",
+                    ))
                     continue
                 _validate_payload(payload, name, lease)
                 if payload["status"] == "prepared":
@@ -259,10 +309,20 @@ def recover_workspace_publications(
                     lease.assert_current()
                     _verify_workspace_fd(roots.workspace_fd, lease)
                     os.fsync(roots.workspace_fd)
+                    outcome: Literal["rolled_back", "committed"] = "rolled_back"
+                else:
+                    outcome = "committed"
+                recovery = WorkspacePublicationRecovery(
+                    transaction_id=payload["transaction_id"],
+                    outcome=outcome,
+                    manifest_hash=payload["manifest_hash"],
+                    entries_published=len(payload["records"]),
+                    lease_generation=payload["lease_generation"],
+                )
                 os.close(transaction_fd)
                 transaction_fd = -1
                 _remove_transaction(roots.journal_fd, name)
-                recovered.append(payload["transaction_id"])
+                recovered.append(recovery)
             finally:
                 if transaction_fd >= 0:
                     os.close(transaction_fd)

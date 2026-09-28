@@ -20,6 +20,7 @@ from orchestrator.isolation import (
     export_overlay_diff,
     publish_workspace_diff,
     recover_workspace_publications,
+    recover_workspace_publications_with_outcomes,
 )
 from orchestrator.isolation import workspace_publish
 from orchestrator.isolation import workspace as workspace_module
@@ -161,6 +162,53 @@ def test_process_death_rolls_back_every_published_entry(tmp_path: Path, crash_af
     assert not (workspace / "link").exists()
     assert (workspace / "existing").stat().st_mode & 0o777 == 0o700
     assert (lower / "changed.txt").read_text(encoding="utf-8") == "old\n"
+
+
+def test_detailed_recovery_reports_confirmed_rollback(tmp_path: Path) -> None:
+    _lower, workspace, _candidate, journal, _source, _diff, result = _run_publish_crash(
+        tmp_path, crash_after=2
+    )
+    assert result.returncode == 73
+
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        recovered = recover_workspace_publications_with_outcomes(workspace, lease, journal)
+
+    assert len(recovered) == 1
+    assert recovered[0].outcome == "rolled_back"
+    assert recovered[0].manifest_hash.startswith("sha256:")
+    assert recovered[0].entries_published > 0
+
+
+def test_detailed_recovery_reports_committed_publication(tmp_path: Path) -> None:
+    _lower, workspace, _candidate, journal, _source, _diff, result = _run_publish_crash(
+        tmp_path, crash_after=0, hook="cleanup"
+    )
+    assert result.returncode == 74
+
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        recovered = recover_workspace_publications_with_outcomes(workspace, lease, journal)
+
+    assert len(recovered) == 1
+    assert recovered[0].outcome == "committed"
+    assert recovered[0].manifest_hash.startswith("sha256:")
+    assert recovered[0].entries_published > 0
+
+
+def test_detailed_recovery_reports_transaction_without_prepared_journal(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    journal = tmp_path / "journal"
+    workspace.mkdir()
+    journal.mkdir(mode=0o700)
+    journal.chmod(0o700)
+    transaction_id = "c" * 32
+    (journal / f"publish-{transaction_id}").mkdir(mode=0o700)
+
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        recovered = recover_workspace_publications_with_outcomes(workspace, lease, journal)
+
+    assert len(recovered) == 1
+    assert recovered[0].transaction_id == transaction_id
+    assert recovered[0].outcome == "not_started"
 
 
 def test_recovery_fails_closed_if_workspace_changed_after_process_death(tmp_path: Path) -> None:

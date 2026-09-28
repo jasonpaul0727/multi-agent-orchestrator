@@ -44,8 +44,10 @@ from .workspace_publish import (
     WorkspacePublishError,
     WorkspacePublishReceipt,
     WorkspacePublishRecoveryConflict,
+    WorkspacePublicationRecovery,
     publish_workspace_diff,
     recover_workspace_publications,
+    recover_workspace_publications_with_outcomes,
 )
 from .overlay_launcher import (
     OverlayCandidateResult,
@@ -80,6 +82,7 @@ __all__ = [
     "WorkspacePublishError",
     "WorkspacePublishReceipt",
     "WorkspacePublishRecoveryConflict",
+    "WorkspacePublicationRecovery",
     "WorkspaceDiff",
     "WorkspaceDiffEntry",
     "WorkspaceInspection",
@@ -90,6 +93,7 @@ __all__ = [
     "inspect_workspace",
     "publish_workspace_diff",
     "recover_workspace_publications",
+    "recover_workspace_publications_with_outcomes",
     "snapshot_workspace",
     "validate_overlay_candidate",
     "landlock_abi",

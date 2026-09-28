@@ -43,6 +43,7 @@ from orchestrator.isolation import (
     acquire_workspace_write_lease,
     publish_workspace_diff,
     recover_workspace_publications,
+    recover_workspace_publications_with_outcomes,
 )
 from orchestrator.persistence.events import EventDraft, StoredEvent
 from orchestrator.security.policy import PolicyDecision, PolicyEngine, PolicyManifest, PolicyRequest
@@ -401,84 +402,33 @@ class WorkspaceWriteGateway:
                 transaction_id=tx_id,
                 authorize=lambda: self._authorized_now(request, state),
             )
-            if consumed is not None and approval_attempt is not None:
-                effect_hash = _hash_json({
-                    "transaction_id": receipt.transaction_id,
-                    "manifest_hash": receipt.manifest_hash,
-                    "entries_published": receipt.entries_published,
-                    "lease_generation": receipt.lease_generation,
-                })
-                self._approval_service.record_effect_receipt(
-                    consumed, approval_attempt, outcome="applied", receipt_hash=effect_hash
-                )
-            receipt_payload = {
-                **intent,
-                "lease_generation": receipt.lease_generation,
-                "entries_published": receipt.entries_published,
-            }
-            receipt_decider = lambda events, _version: self._new_event_once(
-                events, request, "WorkspacePublicationCompleted", receipt_payload,
-                _publication_intent_event_id(events, request), require_start=False,
-            )
-            self._append_required(
-                "workspace_publications",
-                self._publication_stream_id,
-                f"workspace-publication-receipt:{request.run_id}:{request.request_id}",
-                receipt_decider,
-                "workspace publication receipt was not durably audited",
-            )
-            self._append_required(
-                "security",
-                request.run_id,
-                f"workspace-publication-receipt:{request.request_id}",
-                receipt_decider,
-                "workspace publication receipt was not durably audited",
-            )
-        except _WriteAuthorityLost:
-            recovered = recover_workspace_publications(self._workspace, lease, self._journal_root)
-            if intent is not None and (tx_id in recovered or not recovered):
-                self._approval_receipt_if_consumed(
-                    consumed, approval_attempt, "not_applied", _digest(b"publication-rolled-back")
-                )
-                self._record_publication_aborted(request, intent, "authority_lost_during_publication")
-            else:
-                self._approval_receipt_if_consumed(
-                    consumed, approval_attempt, "not_applied", _digest(b"authority-lost-before-publication")
-                )
-            self._terminal(request, "ToolExecutionCancelled", {"outcome": "authority_lost"})
-            return ToolExecutionResult(request.request_id, "authority_lost", decision)
-        except WorkspacePublishAuthorizationLost as exc:
-            recovered = recover_workspace_publications(self._workspace, lease, self._journal_root)
-            if intent is not None and (tx_id in recovered or not recovered):
+            self._record_publication_completed(request, intent, receipt, consumed, approval_attempt)
+        except _WriteAuthorityLost as exc:
+            if intent is None:
                 self._approval_receipt_if_consumed(
                     consumed, approval_attempt, "not_applied", _digest(str(exc).encode())
                 )
-                self._record_publication_aborted(request, intent, str(exc))
-                self._terminal(request, "ToolExecutionCancelled", {
-                    "outcome": "authority_lost", "reason": "authority_lost_during_publication",
-                })
+                self._terminal(request, "ToolExecutionCancelled", {"outcome": "authority_lost"})
                 return ToolExecutionResult(request.request_id, "authority_lost", decision)
-            self._terminal(request, "ToolExecutionOutcomeUnknown", {
-                "outcome": "execution_unknown", "reason": "publication_recovery_uncertain",
-            })
-            return ToolExecutionResult(request.request_id, "execution_unknown", decision,
-                                       termination_confirmed=False)
-        except WorkspacePublishConflict as exc:
-            self._approval_receipt_if_consumed(
-                consumed, approval_attempt, "not_applied", _digest(str(exc).encode())
+            return self._reconcile_publication_failure(
+                request, decision, candidate, lease, tx_id, intent, consumed, approval_attempt,
+                reason=str(exc), not_applied_outcome="authority_lost",
             )
-            self._record_publication_aborted(request, intent, "workspace_conflict")
-            self._terminal(request, "ToolExecutionFailed", {"reason": "workspace_conflict"})
-            return self._result(request, decision, "failed", candidate)
+        except WorkspacePublishAuthorizationLost as exc:
+            return self._reconcile_publication_failure(
+                request, decision, candidate, lease, tx_id, intent, consumed, approval_attempt,
+                reason=str(exc), not_applied_outcome="authority_lost",
+            )
+        except WorkspacePublishConflict as exc:
+            return self._reconcile_publication_failure(
+                request, decision, candidate, lease, tx_id, intent, consumed, approval_attempt,
+                reason=str(exc), not_applied_outcome="failed",
+            )
         except WorkspacePublishError as exc:
-            recovered = recover_workspace_publications(self._workspace, lease, self._journal_root)
-            if tx_id in recovered:
-                self._terminal(request, "ToolExecutionOutcomeUnknown", {
-                    "outcome": "execution_unknown", "reason": "publication_result_requires_reconciliation",
-                })
-                return ToolExecutionResult(request.request_id, "execution_unknown", decision,
-                                           termination_confirmed=False)
-            raise
+            return self._reconcile_publication_failure(
+                request, decision, candidate, lease, tx_id, intent, consumed, approval_attempt,
+                reason=str(exc), not_applied_outcome="failed",
+            )
 
         self._terminal(
             request,
@@ -486,6 +436,120 @@ class WorkspaceWriteGateway:
             _execution_payload(request, candidate, outcome="completed", receipt=receipt),
         )
         return self._result(request, decision, "completed", candidate, receipt=receipt)
+
+    def _reconcile_publication_failure(
+        self,
+        request: WorkspaceWriteRequest,
+        decision: PolicyDecision,
+        candidate: OverlayCandidateResult,
+        lease: WorkspaceWriteLease,
+        transaction_id: str,
+        intent: dict[str, Any] | None,
+        consumed: ConsumedApproval | None,
+        approval_attempt: ExecutionAttempt | None,
+        *,
+        reason: str,
+        not_applied_outcome: str,
+    ) -> ToolExecutionResult:
+        try:
+            recovered = recover_workspace_publications_with_outcomes(
+                self._workspace, lease, self._journal_root
+            )
+        except Exception:
+            return self._publication_outcome_unknown(request, decision)
+        recovery = next((item for item in recovered if item.transaction_id == transaction_id), None)
+
+        # The publisher returns success after a durable committed marker even
+        # if journal cleanup fails. A remaining prepared journal is resolved
+        # only after recovery proves rollback; no journal proves no mutation.
+        if recovery is None or recovery.outcome in {"not_started", "rolled_back"}:
+            self._approval_receipt_if_consumed(
+                consumed, approval_attempt, "not_applied", _digest(reason.encode())
+            )
+            if intent is not None:
+                self._record_publication_aborted(request, intent, reason)
+            if not_applied_outcome == "authority_lost":
+                self._terminal(request, "ToolExecutionCancelled", {
+                    "outcome": "authority_lost", "reason": _reason_code(reason),
+                })
+                return ToolExecutionResult(request.request_id, "authority_lost", decision)
+            self._terminal(request, "ToolExecutionFailed", {
+                "reason": _reason_code(reason), "publication_outcome": "not_applied",
+            })
+            return self._result(request, decision, "failed", candidate)
+
+        if recovery.outcome == "committed" and intent is not None:
+            receipt = WorkspacePublishReceipt(
+                transaction_id=transaction_id,
+                manifest_hash=recovery.manifest_hash or intent["manifest_hash"],
+                entries_published=recovery.entries_published,
+                lease_generation=recovery.lease_generation or lease.generation,
+            )
+            self._record_publication_completed(
+                request, intent, receipt, consumed, approval_attempt
+            )
+            self._terminal(
+                request,
+                "ToolExecutionCompleted",
+                _execution_payload(request, candidate, outcome="completed", receipt=receipt),
+            )
+            return self._result(request, decision, "completed", candidate, receipt=receipt)
+
+        return self._publication_outcome_unknown(request, decision)
+
+    def _publication_outcome_unknown(
+        self, request: WorkspaceWriteRequest, decision: PolicyDecision
+    ) -> ToolExecutionResult:
+        self._terminal(request, "ToolExecutionOutcomeUnknown", {
+            "outcome": "execution_unknown", "reason": "publication_recovery_uncertain",
+        })
+        return ToolExecutionResult(
+            request.request_id, "execution_unknown", decision, termination_confirmed=False
+        )
+
+    def _record_publication_completed(
+        self,
+        request: WorkspaceWriteRequest,
+        intent: dict[str, Any],
+        receipt: WorkspacePublishReceipt,
+        consumed: ConsumedApproval | None,
+        approval_attempt: ExecutionAttempt | None,
+    ) -> None:
+        if consumed is not None and approval_attempt is not None:
+            effect_hash = _hash_json({
+                "transaction_id": receipt.transaction_id,
+                "manifest_hash": receipt.manifest_hash,
+                "entries_published": receipt.entries_published,
+                "lease_generation": receipt.lease_generation,
+            })
+            self._approval_service.record_effect_receipt(
+                consumed, approval_attempt, outcome="applied", receipt_hash=effect_hash
+            )
+        receipt_payload = {
+            **intent,
+            "lease_generation": receipt.lease_generation,
+            "entries_published": receipt.entries_published,
+        }
+        security_decider = lambda events, _version: self._new_event_once(
+            events, request, "WorkspacePublicationCompleted", receipt_payload,
+            _publication_intent_event_id(events, request), require_start=False,
+        )
+        workspace_decider = lambda events, _version: self._new_event_once(
+            events, request, "WorkspacePublicationCompleted", receipt_payload,
+            _publication_intent_event_id(events, request), require_start=False,
+        )
+        # The workspace-wide intent remains unresolved until the Run audit
+        # receipt is durable, so its failure keeps every later writer blocked.
+        self._append_required(
+            "security", request.run_id,
+            f"workspace-publication-receipt:{request.request_id}", security_decider,
+            "workspace publication receipt was not durably audited",
+        )
+        self._append_required(
+            "workspace_publications", self._publication_stream_id,
+            f"workspace-publication-receipt:{request.run_id}:{request.request_id}", workspace_decider,
+            "workspace publication receipt was not durably audited",
+        )
 
     def _decision(self, request: WorkspaceWriteRequest, state: PolicyState) -> PolicyDecision:
         policy_request = PolicyRequest(
@@ -905,17 +969,17 @@ class WorkspaceWriteGateway:
             require_start=False,
         )
         self._append_required(
-            "workspace_publications", self._publication_stream_id,
-            f"workspace-publication-aborted:{request.run_id}:{request.request_id}",
-            global_decider,
-            "workspace-scoped rollback receipt was not durably audited",
-        )
-        self._append_required(
             "security", request.run_id, f"workspace-publication-aborted:{request.request_id}",
             lambda events, _version: self._new_event_once(
                 events, request, "WorkspacePublicationAborted", payload, intent_event.event_id,
             ),
             "workspace publication rollback receipt was not durably audited",
+        )
+        self._append_required(
+            "workspace_publications", self._publication_stream_id,
+            f"workspace-publication-aborted:{request.run_id}:{request.request_id}",
+            global_decider,
+            "workspace-scoped rollback receipt was not durably audited",
         )
 
     def _has_unresolved_publication(self, run_id: str) -> bool:

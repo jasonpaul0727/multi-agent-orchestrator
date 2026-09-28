@@ -10,6 +10,7 @@ from orchestrator.isolation import (
     OverlayCandidateResult,
     SandboxLimits,
     SandboxResult,
+    WorkspacePublishError,
     WorkspaceLeaseBusy,
     acquire_workspace_write_lease,
     export_overlay_diff,
@@ -247,6 +248,147 @@ def test_publication_intent_audit_failure_prevents_any_workspace_write(tmp_path:
 
     assert not (workspace / "new.txt").exists()
     assert session.closed
+    assert len(launcher.calls) == 1
+
+
+def test_prepared_publication_error_records_confirmed_rollback(tmp_path: Path, monkeypatch) -> None:
+    workspace, events, _launcher, _session, _leases, journal, gateway, _approvals = _fixture(tmp_path)
+
+    from orchestrator.isolation import workspace_publish
+
+    def fail_after_first_entry(_transaction_id, _path):
+        raise WorkspacePublishError("injected publication interruption")
+
+    monkeypatch.setattr(workspace_publish, "_after_publish_entry", fail_after_first_entry)
+
+    result = gateway.execute(_request(workspace))
+
+    assert result.outcome == "failed"
+    assert not (workspace / "new.txt").exists()
+    assert list(journal.iterdir()) == []
+    run_events = events.read_stream("security", "run-1")
+    global_events = events.read_stream("workspace_publications", gateway._publication_stream_id)
+    assert any(event.event_type == "WorkspacePublicationAborted" for event in run_events)
+    assert any(event.event_type == "WorkspacePublicationAborted" for event in global_events)
+
+
+def test_mid_publication_conflict_keeps_unconfirmed_intent_unresolved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace, events, launcher, session, leases, journal, gateway, _approvals = _fixture(tmp_path)
+    lower = session.result.lower_root
+    upper = tmp_path / "two-entry-upper"
+    upper.mkdir()
+    (upper / "new.txt").write_text("private candidate data\n", encoding="utf-8")
+    (upper / "second.txt").write_text("another candidate\n", encoding="utf-8")
+    diff = export_overlay_diff(lower, upper, tmp_path / "two-entry-candidate")
+    session.result = OverlayCandidateResult(session.result.execution, lower, diff)
+
+    from orchestrator.isolation import workspace_publish
+
+    original_hook = workspace_publish._after_publish_entry
+
+    def create_external_conflict(transaction_id, path):
+        original_hook(transaction_id, path)
+        if path == "new.txt":
+            (workspace / "second.txt").write_text("external edit\n", encoding="utf-8")
+
+    monkeypatch.setattr(workspace_publish, "_after_publish_entry", create_external_conflict)
+
+    result = gateway.execute(_request(workspace))
+
+    assert result.outcome == "execution_unknown"
+    assert (workspace / "new.txt").read_text(encoding="utf-8") == "private candidate data\n"
+    assert (workspace / "second.txt").read_text(encoding="utf-8") == "external edit\n"
+    assert any(path.name.startswith("publish-") for path in journal.iterdir())
+    run_events = events.read_stream("security", "run-1")
+    global_events = events.read_stream("workspace_publications", gateway._publication_stream_id)
+    assert not any(event.event_type == "WorkspacePublicationAborted" for event in run_events)
+    assert [event.event_type for event in global_events] == ["WorkspacePublicationIntent"]
+
+    blocked = gateway.execute(_request(workspace, "write-2"))
+    assert blocked.outcome == "denied"
+    assert len(launcher.calls) == 1
+
+
+def test_prepared_journal_creation_error_records_not_applied(tmp_path: Path, monkeypatch) -> None:
+    workspace, events, _launcher, _session, _leases, journal, gateway, _approvals = _fixture(tmp_path)
+
+    from orchestrator.isolation import workspace_publish
+
+    def fail_before_prepared(*_args, **_kwargs):
+        raise WorkspacePublishError("injected pre-journal failure")
+
+    monkeypatch.setattr(workspace_publish, "_capture_originals", fail_before_prepared)
+
+    result = gateway.execute(_request(workspace))
+
+    assert result.outcome == "failed"
+    assert not (workspace / "new.txt").exists()
+    assert list(journal.iterdir()) == []
+    assert events.read_stream("security", "run-1")[-2].event_type == "WorkspacePublicationAborted"
+
+
+def test_committed_publish_cleanup_error_keeps_success_outcome(tmp_path: Path, monkeypatch) -> None:
+    workspace, events, _launcher, _session, _leases, journal, gateway, _approvals = _fixture(tmp_path)
+
+    from orchestrator.isolation import workspace_publish
+
+    original_remove = workspace_publish._remove_transaction
+
+    def remove_then_fail(directory_fd, transaction_name):
+        original_remove(directory_fd, transaction_name)
+        raise WorkspacePublishError("injected post-commit cleanup failure")
+
+    monkeypatch.setattr(workspace_publish, "_remove_transaction", remove_then_fail)
+
+    result = gateway.execute(_request(workspace))
+
+    assert result.outcome == "completed"
+    assert (workspace / "new.txt").read_text(encoding="utf-8") == "private candidate data\n"
+    assert events.read_stream("security", "run-1")[-1].event_type == "ToolExecutionCompleted"
+    assert list(journal.iterdir()) == []
+
+
+@pytest.mark.parametrize("phase", ["completed", "aborted"])
+def test_missing_run_receipt_keeps_workspace_intent_unresolved(
+    tmp_path: Path, monkeypatch, phase: str
+) -> None:
+    authority = _Authority()
+    workspace, events, launcher, _session, _leases, _journal, gateway, _approvals = _fixture(
+        tmp_path, authority=authority
+    )
+    original_append = events.append_checked
+    failed = False
+
+    def fail_run_receipt(stream_type, stream_id, idempotency_key, decide):
+        nonlocal failed
+        expected_key = "workspace-publication-receipt:" if phase == "completed" else "workspace-publication-aborted:"
+        if not failed and stream_type == "security" and idempotency_key.startswith(expected_key):
+            failed = True
+            raise OSError("injected Run audit failure")
+        return original_append(stream_type, stream_id, idempotency_key, decide)
+
+    events.append_checked = fail_run_receipt
+    if phase == "aborted":
+        from orchestrator.isolation import workspace_publish
+
+        original_hook = workspace_publish._after_publish_entry
+
+        def revoke_before_commit(transaction_id, path):
+            authority.valid = False
+            original_hook(transaction_id, path)
+
+        monkeypatch.setattr(workspace_publish, "_after_publish_entry", revoke_before_commit)
+
+    with pytest.raises(ToolAuditUnavailable):
+        gateway.execute(_request(workspace))
+
+    global_events = events.read_stream("workspace_publications", gateway._publication_stream_id)
+    assert [event.event_type for event in global_events] == ["WorkspacePublicationIntent"]
+    authority.valid = True
+    blocked = gateway.execute(_request(workspace, "write-2"))
+    assert blocked.outcome == "denied"
     assert len(launcher.calls) == 1
 
 

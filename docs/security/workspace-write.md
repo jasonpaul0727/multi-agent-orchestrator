@@ -17,9 +17,13 @@ writes even when a different Run targets the same directory. The writer holds
 the exclusive workspace lease from before candidate snapshot/execution through
 publication, rechecks Attempt and policy authority while the command runs and
 before each publish step, and recovers prepared journals while holding that
-lease. A confirmed rollback gets a `WorkspacePublicationAborted` receipt. An
-intent without a durable completion/abort receipt remains unresolved and
-fail-closes future writes; it is never replayed automatically.
+lease. Recovery distinguishes a transaction that never reached its prepared
+journal, a confirmed rollback, and a durable commit. Only the first two get a
+`WorkspacePublicationAborted` receipt; a durable commit gets a completion
+receipt. Run-level receipts are written before the workspace-scoped stream is
+resolved, so a missing Run audit record continues to block every writer for
+that workspace. An intent without a durable completion/abort receipt remains
+unresolved and fail-closes future writes; it is never replayed automatically.
 
 ## Private candidate execution contract
 
@@ -140,11 +144,12 @@ transaction.
   before launching its candidate. It also checks a workspace-identity-scoped
   unresolved-intent stream, including intents created by other Runs targeting
   the same directory.
-- Authorization loss during a prepared publication triggers journal recovery;
-  only a confirmed rollback gets `WorkspacePublicationAborted`. An intent
-  without a durable completion/abort receipt remains unresolved and blocks
-  later writes; it is never replayed automatically. A crash after a committed
-  publication but before its durable receipt needs operator reconciliation.
+- A definite publisher error triggers journal recovery. A prepared transaction
+  is recorded aborted only after rollback is confirmed; a durable committed
+  journal is reconciled as completed. Run-level completion/abort receipts are
+  appended before the workspace-wide stream is resolved, leaving failures
+  fail-closed. A process crash after a committed publication but before its
+  durable receipt still needs operator reconciliation.
 - A real Ubuntu 24.04/WSL2 test exercises
   `WorkspaceWriteGateway → SystemdOverlayCandidateLauncher → SQLite audit →
   journaled publisher`. The approval branch is covered using the actual
