@@ -1,14 +1,25 @@
 # Workspace Write Boundary
 
-The workspace-write path is not enabled. The repository currently contains
-an internal `SystemdOverlayCandidateLauncher`, a bounded Overlay upper-layer exporter, a
-read-only candidate validator, and a read-only comparison of touched live paths
-against the frozen lower snapshot. `acquire_workspace_write_lease` adds a
-fourth primitive for serializing host writers. `publish_workspace_diff` now
-composes the candidate validator, conflict check, and lease into a bounded
-host-side publisher with a durable rollback journal. `recover_workspace_publications`
-rolls back prepared transactions or cleans committed transaction records after
-restart.
+The repository now contains an internal, attempt-fenced workspace-write
+vertical slice, but product workspace-write remains disabled. Its
+`WorkspaceWriteGateway` exposes only `workspace.write-candidate`, evaluates the
+frozen `reversible_workspace_write` policy action, runs against a private
+OverlayFS candidate, and publishes only validated additions/updates through a
+lease-bound journaled host publisher. Approval-required policy is wired to the
+existing `ApprovalService`; it binds the exact command/workspace/policy/profile
+scope to a newer accepted Attempt and records an effect receipt. See
+[`tool-gateway.md`](tool-gateway.md) and [`approvals.md`](approvals.md) for the
+adjacent read-only surface and identity limitations.
+
+Publication intents and receipts are persisted both in the Run security stream
+and in a workspace-identity-scoped stream, so unresolved writes block later
+writes even when a different Run targets the same directory. The writer holds
+the exclusive workspace lease from before candidate snapshot/execution through
+publication, rechecks Attempt and policy authority while the command runs and
+before each publish step, and recovers prepared journals while holding that
+lease. A confirmed rollback gets a `WorkspacePublicationAborted` receipt. An
+intent without a durable completion/abort receipt remains unresolved and
+fail-closes future writes; it is never replayed automatically.
 
 ## Private candidate execution contract
 
@@ -61,13 +72,15 @@ Operators must prove the reported scope and cgroup stopped before removing it.
 Transport stop attempts have a bounded grace; an unknown outcome never becomes
 an accepted candidate.
 
-This initial runtime is measured only on the documented WSL2/systemd host. It
+This runtime is measured only on the documented WSL2/systemd host. It
 binds system Python/native libraries explicitly, not the entire `/usr` tree
 with WSL driver submounts; arbitrary installed packages, networking and project
 test environments are not promised. Missing kernel/runtime controls fail
-closed. The launcher does not create Attempt/approval/audit events, authorize
-publication, supply model/tool mediation or accept lifecycle state. It is an
-internal backend, not a functional Worker or enabled product workspace-write.
+closed. The launcher itself does not create Attempt/approval/audit events,
+authorize publication, supply model/tool mediation or accept lifecycle state.
+The new host Gateway composes those repository APIs for one tested
+workspace-write path, but remains an internal adapter rather than a functional
+Worker or enabled product capability.
 
 ## Lease contract
 
@@ -114,10 +127,34 @@ either its recorded original or candidate state, recovery fails closed and
 retains the journal for inspection. Publishing is blocked while any pending
 transaction directory exists.
 
-## Explicit limitations
+The optional host authorization callback is checked before journaling, before
+each entry, and immediately before commit; loss raises a distinct authorization
+error so the caller can roll back under the same lease. A caller may supply a
+pre-audited 128-bit transaction ID to bind the intent to the journal
+transaction.
 
-- The lease is not yet bound to Scheduler attempt ownership, policy or approval
-  grants, Gateway capabilities, or audit events.
+## Gateway wiring and explicit limitations
+
+- `WorkspaceWriteGateway` holds the exclusive lease from before candidate
+  snapshot/execution through publication, so another cooperative writer blocks
+  before launching its candidate. It also checks a workspace-identity-scoped
+  unresolved-intent stream, including intents created by other Runs targeting
+  the same directory.
+- Authorization loss during a prepared publication triggers journal recovery;
+  only a confirmed rollback gets `WorkspacePublicationAborted`. An intent
+  without a durable completion/abort receipt remains unresolved and blocks
+  later writes; it is never replayed automatically. A crash after a committed
+  publication but before its durable receipt needs operator reconciliation.
+- A real Ubuntu 24.04/WSL2 test exercises
+  `WorkspaceWriteGateway → SystemdOverlayCandidateLauncher → SQLite audit →
+  journaled publisher`. The approval branch is covered using the actual
+  `ApprovalService` and a fake candidate transport; neither proves a deployed
+  Worker/Scheduler application service.
+- Isolation profile hash, AttemptAuthority, policy-state provider, policy
+  snapshot, authenticated approval requester, event store, and private
+  lease/journal roots are host-injected. Production provisioning, a separate
+  authority service, Secret Broker, Worker IPC and Scheduler lifecycle
+  reconciliation remain unimplemented.
 - The conflict report by itself remains advisory. The publisher holds a lease
   and repeats checks, but the lock only serializes cooperating writers; it is
   not an OS lock against arbitrary same-user edits.
@@ -126,12 +163,12 @@ transaction directory exists.
 - A batch is crash-recoverable, not atomically visible as one change to
   unrelated readers: each file/symlink replacement is atomic, but a reader
   racing a multi-entry publish may observe an intermediate tree.
-- This publisher is a host-side primitive only. It is not connected to
-  ApprovalService, Scheduler/Worker attempt ownership, Tool Gateway
-  capabilities, Secret Broker, or a durable security audit event. It does not
-  enable workspace-write in the product.
-- No Worker receives this lease API. The Tool Gateway still does not enable
-  workspace-write.
+- The internal Gateway binds publication to Attempt authority, policy,
+  optional ApprovalService, one-use capability events and durable publication
+  audit, but is not yet invoked by the Scheduler/Worker application service.
+- The publisher remains a host-side primitive and no Worker receives this
+  lease API. The Gateway is opt-in and does not enable workspace-write in the
+  product.
 
 Tests include subprocess termination after partial publication and before the
 first write, termination around the commit/cleanup boundary, symlink and
@@ -140,11 +177,12 @@ cover cross-process exclusion, generation replay, partial journal-tail
 recovery, corrupt-journal rejection, root/file symlink boundaries,
 permissions, root replacement, mount identity, and uncertain persistence.
 The live `test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits`
-integration test additionally creates and validates a candidate inside a real
-systemd/OverlayFS scope, then invokes the host-side publisher and checks the
-published workspace plus unchanged lower tree. This is still not
-end-to-end Approval/Gateway/Worker integration or a product platform-support
-claim.
+integration test creates and validates a candidate in a real systemd/OverlayFS
+scope and invokes the host publisher. The
+`test_live_candidate_gateway_audits_then_publishes_exact_workspace_diff`
+integration test exercises the full candidate Gateway/audit/publisher path on
+that host. These are still not Worker/Scheduler service integration or a
+product platform-support claim.
 `tests/integration/test_overlay_candidate_launcher.py` now exercises the
 actual launcher API, including source immutability, hidden host paths, syscall
 denials, trusted import shadowing, detached descendants, SIGTERM resistance,

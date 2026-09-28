@@ -2,6 +2,8 @@
 
 ## 当前状态
 
+2026-09-28 P4 WorkspaceWriteGateway 切片：新增独立 `workspace.write-candidate` request/tool 与 `WorkspaceWriteGateway`，用冻结 Policy 的 `reversible_workspace_write` action、Attempt/fencing + policy 实时重验、一次性 CapabilityGrant 和可选 ApprovalService→新 Attempt/effect receipt 接入真实 private Overlay candidate + journal publisher。写操作从 candidate snapshot 前持有跨进程 workspace lease 到发布完成，publisher 在 journal 前、每个 entry 前和 commit 前再次检查 authority；WorkspacePublicationIntent/Completed/Aborted 同时写入 Run security stream 和按 workspace identity 共享的 stream。未决 intent、重启后 recovered journal 或锁竞争均不重放，回滚必须经同一 lease 确认。测试覆盖拒绝/旧 Attempt、审批 fresh Attempt、审计失败、回执失败后的重试封锁、跨 Run 未决 intent、writer lease 冲突、撤权中途回滚，以及真实 WSL2 systemd candidate→SQLite audit→publish。此 slice 仍是 host 注入式内部 API：profile/authority/身份由 host 配置，不接 Scheduler/Worker service，进程崩溃后的跨流自动 reconciliation 仍没有，未决 post-commit intent 需要人工对账，故 workspace-write 产品能力仍关闭。
+
 2026-09-27 候选后端最终验收：全量 1095 项测试通过，无跳过；总覆盖率 90.76%，未降低 90% 门槛。编译、`pip check`、wheel 构建和 diff 检查通过，独立只读审阅发现的问题已修复并有回归测试。未调用付费 Provider，不构成 Maestro 改善数字的基准证据。
 
 2026-09-27 P4 候选执行后端更新：新增 `SystemdOverlayCandidateLauncher`/`OverlayCandidateSession`，以工作区冻结快照和有界 tmpfs Overlay 执行真实命令，源工作区不可写；user/mount/net/PID namespace、能力清空、Landlock、默认拒绝 seccomp、cgroup/rlimit 校验及无密钥环境已接入。受信 Python 启动器以 `-P -S` 禁止工作区包/site 注入（同时修复原只读启动器）。命令结束后 PID 1 杀死并回收全部后代，卸载 Overlay、严格导出候选；宿主验证私有完成记录及实际 bytes/manifest/lower baseline，且同时核对 systemd 状态与冻结 cgroup 的内核空组证明。未知启动或停止保留现场，输出/超时/取消/非法 diff 不产生可用候选。真实测试覆盖源不变、隐藏宿主路径、拒绝 socket/mount/chroot/xattr、包导入注入、脱离子进程、忽略 SIGTERM、限额、候选与现有租约/发布器兼容；详情见 `docs/security/workspace-write.md`。这仍未接入 Worker/Scheduler、Approval/Gateway/Secret Broker、持久化安全审计或恢复服务，产品 workspace-write 仍关闭。旧日期条目是历史状态，以本段及 README 为最新边界。
@@ -16,7 +18,7 @@
 
 持久化/预算/观测基础、P1 四层配置及 P2 策略/确定性路由均已实现。P3 包含 Agent Registry 累计数量/深度/活动限制、等待用户/取消门控、生命周期 checkpoint/replay、只读一致性恢复，以及 Effect/Artifact/Gateway failure 记录与受限恢复授权。Artifact publication intent 可跨进程重启归属 Run 并检查 bytes/provenance；候选不会自动采纳或删除，旧/裸 orphan 仍不可归属。Scheduler admission/reconciliation 的子进程测试证明 SQLite 原子性和幂等重放，但不证明 Provider 查询/回执真实性；完整跨进程中断矩阵、真实 Worker 终止回执、Provider reconciliation 和自动恢复循环仍缺，协调器目前不启动/终止 Worker。
 
-P4 只有经实测的 Linux/systemd 只读隔离 profile、固定只读 ToolGateway 切片、未接 Worker 的 ApprovalService 原语和进程内 Secret Broker 原型。workspace-write/Overlay 安全发布、独立 Worker 边界、生产身份/keyring、Gateway/Worker 审批接线未完成。P5 Worker/Verifier、P6 CLI/MCP、P7 完整 E2E/安全验收及性能基准均未完成；默认 Provider broker fail-closed，项目不具备完整产品或生产系统交付条件。Maestro 成本、Token 和重复工作目标尚无可复现基准证据；边界见 `docs/security/run-recovery.md`。
+P4 有经实测的 Linux/systemd 只读隔离与 Overlay candidate profile、固定只读 ToolGateway 及内部 WorkspaceWriteGateway→journal publisher 切片、ApprovalService 原语和进程内 Secret Broker 原型。workspace-write Gateway 尚未接 Scheduler/Worker service，生产身份/keyring/Secret Broker egress 与跨流自动恢复仍未完成。P5 功能 Worker/Verifier、P6 CLI/MCP、P7 完整 E2E/安全验收及性能基准均未完成；默认 Provider broker fail-closed，项目不具备完整产品或生产系统交付条件。Maestro 成本、Token 和重复工作目标尚无可复现基准证据；边界见 `docs/security/run-recovery.md`。
 
 ## 产品目标
 

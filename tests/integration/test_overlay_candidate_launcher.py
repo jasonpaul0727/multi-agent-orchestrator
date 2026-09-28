@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -14,6 +15,14 @@ import time
 import pytest
 
 import orchestrator.isolation as isolation
+from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
+from orchestrator.security.policy import PolicyAuthority, PolicyManifest
+from orchestrator.tools import (
+    PolicyState,
+    WORKSPACE_WRITE_TOOL_ID,
+    WorkspaceWriteGateway,
+    WorkspaceWriteRequest,
+)
 
 
 def _systemd_available() -> bool:
@@ -97,6 +106,61 @@ print(json.dumps(result, sort_keys=True))
     assert (workspace / "input.txt").read_text() == "original\n"
     assert not (workspace / "new.txt").exists()
     assert secret.read_text() == "canary-host-only"
+
+
+def test_live_candidate_gateway_audits_then_publishes_exact_workspace_diff(tmp_path: Path) -> None:
+    workspace = tmp_path / "gateway-workspace"
+    workspace.mkdir()
+    (workspace / "existing.txt").write_text("unchanged\n")
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir(mode=0o700)
+    journal_root = tmp_path / "journal"
+    journal_root.mkdir(mode=0o700)
+    events = SQLiteEventStore(tmp_path / "gateway-events.db")
+    manifest = PolicyManifest(authorities=(PolicyAuthority(
+        source="system",
+        max_permission="workspace-write",
+        allowed_actions=("reversible_workspace_write",),
+        allowed_tools=(WORKSPACE_WRITE_TOOL_ID,),
+    ),))
+    gateway = WorkspaceWriteGateway(
+        run_id="run-live-write",
+        workspace=workspace,
+        event_store=events,
+        policy_manifest=manifest,
+        attempt_authority=type("Authority", (), {"is_current": lambda self, request: True})(),
+        policy_state=lambda request: PolicyState(1, 0),
+        lease_root=lease_root,
+        journal_root=journal_root,
+        isolation_profile_hash="sha256:" + hashlib.sha256(b"live-overlay-workspace-write-profile").hexdigest(),
+    )
+    request = WorkspaceWriteRequest(
+        request_id="live-write-1",
+        run_id="run-live-write",
+        node_id="node-1",
+        attempt_id="attempt-1",
+        fencing_generation=1,
+        role="worker",
+        causation_id="attempt-accepted-live",
+        workspace=str(workspace),
+        command=(
+            "/usr/bin/python3",
+            "-c",
+            "from pathlib import Path; Path('created.txt').write_text('candidate output\\n')",
+        ),
+    )
+
+    result = gateway.execute(request)
+
+    assert result.outcome == "completed"
+    assert (workspace / "existing.txt").read_text() == "unchanged\n"
+    assert (workspace / "created.txt").read_text() == "candidate output\n"
+    assert list(journal_root.iterdir()) == []
+    security_events = events.read_stream("security", "run-live-write")
+    assert [event.event_type for event in security_events][-3:] == [
+        "WorkspacePublicationIntent", "WorkspacePublicationCompleted", "ToolExecutionCompleted",
+    ]
+    assert not any(str(workspace) in repr(event.payload) for event in security_events)
 
 
 def test_candidate_session_forwards_bounded_stdin_and_reaps_detached_children(tmp_path: Path) -> None:

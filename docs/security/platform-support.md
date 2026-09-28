@@ -7,7 +7,7 @@ full security acceptance suite are integrated and pass.
 
 | Platform | Observed runtime | Read-only command profile | Workspace-write profile | Product support |
 | --- | --- | --- | --- | --- |
-| Ubuntu 24.04 under WSL2 | Microsoft kernel `6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17` | Live-tested through `SystemdReadOnlyLauncher`; no-follow snapshot, exact cgroup/rlimits, Landlock, private network/tmp/home and read-only binds. Trusted Python startup rejects workspace import shadowing. | `SystemdOverlayCandidateLauncher` now live-tests private command writes with user/mount/net/PID namespaces, bounded tmpfs, dropped capabilities, Landlock, default-deny seccomp, whole-tree stop and independently verified cgroup emptiness before host candidate admission. Explicit lease/journal publication is tested separately. Product workspace-write remains disabled: no Approval/Gateway/audit/Worker service wiring. Deletions/whiteouts unsupported; multi-entry publication not reader-atomic. | Measured internal backends only, not a complete V1 execution platform. |
+| Ubuntu 24.04 under WSL2 | Microsoft kernel `6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17` | Live-tested through `SystemdReadOnlyLauncher`; no-follow snapshot, exact cgroup/rlimits, Landlock, private network/tmp/home and read-only binds. Trusted Python startup rejects workspace import shadowing. | `SystemdOverlayCandidateLauncher` and `WorkspaceWriteGateway` live-test private candidate execution, Attempt/policy checks, SQLite publication intent/receipt, exclusive lease and journaled host publication; optional ApprovalService path has unit integration tests. Product workspace-write remains disabled: not invoked by Worker/Scheduler, host injects profile/authority/identity, and no automatic cross-stream reconciliation. Deletions/whiteouts unsupported; multi-entry publication not reader-atomic. | Measured internal backends only, not a complete V1 execution platform. |
 | Other Linux distributions | Not measured | Unverified; do not infer support from the presence of systemd. | Unsupported | Unsupported/unverified. |
 | Windows and macOS | Not measured | Unsupported by this backend | Unsupported | Unsupported. |
 
@@ -36,9 +36,11 @@ Its frozen cgroup identity is checked before command start and its kernel
 emptiness after transport exit; unknown start/stop retains private staging.
 The curated runtime does not promise arbitrary project packages or test
 environments. See `workspace-write.md` for lifetime and cleanup obligations.
-It is not wired into approval/audit/
-Worker services. Its multi-entry changes are not a single reader-visible
-atomic swap. These primitives do not enable workspace-write.
+The launcher itself does not make policy, Attempt, or approval decisions; the
+new opt-in `WorkspaceWriteGateway` composes those checks and durable audit with
+the publisher, but is not connected to the application service. Its multi-entry
+changes are not a single reader-visible atomic swap, and the product capability
+remains disabled.
 The Tool Gateway evaluates a frozen
 `PolicyManifest`, records `PolicyDecision` and a one-use capability in the
 security event stream, checks an injected attempt/fencing authority before and
@@ -47,7 +49,9 @@ test covers that full path through the actual systemd unit. This is not yet
 connected to a Worker or Scheduler application service. The Tool Gateway does
 not implement workspace writes, candidate validation or artifact publication,
 workspace-write approval-grant consumption, or a Secret Broker. Its fixed
-read-only command has an internal ApprovalService path; other effects remain
-blocked, and no functional Worker application service is connected.
+read-only command has an internal ApprovalService path; reversible workspace
+changes use the separate `WorkspaceWriteGateway` ApprovalService path. Other
+effects remain blocked, and no functional Worker application service is
+connected.
 Model and managed-web network access are not provided inside the command unit;
 future network access must go through their own Gateway.

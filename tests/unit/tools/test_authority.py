@@ -10,6 +10,7 @@ from orchestrator.isolation import SandboxResult
 from orchestrator.persistence import EventDraft, SQLiteEventStore
 from orchestrator.security import PolicyAuthority, PolicyManifest
 from orchestrator.tools.authority import DurableAttemptAuthority
+from orchestrator.tools.workspace_write import WORKSPACE_WRITE_TOOL_ID, WorkspaceWriteRequest
 from orchestrator.tools.gateway import READ_ONLY_COMMAND_TOOL_ID, PolicyState, ToolGateway, ToolRequest
 from orchestrator.tools.authority import _attempt_ref
 from orchestrator.workspace_identity import workspace_identity_hash
@@ -123,6 +124,16 @@ def _fixture(
 def test_durable_authority_accepts_only_live_bound_attempt(tmp_path) -> None:
     store, authority, request, _, _ = _fixture(tmp_path)
     assert authority.is_current(request)
+    store.close()
+
+
+def test_durable_authority_accepts_write_tool_only_when_route_names_it(tmp_path) -> None:
+    tool_ids = (READ_ONLY_COMMAND_TOOL_ID, WORKSPACE_WRITE_TOOL_ID)
+    store, authority, request, _, _ = _fixture(tmp_path, tool_ids=tool_ids)
+    write_request = WorkspaceWriteRequest.model_validate(request.model_dump())
+
+    assert authority.is_current(write_request)
+    assert not authority.is_current(write_request.model_copy(update={"attempt_id": "attempt-2"}))
     store.close()
 
 

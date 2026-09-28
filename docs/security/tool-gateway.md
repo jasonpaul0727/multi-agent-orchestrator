@@ -6,6 +6,12 @@ attempt to one isolated command. It currently exposes only the fixed tool id
 provide workspace-write, Git mutation, web access, secret use, or external
 effects.
 
+Workspace writes use a separate, opt-in `WorkspaceWriteGateway`; they are not
+accepted by this read-only `ToolGateway`. The write path has its own
+`workspace.write-candidate` request type and is documented in
+[`workspace-write.md`](workspace-write.md). This keeps the base read-only
+command lane from being silently widened into a write capability.
+
 ## Enforcement sequence
 
 1. The trusted host creates a Gateway instance bound to a Run ID, immutable
@@ -72,22 +78,19 @@ Runs without a frozen workspace binding fail closed for this adapter. The
 injected authority interface remains trusted and could be misconfigured by a
 future caller.
 
-Only the Ubuntu 24.04/WSL2 systemd read-only profile in
-[`platform-support.md`](platform-support.md) has live evidence. There is no
-enabled workspace-write support, general-purpose Approval/Secret Broker
-process boundary, functional Worker, CLI, or MCP wiring. The new ApprovalService
-connection covers only this fixed read-only command path and relies on the host
-to supply an authenticated requester, an accepted fresh Attempt, and a measured
-profile hash; it is not a user-facing approval queue or proof of production
-identity. A host-side lease-bound Overlay candidate publisher and
-crash-recovery journal now exist with unit/subprocess-crash evidence. The live
-`test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits`
-probe also sends a candidate created in a real systemd/OverlayFS scope through
-the host publisher. This remains a primitive-only path: it is not integrated
-with this Gateway, approval, audit, or attempt ownership, and it does not run
-an untrusted Worker through the publisher. Thus these primitives are not
-evidence that the complete P4/P5 execution path or the V1 product is
-deliverable.
+Only the Ubuntu 24.04/WSL2 systemd read-only and candidate profiles in
+[`platform-support.md`](platform-support.md) have live evidence. There is no
+product-enabled workspace-write support, general-purpose Approval/Secret
+Broker process boundary, functional Worker, CLI, or MCP wiring. The read-only
+ApprovalService connection and sibling workspace-write approval path both
+rely on host-supplied authenticated requesters, current Attempts, and
+isolation profile hashes; neither is a user-facing approval queue or proof of
+production identity. The WorkspaceWriteGateway has a live
+`test_live_candidate_gateway_audits_then_publishes_exact_workspace_diff` probe
+for candidate execution, SQLite audit and journaled publication. It remains an
+internal application adapter, not a Worker/Scheduler service or full
+cross-stream recovery path. These tests do not establish that P4/P5 or the V1
+product is deliverable.
 
 ## Verification
 

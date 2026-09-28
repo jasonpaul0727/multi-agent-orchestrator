@@ -128,6 +128,20 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 ## P4：OS 隔离、Tool Gateway、密钥与审批
 
+2026-09-28 internal workspace-write vertical slice: added a separate
+`WorkspaceWriteGateway`/`workspace.write-candidate` capability. It holds the
+exclusive workspace lease from before candidate snapshot through publication,
+rechecks accepted Attempt/policy authority while executing and before each
+journaled publish step, supports the exact-scope ApprovalService fresh-Attempt
+flow, and persists workspace-identity-scoped intent/completion/confirmed-abort
+events. Unresolved intents block writes across Runs and are not replayed.
+Unit tests cover grant/attempt replay boundaries, lease contention, audit and
+receipt failures, conflict abort, and revocation rollback; a WSL2/systemd live
+integration exercises candidate→audit→publish. This does not close P4:
+Scheduler/Worker invocation, production identity/profile provisioning, Secret
+Broker process separation, and crash-time cross-stream reconciliation remain
+open. See `docs/security/workspace-write.md`.
+
 2026-09-27 internal candidate backend slice: `SystemdOverlayCandidateLauncher`
 now wraps the live-tested private OverlayFS path with a cancellable session,
 bounded stdin/output/storage, no-follow workspace freeze, user/mount/net/PID
@@ -155,6 +169,7 @@ See `docs/security/workspace-write.md` and the scoped
 - [ ] 实现 Tool Gateway，作为文件、受限命令、Git、managed web read 和外部工具的唯一入口；执行前重验 Grant、目标/参数哈希、fencing、隔离指纹、撤销版本及策略版本。
 - [ ] 完成端到端一次性精确 ApprovalRequest/ApprovalGrant：将已有内部 ApprovalService 原语接入可信身份/Authority Envelope、ToolGateway 和 Worker；覆盖绑定 effect intent、原子单次消费、过期/撤销及授权后创建新 attempt；批准只令阻塞节点重新就绪，不恢复旧 attempt 或复用旧 RoutingDecision。
 - [x] 在固定只读 `system.readonly-command` 垂直路径中接入 ApprovalService：Gateway 自动记录精确 hash-only ApprovalRequest，只有新的匹配 Attempt 才能一次性消费 grant/EffectIntent/预算并执行；终态写 receipt。真实身份/Authority Envelope、Worker/Scheduler 自动重调度、workspace-write 与其他副作用仍未完成。
+- [x] 实现内部 workspace-write candidate Gateway 切片：独立写 tool/policy action、Attempt/fencing 重验、ApprovalService 新 Attempt/单次 effect receipt、跨 Run 写租约、持久发布 intent/receipt 和 journal rollback。尚未接入 Worker/Scheduler service，未决 crash 结果需要人工 reconciliation，因此不解除产品 workspace-write 禁用。
 - [ ] 完成 Secret Broker 端到端安全边界：将现有进程内 allowlist/audit 原型接入独立可信 Gateway/Worker 进程布局、宿主身份/密钥后端与策略撤销；实测密钥不进入 Worker/Shell、环境变量继承、命令行、提示、事件、日志、Artifact 或审批预览。
 - [ ] 外部副作用严格按 intent -> grant consume -> execute -> receipt/reconcile；结果不明禁止自动重试。managed web 代理阻止认证信息、上传、私网/localhost/metadata、重定向绕过和 DNS 重绑定。
 - [ ] Git/worktree 写入采用串行共享工作区写租约或独立 worktree 并行；合并作为独立验证节点。

@@ -39,6 +39,7 @@ from .workspace_lease import (
     acquire_workspace_write_lease,
 )
 from .workspace_publish import (
+    WorkspacePublishAuthorizationLost,
     WorkspacePublishConflict,
     WorkspacePublishError,
     WorkspacePublishReceipt,
@@ -75,6 +76,7 @@ __all__ = [
     "WorkspaceLeaseError",
     "WorkspaceLeaseUnavailable",
     "WorkspacePublishConflict",
+    "WorkspacePublishAuthorizationLost",
     "WorkspacePublishError",
     "WorkspacePublishReceipt",
     "WorkspacePublishRecoveryConflict",

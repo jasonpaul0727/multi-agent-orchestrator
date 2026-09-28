@@ -1,8 +1,8 @@
 # ApprovalService 当前边界
 
-更新时间：2026-09-26
+更新时间：2026-09-28
 
-`orchestrator.approvals.ApprovalService` 是 P4 的内部控制面原语。2026-09-26 起，它通过 `ToolGateway` 接入仓库现有的**固定只读命令**路径：Gateway 可生成精确审批请求，批准后只能由新的 Attempt 绑定并消费 grant，最后写入 EffectReceipt。它仍不是已集成的用户审批产品：请求者身份、认证器、可信 attempt/profile 和 CLI/MCP/UI 都由 host/application 层提供。
+`orchestrator.approvals.ApprovalService` 是 P4 的内部控制面原语。它通过 `ToolGateway` 接入固定只读命令，并新增通过 `WorkspaceWriteGateway` 接入可逆工作区发布：批准 scope 绑定命令参数、workspace identity、策略与隔离 profile；批准后必须由更新的 Attempt 绑定并消费 grant，发布回执再写入 EffectReceipt。它仍不是已集成的用户审批产品：请求者身份、认证器、可信 Attempt/profile 和 CLI/MCP/UI 都由 host/application 层提供。
 
 ## 已实现并由测试覆盖
 
@@ -13,16 +13,17 @@
 - 过期、Policy 版本变化、撤销、失败的 attempt authority、缺失的因果/attempt 上下文均 fail-closed。结果回执绑定到已消费的 effect/attempt，完全相同的回执幂等；不同结果拒绝覆盖。
 - 持久化只写审批理由哈希和 Provider idempotency key 哈希；测试断言这些原始值不出现在事件内容中。
 - ToolGateway 只在 ApprovalService 与自己共享同一个 SQLite event store、且 host 提供认证请求者和 profile hash 时启用接线。审批 scope 哈希绑定固定只读工具、workspace identity、命令参数、运行限制与冻结 Policy；新 Attempt 必须逐项匹配后才绑定 grant。grant 消费、effect intent、零费用预算预留、Gateway start 和终态 receipt 均有集成测试。
-- 这条垂直路径仅适用于 `system.readonly-command`，不是 workspace-write/发布/外部 Provider 的审批接线。调用者需另行通过已认证审批 API批准，并为相同 scope 调度新的已接受 Attempt；Gateway 不恢复旧 Attempt。
+- WorkspaceWriteGateway 也要求共享 SQLite event store 与 host 提供的认证 requester/profile。审批 scope 绑定 `workspace.write-candidate`、workspace identity、固定 command、运行限制与冻结 Policy；一次性 effect grant 只可由更新的 Attempt 消费，发布后产生 EffectReceipt。该分支有真实 ApprovalService + 假 candidate transport 测试；真实 systemd candidate→audit→publish 有独立 live integration test。
+- 两条垂直路径都不接 Scheduler/Worker application service。调用者仍要通过已认证审批 API并调度新的已接受 Attempt；Gateway 不恢复旧 Attempt，也不代表跨流崩溃协调已完成。
 
 ## 尚未实现（不能据此宣称安全审批闭环）
 
 - 未配置真实身份提供方、密钥存储、角色目录、MFA 或用户界面。传入的 authenticator 是可信系统边界；接入方必须自行保证不可伪造且能区分调用者。
 - 请求创建仍是内部 API：Gateway 的只读命令适配器会从注入的 host 身份回调取得 requester，但请求者对来源 attempt、目标或参数的产品级权限仍要由真实身份/Authority Envelope 校验。
 - 尚未被 Worker/Scheduler application service 消费；CLI/MCP 入口、批准后的通知/队列/自动生成新 Attempt 流程仍缺。Gateway 只接受 host 显式传入 grant 与新的当前 Attempt，不恢复旧 `RoutingDecision` 或旧 attempt。
-- 尚未集成 Secret Broker、workspace-write/Overlay、CLI/MCP `Authority Envelope`、通知/审批队列或产品级审计查看器。
+- 尚未集成 Secret Broker、Worker/Scheduler 的 workspace-write/Overlay 应用服务、CLI/MCP `Authority Envelope`、通知/审批队列或产品级审计查看器。
 - SQLite 本地事件事务不是跨主机一致性协议；此实现不构成分布式授权服务或多租户身份系统。
 
 ## 本地验证
 
-运行 `pytest tests/unit/approvals/test_service.py tests/unit/budget/test_ledger.py tests/unit/tools/test_gateway.py tests/integration/test_approval_tool_gateway.py tests/contract/test_cross_spec_events.py -q`。这些测试覆盖内部事件/账本契约、并发单次消费，以及固定只读命令的 ApprovalService→ToolGateway 路径；不证明真实身份验证、Worker 隔离、workspace-write/外部 Provider 副作用、跨进程恢复或端到端 UI 流程。
+运行 `pytest tests/unit/approvals/test_service.py tests/unit/budget/test_ledger.py tests/unit/tools/test_gateway.py tests/unit/tools/test_workspace_write_gateway.py tests/integration/test_approval_tool_gateway.py tests/contract/test_cross_spec_events.py -q`。这些测试覆盖内部事件/账本契约、并发单次消费，以及只读和可逆 workspace-write 的 ApprovalService 路径；不证明真实身份验证、Worker 隔离、外部 Provider 副作用、跨进程恢复或端到端 UI 流程。

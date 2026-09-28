@@ -11,9 +11,11 @@ from .gateway import (
     ToolRequest,
     ToolRequestAlreadyUsed,
 )
+from .workspace_write import WORKSPACE_WRITE_TOOL_ID, WorkspaceWriteGateway, WorkspaceWriteRequest
 
 __all__ = [
     "READ_ONLY_COMMAND_TOOL_ID",
+    "WORKSPACE_WRITE_TOOL_ID",
     "AttemptAuthority",
     "DurableAttemptAuthority",
     "PolicyState",
@@ -22,4 +24,6 @@ __all__ = [
     "ToolGateway",
     "ToolRequest",
     "ToolRequestAlreadyUsed",
+    "WorkspaceWriteGateway",
+    "WorkspaceWriteRequest",
 ]

@@ -17,7 +17,7 @@ import re
 import secrets
 import shutil
 import stat
-from typing import Any
+from typing import Any, Callable
 
 from .workspace import (
     WorkspaceBoundaryError,
@@ -47,6 +47,10 @@ class WorkspacePublishRecoveryConflict(WorkspacePublishError):
     """Recovery found a target changed outside the recorded transaction."""
 
 
+class WorkspacePublishAuthorizationLost(WorkspacePublishError):
+    """Publication fencing or policy authorization was revoked mid-transaction."""
+
+
 @dataclass(frozen=True)
 class WorkspacePublishReceipt:
     """Non-sensitive summary of a completed journaled publication."""
@@ -67,6 +71,8 @@ def publish_workspace_diff(
     max_entries: int = 100_000,
     max_bytes: int = 1024 * 1024 * 1024,
     max_backup_bytes: int = 1024 * 1024 * 1024,
+    transaction_id: str | None = None,
+    authorize: Callable[[], bool] | None = None,
 ) -> WorkspacePublishReceipt:
     """Publish additions/updates under an exclusive lease with crash rollback.
 
@@ -101,13 +107,18 @@ def publish_workspace_diff(
         raise WorkspacePublishConflict("workspace candidate conflicts with live paths")
 
     roots = _open_roots(lower_root, workspace_root, diff.candidate_root, journal_root)
-    transaction_id = secrets.token_hex(16)
+    if transaction_id is None:
+        transaction_id = secrets.token_hex(16)
+    elif not isinstance(transaction_id, str) or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
+        roots.close()
+        raise WorkspacePublishError("transaction_id must be a 128-bit lowercase hexadecimal value")
     transaction_name = f"publish-{transaction_id}"
     transaction_fd: int | None = None
     try:
         _assert_roots_disjoint(roots)
         lease.assert_current()
         _verify_workspace_fd(roots.workspace_fd, lease)
+        _require_publish_authority(authorize)
         _assert_no_pending_transactions(roots.journal_fd)
         try:
             os.mkdir(transaction_name, 0o700, dir_fd=roots.journal_fd)
@@ -135,6 +146,7 @@ def publish_workspace_diff(
             )
             lease.assert_current()
             _verify_workspace_fd(roots.workspace_fd, lease)
+            _require_publish_authority(authorize)
             payload = _make_payload(
                 status="prepared",
                 transaction_id=transaction_id,
@@ -152,12 +164,14 @@ def publish_workspace_diff(
         for record in records:
             lease.assert_current()
             _verify_workspace_fd(roots.workspace_fd, lease)
+            _require_publish_authority(authorize)
             _assert_live_state(roots.workspace_fd, roots.workspace_mount_id, record, "before")
             _apply_record(roots, record, transaction_id)
             _after_publish_entry(transaction_id, record["path"])
 
         lease.assert_current()
         _verify_workspace_fd(roots.workspace_fd, lease)
+        _require_publish_authority(authorize)
         os.fsync(roots.workspace_fd)
         _write_journal(transaction_fd, {**payload, "status": "committed"})
         receipt = WorkspacePublishReceipt(
@@ -178,6 +192,17 @@ def publish_workspace_diff(
         if transaction_fd is not None:
             os.close(transaction_fd)
         roots.close()
+
+
+def _require_publish_authority(authorize: Callable[[], bool] | None) -> None:
+    if authorize is None:
+        return
+    try:
+        current = authorize()
+    except Exception as exc:
+        raise WorkspacePublishAuthorizationLost("workspace publication authority is unavailable") from exc
+    if current is not True:
+        raise WorkspacePublishAuthorizationLost("workspace publication authority was revoked")
 
 
 def recover_workspace_publications(

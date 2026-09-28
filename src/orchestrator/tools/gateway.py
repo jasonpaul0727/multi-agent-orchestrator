@@ -140,7 +140,9 @@ class ToolExecutionResult:
     """Bounded process output; audit events retain hashes and lengths only."""
 
     request_id: str
-    outcome: Literal["completed", "awaiting_approval", "denied", "authority_lost", "execution_unknown"]
+    outcome: Literal[
+        "completed", "awaiting_approval", "denied", "failed", "authority_lost", "execution_unknown"
+    ]
     decision: PolicyDecision
     stdout: bytes = b""
     stderr: bytes = b""

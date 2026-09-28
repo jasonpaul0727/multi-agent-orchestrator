@@ -2,11 +2,11 @@
 
 一个本地运行的多模型、多 Agent 编排系统。项目以 GPT/Codex 为主要模型，同时支持通过 API Key 接入其他模型厂商；系统会根据任务角色、成本、风险和失败情况选择模型，并在必要时升级到更高能力的模型。
 
-> **当前状态：P1/P2 已实现；P3 控制平面、P4 只读隔离/ToolGateway 和私有 OverlayFS 候选执行后端已实现；完整编排系统仍不可运行。**
+> **当前状态：P1/P2 已实现；P3 控制平面、P4 只读隔离/ToolGateway 与内部 workspace-write 候选发布切片已有实现；完整编排系统仍不可运行。**
 > 实施计划 Task 1–9 已完成，涵盖事件存储、快照恢复、Artifact Store、预算账本、脱敏投影、跨规格事件契约、崩溃/并发测试及打包验收。
 > 已完成严格四层配置及 Run 快照、Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件存储驱动的健康熔断/ProbeLease、Recovery Controller，以及三种 Provider codec 和受限 HTTPS transport。
 > P3 尚未完整：SQLite ProviderCallJournal 持久化派发意图/脱敏终态并阻止相同 Attempt 请求重放，但 Provider 权威查询/费用对账、完整跨进程崩溃矩阵和自动恢复循环仍缺。Scheduler 仍由 host service 显式驱动。
-> P4 的 `SystemdOverlayCandidateLauncher` 现在可以执行命令并返回经宿主验证的私有候选 diff，源工作区不变；它不自动发布，也未接入 Approval/Gateway/Worker。只读 ToolGateway 的审批路径已连通，Secret Broker 仍是进程内原型，产品 workspace-write 仍关闭。
+> P4 新增内部 `WorkspaceWriteGateway`：以专用 `workspace.write-candidate` 能力执行隔离候选，经 Attempt/策略重验、一次性能力/可选 Approval、工作区租约、持久发布意图和 journal publisher 后才写入工作区；真实 WSL2 systemd 候选→审计→发布集成测试通过。它尚未接入 Scheduler/Worker application service，Secret Broker 仍是进程内原型，产品 workspace-write 仍关闭。
 > P5 已有 blocked-only Worker IPC、Artifact 来源准入及独立只读格式 Verifier，**没有真正执行模型/工具任务的 Worker，也没有节点语义验收**。P6 CLI/MCP、P7 完整 E2E/安全验收仍未完成；离线基准评估器没有真实数据，默认 Provider broker 仍 fail-closed。
 > 本项目**不具备生产就绪状态**。
 
@@ -86,7 +86,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 
 `orchestrator.config` 已实现完整配置 schema、system default → user global → project → Run 四层解析、逐字段来源追踪、Policy Envelope 单调收紧、selector tombstone/guard 累加、安全 YAML loaders 和 JSON Schema。`ConfigManager` 会先完整构造并验证候选，再以单次原子切换替换活动配置；校验失败保留原配置。Run 启动时将有效配置、注册表及哈希、字段来源和来源标签冻结到 `RunCreated` 事件，并以校验快照作恢复加速；重启时从事件重放原始快照，不受配置文件后续变化影响。并发 reload、Run 启动竞争、重复 Run 创建、失败重试和重启恢复均有测试。当前尚未接入完整生命周期执行。已建立跨规格事件契约，要求因果事件具有运行/节点/尝试/fencing/causation 上下文，校验外部副作用的 intent/receipt 顺序及审批消费与预算预留的一致性。预算独立使用时仍可省略执行上下文。
 
-`orchestrator.models` 增加版本化 Tokenizer/FX snapshots：都以规范化内容生成稳定 SHA-256 ID，并在调用事件时间验证有效期；汇率用整数有理数表示，转换与费用估算均向上取整。三种 codec 已实现 Responses、Anthropic Messages 和 OpenAI-compatible Chat Completions 的请求/响应转换、工具提案、usage 和失败归一化。`UrllibHTTPSTransport` 使用注册 endpoint、关闭环境代理、拒绝重定向并限制响应大小；`ProviderModelGateway` 要求已接受路由验证器、凭据 Broker 与持久化 `ProviderCallJournal`，无账本时在取密钥/发请求前 fail-closed。账本以 attempt/请求身份 CAS 记录请求体哈希意图和脱敏终态；崩溃/未知结果可列出待处理项，同一调用身份禁止再派发。该账本尚不查询 Provider、不验外部费用或自动结算，仍需权威 provider-specific reconciliation adapter；也尚未形成独立进程边界或在线 Provider 验收。默认 broker 是 fail-closed；`orchestrator.secrets.AuditedSecretBroker` 仅在 host 明确提供按 Run/provider/ref/endpoint/purpose 绑定的 allowlist 和 SecretValueStore 时，才写脱敏 SQLite 审计并返回绑定 audience 的短期凭据。P3 已把模型预算预留/结算接入 attempt lifecycle。`orchestrator.tools.ToolGateway` 只支持只读命令，通过冻结策略、一次性 CapabilityGrant、attempt fencing 与真实 systemd 隔离后端。`orchestrator.approvals.ApprovalService` 除内部 hash-scoped 请求、grant 绑定/消费和预算事务原语外，现可为该固定只读命令生成审批请求，批准后要求新 Attempt 并消费 effect/回执；它仍依赖注入式身份/profile，不是产品 UI 或生产身份链。Approval 和 Secret Broker 都尚未接 Worker/Scheduler application service；workspace-write、Provider effect、CLI/MCP 仍无审批消费接线。
+`orchestrator.models` 增加版本化 Tokenizer/FX snapshots：都以规范化内容生成稳定 SHA-256 ID，并在调用事件时间验证有效期；汇率用整数有理数表示，转换与费用估算均向上取整。三种 codec 已实现 Responses、Anthropic Messages 和 OpenAI-compatible Chat Completions 的请求/响应转换、工具提案、usage 和失败归一化。`UrllibHTTPSTransport` 使用注册 endpoint、关闭环境代理、拒绝重定向并限制响应大小；`ProviderModelGateway` 要求已接受路由验证器、凭据 Broker 与持久化 `ProviderCallJournal`，无账本时在取密钥/发请求前 fail-closed。账本以 attempt/请求身份 CAS 记录请求体哈希意图和脱敏终态；崩溃/未知结果可列出待处理项，同一调用身份禁止再派发。该账本尚不查询 Provider、不验外部费用或自动结算，仍需权威 provider-specific reconciliation adapter；也尚未形成独立进程边界或在线 Provider 验收。默认 broker 是 fail-closed；`orchestrator.secrets.AuditedSecretBroker` 仅在 host 明确提供按 Run/provider/ref/endpoint/purpose 绑定的 allowlist 和 SecretValueStore 时，才写脱敏 SQLite 审计并返回绑定 audience 的短期凭据。P3 已把模型预算预留/结算接入 attempt lifecycle。`orchestrator.tools.ToolGateway` 只支持只读命令，通过冻结策略、一次性 CapabilityGrant、attempt fencing 与真实 systemd 隔离后端。新的 `WorkspaceWriteGateway` 是隔离的写入入口：基于独立 policy/tool ID，串行持有工作区租约，发布审计意图与回执，按当前 Attempt/策略回调重新验证；可选的 ApprovalService 分支要求新 Attempt 并写 EffectReceipt。此路径当前为 host 注入式内部适配器，不接 Scheduler/Worker app service， profile hash 和审批身份也由 host 提供。Secret Broker 仍未连接真实 Worker。
 
 `orchestrator.security` 的 Policy Engine 对冻结策略版本作 deny 优先判定，按权限/工具 allowlist 交集处理并返回 scope-bound `PolicyDecision`。`orchestrator.routing` 以固定本地分类器生成不含原文的标签/哈希，Planning 阶段将 GuardRule、预算和角色限制冻结进节点契约；Router 对候选执行授权、能力、健康、凭据和最坏成本过滤，并按成本/配置顺位/模型 ID 稳定排序。Health Controller 将 provider/model 健康变化写入独立 SQLite event streams；跨聚合 ProbeLease 使用控制器 stream 与 aggregate stream 的同一 SQLite 事务完成版本 CAS，可按记录的事件时间重放/过期。Recovery Controller 仅生成有界的重试、同层 fallback、升级或独立角色节点计划；Gateway 失败分类器只从脱敏错误元数据生成确定性 `RecoveryEvidence`，Provider request ID 和原始响应不进入证据；Scheduler 现在可将分类与计划原子持久化，并要求新的同节点恢复 Attempt 精确消费一次已记录授权、匹配失败类别/耗尽模型/重试级别。未知调用结果必须显式对账，已知成功但结算异常也不会被当成失败重试。Worker 尚未接管该流程，因此仍需外部 application service 驱动，而不是自动恢复循环。
 
@@ -100,7 +100,7 @@ Run lifecycle 在初始化、图变更、Run 状态和 Attempt 变化后写入�
 
 `SystemdOverlayCandidateLauncher` 是内部命令执行后端：冻结 lower 快照，在有界 tmpfs Overlay 层中执行，保留候选直到显式关闭 session；整个进程树停止、卸载并导出后，宿主再验证 diff。命令使用私有 user/mount/net/PID namespace、空 capabilities、Landlock 和默认拒绝的 seccomp；受信启动器禁止从工作区导入同名包。停止证明同时要求 systemd 状态和冻结 cgroup 的内核空组证据，未知启动/停止保留现场。只读启动器也已修复同名包导入边界。接口及限制见 [workspace-write 边界](docs/security/workspace-write.md)。
 
-仍未实现：workspace-write 的审批/Worker 安全发布闭环、Secret Broker 与真实 Worker 的端到端接线、能生成候选产物的功能 Worker、节点语义验收与持久化 Verifier 证据、CLI、MCP Server、Provider 权威查询和费用对账、跨流完整崩溃恢复与性能基准证据。当前内置 Verifier 只在 systemd 只读沙箱检查 ArtifactStore 精确 Attempt 产物的哈希/大小、UTF-8、JSON 或 Python 语法；它不运行项目测试、不作语义审查，也不接受 lifecycle 成功状态。因此当前交付仍不是可完整运行的多 Agent 产品。
+仍未实现：workspace-write 与 Scheduler/Worker 的安全服务接线、Secret Broker 与真实 Worker 的端到端接线、能生成候选产物的功能 Worker、节点语义验收与持久化 Verifier 证据、CLI、MCP Server、Provider 权威查询和费用对账、跨流完整崩溃恢复与性能基准证据。未决发布意图会 fail-closed，但没有自动跨流 reconciliation service。当前内置 Verifier 只在 systemd 只读沙箱检查 ArtifactStore 精确 Attempt 产物的哈希/大小、UTF-8、JSON 或 Python 语法；它不运行项目测试、不作语义审查，也不接受 lifecycle 成功状态。因此当前交付仍不是可完整运行的多 Agent 产品。
 
 ### 预算生命周期
 
@@ -118,7 +118,7 @@ reserve ──┬──▶ commit   结算真实用量，按 settlement_key 幂�
 
 项目规划提供 `read-only`、`workspace-write` 和 `full-trust` 三档权限。文件访问以声明的工作区边界为基础；删除、安装系统软件、发布、推送和密钥访问等高风险动作可分别配置策略，并由控制层强制执行与审计。
 
-目前有实测只读 ToolGateway，并将 ApprovalService 接入该固定命令的 hash-scoped 一次性授权路径；真实身份/Authority Envelope、workspace-write、Secret Broker/Worker 独立边界、功能 Worker、生产级 Verifier、CLI/MCP 授权入口尚未实现，三档权限模型仍未形成完整端到端安全闭环。
+目前有实测只读 ToolGateway 和内部 `WorkspaceWriteGateway` 候选发布路径，并将 ApprovalService 分别接入只读与可逆工作区变更的 hash-scoped 一次性授权；真实身份/Authority Envelope、Worker/Scheduler 应用服务、Secret Broker/Worker 独立边界、功能 Worker、生产级 Verifier、CLI/MCP 授权入口尚未实现，三档权限模型仍未形成完整端到端安全闭环。
 
 ## 开发
 

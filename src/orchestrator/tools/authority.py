@@ -1,7 +1,7 @@
-"""Durable, thread-safe authority check for the read-only Tool Gateway.
+"""Durable, thread-safe authority check for isolated command gateways.
 
 Each check opens its own SQLite connection and reads lifecycle, scheduler,
-and Agent streams in one snapshot. This is intentionally a read-only gate:
+and Agent streams in one snapshot. This is intentionally an authority gate:
 it does not make an ApprovalGrant or external effect safe to consume.
 """
 
@@ -19,6 +19,7 @@ from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
 from orchestrator.workspace_identity import workspace_identity_hash
 
 from .gateway import READ_ONLY_COMMAND_TOOL_ID, ToolRequest
+from .workspace_write import WORKSPACE_WRITE_TOOL_ID
 
 
 class DurableAttemptAuthority:
@@ -87,6 +88,9 @@ class DurableAttemptAuthority:
             return False
 
     def _matches(self, request: ToolRequest, now: datetime, streams: dict) -> bool:
+        tool_id = getattr(request, "tool_id", READ_ONLY_COMMAND_TOOL_ID)
+        if tool_id not in {READ_ONLY_COMMAND_TOOL_ID, WORKSPACE_WRITE_TOOL_ID}:
+            return False
         lifecycle_events = streams[("run_lifecycle", request.run_id)]
         scheduler_events = streams[("scheduler", "global")]
         agent_events = streams[("agent_registry", request.run_id)]
@@ -103,7 +107,7 @@ class DurableAttemptAuthority:
         if (
             node.status != "running"
             or node.spec.role != request.role
-            or READ_ONLY_COMMAND_TOOL_ID not in node.spec.tool_ids
+            or tool_id not in node.spec.tool_ids
             or not node.attempts
         ):
             return False
@@ -145,7 +149,7 @@ class DurableAttemptAuthority:
             or route.payload.get("agent_instance_id") != expected_agent_id
             or route.payload.get("decision_hash") != attempt.decision_hash
             or route.payload.get("lease_expires_at") != attempt.lease_expires_at
-            or READ_ONLY_COMMAND_TOOL_ID not in route.payload.get("tool_ids", ())
+            or tool_id not in route.payload.get("tool_ids", ())
             or datetime.fromisoformat(route.payload["lease_expires_at"]) <= now
         ):
             return False
