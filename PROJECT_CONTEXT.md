@@ -2,6 +2,10 @@
 
 ## 当前状态
 
+2026-09-27 候选后端最终验收：全量 1095 项测试通过，无跳过；总覆盖率 90.76%，未降低 90% 门槛。编译、`pip check`、wheel 构建和 diff 检查通过，独立只读审阅发现的问题已修复并有回归测试。未调用付费 Provider，不构成 Maestro 改善数字的基准证据。
+
+2026-09-27 P4 候选执行后端更新：新增 `SystemdOverlayCandidateLauncher`/`OverlayCandidateSession`，以工作区冻结快照和有界 tmpfs Overlay 执行真实命令，源工作区不可写；user/mount/net/PID namespace、能力清空、Landlock、默认拒绝 seccomp、cgroup/rlimit 校验及无密钥环境已接入。受信 Python 启动器以 `-P -S` 禁止工作区包/site 注入（同时修复原只读启动器）。命令结束后 PID 1 杀死并回收全部后代，卸载 Overlay、严格导出候选；宿主验证私有完成记录及实际 bytes/manifest/lower baseline，且同时核对 systemd 状态与冻结 cgroup 的内核空组证明。未知启动或停止保留现场，输出/超时/取消/非法 diff 不产生可用候选。真实测试覆盖源不变、隐藏宿主路径、拒绝 socket/mount/chroot/xattr、包导入注入、脱离子进程、忽略 SIGTERM、限额、候选与现有租约/发布器兼容；详情见 `docs/security/workspace-write.md`。这仍未接入 Worker/Scheduler、Approval/Gateway/Secret Broker、持久化安全审计或恢复服务，产品 workspace-write 仍关闭。旧日期条目是历史状态，以本段及 README 为最新边界。
+
 2026-09-23 P3 Planning 更新：新增 `GraphPlanningService`/`NodeProposal` 可信 host-side 路径，以 Run 冻结的 EffectiveConfig/Registry 和首次图追加冻结的完整 `PolicyManifest` 编译并追加 DAG；事件持久化完整 `PlanningNodeContract`（分类 hash/证据、策略约束、候选模型、Token 和工具声明），重放校验 Run/config/Registry/policy/node/role/hash 绑定，Scheduler 接纳还会将请求策略哈希比对该已冻结节点策略。动态追加不能改变 Run policy；任务原文不进入事件。计划文件的 P3 Intake/Planning 与完整节点契约项现完成。此服务尚未接入非可信 Planner Worker 或面向用户的 application service，不改变 P5/P6 缺口。本轮最终验收：629 项全量测试通过、覆盖率 90.06%（门槛 90%），compileall、pip check、wheel build、diff check 通过。
 
 2026-09-23 本轮 P4 更新：新增内部 ApprovalService 原语，hash-scoped ApprovalRequest、带权限的注入式身份认证、到新 attempt 的 grant 绑定、过期/撤销、一次性 effect intent + grant 消费 + budget reservation 原子追加，以及 attempt-bound receipt 均有定向测试。它尚未接入 ToolGateway/Worker，也没有生产身份提供方或 CLI/MCP 审批入口。另新增 `AuditedSecretBroker`：对显式按 Run/provider/ref/endpoint/purpose 配置的请求写脱敏 SQLite 事件后才解析环境/插件 SecretValueStore；Worker 进程边界、keyring/plugin 后端及真实 Provider egress 仍未验收。边界见 `docs/security/approvals.md` 与 `docs/security/secrets.md`；均不代表端到端安全功能已交付。

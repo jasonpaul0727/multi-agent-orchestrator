@@ -2,10 +2,12 @@
 
 一个本地运行的多模型、多 Agent 编排系统。项目以 GPT/Codex 为主要模型，同时支持通过 API Key 接入其他模型厂商；系统会根据任务角色、成本、风险和失败情况选择模型，并在必要时升级到更高能力的模型。
 
-> **当前状态：P1/P2 已实现；P3 控制平面与 P4 只读隔离/ToolGateway 内部切片已实现；完整编排系统仍不可运行。**
+> **当前状态：P1/P2 已实现；P3 控制平面、P4 只读隔离/ToolGateway 和私有 OverlayFS 候选执行后端已实现；完整编排系统仍不可运行。**
 > 实施计划 Task 1–9 已完成，涵盖事件存储、快照恢复、Artifact Store、预算账本、脱敏投影、跨规格事件契约、崩溃/并发测试及打包验收。
 > 已完成严格四层配置及 Run 快照、Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件存储驱动的健康熔断/ProbeLease、Recovery Controller，以及三种 Provider codec 和受限 HTTPS transport。
-> P3 尚未完整：已增加 SQLite ProviderCallJournal 持久化派发意图/脱敏终态并阻止相同 Attempt 请求重放；全量跨流/Worker 崩溃矩阵、Provider 侧权威结果查询与回执验证、真实 Worker 终止确认和自动恢复循环仍缺。Scheduler 已持久化脱敏失败证据/有界计划并验证单次路由授权，但目前由 host service 显式驱动。P4 有实测 Linux/systemd 只读隔离 profile、宿主绑定 workspace 的内部 `ToolGateway`，ApprovalService 现仅接入固定只读命令路径；Secret Broker 仍是显式 host 组装的进程内原型。Overlay 候选与宿主发布有原语及实测，但 workspace-write 的审批/审计/Worker 安全闭环、真实身份服务与完整 Scheduler/Worker 集成仍缺。P5 现有隔离子进程的有界 IPC 烟测（只返回 `blocked`）和宿主 Artifact 候选来源校验，**没有真正执行任务的 Worker 或独立 Verifier**。P6 CLI/MCP、P7 完整 E2E/安全验收仍未完成；离线成对基准评估器已就位但没有真实数据，默认 Provider broker 仍 fail-closed。
+> P3 尚未完整：SQLite ProviderCallJournal 持久化派发意图/脱敏终态并阻止相同 Attempt 请求重放，但 Provider 权威查询/费用对账、完整跨进程崩溃矩阵和自动恢复循环仍缺。Scheduler 仍由 host service 显式驱动。
+> P4 的 `SystemdOverlayCandidateLauncher` 现在可以执行命令并返回经宿主验证的私有候选 diff，源工作区不变；它不自动发布，也未接入 Approval/Gateway/Worker。只读 ToolGateway 的审批路径已连通，Secret Broker 仍是进程内原型，产品 workspace-write 仍关闭。
+> P5 已有 blocked-only Worker IPC、Artifact 来源准入及独立只读格式 Verifier，**没有真正执行模型/工具任务的 Worker，也没有节点语义验收**。P6 CLI/MCP、P7 完整 E2E/安全验收仍未完成；离线基准评估器没有真实数据，默认 Provider broker 仍 fail-closed。
 > 本项目**不具备生产就绪状态**。
 
 ## V1 目标
@@ -68,6 +70,7 @@ V1 的事件存储实现基于 SQLite WAL，要求一个专用的**控制目录*
 | `orchestrator.approvals` | 精确 scope、one-shot grant、effect intent 与预算原子消费原语 | `ApprovalService` · `ApprovalRequest` · `EffectIntentSpec` |
 | `orchestrator.security` | Policy manifest 与确定性权限判定 | `PolicyManifest` · `PolicyEngine` · `PolicyDecision` |
 | `orchestrator.tools` | 宿主工作区绑定、持久化 Attempt 鉴权与固定只读命令 Tool Gateway | `ToolGateway` · `DurableAttemptAuthority` · `ToolRequest` · `ToolExecutionResult` |
+| `orchestrator.isolation` | systemd 只读命令与私有 OverlayFS 候选执行、宿主验证、租约及可恢复发布原语 | `SystemdReadOnlyLauncher` · `SystemdOverlayCandidateLauncher` · `OverlayCandidateSession` · `publish_workspace_diff()` |
 | `orchestrator.routing` | TaskClassifier、Planning 节点契约、确定性路由、事件驱动健康熔断和恢复授权 | `TaskClassifier` · `PlanningNodeContract` · `ModelRouter` · `HealthController` · `RecoveryController` |
 | `orchestrator.identifiers` | 稳定标识符生成 | `new_id()` |
 | `orchestrator.persistence` | 追加式事件存储、快照 | `EventDraft` · `StoredEvent` · `SQLiteEventStore` · `SnapshotStore` |
@@ -94,6 +97,8 @@ P3 控制平面已实现：`LifecycleController` 将 Run 配置/Registry 哈希�
 Run 可事件化进入 `awaiting_user`，只有带请求 ID 和响应哈希的显式回应才能恢复调度；取消先进入 `cancelling`，立即阻止新节点/Attempt 接纳。调度中的 Attempt 在外部运行时出具停止回执、并完成 usage 结算或提供无副作用回执哈希后才能标记 cancelled 和释放 slot；未知结果必须 reconciliation，不能用取消绕过不确定副作用。取消/等待用户目前只有控制平面状态机，不能替代尚未实现的隔离 Worker 进程终止。
 
 Run lifecycle 在初始化、图变更、Run 状态和 Attempt 变化后写入带版本/源事件锚点的快照；重放使用通过 schema/hash/version/anchor 校验的快照并应用后续事件。只读 Run Recovery Coordinator 交叉核对 lifecycle、Agent Registry、budget、scheduler lease、effect intent/receipt 与 ArtifactPublished 元数据/内容哈希；无收据副作用保持未知且终态不一致时 fail-closed。它不会自行查询外部 Provider、重新派发 effect、恢复 worker 进程，也无法归属未写 ArtifactPublished 事件的孤儿对象，所以目前仍不是完整自动 Run crash recovery。
+
+`SystemdOverlayCandidateLauncher` 是内部命令执行后端：冻结 lower 快照，在有界 tmpfs Overlay 层中执行，保留候选直到显式关闭 session；整个进程树停止、卸载并导出后，宿主再验证 diff。命令使用私有 user/mount/net/PID namespace、空 capabilities、Landlock 和默认拒绝的 seccomp；受信启动器禁止从工作区导入同名包。停止证明同时要求 systemd 状态和冻结 cgroup 的内核空组证据，未知启动/停止保留现场。只读启动器也已修复同名包导入边界。接口及限制见 [workspace-write 边界](docs/security/workspace-write.md)。
 
 仍未实现：workspace-write 的审批/Worker 安全发布闭环、Secret Broker 与真实 Worker 的端到端接线、能生成候选产物的功能 Worker、节点语义验收与持久化 Verifier 证据、CLI、MCP Server、Provider 权威查询和费用对账、跨流完整崩溃恢复与性能基准证据。当前内置 Verifier 只在 systemd 只读沙箱检查 ArtifactStore 精确 Attempt 产物的哈希/大小、UTF-8、JSON 或 Python 语法；它不运行项目测试、不作语义审查，也不接受 lifecycle 成功状态。因此当前交付仍不是可完整运行的多 Agent 产品。
 
@@ -155,6 +160,6 @@ python -m build
 ## 下一步
 
 1. 继续完成 P3：跨进程中断矩阵、真实 Worker 终止确认、Provider 侧 reconciliation，以及 Run 级 ArtifactStore 孤儿归属。
-2. P4 继续补 workspace-write/安全变更发布，以及 Secret Broker 到真实 Worker/Scheduler 的安全接线；ApprovalService 目前只连通固定只读命令路径，不解除执行硬门。
+2. 将已实测的 Overlay 候选执行后端和租约/发布器接入 P4 的 Attempt fencing、Approval、ToolGateway、持久化审计和恢复流程，再接通 Secret Broker 到真实 Worker/Scheduler 的安全边界；内部后端就绪不解除产品执行硬门。
 3. P5 实现能调用 Model/Tool Gateway 并发布候选 Artifact 的功能 Worker；把只读 Verifier 的内置格式检查扩展到节点验收契约、测试证据和持久化接受决策。
 4. P6 实现共享同一 application service 的 CLI/MCP、调用方身份和 Authority Envelope，再跑完整离线 E2E 与安全矩阵。

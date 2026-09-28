@@ -7,7 +7,7 @@ full security acceptance suite are integrated and pass.
 
 | Platform | Observed runtime | Read-only command profile | Workspace-write profile | Product support |
 | --- | --- | --- | --- | --- |
-| Ubuntu 24.04 under WSL2 | Microsoft kernel `6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17` | Live-tested through `SystemdReadOnlyLauncher`; each launch uses a descriptor-anchored no-follow snapshot, requires exact cgroup/rlimit values, Landlock, private network/tmp/home, and read-only bind mounts. Any mismatch fails closed. | Still unsupported. A bounded Overlay upper-to-private-candidate exporter and validator are live-tested in a systemd scope; the validated candidate is then published by the host through the lease/journal publisher in `test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits`. Publisher subprocess interruption/recovery is also tested. File/symlink replacements are individually atomic, while multi-entry visibility is not. This does not exercise an untrusted Worker, Approval, Gateway, or Secret Broker and does not enable product workspace-write. Deletions/whiteouts remain unsupported. | Candidate/publisher primitives only; not a complete V1 execution platform. |
+| Ubuntu 24.04 under WSL2 | Microsoft kernel `6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17` | Live-tested through `SystemdReadOnlyLauncher`; no-follow snapshot, exact cgroup/rlimits, Landlock, private network/tmp/home and read-only binds. Trusted Python startup rejects workspace import shadowing. | `SystemdOverlayCandidateLauncher` now live-tests private command writes with user/mount/net/PID namespaces, bounded tmpfs, dropped capabilities, Landlock, default-deny seccomp, whole-tree stop and independently verified cgroup emptiness before host candidate admission. Explicit lease/journal publication is tested separately. Product workspace-write remains disabled: no Approval/Gateway/audit/Worker service wiring. Deletions/whiteouts unsupported; multi-entry publication not reader-atomic. | Measured internal backends only, not a complete V1 execution platform. |
 | Other Linux distributions | Not measured | Unverified; do not infer support from the presence of systemd. | Unsupported | Unsupported/unverified. |
 | Windows and macOS | Not measured | Unsupported by this backend | Unsupported | Unsupported. |
 
@@ -28,7 +28,15 @@ monotonic fence. `publish_workspace_diff` binds these primitives in a
 lease-held host transaction with backups, a durable journal, per-entry atomic
 replacement, and explicit restart rollback. A live systemd/OverlayFS probe now
 exports a candidate and publishes it through the host transaction, in addition
-to unit/subprocess interruption tests. It is not wired into approval/audit/
+to unit/subprocess interruption tests. The actual candidate launcher now has
+live API tests for source immutability, hidden host paths, import shadowing,
+syscall denial, detached children, SIGTERM resistance, input, cancellation,
+time/output/disk/file bounds, export rejection and explicit host publication.
+Its frozen cgroup identity is checked before command start and its kernel
+emptiness after transport exit; unknown start/stop retains private staging.
+The curated runtime does not promise arbitrary project packages or test
+environments. See `workspace-write.md` for lifetime and cleanup obligations.
+It is not wired into approval/audit/
 Worker services. Its multi-entry changes are not a single reader-visible
 atomic swap. These primitives do not enable workspace-write.
 The Tool Gateway evaluates a frozen
@@ -38,7 +46,8 @@ during execution, and logs only output digests and lengths. A live integration
 test covers that full path through the actual systemd unit. This is not yet
 connected to a Worker or Scheduler application service. The Tool Gateway does
 not implement workspace writes, candidate validation or artifact publication,
-approval-grant consumption, or a Secret Broker; requests needing approval
-remain blocked.
+workspace-write approval-grant consumption, or a Secret Broker. Its fixed
+read-only command has an internal ApprovalService path; other effects remain
+blocked, and no functional Worker application service is connected.
 Model and managed-web network access are not provided inside the command unit;
 future network access must go through their own Gateway.

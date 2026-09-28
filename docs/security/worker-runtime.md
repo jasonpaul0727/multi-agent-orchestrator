@@ -65,6 +65,15 @@ Approval / Secret Broker mediation, durable evidence acceptance, crash
 recovery, and CLI/MCP application services remain unimplemented. No
 production Worker profile is enabled by this slice.
 
+The new `SystemdOverlayCandidateLauncher` is a separate internal command
+backend, not a change to the blocked-only Worker. It can produce private,
+host-validated workspace diffs without modifying source, but no Worker IPC,
+Attempt acceptance, ArtifactStore publication, ToolGateway/approval or model
+mediation is connected to it. See `workspace-write.md`; callers must not treat
+a successful command/diff as a verified Node result. Trusted read-only Python
+bootstrap imports now use `-P -S`, so workspace packages/site hooks cannot
+replace Worker/Verifier security setup.
+
 ## Local tests
 
 `tests/unit/runtime/test_contracts.py` covers schema bounds, duplicate and

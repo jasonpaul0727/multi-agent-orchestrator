@@ -183,6 +183,8 @@ class SystemdReadOnlyLauncher:
             "-i",
             *env_args,
             "/usr/bin/python3",
+            "-P",
+            "-S",
             "-m",
             "orchestrator.isolation._exec",
             "--",
@@ -239,6 +241,8 @@ class SandboxSession:
         timeout_seconds: int,
         staging: tempfile.TemporaryDirectory[str],
         input_bytes: bytes | None = None,
+        cancel_after_transport_exit: bool = False,
+        stop_grace_seconds: float | None = None,
     ) -> None:
         self.unit_name = unit_name
         self._process = process
@@ -248,6 +252,8 @@ class SandboxSession:
         self._timeout_seconds = timeout_seconds
         self._staging = staging
         self._input_bytes = input_bytes
+        self._cancel_after_transport_exit = cancel_after_transport_exit
+        self._stop_grace_seconds = stop_grace_seconds
         self._started = time.monotonic()
         self._cancel_requested = threading.Event()
         self._cancel_signal_accepted = False
@@ -262,7 +268,7 @@ class SandboxSession:
         # pipe. Serialize those retries with the caller's initial signal so the
         # child cannot return a result before the accepted signal is recorded.
         with self._cancel_lock:
-            if self._process.poll() is not None:
+            if self._process.poll() is not None and not self._cancel_after_transport_exit:
                 return False
             self._cancel_requested.set()
             try:
@@ -293,7 +299,10 @@ class SandboxSession:
                 return self._result
             except BaseException:
                 self.cancel()
-                self._process.wait()
+                try:
+                    self._process.wait(timeout=self._stop_grace_seconds)
+                except subprocess.TimeoutExpired:
+                    pass  # Caller must retain staging when scope stop is unconfirmed.
                 raise
             finally:
                 if self._process.poll() is not None:
@@ -319,6 +328,7 @@ class SandboxSession:
         output_limited = False
         deadline = self._started + self._timeout_seconds
         next_kill_retry = self._started
+        stop_deadline = None
         try:
             while selector.get_map() or self._process.poll() is None:
                 now = time.monotonic()
@@ -326,6 +336,11 @@ class SandboxSession:
                     cancelled = True
                 if now >= deadline:
                     timed_out = True
+                if cancelled or timed_out or output_limited:
+                    if stop_deadline is None and self._stop_grace_seconds is not None:
+                        stop_deadline = now + self._stop_grace_seconds
+                    if stop_deadline is not None and now >= stop_deadline:
+                        break
                 if (cancelled or timed_out or output_limited) and now >= next_kill_retry:
                     self.cancel()
                     next_kill_retry = now + 1
@@ -366,7 +381,8 @@ class SandboxSession:
                         output_limited = True
                         self.cancel()
                         cancelled = True
-            self._process.wait()
+            if stop_deadline is None or time.monotonic() < stop_deadline:
+                self._process.wait()
         finally:
             selector.close()
             if input_stream is not None and not input_stream.closed:
@@ -375,7 +391,7 @@ class SandboxSession:
                 if not stream.closed:
                     stream.close()
         elapsed = max(0.0, time.monotonic() - self._started)
-        returncode = int(self._process.returncode or 0)
+        returncode = int(self._process.returncode) if self._process.returncode is not None else 125
         if (
             not self._cancel_requested.is_set()
             and not output_limited

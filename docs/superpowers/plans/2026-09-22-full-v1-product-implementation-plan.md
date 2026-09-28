@@ -128,6 +128,19 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 ## P4：OS 隔离、Tool Gateway、密钥与审批
 
+2026-09-27 internal candidate backend slice: `SystemdOverlayCandidateLauncher`
+now wraps the live-tested private OverlayFS path with a cancellable session,
+bounded stdin/output/storage, no-follow workspace freeze, user/mount/net/PID
+namespaces, empty capabilities, Landlock and default-deny seccomp. Trusted
+Python startup cannot import workspace packages/site hooks (also fixed for the
+read-only launcher). The supervisor verifies its frozen cgroup identity and
+limits, reaps all descendants, unmounts, strictly exports and validates.
+Host admission additionally requires the expected cgroup to be kernel-empty;
+unknown starts/stops retain staging. This is not Worker, Approval/Gateway/audit
+or recovery wiring and does not complete P4 or enable product workspace-write.
+See `docs/security/workspace-write.md` and the scoped
+`2026-09-27-overlay-candidate-backend.md` plan for measured tests/limitations.
+
 建议新增包：`orchestrator/isolation`、`orchestrator/tools`、`orchestrator/approvals`、`orchestrator/secrets`。
 
 2026-09-23 部分进展：已通过实测 `SystemdReadOnlyLauncher` 将 `orchestrator.tools.ToolGateway` 的固定只读命令接入候选安全事件流。Gateway 只在冻结 `PolicyManifest` 判定 allow 后消费一次性 capability；启动前重验 fencing/策略版本，运行中监视权限并取消，审计只记输入/输出摘要；真机集成测试覆盖 SQLite 审计→systemd 执行。该切片不能勾销后面列出的整体 P4 验收项：没有 workspace-write/原子变更应用、Approval Service、Secret Broker、Worker/Scheduler 接线，也没有 Tool effect 的崩溃对账。

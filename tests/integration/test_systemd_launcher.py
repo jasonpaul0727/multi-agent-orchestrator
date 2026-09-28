@@ -38,6 +38,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_readonly_trusted_bootstrap_cannot_be_shadowed_by_workspace_package(tmp_path: Path) -> None:
+    package = tmp_path / "orchestrator"
+    package.mkdir()
+    (package / "__init__.py").write_text("print('bootstrap hijacked'); raise SystemExit(21)")
+    (tmp_path / "sitecustomize.py").write_text("print('site hijacked'); raise SystemExit(22)")
+    result = SystemdReadOnlyLauncher().launch(
+        tmp_path, ["/usr/bin/python3", "-I", "-S", "-c", "print('requested')"],
+    ).wait()
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert result.stdout == b"requested\n" and result.termination_confirmed
+
+
 def test_launcher_enforces_filesystem_network_environment_and_resource_boundaries(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

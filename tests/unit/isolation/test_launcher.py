@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import threading
@@ -38,6 +39,41 @@ from orchestrator.isolation.launcher import (
 def test_limits_reject_invalid_values(field: str, value: int) -> None:
     with pytest.raises(InvalidSandboxRequest):
         SandboxLimits(**{field: value})
+
+
+@pytest.mark.parametrize("leader_exited", [True, False])
+def test_scope_collection_has_bounded_stop_grace_even_with_held_pipes(monkeypatch, leader_exited) -> None:
+    class Transport:
+        stdin = None
+        returncode = 0 if leader_exited else None
+        def __init__(self):
+            self.writers = []
+            for name in ("stdout", "stderr"):
+                reader, writer = os.pipe()
+                setattr(self, name, os.fdopen(reader, "rb", buffering=0))
+                self.writers.append(writer)
+        def poll(self):
+            return self.returncode
+        def wait(self, **_options):
+            pytest.fail("must not block waiting for an unconfirmed transport")
+    transport = Transport()
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda args, **_options: calls.append(args) or subprocess.CompletedProcess(args, 1))
+    with tempfile.TemporaryDirectory() as temporary:
+        staging = type("Stage", (), {"cleanup": lambda _self: None})()
+        session = SandboxSession(process=transport, unit_name="scope.scope", systemctl="systemctl",
+            client_env={}, output_limit=1024, timeout_seconds=10, staging=staging,
+            cancel_after_transport_exit=True, stop_grace_seconds=0.01)
+        session._cancel_requested.set()
+        try:
+            result = session.wait()
+        finally:
+            for writer in transport.writers:
+                os.close(writer)
+    assert calls and calls[0][-1] == "scope.scope"
+    assert result.elapsed_seconds < 1
+    assert result.termination_confirmed is leader_exited
+    assert result.returncode == (0 if leader_exited else 125)
 
 
 @pytest.mark.parametrize("command", [[], "echo hi", [""], ["echo", "bad\x00arg"]])

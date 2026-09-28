@@ -1,7 +1,7 @@
 # Workspace Write Boundary
 
 The workspace-write path is not enabled. The repository currently contains
-three separate primitives: a bounded Overlay upper-layer exporter, a
+an internal `SystemdOverlayCandidateLauncher`, a bounded Overlay upper-layer exporter, a
 read-only candidate validator, and a read-only comparison of touched live paths
 against the frozen lower snapshot. `acquire_workspace_write_lease` adds a
 fourth primitive for serializing host writers. `publish_workspace_diff` now
@@ -9,6 +9,65 @@ composes the candidate validator, conflict check, and lease into a bounded
 host-side publisher with a durable rollback journal. `recover_workspace_publications`
 rolls back prepared transactions or cleans committed transaction records after
 restart.
+
+## Private candidate execution contract
+
+`SystemdOverlayCandidateLauncher.launch(workspace, command, limits=...,
+input_bytes=..., expected_workspace_identity_hash=...)` freezes a no-follow
+snapshot outside the source workspace, excluding Git/control directories. It
+launches a systemd user scope with exact cgroup memory/swap/task/CPU bounds,
+short stop timeout and new user/mount/network/PID namespaces. The trusted PID 1
+checks both its host-frozen cgroup identity and effective limits before mounts
+or command execution. It creates a bounded tmpfs upper (16 MiB by default),
+scratch tmpfs (8 MiB), a private OverlayFS workspace and read-only runtime root.
+The source workspace itself is never mounted into that root.
+
+Before executing the requested command, the child chroots, clears all process,
+ambient and bounding capabilities, sets no-new-privileges, installs Landlock
+and native-architecture default-deny seccomp. Socket creation, namespace/mount
+changes, chroot, xattr mutation, BPF and io_uring are not allowed. Ordinary
+fork/threads stay in the same namespaces/cgroup. The root is read-only except
+the Overlay workspace and scratch; `/proc`, home, control paths and raw upper
+are unavailable. The command gets only a fixed environment and bounded stdin,
+not credentials or host control-plane handles. Both trusted Python startup
+stages use `-P -S` with an explicit trusted PYTHONPATH, preventing workspace
+packages and site-startup code from replacing security setup. The existing
+read-only startup now has the same import protection.
+
+After leader exit, namespace PID 1 kills and reaps every remaining descendant,
+then unmounts the workspace Overlay. Only then does it normalize three observed,
+content-neutral kernel xattrs (`user.overlay.uuid` with a 16-byte value,
+`user.overlay.impure=y`, and empty `user.overlay.origin`). Every other xattr is
+rejected; index/metacopy/redirect-following are disabled and the command cannot
+set xattrs. The existing exporter still rejects all remaining xattrs,
+deletions/whiteouts, hardlinks, escaping symlinks, protected paths and bounds.
+
+`session.wait()` returns `OverlayCandidateResult(execution, lower_root, diff,
+candidate_error)`. A diff is available only after clean execution, complete
+input, confirmed transport exit, inactive/failed/missing unit state **and**
+kernel evidence that the frozen expected scope cgroup is empty or gone.
+`failed` alone is not stop evidence. A private no-follow/nonblocking completion
+record is size/schema bounded and duplicate-key safe; candidate contents and
+lower baselines are revalidated independently of stdout or the supplied hash.
+
+Use the session as a context manager. Candidate/lower paths remain valid only
+until `close()`; consume or copy the candidate via trusted host gates first.
+Closing before waiting cancels the scope. Unknown stop prevents admission and
+cleanup; later `close()` may clean only after fresh stop proof. An uncertain
+transport start always retains staging, even if the unit is not yet visible,
+because delayed scope registration is possible. A host crash or lost session
+also leaves staging: there is no automatic startup cleanup/recovery service.
+Operators must prove the reported scope and cgroup stopped before removing it.
+Transport stop attempts have a bounded grace; an unknown outcome never becomes
+an accepted candidate.
+
+This initial runtime is measured only on the documented WSL2/systemd host. It
+binds system Python/native libraries explicitly, not the entire `/usr` tree
+with WSL driver submounts; arbitrary installed packages, networking and project
+test environments are not promised. Missing kernel/runtime controls fail
+closed. The launcher does not create Attempt/approval/audit events, authorize
+publication, supply model/tool mediation or accept lifecycle state. It is an
+internal backend, not a functional Worker or enabled product workspace-write.
 
 ## Lease contract
 
@@ -86,3 +145,10 @@ systemd/OverlayFS scope, then invokes the host-side publisher and checks the
 published workspace plus unchanged lower tree. This is still not
 end-to-end Approval/Gateway/Worker integration or a product platform-support
 claim.
+`tests/integration/test_overlay_candidate_launcher.py` now exercises the
+actual launcher API, including source immutability, hidden host paths, syscall
+denials, trusted import shadowing, detached descendants, SIGTERM resistance,
+stdin, cancellation, bounds, export rejection and explicit host publication.
+Unit tests cover malformed/FIFO completion, cgroup proof, retained staging,
+privilege/seccomp setup failures and post-stop export ordering. These tests do
+not replace end-to-end service wiring or a kernel-vulnerability assessment.

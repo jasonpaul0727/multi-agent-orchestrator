@@ -46,6 +46,11 @@ from .workspace_publish import (
     publish_workspace_diff,
     recover_workspace_publications,
 )
+from .overlay_launcher import (
+    OverlayCandidateResult,
+    OverlayCandidateSession,
+    SystemdOverlayCandidateLauncher,
+)
 
 __all__ = [
     "InvalidSandboxRequest",
@@ -54,6 +59,9 @@ __all__ = [
     "SandboxResult",
     "SandboxSession",
     "SystemdReadOnlyLauncher",
+    "SystemdOverlayCandidateLauncher",
+    "OverlayCandidateResult",
+    "OverlayCandidateSession",
     "FsAccess",
     "LandlockResult",
     "LandlockUnavailable",
