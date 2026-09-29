@@ -155,7 +155,8 @@ def validate_event_contract(events: list[Any]) -> None:
             required_fields = {
                 "run_id", "node_id", "attempt_id", "fencing_generation", "request_id",
                 "idempotency_key_hash", "accepted_route_id", "provider_id", "model_id",
-                "registry_manifest_hash", "budget_reservation_id", "request_hash",
+                "provider_adapter", "provider_correlation_id", "registry_manifest_hash",
+                "budget_reservation_id", "request_hash",
             }
             if (
                 provider_call_intent is not None
@@ -178,6 +179,23 @@ def validate_event_contract(events: list[Any]) -> None:
                     _validate_non_blank(payload.get(name), name)
                 except ValueError as exc:
                     raise EventContractError("ProviderCallIntentRecorded has invalid identifiers") from exc
+            provider_adapter = payload.get("provider_adapter")
+            if not isinstance(provider_adapter, str) or provider_adapter not in (
+                "openai_responses", "anthropic_messages", "openai_compatible"
+            ):
+                raise EventContractError("ProviderCallIntentRecorded has invalid adapter")
+            provider_correlation_id = payload.get("provider_correlation_id")
+            if provider_adapter == "openai_responses":
+                if (
+                    not isinstance(provider_correlation_id, str)
+                    or not provider_correlation_id
+                    or len(provider_correlation_id) > 512
+                    or not provider_correlation_id.isascii()
+                    or not _safe_event_text(provider_correlation_id)
+                ):
+                    raise EventContractError("ProviderCallIntentRecorded has invalid correlation id")
+            elif provider_correlation_id is not None:
+                raise EventContractError("ProviderCallIntentRecorded has invalid correlation id")
             for name in ("idempotency_key_hash", "registry_manifest_hash", "request_hash"):
                 value = payload.get(name)
                 if not isinstance(value, str) or not value.startswith("sha256:"):

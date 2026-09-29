@@ -862,3 +862,45 @@ def _adapter_response(value):
     from orchestrator.models import AdapterResponse
 
     return AdapterResponse(http_status=200, body_json=json.dumps(value))
+
+
+def test_openai_compatible_gateway_never_sends_provider_correlation_header(tmp_path):
+    registry = model_registry("openai_compatible")
+    request = model_request(registry)
+
+    class _CompatibilityBroker:
+        async def acquire_provider_credential(
+            self, *, secret_ref, provider, endpoint, purpose, context
+        ):
+            return ProviderCredential(
+                header_name="Authorization",
+                value="compat-secret",
+                provider_id=provider.id,
+                endpoint=endpoint,
+                purpose=purpose,
+            )
+
+    response = HTTPTransportResponse(
+        status=200,
+        headers=(),
+        body=json.dumps(
+            {
+                "id": "chatcmpl_1",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+            }
+        ).encode(),
+    )
+    transport = _FakeTransport(response)
+    gateway = ProviderModelGateway(
+        registry=registry,
+        accepted_route_verifier=_Verifier(),
+        secret_broker=_CompatibilityBroker(),
+        transport=transport,
+        provider_call_journal=_provider_call_journal(tmp_path),
+    )
+
+    asyncio.run(gateway.invoke(request))
+
+    header_names = {name for name, _value in transport.calls[0]["headers"]}
+    assert "X-Client-Request-Id" not in header_names

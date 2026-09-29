@@ -24,6 +24,7 @@ from urllib.request import (
 )
 
 from orchestrator.config.models import ModelRegistryManifest, ProviderSpec
+from orchestrator.identifiers import new_id
 from orchestrator.models.adapters import adapter_for
 from orchestrator.models.gateway import (
     AdapterResponse,
@@ -282,6 +283,11 @@ class ProviderModelGateway:
             self._fail("provider_journal_unavailable", "preflight", "not_sent", False)
         if prior_call is not None:
             self._fail("idempotency_conflict", "preflight", "not_sent", False)
+        provider_correlation_id = (
+            "maestro-" + new_id()
+            if provider.adapter == "openai_responses"
+            else None
+        )
         try:
             credential = await self.secret_broker.acquire_provider_credential(
                 secret_ref=provider.secret_ref,
@@ -328,7 +334,9 @@ class ProviderModelGateway:
             self.provider_call_journal.record_intent(
                 request,
                 provider_id=provider.id,
+                provider_adapter=provider.adapter,
                 request_body=encoded.body_json.encode("utf-8"),
+                provider_correlation_id=provider_correlation_id,
             )
         except ProviderCallReplayBlocked:
             self._fail("idempotency_conflict", "preflight", "not_sent", False)
@@ -342,6 +350,8 @@ class ProviderModelGateway:
             ("Idempotency-Key", request.idempotency_key),
             ("X-Request-Id", request.request_id),
         ]
+        if provider_correlation_id is not None:
+            headers.append(("X-Client-Request-Id", provider_correlation_id))
         headers.extend((item.name, item.value) for item in encoded.headers)
         try:
             response = await self.transport.post_json(

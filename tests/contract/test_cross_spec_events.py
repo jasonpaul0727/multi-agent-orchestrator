@@ -23,6 +23,62 @@ def _domain_event(event_type, payload, **context_overrides):
     return EventDraft(event_type, payload, **_context(**context_overrides))
 
 
+def _provider_call_intent_payload(**overrides):
+    return {
+        "run_id": "run-1",
+        "node_id": "node-1",
+        "attempt_id": "attempt-1",
+        "fencing_generation": 1,
+        "request_id": "request-1",
+        "idempotency_key_hash": "sha256:" + "a" * 64,
+        "accepted_route_id": "decision-1",
+        "provider_id": "primary",
+        "provider_adapter": "openai_responses",
+        "provider_correlation_id": "maestro-correlation-1",
+        "model_id": "model-1",
+        "registry_manifest_hash": "sha256:" + "b" * 64,
+        "budget_reservation_id": "reservation-1",
+        "request_hash": "sha256:" + "c" * 64,
+        **overrides,
+    }
+
+
+def test_provider_call_intent_binds_adapter_and_correlation_schema(tmp_path):
+    store = SQLiteEventStore(tmp_path / "provider-intent-schema.db")
+    intent = EventDraft(
+        "ProviderCallIntentRecorded",
+        _provider_call_intent_payload(),
+        **_context(causation_id="decision-1"),
+    )
+
+    stored = store.append("provider_call", "call-stream-1", 0, [intent], "call-intent")
+
+    assert stored[0].payload["provider_adapter"] == "openai_responses"
+    assert stored[0].payload["provider_correlation_id"] == "maestro-correlation-1"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"provider_adapter": "unknown"}, "adapter"),
+        ({"provider_adapter": "openai_responses", "provider_correlation_id": None}, "correlation"),
+        ({"provider_adapter": "openai_compatible", "provider_correlation_id": "maestro-x"}, "correlation"),
+        ({"provider_correlation_id": "not-ascii-é"}, "correlation"),
+        ({"provider_correlation_id": "x" * 513}, "correlation"),
+    ],
+)
+def test_provider_call_intent_rejects_invalid_adapter_correlation_pair(tmp_path, overrides, message):
+    store = SQLiteEventStore(tmp_path / f"provider-intent-{message}-{len(overrides)}.db")
+    intent = EventDraft(
+        "ProviderCallIntentRecorded",
+        _provider_call_intent_payload(**overrides),
+        **_context(causation_id="decision-1"),
+    )
+
+    with pytest.raises(EventContractError, match=message):
+        store.append("provider_call", "call-stream-1", 0, [intent], "invalid-call-intent")
+
+
 @pytest.mark.parametrize(
     "event_type",
     [

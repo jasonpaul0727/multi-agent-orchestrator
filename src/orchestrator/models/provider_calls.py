@@ -8,6 +8,7 @@ import re
 from types import MappingProxyType
 from typing import Literal, Mapping, Protocol
 
+from orchestrator.config.models import ProviderAdapter
 from orchestrator.identifiers import new_id
 from orchestrator.models.gateway import ModelRequest, TokenUsage
 from orchestrator.persistence import EventDraft, IdempotencyConflict, SQLiteEventStore, StaleStream
@@ -32,7 +33,9 @@ class ProviderCallJournal(Protocol):
         request: ModelRequest,
         *,
         provider_id: str,
+        provider_adapter: ProviderAdapter,
         request_body: bytes,
+        provider_correlation_id: str | None = None,
     ) -> str: ...
 
     def read(self, request: ModelRequest) -> ProviderCallSnapshot | None: ...
@@ -63,6 +66,8 @@ class ProviderCallSnapshot:
     accepted_route_id: str
     budget_reservation_id: str
     provider_id: str
+    provider_adapter: ProviderAdapter
+    provider_correlation_id: str | None
     model_id: str
     registry_manifest_hash: str
     request_hash: str
@@ -91,7 +96,9 @@ class SQLiteProviderCallJournal:
         request: ModelRequest,
         *,
         provider_id: str,
+        provider_adapter: ProviderAdapter,
         request_body: bytes,
+        provider_correlation_id: str | None = None,
     ) -> str:
         if (
             not isinstance(provider_id, str)
@@ -99,6 +106,21 @@ class SQLiteProviderCallJournal:
             or provider_id != request.accepted_route.provider_id
         ):
             raise ValueError("provider call does not match its accepted route")
+        if not isinstance(provider_adapter, str) or provider_adapter not in (
+            "openai_responses", "anthropic_messages", "openai_compatible"
+        ):
+            raise ValueError("provider call adapter is unsupported")
+        if provider_adapter == "openai_responses":
+            if (
+                not isinstance(provider_correlation_id, str)
+                or not provider_correlation_id
+                or len(provider_correlation_id) > 512
+                or not provider_correlation_id.isascii()
+                or not _safe_text(provider_correlation_id)
+            ):
+                raise ValueError("provider correlation id is invalid")
+        elif provider_correlation_id is not None:
+            raise ValueError("provider correlation id is invalid for this adapter")
         if not isinstance(request_body, bytes) or len(request_body) > 8_000_000:
             raise ValueError("provider request body must be bounded bytes")
 
@@ -108,6 +130,8 @@ class SQLiteProviderCallJournal:
             "idempotency_key_hash": _hash(request.idempotency_key.encode("utf-8")),
             "accepted_route_id": request.accepted_route.decision_id,
             "provider_id": provider_id,
+            "provider_adapter": provider_adapter,
+            "provider_correlation_id": provider_correlation_id,
             "model_id": request.model_id,
             "registry_manifest_hash": request.accepted_route.registry_manifest_hash,
             "budget_reservation_id": request.budget_reservation_id,
@@ -241,6 +265,8 @@ class SQLiteProviderCallJournal:
             accepted_route_id=payload["accepted_route_id"],
             budget_reservation_id=payload["budget_reservation_id"],
             provider_id=payload["provider_id"],
+            provider_adapter=payload["provider_adapter"],
+            provider_correlation_id=payload["provider_correlation_id"],
             model_id=payload["model_id"],
             registry_manifest_hash=payload["registry_manifest_hash"],
             request_hash=payload["request_hash"],
@@ -283,6 +309,8 @@ class SQLiteProviderCallJournal:
                 accepted_route_id=payload["accepted_route_id"],
                 budget_reservation_id=payload["budget_reservation_id"],
                 provider_id=payload["provider_id"],
+                provider_adapter=payload["provider_adapter"],
+                provider_correlation_id=payload["provider_correlation_id"],
                 model_id=payload["model_id"],
                 registry_manifest_hash=payload["registry_manifest_hash"],
                 request_hash=payload["request_hash"],

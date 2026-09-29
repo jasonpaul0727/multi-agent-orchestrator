@@ -139,7 +139,9 @@ def test_provider_call_intent_and_receipt_survive_restart_without_prompt_or_outp
     journal.record_intent(
         request,
         provider_id="primary",
+        provider_adapter="openai_responses",
         request_body=b'{"prompt":"private prompt"}',
+        provider_correlation_id="maestro-restart-test",
     )
     journal.record_outcome(
         request,
@@ -170,7 +172,7 @@ def test_provider_call_outcome_must_match_the_entire_frozen_call_scope(tmp_path)
     request = model_request(registry)
     store = SQLiteEventStore(tmp_path / "binding.db")
     journal = SQLiteProviderCallJournal(store)
-    journal.record_intent(request, provider_id="primary", request_body=b'{"prompt":"secret"}')
+    journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses", request_body=b'{"prompt":"secret"}', provider_correlation_id="maestro-test")
     mismatched_route = request.accepted_route.model_copy(update={"decision_id": "other-decision"})
     mismatched_request = request.model_copy(update={"accepted_route": mismatched_route})
 
@@ -186,7 +188,7 @@ def test_unresolved_provider_call_is_recoverable_but_not_replayed_after_restart(
     database = tmp_path / "unresolved.db"
     first = SQLiteEventStore(database)
     first_journal = SQLiteProviderCallJournal(first)
-    first_journal.record_intent(request, provider_id="primary", request_body=b'{"prompt":"secret"}')
+    first_journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses", request_body=b'{"prompt":"secret"}', provider_correlation_id="maestro-test")
     first.close()
 
     reopened = SQLiteEventStore(database)
@@ -195,7 +197,7 @@ def test_unresolved_provider_call_is_recoverable_but_not_replayed_after_restart(
 
     assert pending.status == "dispatching"
     with pytest.raises(ProviderCallReplayBlocked):
-        recovered.record_intent(request, provider_id="primary", request_body=b'{"prompt":"secret"}')
+        recovered.record_intent(request, provider_id="primary", provider_adapter="openai_responses", request_body=b'{"prompt":"secret"}', provider_correlation_id="maestro-test")
 
 
 def test_event_store_rejects_provider_outcome_without_matching_intent(tmp_path):
@@ -234,11 +236,11 @@ def test_provider_journal_rejects_invalid_store_provider_and_body(tmp_path):
         SQLiteProviderCallJournal(object())
     journal = SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / "invalid-intent.db"))
     with pytest.raises(ValueError, match="accepted route"):
-        journal.record_intent(request, provider_id="wrong-provider", request_body=b"{}")
+        journal.record_intent(request, provider_id="wrong-provider", provider_adapter="openai_responses", request_body=b"{}", provider_correlation_id="maestro-test")
     with pytest.raises(ValueError, match="bounded bytes"):
-        journal.record_intent(request, provider_id="primary", request_body="not bytes")
+        journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses", request_body="not bytes", provider_correlation_id="maestro-test")
     with pytest.raises(ValueError, match="bounded bytes"):
-        journal.record_intent(request, provider_id="primary", request_body=b"x" * 8_000_001)
+        journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses", request_body=b"x" * 8_000_001, provider_correlation_id="maestro-test")
 
 
 @pytest.mark.parametrize(
@@ -258,7 +260,7 @@ def test_provider_journal_rejects_malformed_terminal_receipts(tmp_path, receipt)
     registry = model_registry()
     request = model_request(registry)
     journal = SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / "invalid-receipt.db"))
-    journal.record_intent(request, provider_id="primary", request_body=b"{}")
+    journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses", request_body=b"{}", provider_correlation_id="maestro-test")
 
     with pytest.raises(ValueError):
         journal.record_outcome(request, **receipt)
@@ -280,10 +282,10 @@ def test_provider_journal_idempotency_collision_cannot_claim_second_body(tmp_pat
     request = model_request(registry)
     journal = SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / "claim-collision.db"))
     monkeypatch.setattr("orchestrator.models.provider_calls.new_id", lambda: "fixed-claim")
-    journal.record_intent(request, provider_id="primary", request_body=b"first-body")
+    journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses", request_body=b"first-body", provider_correlation_id="maestro-test")
 
     with pytest.raises(ProviderCallReplayBlocked):
-        journal.record_intent(request, provider_id="primary", request_body=b"different-body")
+        journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses", request_body=b"different-body", provider_correlation_id="maestro-test")
 
 
 def test_provider_call_intent_is_single_winner_across_concurrent_store_connections(tmp_path):
@@ -298,7 +300,9 @@ def test_provider_call_intent_is_single_winner_across_concurrent_store_connectio
             return SQLiteProviderCallJournal(store).record_intent(
                 request,
                 provider_id="primary",
+                provider_adapter="openai_responses",
                 request_body=b'{"model":"remote-model-1"}',
+                provider_correlation_id="maestro-test",
             )
         except ProviderCallReplayBlocked:
             return "blocked"
@@ -437,3 +441,50 @@ def test_gateway_keeps_success_unresolved_if_receipt_persistence_fails(tmp_path)
         asyncio.run(retry.invoke(request))
     assert blocked.value.failure.code == "idempotency_conflict"
     assert len(transport.calls) == 1
+
+
+def test_gateway_persists_and_sends_one_openai_correlation_id(tmp_path):
+    registry = model_registry()
+    request = model_request(registry)
+    store = SQLiteEventStore(tmp_path / "correlation.db")
+    journal = SQLiteProviderCallJournal(store)
+    transport = _FakeTransport(_success_response())
+    gateway = ProviderModelGateway(
+        registry=registry,
+        accepted_route_verifier=_Verifier(),
+        secret_broker=_Broker(),
+        transport=transport,
+        provider_call_journal=journal,
+    )
+
+    asyncio.run(gateway.invoke(request))
+
+    pending = journal.read(request)
+    assert pending is not None
+    assert pending.provider_correlation_id is not None
+    headers = dict(transport.calls[0]["headers"])
+    assert headers["X-Client-Request-Id"] == pending.provider_correlation_id
+    assert pending.provider_correlation_id.isascii()
+    assert 0 < len(pending.provider_correlation_id) <= 512
+
+
+def test_openai_correlation_id_survives_provider_journal_restart(tmp_path):
+    registry = model_registry()
+    request = model_request(registry)
+    database = tmp_path / "correlation-restart.db"
+    first_store = SQLiteEventStore(database)
+    first_journal = SQLiteProviderCallJournal(first_store)
+    first_journal.record_intent(
+        request,
+        provider_id="primary",
+        provider_adapter="openai_responses",
+        request_body=b"{}",
+        provider_correlation_id="maestro-stable-correlation-id",
+    )
+    first_store.close()
+
+    reopened = SQLiteProviderCallJournal(SQLiteEventStore(database))
+    recovered = reopened.unresolved()[0]
+
+    assert recovered.provider_correlation_id == "maestro-stable-correlation-id"
+    assert recovered.provider_adapter == "openai_responses"
