@@ -88,7 +88,7 @@ def test_gateway_persists_and_sends_one_openai_correlation_id(tmp_path):
 
 - [ ] **Step 2: Run the focused test and confirm it fails** because the snapshot has no persisted correlation field/header yet.
 
-Run: `python -m pytest tests/unit/models/test_provider_call_journal.py::test_gateway_persists_and_sends_one_openai_correlation_id -q`
+Run: `python3 -m pytest tests/unit/models/test_provider_call_journal.py::test_gateway_persists_and_sends_one_openai_correlation_id -q`
 
 Expected: FAIL with the missing correlation field or header assertion.
 
@@ -123,7 +123,7 @@ if provider_correlation_id is not None:
 - [ ] **Step 4: Add restart and endpoint-scope assertions.** Record an intent-only call in a first journal, close/reopen the SQLite store, and assert `unresolved()[0].provider_correlation_id` is byte-for-byte unchanged. Add a `openai_compatible` Gateway test with `endpoint="https://compat.example/v1"` and assert the request contains no `X-Client-Request-Id` header.
 - [ ] **Step 5: Run both focused model test modules.**
 
-Run: `python -m pytest tests/unit/models/test_provider_call_journal.py tests/unit/models/test_provider_adapters_transport.py -q`
+Run: `python3 -m pytest tests/unit/models/test_provider_call_journal.py tests/unit/models/test_provider_adapters_transport.py -q`
 
 Expected: PASS; existing replay blocking and secret redaction assertions remain unchanged.
 
@@ -229,7 +229,7 @@ Import `ProviderCallReconciliation` from `orchestrator.models.provider_calls`, `
 
 - [ ] **Step 2: Run the new journal test and confirm the missing API/state rejects it.**
 
-Run: `python -m pytest tests/unit/models/test_provider_call_journal.py::test_provider_reconciliation_accepts_dispatching_or_unknown_only -q`
+Run: `python3 -m pytest tests/unit/models/test_provider_call_journal.py::test_provider_reconciliation_accepts_dispatching_or_unknown_only -q`
 
 Expected: FAIL because the reconciliation model/API and event transition are not implemented.
 
@@ -267,7 +267,7 @@ else:
 - [ ] **Step 6: Add malformed-chain and concurrent-CAS tests.** Assert an orphan reconciliation, invalid event order, different Attempt/fence, second conflicting receipt, and marker for another reconciliation ID all raise `EventContractError` or a typed journal error. Use two `SQLiteEventStore` connections and `ThreadPoolExecutor(max_workers=2)` to prove only one concurrent reconciliation append wins.
 - [ ] **Step 7: Run event and journal suites, then commit and push Task 2.**
 
-Run: `python -m pytest tests/unit/models/test_provider_call_journal.py tests/contract/test_cross_spec_events.py -q`
+Run: `python3 -m pytest tests/unit/models/test_provider_call_journal.py tests/contract/test_cross_spec_events.py -q`
 
 Expected: PASS, with exactly one durable reconciliation winner per call stream.
 
@@ -351,7 +351,7 @@ def test_unavailable_provider_evidence_verifier_leaves_call_unknown():
 
 - [ ] **Step 2: Run the verifier boundary test and confirm it fails because the service/contracts are absent.**
 
-Run: `python -m pytest tests/unit/test_provider_reconciliation.py::test_unavailable_provider_evidence_verifier_leaves_call_unknown -q`
+Run: `python3 -m pytest tests/unit/test_provider_reconciliation.py::test_unavailable_provider_evidence_verifier_leaves_call_unknown -q`
 
 Expected: FAIL because `ProviderReconciliationService` and fail-closed verifier types do not exist.
 
@@ -385,7 +385,7 @@ class UnavailableAttemptTerminationVerifier:
 - [ ] **Step 6: Add fakes only in tests.** Implement `FakeProviderEvidenceVerifier(evidence_result)` and `FakeAttemptTerminationVerifier(expected_digest)` in the test module; test unknown status, wrong evidence digest/provider/request hash/fencing, caller-supplied Provider result/final proof objects, and no-effect/charged usage shape. Do not register the fake in package runtime exports.
 - [ ] **Step 7: Run focused verifier tests and commit/push Task 3.**
 
-Run: `python -m pytest tests/unit/test_provider_reconciliation.py tests/unit/models/test_provider_call_journal.py -q`
+Run: `python3 -m pytest tests/unit/test_provider_reconciliation.py tests/unit/models/test_provider_call_journal.py -q`
 
 Expected: PASS; no production verifier is registered and default behavior remains unresolved/fail-closed.
 
@@ -557,7 +557,7 @@ Keep the test-only `service.reconcile()` call inside the parametrized test body.
 
 - [ ] **Step 2: Run the integration test and confirm the missing service orchestration fails.**
 
-Run: `python -m pytest tests/unit/lifecycle/test_scheduler.py::test_scheduler_reconciles_provider_no_delivery_and_charged_usage -q`
+Run: `python3 -m pytest tests/unit/lifecycle/test_scheduler.py::test_scheduler_reconciles_provider_no_delivery_and_charged_usage -q`
 
 Expected: FAIL until proof append, Scheduler call, and settlement marker are wired.
 
@@ -567,7 +567,7 @@ Expected: FAIL until proof append, Scheduler call, and settlement marker are wir
 - [ ] **Step 6: Test rejection and idempotency.** Reject an Attempt not yet unknown, wrong fence, stale timestamp, mismatched reservation/run/currency, missing usage on charged outcome, or usage on no-effect. Call `reconcile()` twice with identical evidence and prove budget events/slot release do not duplicate; conflicting evidence must fail closed.
 - [ ] **Step 7: Run the Scheduler suite, then commit/push Task 4.**
 
-Run: `python -m pytest tests/unit/lifecycle/test_scheduler.py -q`
+Run: `python3 -m pytest tests/unit/lifecycle/test_scheduler.py -q`
 
 Expected: PASS; all existing scheduler reconciliation invariants still hold.
 
@@ -681,15 +681,15 @@ Run three independent spawned children, each with the fresh service setup above.
 - [ ] **Step 5: Update the P3 status and checkboxes in the full V1 plan.** Mark only implemented correlation/evidence-contract/replay behavior complete. Keep “production Provider authoritative lookup”, complete Worker termination binding, Worker/application automatic startup wiring, CLI/MCP, E2E security, and benchmarks open. Do not label P3 or V1 delivered.
 - [ ] **Step 6: Run acceptance verification before the final commit.**
 
-Run: `python -m pytest -q`
+Run: `python3 -m pytest -q`
 
 Expected: PASS with no skipped deterministic unit/contract tests.
 
-Run: `python -m coverage run -m pytest -q && python -m coverage report --fail-under=90`
+Run: `python3 -m coverage run -m pytest -q && python3 -m coverage report --fail-under=90`
 
 Expected: PASS at `>= 90%` total project coverage.
 
-Run: `python -m compileall -q src tests && python -m pip check && python -m build --wheel`
+Run: `python3 -m compileall -q src tests && python3 -m pip check && python3 -m build --wheel`
 
 Expected: all commands exit 0 and the wheel is produced.
 
