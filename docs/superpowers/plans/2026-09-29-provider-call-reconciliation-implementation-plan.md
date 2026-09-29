@@ -35,6 +35,7 @@
 
 - Modify `src/orchestrator/models/transport.py`: generate the correlation ID after prior-call rejection, persist it with intent, and attach it only to the supported first-party OpenAI Responses request.
 - Modify `src/orchestrator/models/provider_calls.py`: add correlation/reconciliation projection fields and journal APIs that can recover a stream without reconstructing prompt-bearing `ModelRequest` data.
+- Modify `src/orchestrator/persistence/events.py`: extend the exact intent-event schema to bind the adapter capability and nullable correlation ID; reject malformed or unsupported combinations.
 - Modify `src/orchestrator/persistence/events.py`: strictly validate the new append-only Provider reconciliation and Scheduler-applied marker event sequences.
 - Create `src/orchestrator/provider_reconciliation.py`: define the host-only `ProviderEvidenceVerifier`, `AttemptTerminationVerifier`, and `ProviderReconciliationService`; default evidence verification is unavailable/fail-closed.
 - Use `src/orchestrator/scheduler/core.py` unchanged for the atomic budget/lifecycle/Agent/slot operation through `Scheduler.reconcile_attempt()`; do not add a parallel settlement implementation.
@@ -50,13 +51,16 @@
 **Files:**
 - Modify: `src/orchestrator/models/provider_calls.py`
 - Modify: `src/orchestrator/models/transport.py`
+- Modify: `src/orchestrator/persistence/events.py`
 - Test: `tests/unit/models/test_provider_call_journal.py`
 - Test: `tests/unit/models/test_provider_adapters_transport.py`
+- Test: `tests/contract/test_cross_spec_events.py`
 
 **Interfaces:**
 - `ProviderCallJournal.record_intent(request, *, provider_id, provider_adapter, request_body, provider_correlation_id=None) -> str` stores the route's adapter capability and a nullable, bounded ID in the same intent event.
 - `ProviderCallSnapshot.provider_adapter: ProviderAdapter` and `provider_correlation_id: str | None` return the persisted values after reopening SQLite; reconciliation is enabled only for a supported first-party adapter.
 - `ProviderModelGateway.invoke()` creates one `maestro-<uuid>` ASCII ID only when the validated manifest route has `adapter == "openai_responses"` (whose endpoint is already constrained to `https://api.openai.com/v1`). It sends that same value as `X-Client-Request-Id`; all other adapters send no such header.
+- The exact `ProviderCallIntentRecorded` schema includes `provider_adapter` and `provider_correlation_id`; require a supported adapter literal, and for `openai_responses` require a non-empty ASCII correlation ID bounded to 512 characters. Compatibility routes persist their adapter and `null` correlation ID.
 
 - [ ] **Step 1: Write the failing correlation persistence and header test** in `tests/unit/models/test_provider_call_journal.py` using the existing `model_registry()`, `model_request()`, `_FakeTransport`, `_Broker`, `_Verifier`, and `_success_response()` helpers.
 
@@ -92,7 +96,13 @@ Run: `python3 -m pytest tests/unit/models/test_provider_call_journal.py::test_ga
 
 Expected: FAIL with the missing correlation field or header assertion.
 
-- [ ] **Step 3: Add the optional journal field and one-time Gateway generation.** Extend the `record_intent` protocol/implementation and snapshot. In `transport.py`, generate only after the existing prior-call check, pass the same value to `record_intent`, and add a header only when non-`None`:
+- [ ] **Step 3: Add restart and endpoint-scope tests before implementation.** In the journal test module, write an intent with `provider_adapter="openai_responses"` and a literal correlation ID, close and reopen SQLite, and assert the value is unchanged. In the adapter transport test module, invoke an `openai_compatible` Gateway configured at `https://compat.example/v1` and assert no `X-Client-Request-Id` header is present. Run both tests now; the persistence test must fail for the missing intent fields and the endpoint-scope test may already pass, establishing the baseline safety behavior.
+
+Run: `python3 -m pytest tests/unit/models/test_provider_call_journal.py::test_openai_correlation_id_survives_provider_journal_restart tests/unit/models/test_provider_adapters_transport.py::test_openai_compatible_gateway_never_sends_provider_correlation_header -q`
+
+Expected: the restart test fails because `record_intent` does not accept the adapter/correlation fields; the compatibility test passes and remains a regression guard.
+
+- [ ] **Step 4: Add the journal/event fields and one-time Gateway generation.** Extend `record_intent`, the snapshot projection, and exact `ProviderCallIntentRecorded` payload validation with the adapter and optional correlation ID. In `transport.py`, generate only after the existing prior-call check, pass the same value to `record_intent`, and add a header only when non-`None`:
 
 ```python
 from orchestrator.identifiers import new_id
@@ -120,17 +130,16 @@ if provider_correlation_id is not None:
     headers.append(("X-Client-Request-Id", provider_correlation_id))
 ```
 
-- [ ] **Step 4: Add restart and endpoint-scope assertions.** Record an intent-only call in a first journal, close/reopen the SQLite store, and assert `unresolved()[0].provider_correlation_id` is byte-for-byte unchanged. Add a `openai_compatible` Gateway test with `endpoint="https://compat.example/v1"` and assert the request contains no `X-Client-Request-Id` header.
-- [ ] **Step 5: Run both focused model test modules.**
+- [ ] **Step 5: Run the focused model and event-contract tests.**
 
-Run: `python3 -m pytest tests/unit/models/test_provider_call_journal.py tests/unit/models/test_provider_adapters_transport.py -q`
+Run: `python3 -m pytest tests/unit/models/test_provider_call_journal.py tests/unit/models/test_provider_adapters_transport.py tests/contract/test_cross_spec_events.py -q`
 
 Expected: PASS; existing replay blocking and secret redaction assertions remain unchanged.
 
 - [ ] **Step 6: Commit and push Task 1.**
 
 ```bash
-git add src/orchestrator/models/provider_calls.py src/orchestrator/models/transport.py tests/unit/models/test_provider_call_journal.py tests/unit/models/test_provider_adapters_transport.py
+git add src/orchestrator/models/provider_calls.py src/orchestrator/models/transport.py src/orchestrator/persistence/events.py tests/unit/models/test_provider_call_journal.py tests/unit/models/test_provider_adapters_transport.py tests/contract/test_cross_spec_events.py
 git commit -m "feat: correlate OpenAI provider calls"
 git push origin codex/p3-systemd-termination-receipts
 ```
