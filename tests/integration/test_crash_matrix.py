@@ -1,3 +1,9 @@
+import asyncio
+import multiprocessing
+import os
+import signal
+import time
+
 import pytest
 
 from orchestrator.budget import BudgetLedger, CostEstimate, RunLimit
@@ -17,6 +23,48 @@ def _context(*, causation_id="event-parent"):
 
 def _effect_event(event_type, payload, *, causation_id="event-parent"):
     return EventDraft(event_type, payload, **_context(causation_id=causation_id))
+
+
+def _provider_call_child(database, dispatched_marker, registry, request):
+    from pathlib import Path
+
+    from orchestrator.models import (
+        ProviderCredential,
+        ProviderModelGateway,
+        SQLiteProviderCallJournal,
+    )
+
+    class _Verifier:
+        async def is_accepted(self, _request):
+            return True
+
+    class _Broker:
+        async def acquire_provider_credential(self, **_values):
+            return ProviderCredential(
+                "authorization", "test-only-secret", "primary",
+                "https://api.openai.com/v1", "model_inference",
+            )
+
+    class _HangingTransport:
+        async def post_json(self, **_values):
+            with Path(dispatched_marker).open("x", encoding="utf-8") as marker:
+                marker.write("dispatched\n")
+                marker.flush()
+                os.fsync(marker.fileno())
+            await asyncio.Event().wait()
+
+    store = SQLiteEventStore(database)
+    gateway = ProviderModelGateway(
+        registry=registry,
+        accepted_route_verifier=_Verifier(),
+        secret_broker=_Broker(),
+        transport=_HangingTransport(),
+        provider_call_journal=SQLiteProviderCallJournal(store),
+    )
+    try:
+        asyncio.run(gateway.invoke(request))
+    finally:
+        store.close()
 
 
 class _CommitThenLoseResponse:
@@ -273,3 +321,75 @@ def test_crash_after_settlement_commit_retries_without_double_charge(tmp_path):
     assert [event.event_type for event in restarted.read_stream("budget", "run-1")].count(
         "CostCommitted"
     ) == 1
+
+
+def test_gateway_does_not_replay_after_process_dies_during_provider_dispatch(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("hard process termination requires the fork start method")
+
+    from orchestrator.models import (
+        ModelGatewayError,
+        ProviderModelGateway,
+        SQLiteProviderCallJournal,
+    )
+    from orchestrator.persistence import SQLiteEventStore
+    from tests.unit.models.test_provider_call_journal import (
+        _Broker,
+        _FakeTransport,
+        _Verifier,
+        _success_response,
+        model_registry,
+        model_request,
+    )
+
+    registry = model_registry()
+    request = model_request(registry)
+    database = tmp_path / "provider-dispatch-crash.db"
+    dispatched_marker = tmp_path / "provider-dispatched"
+    child = multiprocessing.get_context("fork").Process(
+        target=_provider_call_child,
+        args=(database, dispatched_marker, registry, request),
+    )
+    child.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not dispatched_marker.exists() and child.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert dispatched_marker.exists(), f"child never reached provider transport (exit={child.exitcode})"
+        assert child.is_alive(), "fake provider transport must still be blocked before termination"
+        child.kill()
+        child.join(timeout=5)
+        assert not child.is_alive()
+        assert child.exitcode == -signal.SIGKILL
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join(timeout=5)
+        child.close()
+
+    assert dispatched_marker.read_text(encoding="utf-8").splitlines() == ["dispatched"]
+
+    recovered_store = SQLiteEventStore(database)
+    recovered_journal = SQLiteProviderCallJournal(recovered_store)
+    [pending] = recovered_journal.unresolved()
+    assert pending.status == "dispatching"
+    assert pending.attempt_id == request.attempt_id
+
+    broker = _Broker()
+    transport = _FakeTransport(_success_response())
+    gateway = ProviderModelGateway(
+        registry=registry,
+        accepted_route_verifier=_Verifier(),
+        secret_broker=broker,
+        transport=transport,
+        provider_call_journal=recovered_journal,
+    )
+    with pytest.raises(ModelGatewayError) as replay:
+        asyncio.run(gateway.invoke(request))
+
+    assert replay.value.failure.code == "idempotency_conflict"
+    assert broker.calls == 0
+    assert transport.calls == []
+    assert dispatched_marker.read_text(encoding="utf-8").splitlines() == ["dispatched"]
+    recovered_store.close()
