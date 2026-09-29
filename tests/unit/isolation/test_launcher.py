@@ -234,7 +234,9 @@ def test_launcher_rejects_missing_or_ambiguous_trusted_runtime(monkeypatch, tmp_
         )
 
 
-def test_launcher_cleans_staging_when_systemd_client_cannot_start(monkeypatch, tmp_path: Path) -> None:
+def test_launcher_retains_staging_when_systemd_client_start_is_interrupted(
+    monkeypatch, tmp_path: Path
+) -> None:
     import orchestrator.isolation.launcher as module
 
     workspace = tmp_path / "workspace"
@@ -244,14 +246,45 @@ def test_launcher_cleans_staging_when_systemd_client_cannot_start(monkeypatch, t
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0))
     monkeypatch.setattr(module, "_systemd_cgroup_parent", lambda *_args: Path("/sys/fs/cgroup/user.slice/app.slice"))
 
-    def fail_to_start(*args, **kwargs):
-        raise OSError("no process")
+    staging = tempfile.TemporaryDirectory(dir=tmp_path)
+    staging_path = Path(staging.name)
 
+    def fail_to_start(*args, **kwargs):
+        assert staging._finalizer.peek() is None
+        (staging_path / "marker").write_text("retained", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(module, "_create_staging", lambda _root: staging)
     monkeypatch.setattr(module.subprocess, "Popen", fail_to_start)
+    with pytest.raises(KeyboardInterrupt):
+        SystemdReadOnlyLauncher(systemd_run="systemd-run", systemctl="systemctl").launch(
+            workspace, ["/bin/true"]
+        )
+
+    assert staging._finalizer.peek() is None
+    assert (staging_path / "marker").read_text(encoding="utf-8") == "retained"
+
+
+def test_launcher_cleans_staging_when_systemd_client_cannot_start(monkeypatch, tmp_path: Path) -> None:
+    import orchestrator.isolation.launcher as module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(module, "_systemd_client_environment", lambda: {"PATH": "/usr/bin:/bin"})
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0))
+    monkeypatch.setattr(module, "_systemd_cgroup_parent", lambda *_args: Path("/sys/fs/cgroup/user.slice/app.slice"))
+    staging = tempfile.TemporaryDirectory(dir=tmp_path)
+    staging_path = Path(staging.name)
+    monkeypatch.setattr(module, "_create_staging", lambda _root: staging)
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("no process")))
+
     with pytest.raises(IsolationUnavailable, match="could not be started"):
         SystemdReadOnlyLauncher(systemd_run="systemd-run", systemctl="systemctl").launch(
             workspace, ["/bin/true"]
         )
+
+    assert not staging_path.exists()
 
 
 def test_launcher_cleans_staging_when_bind_targets_cannot_be_created(monkeypatch, tmp_path: Path) -> None:

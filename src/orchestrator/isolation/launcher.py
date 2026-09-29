@@ -271,6 +271,7 @@ class SystemdReadOnlyLauncher:
             "--",
             *exec_command,
         ]
+        retained_staging = _RetainedStaging(staging)
         try:
             process = subprocess.Popen(
                 systemd_command,
@@ -282,9 +283,8 @@ class SystemdReadOnlyLauncher:
                 close_fds=True,
             )
         except OSError as exc:
-            staging.cleanup()
+            retained_staging.discard()
             raise IsolationUnavailable("systemd transient unit could not be started") from exc
-        retained_staging = _RetainedStaging(staging)
         return SandboxSession(
             process=process,
             unit_name=unit_name,
