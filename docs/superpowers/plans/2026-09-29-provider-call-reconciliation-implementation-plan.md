@@ -144,8 +144,8 @@ git push origin codex/p3-systemd-termination-receipts
 - Test: `tests/contract/test_cross_spec_events.py`
 
 **Interfaces:**
-- Add immutable `ProviderCallReconciliation` with the complete call binding (`provider_call_stream_id`, `provider_adapter`, correlation ID, Run/Node/Attempt/fence, Provider/model/route/reservation, registry hash, and request hash), plus `effect: Literal["not_received", "received_and_charged"]`, optional exact `UsageRecord`, optional `provider_request_id`, `evidence_source: Literal["provider_signed_receipt", "provider_authoritative_api"]`, SHA-256 `evidence_digest`, required SHA-256 `termination_receipt_hash`, and timezone-aware `observed_at`. Neither correlation IDs, aggregate usage buckets, nor operator assertions qualify as exact evidence sources. Reconciliation supports only `provider_adapter == "openai_responses"` with a non-null generated correlation ID. `not_received` requires no usage; `received_and_charged` requires exact usage.
-- Extend `ProviderCallStatus` with `settlement_pending` and `reconciled`; add immutable snapshot fields `reconciliation_event_id: str | None`, `reconciled_at: datetime | None`, and `settlement_applied: bool`.
+- Add immutable `ProviderCallReconciliation` in `models/provider_calls.py` with the complete call binding (`provider_call_stream_id`, `provider_adapter`, correlation ID, Run/Node/Attempt/fence, Provider/model/route/reservation, registry hash, and request hash), plus `effect: Literal["not_received", "received_and_charged"]`, optional exact `UsageRecord`, optional `provider_request_id`, `evidence_source: Literal["provider_signed_receipt", "provider_authoritative_api"]`, SHA-256 `evidence_digest`, required SHA-256 `termination_receipt_hash`, and timezone-aware `observed_at`. Neither correlation IDs, aggregate usage buckets, nor operator assertions qualify as exact evidence sources. `not_received` requires no usage; `received_and_charged` requires exact usage.
+- Extend `ProviderCallStatus` with `settlement_pending` and `reconciled`; add immutable snapshot fields `reconciliation: ProviderCallReconciliation | None`, `reconciliation_event_id: str | None`, `reconciled_at: datetime | None`, and `settlement_applied: bool`. The stored proof must be present in the snapshot so `apply_pending_settlements()` can replay without re-querying the Provider.
 - Add internal `SQLiteProviderCallJournal._append_reconciliation(stream_id: str, proof: ProviderCallReconciliation, reconciled_at: datetime) -> str` and `_record_scheduler_settlement(stream_id: str, reconciliation_event_id: str) -> None`; expose `read_call(stream_id: str) -> ProviderCallSnapshot | None` and `pending_settlements() -> tuple[ProviderCallSnapshot, ...]` for the host service. Persist `reconciled_at` separately from the Provider evidence's `observed_at`, so Scheduler replay uses the same timestamp after restart. No CLI/MCP or Worker surface calls the internal append methods.
 - A legal provider stream is `intent`, optionally followed by `outcome(unknown)`, then `reconciliation`, then `scheduler_settlement_applied`. A terminal known outcome cannot be reconciled or overwritten. Both append operations use the exact expected stream version and deterministic idempotency binding.
 
@@ -285,11 +285,12 @@ git push origin codex/p3-systemd-termination-receipts
 - Test: `tests/unit/models/test_provider_call_journal.py`
 
 **Interfaces:**
-- `ProviderEvidenceVerifier.verify(call: ProviderCallSnapshot, raw_evidence: bytes) -> ProviderCallReconciliation` is the only input-to-proof boundary. It receives at most 64 KiB of evidence bytes and must validate the provider-specific source before returning a proof.
+- `ProviderEvidenceVerifier.verify(call: ProviderCallSnapshot, raw_evidence: bytes) -> ProviderEvidenceResult` is the only raw-input-to-Provider-evidence boundary. It receives at most 64 KiB of evidence bytes and must validate the provider-specific source and every call binding before returning evidence.
+- Define immutable `ProviderEvidenceResult` in `provider_reconciliation.py` with the complete call binding and effect/usage/source/digest/timestamp, but no termination field; only the Provider verifier returns this type. `ProviderReconciliationService` combines it with the host termination digest to construct the final `ProviderCallReconciliation` defined in Task 2.
 - `AttemptTerminationVerifier.verify_stopped(call: ProviderCallSnapshot, receipt: object) -> str` returns a SHA-256 digest only for a host-created receipt bound to the exact Attempt/fencing generation; it raises `ReconciliationRejected` for absent, wrong-unit, non-empty-cgroup, stale, or caller-forged evidence. The current generic `SandboxTerminationReceipt` does not carry that identity, so no production implementation may accept it alone.
 - `UnavailableProviderEvidenceVerifier.verify(...)` always raises `ProviderEvidenceUnsupported`; do not implement an OpenAI support/Usage shortcut as a verifier.
 - `UnavailableAttemptTerminationVerifier.verify_stopped(...)` always raises `ReconciliationRejected` until a real host supervisor can prove the Attempt/fence binding.
-- `ProviderReconciliationService.reconcile(stream_id: str, raw_evidence: bytes, termination_receipt: object, reconciled_at: datetime) -> ProviderCallSnapshot` accepts raw evidence, never a caller-built proof object.
+- `ProviderReconciliationService.reconcile(stream_id: str, raw_evidence: bytes, termination_receipt: object, reconciled_at: datetime) -> ProviderCallSnapshot` accepts raw evidence, never a caller-built Provider result or final proof. It validates `ProviderEvidenceResult`, obtains the termination digest from the host verifier, then constructs and persists `ProviderCallReconciliation`.
 
 - [ ] **Step 1: Write tests for missing verifier, oversized bytes, unavailable/ambiguous source, and caller-supplied proof objects.** The service must not append a reconciliation event or change the budget if any case is rejected.
 
@@ -360,16 +361,16 @@ Expected: FAIL because `ProviderReconciliationService` and fail-closed verifier 
 class ProviderEvidenceVerifier(Protocol):
     def verify(
         self, call: ProviderCallSnapshot, raw_evidence: bytes
-    ) -> ProviderCallReconciliation: ...
+    ) -> ProviderEvidenceResult: ...
 
 
 class UnavailableProviderEvidenceVerifier:
-    def verify(self, call: ProviderCallSnapshot, raw_evidence: bytes) -> ProviderCallReconciliation:
+    def verify(self, call: ProviderCallSnapshot, raw_evidence: bytes) -> ProviderEvidenceResult:
         raise ProviderEvidenceUnsupported("no authoritative Provider evidence source is configured")
 ```
 
-- [ ] **Step 4: Validate verifier output before it can reach the journal.** Revalidate the snapshot and returned immutable proof; require `call.provider_adapter == "openai_responses"` and a non-null correlation ID, then require equality for every binding field, including provider-call stream ID, adapter, correlation ID, request-body hash, route, registry, reservation, Run/Node/Attempt/fence; accept only `not_received` without usage or `received_and_charged` with exact UsageRecord; reject an object supplied in place of raw evidence bytes so callers cannot bypass the verifier with a constructed proof; never log or persist raw evidence.
-- [ ] **Step 5: Define the Attempt-termination protocol and fail-closed default.** Require a host-created supervisor result bound to the full Run/Node/Attempt/fence. The current Sandbox receipt can be consumed only after a supervisor has associated its unit with this exact context; it does not prove this association on its own.
+- [ ] **Step 4: Validate verifier output before it can reach the journal.** Revalidate the snapshot and returned `ProviderEvidenceResult`; require `call.provider_adapter == "openai_responses"` and a non-null correlation ID, then require equality for every binding field, including provider-call stream ID, adapter, correlation ID, request-body hash, route, registry, reservation, Run/Node/Attempt/fence; accept only `not_received` without usage or `received_and_charged` with exact UsageRecord; reject an object supplied in place of raw evidence bytes so callers cannot bypass the verifier with a constructed proof; never log or persist raw evidence.
+- [ ] **Step 5: Define the Attempt-termination protocol and fail-closed default.** Require a host-created supervisor result bound to the full Run/Node/Attempt/fence. The current Sandbox receipt can be consumed only after a supervisor has associated its unit with this exact context; it does not prove this association on its own. After this check returns its digest, combine the Provider result and host digest into the final `ProviderCallReconciliation`; the Provider verifier must not manufacture the termination fact.
 
 ```python
 class AttemptTerminationVerifier(Protocol):
@@ -381,7 +382,7 @@ class UnavailableAttemptTerminationVerifier:
         raise ReconciliationRejected("no Attempt-bound termination witness is configured")
 ```
 
-- [ ] **Step 6: Add fakes only in tests.** Implement `FakeProviderEvidenceVerifier(proof)` and `FakeAttemptTerminationVerifier(expected_digest)` in the test module; test unknown status, wrong evidence digest/provider/request hash/fencing, caller-supplied proof objects, and no-effect/charged usage shape. Do not register the fake in package runtime exports.
+- [ ] **Step 6: Add fakes only in tests.** Implement `FakeProviderEvidenceVerifier(evidence_result)` and `FakeAttemptTerminationVerifier(expected_digest)` in the test module; test unknown status, wrong evidence digest/provider/request hash/fencing, caller-supplied Provider result/final proof objects, and no-effect/charged usage shape. Do not register the fake in package runtime exports.
 - [ ] **Step 7: Run focused verifier tests and commit/push Task 3.**
 
 Run: `python -m pytest tests/unit/test_provider_reconciliation.py tests/unit/models/test_provider_call_journal.py -q`
@@ -402,7 +403,7 @@ git push origin codex/p3-systemd-termination-receipts
 - Test: `tests/unit/lifecycle/test_scheduler.py`
 
 **Interfaces:**
-- `ProviderReconciliationService.reconcile(...)` must require an existing journal state of `dispatching` or `unknown`, verified Provider proof, verified termination, and a Scheduler Attempt already classified `OutcomeUnknown`. It appends proof before calling Scheduler.
+- `ProviderReconciliationService.reconcile(...)` on an unresolved call requires verified Provider evidence, verified termination, and a Scheduler Attempt already classified `OutcomeUnknown`; it constructs/appends the final proof before calling Scheduler. For `settlement_pending` or `reconciled`, an exact replay of the same evidence digest, proof, termination hash, and timestamp returns/reuses the persisted result; conflicting evidence is rejected.
 - `ProviderReconciliationService.apply_pending_settlements() -> tuple[str, ...]` replays only proof events already persisted and not yet marked applied; it reads each persisted `reconciled_at`, never re-queries the Provider, and takes no raw evidence.
 - No-effect proof calls `Scheduler.reconcile_attempt(..., outcome="failed", known_no_effect=True)`. Charged proof calls `Scheduler.reconcile_attempt(..., outcome="failed", usage=exact_usage)`. The call's lost output is never treated as success.
 - After the Scheduler transaction succeeds, the service appends `ProviderCallSchedulerSettlementApplied`; scheduler idempotency plus the Provider journal marker make the cross-stream operation replay-safe.
@@ -442,7 +443,7 @@ Use a test fake that returns one of two immutable proofs selected by the test pa
 
 ```python
 from orchestrator.budget.models import UsageRecord
-from orchestrator.models.provider_calls import ProviderCallReconciliation
+from orchestrator.provider_reconciliation import ProviderEvidenceResult
 
 binding = {
     "provider_call_stream_id": call.stream_id,
@@ -470,24 +471,22 @@ usage = UsageRecord(
     provider_fee_minor=3,
     cost_minor=3,
 )
-charged_proof = ProviderCallReconciliation(
+charged_evidence = ProviderEvidenceResult(
     **binding,
     effect="received_and_charged",
     usage=usage,
     provider_request_id="provider-request-1",
     evidence_source="provider_signed_receipt",
     evidence_digest="sha256:" + "b" * 64,
-    termination_receipt_hash="sha256:" + "c" * 64,
     observed_at=NOW + timedelta(minutes=2),
 )
-not_received_proof = ProviderCallReconciliation(
+not_received_evidence = ProviderEvidenceResult(
     **binding,
     effect="not_received",
     usage=None,
     provider_request_id=None,
     evidence_source="provider_signed_receipt",
     evidence_digest="sha256:" + "d" * 64,
-    termination_receipt_hash="sha256:" + "c" * 64,
     observed_at=NOW + timedelta(minutes=2),
 )
 ```
@@ -527,14 +526,13 @@ def test_scheduler_reconciles_provider_no_delivery_and_charged_usage(
     assert intent is not None
     call = journal.read_call(intent.stream_id)
     assert call is not None
-    proof = not_received_proof if effect == "not_received" else charged_proof
+    evidence = not_received_evidence if effect == "not_received" else charged_evidence
+    termination_digest = "sha256:" + "c" * 64
     service = ProviderReconciliationService(
         journal=journal,
         scheduler=control,
-        evidence_verifier=FakeProviderEvidenceVerifier(proof),
-        termination_verifier=FakeAttemptTerminationVerifier(
-            proof.termination_receipt_hash
-        ),
+        evidence_verifier=FakeProviderEvidenceVerifier(evidence),
+        termination_verifier=FakeAttemptTerminationVerifier(termination_digest),
     )
     reconciled = service.reconcile(
         call.stream_id,
@@ -545,6 +543,8 @@ def test_scheduler_reconciles_provider_no_delivery_and_charged_usage(
     )
 
     assert reconciled.status == "reconciled"
+    assert reconciled.reconciliation is not None
+    assert reconciled.reconciliation.termination_receipt_hash == termination_digest
     assert BudgetLedger(store).get_reservation(
         accepted.reservation.reservation_id, run_id="run-1"
     ).status == expected_reservation_status
@@ -713,7 +713,7 @@ Expected: clean worktree and identical local/remote commit IDs. If the live prov
 
 - **Spec coverage:** correlation/header scoping is Task 1; immutable evidence/event binding and privacy are Tasks 2–3; termination proof and the failed-not-succeeded Attempt rule are Tasks 3–4; exact usage/no-effect settlement and crash replay are Tasks 4–5; unsupported production source and V1 status are Task 5.
 - **Placeholder scan:** no task is delegated to an unspecified “later” implementation; the production-grade Provider evidence source, Attempt-bound termination supervisor, and automatic application startup composition are explicit prerequisites, stay unavailable/fail-closed, and remain V1 blockers. Until startup composition exists, the host service is an internal explicit API only.
-- **Type consistency:** `ProviderCallReconciliation` is introduced in Task 2 and consumed by the verifier in Task 3; `ProviderCallSnapshot` carries persisted call/proof state into the service; `reconcile()` writes proof and delegates to `apply_pending_settlements()`; the latter calls existing `Scheduler.reconcile_attempt()` and then writes the journal marker.
+- **Type consistency:** Task 3's `ProviderEvidenceResult` contains Provider-only evidence, and `ProviderReconciliationService` composes it with the host termination digest into Task 2's persisted `ProviderCallReconciliation`; `ProviderCallSnapshot` carries that proof into restart replay; `apply_pending_settlements()` calls existing `Scheduler.reconcile_attempt()` and then writes the journal marker.
 - **Review Focus mapping:** all five risks have explicit tests in their owning tasks: Task 3 source evidence, Task 1 header scope, Task 4 termination, Task 5 response race, and Task 5 crash matrix.
 
 ## Execution Gate
