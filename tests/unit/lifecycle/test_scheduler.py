@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -39,7 +40,14 @@ from orchestrator.lifecycle import (
 )
 from orchestrator.lifecycle.models import AttemptState, NodeState, RunLifecycleState
 from orchestrator.models import ModelGatewayFailure
+from orchestrator.models.gateway import CostSnapshotRefs, ModelMessage, ModelRequest
+from orchestrator.models.provider_calls import SQLiteProviderCallJournal
 from orchestrator.persistence import EventDraft, SQLiteEventStore
+from orchestrator.provider_reconciliation import (
+    ProviderEvidenceResult,
+    ProviderReconciliationService,
+    ReconciliationRejected,
+)
 from orchestrator.routing import (
     CandidateAssessment,
     RecoveryAuthorization,
@@ -1235,6 +1243,234 @@ def test_scheduler_persists_unknown_failure_as_reconciliation_only(tmp_path):
     assert sum(item.event_type == "RecoveryPlanCreated" for item in events) == 1
     recovered = RunRecoveryCoordinator(store).recover("run-1")
     assert recovered.active_attempts[0].status == "outcome_unknown"
+
+
+@pytest.mark.parametrize(
+    ("effect", "expected_reservation_status", "expected_cost_minor"),
+    [("not_received", "committed", 0), ("received_and_charged", "committed", 3)],
+)
+def test_scheduler_reconciles_provider_no_delivery_and_charged_usage(
+    tmp_path, monkeypatch, effect, expected_reservation_status, expected_cost_minor
+):
+    store = SQLiteEventStore(tmp_path / f"provider-reconcile-{effect}.db")
+    reg, config, _lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    route_request, decision = routed_pair(reg, config, manifest)
+    accepted = accept(control, route_request, decision)
+    route = accepted.accepted_route
+    request = ModelRequest(
+        request_id=f"provider-{route.attempt_id}",
+        idempotency_key=f"provider-idem-{route.attempt_id}",
+        run_id=route.run_id,
+        node_id=route.node_id,
+        attempt_id=route.attempt_id,
+        fencing_generation=route.fencing_generation,
+        budget_reservation_id=route.budget_reservation_id,
+        model_id=route.model_id,
+        accepted_route=route,
+        messages=(ModelMessage(role="user", content="test prompt"),),
+        max_output_tokens=32,
+        reasoning_effort=route.reasoning_effort,
+        timeout_ms=5_000,
+        cost_snapshots=CostSnapshotRefs(
+            registry_manifest_hash=reg.content_hash,
+            tokenizer_snapshot_id=HASH,
+            fx_snapshot_id=HASH,
+            price_snapshot_id=reg.content_hash,
+            estimator_snapshot_id=HASH,
+        ),
+    )
+    journal = SQLiteProviderCallJournal(store)
+    journal.record_intent(
+        request,
+        provider_id=route.provider_id,
+        provider_adapter="openai_responses",
+        request_body=b"{}",
+        provider_correlation_id="maestro-scheduler-test",
+    )
+    journal.record_outcome(request, outcome="unknown", failure_code="timeout")
+    call = journal.read(request)
+    assert call is not None
+    raw_evidence = b"fake-signed-provider-result"
+    usage = None
+    if effect == "received_and_charged":
+        usage = UsageRecord(
+            reservation_id=accepted.reservation.reservation_id,
+            run_id=route.run_id,
+            settlement_key=f"provider-reconcile-{call.stream_id}",
+            currency="USD",
+            input_tokens=12,
+            output_tokens=4,
+            provider_fee_minor=3,
+            cost_minor=3,
+        )
+    evidence = ProviderEvidenceResult(
+        provider_call_stream_id=call.stream_id,
+        provider_adapter=call.provider_adapter,
+        provider_correlation_id=call.provider_correlation_id,
+        run_id=call.run_id,
+        node_id=call.node_id,
+        attempt_id=call.attempt_id,
+        fencing_generation=call.fencing_generation,
+        provider_id=call.provider_id,
+        model_id=call.model_id,
+        accepted_route_id=call.accepted_route_id,
+        budget_reservation_id=call.budget_reservation_id,
+        registry_manifest_hash=call.registry_manifest_hash,
+        request_hash=call.request_hash,
+        effect=effect,
+        usage=usage,
+        provider_request_id="provider-request-1" if usage is not None else None,
+        evidence_source="provider_signed_receipt",
+        evidence_digest="sha256:" + hashlib.sha256(raw_evidence).hexdigest(),
+        observed_at=NOW + timedelta(minutes=2),
+    )
+    termination_digest = "sha256:" + "c" * 64
+    verifier_calls = {"provider": 0, "termination": 0}
+
+    class _EvidenceVerifier:
+        def verify(self, _call, _raw_evidence):
+            verifier_calls["provider"] += 1
+            return evidence
+
+    class _TerminationVerifier:
+        def verify_stopped(self, _call, _receipt):
+            verifier_calls["termination"] += 1
+            return termination_digest
+
+    service = ProviderReconciliationService(
+        journal=journal,
+        scheduler=control,
+        evidence_verifier=_EvidenceVerifier(),
+        termination_verifier=_TerminationVerifier(),
+    )
+    with pytest.raises(ReconciliationRejected, match="OutcomeUnknown"):
+        service.reconcile(
+            call.stream_id,
+            raw_evidence=raw_evidence,
+            termination_receipt=object(),
+            reconciled_at=NOW + timedelta(minutes=3),
+        )
+    assert journal.read_call(call.stream_id).reconciliation is None
+
+    control.finish_attempt(
+        run_id=route_request.run_id,
+        node_id=route_request.node_id,
+        attempt_id=route_request.attempt_id,
+        fencing_generation=route_request.fencing_generation,
+        completed_at=NOW + timedelta(minutes=1),
+        outcome="outcome_unknown",
+    )
+    original_read_call = journal.read_call
+    journal.read_call = lambda stream_id: replace(
+        original_read_call(stream_id),
+        fencing_generation=route_request.fencing_generation + 1,
+    )
+    with pytest.raises(ReconciliationRejected, match="binding"):
+        service.reconcile(
+            call.stream_id,
+            raw_evidence=raw_evidence,
+            termination_receipt=object(),
+            reconciled_at=NOW + timedelta(minutes=3),
+        )
+    journal.read_call = original_read_call
+    assert journal.read_call(call.stream_id).reconciliation is None
+
+    with pytest.raises(ReconciliationRejected, match="predates"):
+        service.reconcile(
+            call.stream_id,
+            raw_evidence=raw_evidence,
+            termination_receipt=object(),
+            reconciled_at=NOW + timedelta(seconds=30),
+        )
+    assert journal.read_call(call.stream_id).reconciliation is None
+    if usage is not None:
+        verified_evidence = evidence
+        evidence = evidence.model_copy(
+            update={"usage": usage.model_copy(update={"currency": "EUR"})}
+        )
+        with pytest.raises(ReconciliationRejected, match="currency"):
+            service.reconcile(
+                call.stream_id,
+                raw_evidence=raw_evidence,
+                termination_receipt=object(),
+                reconciled_at=NOW + timedelta(minutes=3),
+            )
+        evidence = verified_evidence
+        assert journal.read_call(call.stream_id).reconciliation is None
+
+    original_reconcile_attempt = control.reconcile_attempt
+
+    def fail_scheduler_settlement(**_kwargs):
+        raise OSError("simulated process interruption before Scheduler settlement")
+
+    monkeypatch.setattr(control, "reconcile_attempt", fail_scheduler_settlement)
+    with pytest.raises(ReconciliationRejected, match="could not be settled through Scheduler"):
+        service.reconcile(
+            call.stream_id,
+            raw_evidence=raw_evidence,
+            termination_receipt=object(),
+            reconciled_at=NOW + timedelta(minutes=3),
+        )
+    pending = journal.read_call(call.stream_id)
+    assert pending is not None and pending.status == "settlement_pending"
+    assert pending.reconciliation is not None
+    monkeypatch.setattr(control, "reconcile_attempt", original_reconcile_attempt)
+
+    # A fresh process can apply the persisted proof without consulting either
+    # the Provider verifier or the termination witness again.
+    restarted_journal = SQLiteProviderCallJournal(store)
+    restarted_control = scheduler(store)
+    restarted_service = ProviderReconciliationService(
+        journal=restarted_journal,
+        scheduler=restarted_control,
+    )
+    assert restarted_service.apply_pending_settlements() == (call.stream_id,)
+    reconciled = restarted_journal.read_call(call.stream_id)
+    assert reconciled is not None
+    replayed = service.reconcile(
+        call.stream_id,
+        raw_evidence=raw_evidence,
+        termination_receipt=object(),
+        reconciled_at=NOW + timedelta(minutes=3),
+    )
+    assert replayed == reconciled
+    assert verifier_calls == {
+        "provider": 2 if usage is not None else 1,
+        "termination": 2,
+    }
+    with pytest.raises(ReconciliationRejected, match="conflicts"):
+        service.reconcile(
+            call.stream_id,
+            raw_evidence=b"conflicting-provider-evidence",
+            termination_receipt=object(),
+            reconciled_at=NOW + timedelta(minutes=3),
+        )
+
+    assert reconciled.status == "reconciled"
+    assert reconciled.reconciliation is not None
+    assert reconciled.reconciliation.termination_receipt_hash == termination_digest
+    ledger = BudgetLedger(store)
+    assert ledger.get_reservation(
+        accepted.reservation.reservation_id, run_id=route.run_id
+    ).status == expected_reservation_status
+    assert next(
+        event
+        for event in ledger.read(route.run_id)
+        if event.event_type == "CostCommitted"
+    ).payload["cost_minor"] == expected_cost_minor
+    attempt = control.lifecycle.replay(route.run_id).node(route.node_id).attempts[-1]
+    assert attempt.status == "failed"
+    assert control.recovery.recover(route.run_id).active_attempts == ()
+    scheduler_events = store.read_stream("scheduler", "global")
+    assert sum(item.event_type == "AttemptSlotReleased" for item in scheduler_events) == 1
+    provider_events = store.read_stream("provider_call", call.stream_id)
+    assert sum(
+        item.event_type == "ProviderCallReconciliationRecorded" for item in provider_events
+    ) == 1
+    assert sum(
+        item.event_type == "ProviderCallSchedulerSettlementApplied" for item in provider_events
+    ) == 1
 
 
 def test_scheduler_recovery_requires_accepted_and_durably_ended_source(tmp_path):

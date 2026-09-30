@@ -1,9 +1,12 @@
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
+import tempfile
+from types import SimpleNamespace
 
 import pytest
 
+from orchestrator.budget import BudgetLedger, CostEstimate, RunLimit
 from orchestrator.budget.models import UsageRecord
 from orchestrator.models.provider_calls import (
     ProviderCallReconciliation,
@@ -17,6 +20,7 @@ from orchestrator.provider_reconciliation import (
     UnavailableAttemptTerminationVerifier,
     UnavailableProviderEvidenceVerifier,
 )
+from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
 
 
 def _call(**overrides):
@@ -91,6 +95,91 @@ class _Journal:
         )
         return "reconciliation-event-1"
 
+    def _record_scheduler_settlement(self, stream_id, reconciliation_event_id):
+        assert stream_id == self.call.stream_id
+        assert reconciliation_event_id == self.call.reconciliation_event_id
+        self.call = replace(self.call, status="reconciled", settlement_applied=True)
+
+
+class _Scheduler:
+    def __init__(self, call):
+        self._temp_dir = tempfile.TemporaryDirectory()
+        base = SQLiteEventStore(f"{self._temp_dir.name}/events.db")
+        ledger = BudgetLedger(
+            base,
+            run_limits={call.run_id: RunLimit(max_cost_minor=10, max_tokens=10)},
+        )
+        reservation = ledger.reserve(
+            call.run_id,
+            CostEstimate(amount_minor=1, currency="USD", token_limit=1, snapshot_id="test"),
+            reservation_id=call.budget_reservation_id,
+        )
+        ledger.mark_unknown(reservation.reservation_id, run_id=call.run_id)
+        attempt = SimpleNamespace(
+            attempt_id=call.attempt_id,
+            fencing_generation=call.fencing_generation,
+            reservation_id=call.budget_reservation_id,
+            model_id=call.model_id,
+            provider_id=call.provider_id,
+            status="outcome_unknown",
+        )
+        route = {
+            "decision_id": call.accepted_route_id,
+            "run_id": call.run_id,
+            "node_id": call.node_id,
+            "attempt_id": call.attempt_id,
+            "fencing_generation": call.fencing_generation,
+            "budget_reservation_id": call.budget_reservation_id,
+            "provider_id": call.provider_id,
+            "model_id": call.model_id,
+        }
+        events = [
+            SimpleNamespace(
+                event_type="RoutingDecisionAccepted",
+                payload={
+                    "run_id": call.run_id,
+                    "node_id": call.node_id,
+                    "attempt_id": call.attempt_id,
+                    "accepted_route": route,
+                },
+                fencing_generation=call.fencing_generation,
+            ),
+            SimpleNamespace(
+                event_type="AttemptOutcomeUnknown",
+                payload={
+                    "run_id": call.run_id,
+                    "node_id": call.node_id,
+                    "attempt_id": call.attempt_id,
+                    "completed_at": "2026-09-29T12:00:00+00:00",
+                },
+                fencing_generation=call.fencing_generation,
+            ),
+        ]
+
+        class _EventStore:
+            def read_stream(self, stream_type, stream_id, *args, **kwargs):
+                if stream_type == "scheduler" and stream_id == "global":
+                    return events
+                return base.read_stream(stream_type, stream_id, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(base, name)
+
+        class _Lifecycle:
+            def replay(self, run_id):
+                assert run_id == call.run_id
+                return SimpleNamespace(
+                    node=lambda node_id: SimpleNamespace(
+                        attempts=(attempt,) if node_id == call.node_id else ()
+                    )
+                )
+
+        self.event_store = _EventStore()
+        self.lifecycle = _Lifecycle()
+
+    def reconcile_attempt(self, **_kwargs):
+        return None
+
 
 class FakeProviderEvidenceVerifier:
     def __init__(self, evidence_result):
@@ -116,7 +205,7 @@ class FakeAttemptTerminationVerifier:
 def _service(journal, evidence_verifier, termination_verifier):
     return ProviderReconciliationService(
         journal=journal,
-        scheduler=object(),
+        scheduler=_Scheduler(journal.call),
         evidence_verifier=evidence_verifier,
         termination_verifier=termination_verifier,
     )
@@ -350,7 +439,7 @@ def test_verified_provider_only_evidence_is_combined_with_host_digest():
         reconciled_at=reconciled_at,
     )
 
-    assert persisted.status == "settlement_pending"
+    assert persisted.status == "reconciled"
     assert len(journal.appended) == 1
     proof, persisted_at = journal.appended[0]
     assert proof.provider_call_stream_id == call.stream_id
