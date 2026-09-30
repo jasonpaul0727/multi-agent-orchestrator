@@ -56,6 +56,19 @@ def _validate_non_blank(value: Any, field_name: str) -> Any:
 
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}", re.ASCII)
+_PROVIDER_CALL_BINDING_FIELDS = frozenset({
+    "provider_call_stream_id", "provider_adapter", "provider_correlation_id",
+    "run_id", "node_id", "attempt_id", "fencing_generation", "provider_id",
+    "model_id", "accepted_route_id", "budget_reservation_id",
+    "registry_manifest_hash", "request_hash",
+})
+_PROVIDER_RECONCILIATION_FIELDS = _PROVIDER_CALL_BINDING_FIELDS | frozenset({
+    "provider_request_id", "effect", "usage", "evidence_source",
+    "evidence_digest", "termination_receipt_hash", "observed_at", "reconciled_at",
+})
+_PROVIDER_SETTLEMENT_FIELDS = _PROVIDER_CALL_BINDING_FIELDS | frozenset({
+    "reconciliation_event_id",
+})
 
 _CAUSAL_EVENT_TYPES = frozenset(
     {
@@ -94,6 +107,8 @@ _CAUSAL_EVENT_TYPES = frozenset(
         "EffectReceiptRecorded",
         "ProviderCallIntentRecorded",
         "ProviderCallOutcomeRecorded",
+        "ProviderCallReconciliationRecorded",
+        "ProviderCallSchedulerSettlementApplied",
     }
 )
 _RUN_LEVEL_CAUSAL_EVENT_TYPES = frozenset(
@@ -141,10 +156,20 @@ def validate_event_contract(events: list[Any]) -> None:
     accepted_routes: dict[str, Any] = {}
     terminal_attempts: dict[str, tuple[str, Any]] = {}
     provider_call_intent: Any | None = None
+    provider_call_outcome: Any | None = None
+    provider_call_reconciliation: Any | None = None
+    provider_call_settlement: Any | None = None
     provider_call_terminal = False
     for event in events:
         event_type = event.event_type
         payload = event.payload or {}
+        if event.stream_type == "provider_call" and event_type not in {
+            "ProviderCallIntentRecorded",
+            "ProviderCallOutcomeRecorded",
+            "ProviderCallReconciliationRecorded",
+            "ProviderCallSchedulerSettlementApplied",
+        }:
+            raise EventContractError("provider call stream contains an unsupported event")
         execution_key = (
             event.run_id,
             event.node_id,
@@ -210,6 +235,7 @@ def validate_event_contract(events: list[Any]) -> None:
             if (
                 provider_call_intent is None
                 or provider_call_terminal
+                or provider_call_reconciliation is not None
                 or event.stream_version != 2
                 or set(payload) != required_fields
                 or not all(execution_key)
@@ -254,6 +280,44 @@ def validate_event_contract(events: list[Any]) -> None:
             if usage is not None:
                 _validate_provider_usage(usage)
             provider_call_terminal = True
+            provider_call_outcome = event
+        elif event_type == "ProviderCallReconciliationRecorded":
+            expected_version = 2 if provider_call_outcome is None else 3
+            if (
+                provider_call_intent is None
+                or provider_call_reconciliation is not None
+                or provider_call_settlement is not None
+                or event.stream_version != expected_version
+                or (
+                    provider_call_outcome is not None
+                    and provider_call_outcome.payload.get("outcome") != "unknown"
+                )
+            ):
+                raise EventContractError(
+                    "ProviderCallReconciliationRecorded is orphaned, duplicated, or terminal"
+                )
+            _validate_provider_reconciliation_event(
+                event,
+                intent=provider_call_intent,
+                stream_id=event.stream_id,
+            )
+            provider_call_reconciliation = event
+        elif event_type == "ProviderCallSchedulerSettlementApplied":
+            if (
+                provider_call_reconciliation is None
+                or provider_call_settlement is not None
+                or event.stream_version != provider_call_reconciliation.stream_version + 1
+            ):
+                raise EventContractError(
+                    "ProviderCallSchedulerSettlementApplied is orphaned, duplicated, or out of order"
+                )
+            _validate_provider_settlement_event(
+                event,
+                intent=provider_call_intent,
+                reconciliation=provider_call_reconciliation,
+                stream_id=event.stream_id,
+            )
+            provider_call_settlement = event
         elif event_type == "AttemptFailureClassified":
             classification = payload.get("classification")
             accepted = accepted_routes.get(payload.get("attempt_ref"))
@@ -500,6 +564,136 @@ def validate_event_contract(events: list[Any]) -> None:
             raise EventContractError(
                 "ApprovalGrantConsumed and EffectIntentRecorded must share attempt_id and fencing_generation"
             )
+
+
+def _provider_call_binding(intent: Any, stream_id: str) -> dict[str, Any]:
+    source = intent.payload
+    return {
+        "provider_call_stream_id": stream_id,
+        "provider_adapter": source["provider_adapter"],
+        "provider_correlation_id": source["provider_correlation_id"],
+        "run_id": source["run_id"],
+        "node_id": source["node_id"],
+        "attempt_id": source["attempt_id"],
+        "fencing_generation": source["fencing_generation"],
+        "provider_id": source["provider_id"],
+        "model_id": source["model_id"],
+        "accepted_route_id": source["accepted_route_id"],
+        "budget_reservation_id": source["budget_reservation_id"],
+        "registry_manifest_hash": source["registry_manifest_hash"],
+        "request_hash": source["request_hash"],
+    }
+
+
+def _validate_provider_reconciliation_event(event: Any, *, intent: Any, stream_id: str) -> None:
+    payload = event.payload
+    if set(payload) != _PROVIDER_RECONCILIATION_FIELDS:
+        raise EventContractError("ProviderCallReconciliationRecorded has invalid exact fields")
+    expected = _provider_call_binding(intent, stream_id)
+    if (
+        any(payload.get(name) != value for name, value in expected.items())
+        or isinstance(payload.get("fencing_generation"), bool)
+        or event.stream_id != stream_id
+        or event.causation_id != intent.causation_id
+        or (
+            event.run_id,
+            event.node_id,
+            event.attempt_id,
+            event.fencing_generation,
+        ) != (
+            intent.run_id,
+            intent.node_id,
+            intent.attempt_id,
+            intent.fencing_generation,
+        )
+    ):
+        raise EventContractError("ProviderCallReconciliationRecorded has invalid identity binding")
+    for name in ("provider_request_id",):
+        value = payload.get(name)
+        if value is not None and (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 256
+            or not _safe_event_text(value)
+        ):
+            raise EventContractError("ProviderCallReconciliationRecorded has invalid provider request id")
+    if payload.get("effect") not in ("not_received", "received_and_charged"):
+        raise EventContractError("ProviderCallReconciliationRecorded has invalid effect")
+    if payload.get("evidence_source") not in (
+        "provider_signed_receipt", "provider_authoritative_api"
+    ):
+        raise EventContractError("ProviderCallReconciliationRecorded has invalid evidence source")
+    for name in ("evidence_digest", "termination_receipt_hash"):
+        value = payload.get(name)
+        if not isinstance(value, str) or not value.startswith("sha256:"):
+            raise EventContractError("ProviderCallReconciliationRecorded has invalid evidence hash")
+        try:
+            _validate_sha256_hex(value[7:], name)
+        except ValueError as exc:
+            raise EventContractError("ProviderCallReconciliationRecorded has invalid evidence hash") from exc
+    observed_at = _parse_event_datetime(payload.get("observed_at"))
+    reconciled_at = _parse_event_datetime(payload.get("reconciled_at"))
+    if observed_at is None or reconciled_at is None:
+        raise EventContractError("ProviderCallReconciliationRecorded has invalid timestamp")
+    usage = payload.get("usage")
+    if payload["effect"] == "not_received" and usage is not None:
+        raise EventContractError("not_received Provider reconciliation cannot include usage")
+    if payload["effect"] == "received_and_charged" and usage is None:
+        raise EventContractError("received_and_charged Provider reconciliation requires usage")
+    if usage is not None:
+        try:
+            from orchestrator.budget.models import UsageRecord
+
+            exact_usage = UsageRecord.model_validate(usage)
+        except Exception as exc:
+            raise EventContractError("ProviderCallReconciliationRecorded has invalid usage") from exc
+        exact_payload = exact_usage.model_dump(mode="json")
+        if (
+            not isinstance(usage, dict)
+            or set(usage) != set(exact_payload)
+            or usage != exact_payload
+            or exact_usage.run_id != payload["run_id"]
+            or exact_usage.reservation_id != payload["budget_reservation_id"]
+        ):
+            raise EventContractError("ProviderCallReconciliationRecorded has invalid usage binding")
+
+
+def _validate_provider_settlement_event(
+    event: Any, *, intent: Any, reconciliation: Any, stream_id: str
+) -> None:
+    payload = event.payload
+    if set(payload) != _PROVIDER_SETTLEMENT_FIELDS:
+        raise EventContractError("ProviderCallSchedulerSettlementApplied has invalid exact fields")
+    expected = _provider_call_binding(intent, stream_id)
+    if (
+        any(payload.get(name) != value for name, value in expected.items())
+        or isinstance(payload.get("fencing_generation"), bool)
+        or event.stream_id != stream_id
+        or payload.get("reconciliation_event_id") != reconciliation.event_id
+        or event.causation_id != reconciliation.event_id
+        or (
+            event.run_id,
+            event.node_id,
+            event.attempt_id,
+            event.fencing_generation,
+        ) != (
+            intent.run_id,
+            intent.node_id,
+            intent.attempt_id,
+            intent.fencing_generation,
+        )
+    ):
+        raise EventContractError("ProviderCallSchedulerSettlementApplied has invalid identity binding")
+
+
+def _parse_event_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
 
 
 def _validate_execution_context(model: Any, *, event_type: str) -> None:

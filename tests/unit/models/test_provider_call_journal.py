@@ -1,6 +1,8 @@
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from threading import Barrier
 
 import pytest
 
@@ -17,6 +19,11 @@ from orchestrator.models import (
     SQLiteProviderCallJournal,
 )
 from orchestrator.config.models import ModelRegistryManifest, ModelSpec, ProviderSpec
+from orchestrator.budget.models import UsageRecord
+from orchestrator.models.provider_calls import (
+    ProviderCallJournalConflict,
+    ProviderCallReconciliation,
+)
 from orchestrator.models.transport import HTTPTransportResponse
 from orchestrator.persistence import EventContractError, EventDraft, SQLiteEventStore
 
@@ -127,6 +134,33 @@ def _success_response():
             }
         ).encode(),
     )
+
+
+def _provider_reconciliation_for(call, **overrides):
+    values = {
+        "provider_call_stream_id": call.stream_id,
+        "provider_adapter": call.provider_adapter,
+        "provider_correlation_id": call.provider_correlation_id,
+        "run_id": call.run_id,
+        "node_id": call.node_id,
+        "attempt_id": call.attempt_id,
+        "fencing_generation": call.fencing_generation,
+        "provider_id": call.provider_id,
+        "model_id": call.model_id,
+        "accepted_route_id": call.accepted_route_id,
+        "budget_reservation_id": call.budget_reservation_id,
+        "registry_manifest_hash": call.registry_manifest_hash,
+        "request_hash": call.request_hash,
+        "effect": "not_received",
+        "usage": None,
+        "provider_request_id": None,
+        "evidence_source": "provider_signed_receipt",
+        "evidence_digest": "sha256:" + "b" * 64,
+        "termination_receipt_hash": "sha256:" + "c" * 64,
+        "observed_at": datetime(2026, 9, 29, 12, tzinfo=timezone.utc),
+    }
+    values.update(overrides)
+    return ProviderCallReconciliation(**values)
 
 
 def test_provider_call_intent_and_receipt_survive_restart_without_prompt_or_output(tmp_path):
@@ -488,3 +522,339 @@ def test_openai_correlation_id_survives_provider_journal_restart(tmp_path):
 
     assert recovered.provider_correlation_id == "maestro-stable-correlation-id"
     assert recovered.provider_adapter == "openai_responses"
+
+
+def test_provider_reconciliation_accepts_dispatching_or_unknown_only(tmp_path):
+    registry = model_registry()
+    request = model_request(registry)
+
+    def proof_for(call):
+        return ProviderCallReconciliation(
+            provider_call_stream_id=call.stream_id,
+            provider_adapter=call.provider_adapter,
+            provider_correlation_id=call.provider_correlation_id,
+            run_id=call.run_id,
+            node_id=call.node_id,
+            attempt_id=call.attempt_id,
+            fencing_generation=call.fencing_generation,
+            provider_id=call.provider_id,
+            model_id=call.model_id,
+            accepted_route_id=call.accepted_route_id,
+            budget_reservation_id=call.budget_reservation_id,
+            registry_manifest_hash=call.registry_manifest_hash,
+            request_hash=call.request_hash,
+            effect="not_received",
+            usage=None,
+            provider_request_id=None,
+            evidence_source="provider_signed_receipt",
+            evidence_digest="sha256:" + "b" * 64,
+            termination_receipt_hash="sha256:" + "c" * 64,
+            observed_at=datetime(2026, 9, 29, 12, tzinfo=timezone.utc),
+        )
+
+    reconciled_at = datetime(2026, 9, 29, 13, tzinfo=timezone.utc)
+    dispatch_journal = SQLiteProviderCallJournal(
+        SQLiteEventStore(tmp_path / "dispatching.db")
+    )
+    dispatch_journal.record_intent(
+        request,
+        provider_id="primary",
+        provider_adapter="openai_responses",
+        request_body=b"{}",
+        provider_correlation_id="maestro-dispatching",
+    )
+    dispatch_call = dispatch_journal.read_call(dispatch_journal.unresolved()[0].stream_id)
+    assert dispatch_call is not None
+    dispatch_journal._append_reconciliation(
+        dispatch_call.stream_id, proof_for(dispatch_call), reconciled_at
+    )
+    dispatch_result = dispatch_journal.read_call(dispatch_call.stream_id)
+    assert dispatch_result is not None
+    assert dispatch_result.status == "settlement_pending"
+    assert dispatch_result.reconciliation == proof_for(dispatch_call)
+    assert dispatch_result.reconciled_at == reconciled_at
+    assert dispatch_result.settlement_applied is False
+    assert len(dispatch_journal.pending_settlements()) == 1
+
+    unknown_journal = SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / "unknown.db"))
+    unknown_journal.record_intent(
+        request,
+        provider_id="primary",
+        provider_adapter="openai_responses",
+        request_body=b"{}",
+        provider_correlation_id="maestro-unknown",
+    )
+    unknown_journal.record_outcome(request, outcome="unknown", failure_code="timeout")
+    unknown_call = unknown_journal.read_call(unknown_journal.unresolved()[0].stream_id)
+    assert unknown_call is not None
+    unknown_journal._append_reconciliation(
+        unknown_call.stream_id, proof_for(unknown_call), reconciled_at
+    )
+    unknown_result = unknown_journal.read_call(unknown_call.stream_id)
+    assert unknown_result is not None
+    assert unknown_result.status == "settlement_pending"
+
+    terminal_journal = SQLiteProviderCallJournal(
+        SQLiteEventStore(tmp_path / "known-success.db")
+    )
+    terminal_journal.record_intent(
+        request,
+        provider_id="primary",
+        provider_adapter="openai_responses",
+        request_body=b"{}",
+        provider_correlation_id="maestro-terminal",
+    )
+    terminal_journal.record_outcome(request, outcome="known_success", http_status=200)
+    # The known-success stream is terminal and is not included in unresolved calls.
+    terminal_events = terminal_journal.event_store.stream_ids("provider_call")
+    assert len(terminal_events) == 1
+    terminal_call = terminal_journal.read_call(terminal_events[0])
+    assert terminal_call is not None
+    with pytest.raises(ProviderCallJournalConflict, match="terminal"):
+        terminal_journal._append_reconciliation(
+            terminal_call.stream_id, proof_for(terminal_call), reconciled_at
+        )
+
+
+def test_provider_reconciliation_requires_exact_usage_and_aware_timestamps(tmp_path):
+    registry = model_registry()
+    request = model_request(registry)
+    journal = SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / "invalid-proof.db"))
+    journal.record_intent(
+        request,
+        provider_id="primary",
+        provider_adapter="openai_responses",
+        request_body=b"{}",
+        provider_correlation_id="maestro-proof",
+    )
+    call = journal.read_call(journal.unresolved()[0].stream_id)
+    assert call is not None
+
+    proof_fields = {
+        "provider_call_stream_id": call.stream_id,
+        "provider_adapter": call.provider_adapter,
+        "provider_correlation_id": call.provider_correlation_id,
+        "run_id": call.run_id,
+        "node_id": call.node_id,
+        "attempt_id": call.attempt_id,
+        "fencing_generation": call.fencing_generation,
+        "provider_id": call.provider_id,
+        "model_id": call.model_id,
+        "accepted_route_id": call.accepted_route_id,
+        "budget_reservation_id": call.budget_reservation_id,
+        "registry_manifest_hash": call.registry_manifest_hash,
+        "request_hash": call.request_hash,
+        "evidence_source": "provider_authoritative_api",
+        "evidence_digest": "sha256:" + "d" * 64,
+        "termination_receipt_hash": "sha256:" + "e" * 64,
+        "observed_at": datetime(2026, 9, 29, tzinfo=timezone.utc),
+    }
+    with pytest.raises(ValueError, match="usage"):
+        ProviderCallReconciliation(
+            **proof_fields,
+            effect="received_and_charged",
+            usage=None,
+            provider_request_id="provider-request-1",
+        )
+    with pytest.raises(ValueError, match="usage"):
+        ProviderCallReconciliation(
+            **proof_fields,
+            effect="not_received",
+            usage=UsageRecord(
+                reservation_id=call.budget_reservation_id,
+                run_id=call.run_id,
+                settlement_key="settlement-1",
+                currency="USD",
+            ),
+            provider_request_id=None,
+        )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        ProviderCallReconciliation(
+            **{**proof_fields, "observed_at": datetime(2026, 9, 29)},
+            effect="not_received",
+            usage=None,
+            provider_request_id=None,
+        )
+
+
+def test_received_and_charged_provider_reconciliation_round_trips_exact_usage(tmp_path):
+    request = model_request(model_registry())
+    journal = SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / "charged-proof.db"))
+    journal.record_intent(
+        request,
+        provider_id="primary",
+        provider_adapter="openai_responses",
+        request_body=b"{}",
+        provider_correlation_id="maestro-charged",
+    )
+    call = journal.read_call(journal.unresolved()[0].stream_id)
+    assert call is not None
+    usage = UsageRecord(
+        reservation_id=call.budget_reservation_id,
+        run_id=call.run_id,
+        settlement_key="provider-settlement-1",
+        currency="USD",
+        input_tokens=11,
+        output_tokens=7,
+        provider_fee_minor=12,
+        cost_minor=12,
+    )
+    proof = _provider_reconciliation_for(
+        call,
+        effect="received_and_charged",
+        usage=usage,
+        provider_request_id="provider-request-1",
+    )
+
+    journal._append_reconciliation(
+        call.stream_id, proof, datetime(2026, 9, 29, 16, tzinfo=timezone.utc)
+    )
+    replayed = journal.read_call(call.stream_id)
+
+    assert replayed is not None
+    assert replayed.reconciliation == proof
+    assert replayed.reconciliation.usage == usage
+
+
+def test_provider_settlement_marker_must_name_matching_reconciliation_event(tmp_path):
+    store = SQLiteEventStore(tmp_path / "wrong-settlement-marker.db")
+    journal = SQLiteProviderCallJournal(store)
+    request = model_request(model_registry())
+    journal.record_intent(
+        request,
+        provider_id="primary",
+        provider_adapter="openai_responses",
+        request_body=b"{}",
+        provider_correlation_id="maestro-marker",
+    )
+    [intent] = store.read_stream("provider_call", store.stream_ids("provider_call")[0])
+    call = journal.read_call(intent.stream_id)
+    assert call is not None
+    proof = _provider_reconciliation_for(call)
+    reconciled_at = datetime(2026, 9, 29, 17, tzinfo=timezone.utc)
+    reconciliation_event_id = journal._append_reconciliation(
+        intent.stream_id, proof, reconciled_at
+    )
+    marker_payload = {
+        key: value
+        for key, value in proof.model_dump(mode="json").items()
+        if key in {
+            "provider_call_stream_id", "provider_adapter", "provider_correlation_id",
+            "run_id", "node_id", "attempt_id", "fencing_generation", "provider_id",
+            "model_id", "accepted_route_id", "budget_reservation_id",
+            "registry_manifest_hash", "request_hash",
+        }
+    }
+    marker_payload["reconciliation_event_id"] = "wrong-reconciliation-event"
+    marker = EventDraft(
+        "ProviderCallSchedulerSettlementApplied",
+        marker_payload,
+        run_id=request.run_id,
+        node_id=request.node_id,
+        attempt_id=request.attempt_id,
+        fencing_generation=request.fencing_generation,
+        causation_id="wrong-reconciliation-event",
+    )
+
+    assert reconciliation_event_id != marker_payload["reconciliation_event_id"]
+    with pytest.raises(EventContractError, match="identity binding"):
+        store.append(
+            "provider_call", intent.stream_id, 2, [marker], "wrong-marker"
+        )
+
+
+def test_provider_reconciliation_and_scheduler_marker_replays_are_exact(tmp_path):
+    request = model_request(model_registry())
+    journal = SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / "exact-replay.db"))
+    journal.record_intent(
+        request,
+        provider_id="primary",
+        provider_adapter="openai_responses",
+        request_body=b"{}",
+        provider_correlation_id="maestro-replay",
+    )
+    call = journal.read_call(journal.unresolved()[0].stream_id)
+    assert call is not None
+    proof = _provider_reconciliation_for(call)
+    reconciled_at = datetime(2026, 9, 29, 14, tzinfo=timezone.utc)
+
+    reconciliation_event_id = journal._append_reconciliation(
+        call.stream_id, proof, reconciled_at
+    )
+    assert journal._append_reconciliation(
+        call.stream_id, proof, reconciled_at
+    ) == reconciliation_event_id
+    with pytest.raises(ProviderCallJournalConflict, match="conflict"):
+        journal._append_reconciliation(
+            call.stream_id,
+            proof.model_copy(update={"evidence_digest": "sha256:" + "f" * 64}),
+            reconciled_at,
+        )
+    with pytest.raises(ProviderCallJournalConflict, match="conflict"):
+        journal._append_reconciliation(
+            call.stream_id,
+            proof,
+            datetime(2026, 9, 29, 14, 1, tzinfo=timezone.utc),
+        )
+
+    journal._record_scheduler_settlement(call.stream_id, reconciliation_event_id)
+    journal._record_scheduler_settlement(call.stream_id, reconciliation_event_id)
+    settled = journal.read_call(call.stream_id)
+    assert settled is not None
+    assert settled.status == "reconciled"
+    assert settled.settlement_applied is True
+    assert settled.reconciliation_event_id == reconciliation_event_id
+    assert journal.pending_settlements() == ()
+    with pytest.raises(ProviderCallJournalConflict, match="conflict"):
+        journal._record_scheduler_settlement(call.stream_id, "other-reconciliation")
+    assert len(journal.event_store.read_stream("provider_call", call.stream_id)) == 3
+
+
+def test_concurrent_provider_reconciliation_append_has_one_durable_winner(tmp_path):
+    request = model_request(model_registry())
+    database = tmp_path / "concurrent-reconciliation.db"
+    first_store = SQLiteEventStore(database)
+    first_journal = SQLiteProviderCallJournal(first_store)
+    first_journal.record_intent(
+        request,
+        provider_id="primary",
+        provider_adapter="openai_responses",
+        request_body=b"{}",
+        provider_correlation_id="maestro-concurrent",
+    )
+    call = first_journal.read_call(first_journal.unresolved()[0].stream_id)
+    assert call is not None
+    proof = _provider_reconciliation_for(call)
+    reconciled_at = datetime(2026, 9, 29, 15, tzinfo=timezone.utc)
+
+    barrier = Barrier(2)
+
+    def append_from_independent_connection():
+        store = SQLiteEventStore(database)
+        original_read_stream = store.read_stream
+        synchronized = False
+
+        def synchronized_read_stream(stream_type, stream_id, after_version=0):
+            nonlocal synchronized
+            result = original_read_stream(stream_type, stream_id, after_version)
+            if stream_type == "provider_call" and not synchronized:
+                synchronized = True
+                barrier.wait(timeout=5)
+            return result
+
+        store.read_stream = synchronized_read_stream
+        return SQLiteProviderCallJournal(store)._append_reconciliation(
+            call.stream_id, proof, reconciled_at
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(append_from_independent_connection)
+        second = pool.submit(append_from_independent_connection)
+        event_ids = {first.result(), second.result()}
+
+    assert len(event_ids) == 1
+    events = first_store.read_stream("provider_call", call.stream_id)
+    assert [event.event_type for event in events] == [
+        "ProviderCallIntentRecorded",
+        "ProviderCallReconciliationRecorded",
+    ]

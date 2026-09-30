@@ -43,6 +43,33 @@ def _provider_call_intent_payload(**overrides):
     }
 
 
+def _provider_reconciliation_payload(**overrides):
+    return {
+        "provider_call_stream_id": "call-stream-1",
+        "provider_adapter": "openai_responses",
+        "provider_correlation_id": "maestro-correlation-1",
+        "run_id": "run-1",
+        "node_id": "node-1",
+        "attempt_id": "attempt-1",
+        "fencing_generation": 1,
+        "provider_id": "primary",
+        "model_id": "model-1",
+        "accepted_route_id": "decision-1",
+        "budget_reservation_id": "reservation-1",
+        "registry_manifest_hash": "sha256:" + "b" * 64,
+        "request_hash": "sha256:" + "c" * 64,
+        "provider_request_id": None,
+        "effect": "not_received",
+        "usage": None,
+        "evidence_source": "provider_signed_receipt",
+        "evidence_digest": "sha256:" + "d" * 64,
+        "termination_receipt_hash": "sha256:" + "e" * 64,
+        "observed_at": "2026-09-29T12:00:00+00:00",
+        "reconciled_at": "2026-09-29T13:00:00+00:00",
+        **overrides,
+    }
+
+
 def test_provider_call_intent_binds_adapter_and_correlation_schema(tmp_path):
     store = SQLiteEventStore(tmp_path / "provider-intent-schema.db")
     intent = EventDraft(
@@ -77,6 +104,111 @@ def test_provider_call_intent_rejects_invalid_adapter_correlation_pair(tmp_path,
 
     with pytest.raises(EventContractError, match=message):
         store.append("provider_call", "call-stream-1", 0, [intent], "invalid-call-intent")
+
+
+def test_provider_reconciliation_event_requires_a_prior_call_intent(tmp_path):
+    store = SQLiteEventStore(tmp_path / "orphan-provider-reconciliation.db")
+    reconciliation = EventDraft(
+        "ProviderCallReconciliationRecorded",
+        _provider_reconciliation_payload(),
+        **_context(causation_id="decision-1"),
+    )
+
+    with pytest.raises(EventContractError, match="orphaned|invalid|prior"):
+        store.append(
+            "provider_call", "call-stream-1", 0, [reconciliation], "orphan-reconciliation"
+        )
+
+    assert store.current_version("provider_call", "call-stream-1") == 0
+
+
+def test_provider_call_rejects_a_late_outcome_after_reconciliation(tmp_path):
+    store = SQLiteEventStore(tmp_path / "provider-call-late-outcome.db")
+    intent = EventDraft(
+        "ProviderCallIntentRecorded",
+        _provider_call_intent_payload(),
+        **_context(causation_id="decision-1"),
+    )
+    store.append("provider_call", "call-stream-1", 0, [intent], "provider-intent")
+    unknown_outcome = EventDraft(
+        "ProviderCallOutcomeRecorded",
+        {
+            "outcome": "unknown",
+            "provider_request_id": None,
+            "http_status": None,
+            "failure_code": "timeout",
+            "usage": None,
+        },
+        **_context(causation_id="decision-1"),
+    )
+    store.append(
+        "provider_call", "call-stream-1", 1, [unknown_outcome], "unknown-outcome"
+    )
+    reconciliation = EventDraft(
+        "ProviderCallReconciliationRecorded",
+        _provider_reconciliation_payload(),
+        **_context(causation_id="decision-1"),
+    )
+    store.append(
+        "provider_call", "call-stream-1", 2, [reconciliation], "provider-reconciliation"
+    )
+    late_success = EventDraft(
+        "ProviderCallOutcomeRecorded",
+        {
+            "outcome": "known_success",
+            "provider_request_id": "provider-request-1",
+            "http_status": 200,
+            "failure_code": None,
+            "usage": None,
+        },
+        **_context(causation_id="decision-1"),
+    )
+
+    with pytest.raises(EventContractError, match="orphaned|duplicated|invalid"):
+        store.append(
+            "provider_call", "call-stream-1", 3, [late_success], "late-provider-success"
+        )
+
+    assert store.current_version("provider_call", "call-stream-1") == 3
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"provider_call_stream_id": "other-call"}, "identity"),
+        ({"attempt_id": "other-attempt"}, "identity"),
+        ({"provider_adapter": "openai_compatible"}, "identity"),
+        ({"evidence_source": "operator_assertion"}, "evidence"),
+        ({"observed_at": "2026-09-29T12:00:00"}, "timestamp"),
+        ({"usage": {"status": "reported"}}, "usage"),
+    ],
+)
+def test_provider_reconciliation_event_rejects_invalid_binding_or_evidence(
+    tmp_path, overrides, message
+):
+    store = SQLiteEventStore(tmp_path / f"invalid-provider-reconciliation-{message}.db")
+    intent = EventDraft(
+        "ProviderCallIntentRecorded",
+        _provider_call_intent_payload(),
+        **_context(causation_id="decision-1"),
+    )
+    store.append("provider_call", "call-stream-1", 0, [intent], "valid-intent")
+    reconciliation = EventDraft(
+        "ProviderCallReconciliationRecorded",
+        _provider_reconciliation_payload(**overrides),
+        **_context(causation_id="decision-1"),
+    )
+
+    with pytest.raises(EventContractError, match=message):
+        store.append(
+            "provider_call",
+            "call-stream-1",
+            1,
+            [reconciliation],
+            "invalid-reconciliation",
+        )
+
+    assert store.current_version("provider_call", "call-stream-1") == 1
 
 
 @pytest.mark.parametrize(
