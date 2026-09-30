@@ -82,15 +82,14 @@ class ProviderCallReconciliation(BaseModel):
 
     @model_validator(mode="after")
     def validate_evidence_binding(self) -> ProviderCallReconciliation:
-        if self.provider_adapter == "openai_responses":
-            if (
-                self.provider_correlation_id is None
-                or not self.provider_correlation_id.isascii()
-                or len(self.provider_correlation_id) > 512
-            ):
-                raise ValueError("OpenAI Responses reconciliation requires an ASCII correlation id")
-        elif self.provider_correlation_id is not None:
-            raise ValueError("this Provider adapter cannot bind a correlation id")
+        if self.provider_adapter != "openai_responses":
+            raise ValueError("Provider reconciliation is unsupported for this adapter")
+        if (
+            self.provider_correlation_id is None
+            or not self.provider_correlation_id.isascii()
+            or len(self.provider_correlation_id) > 512
+        ):
+            raise ValueError("OpenAI Responses reconciliation requires an ASCII correlation id")
         if self.effect == "not_received" and self.usage is not None:
             raise ValueError("not_received reconciliation cannot include usage")
         if self.effect == "received_and_charged" and self.usage is None:
@@ -100,6 +99,8 @@ class ProviderCallReconciliation(BaseModel):
             or self.usage.reservation_id != self.budget_reservation_id
         ):
             raise ValueError("reconciliation usage does not match Run reservation")
+        if self.usage is not None and self.usage.status != "committed":
+            raise ValueError("reconciliation requires committed exact usage")
         return self
 
 

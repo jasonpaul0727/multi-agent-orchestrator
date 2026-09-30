@@ -122,6 +122,33 @@ def test_provider_reconciliation_event_requires_a_prior_call_intent(tmp_path):
     assert store.current_version("provider_call", "call-stream-1") == 0
 
 
+def test_provider_reconciliation_is_not_enabled_for_generic_provider_adapters(tmp_path):
+    store = SQLiteEventStore(tmp_path / "unsupported-provider-adapter.db")
+    intent_payload = _provider_call_intent_payload(
+        provider_adapter="anthropic_messages",
+        provider_correlation_id=None,
+    )
+    intent = EventDraft(
+        "ProviderCallIntentRecorded",
+        intent_payload,
+        **_context(causation_id="decision-1"),
+    )
+    store.append("provider_call", "call-stream-1", 0, [intent], "provider-intent")
+    reconciliation = EventDraft(
+        "ProviderCallReconciliationRecorded",
+        _provider_reconciliation_payload(
+            provider_adapter="anthropic_messages",
+            provider_correlation_id=None,
+        ),
+        **_context(causation_id="decision-1"),
+    )
+
+    with pytest.raises(EventContractError, match="supported adapter"):
+        store.append(
+            "provider_call", "call-stream-1", 1, [reconciliation], "unsupported-reconciliation"
+        )
+
+
 def test_provider_call_rejects_a_late_outcome_after_reconciliation(tmp_path):
     store = SQLiteEventStore(tmp_path / "provider-call-late-outcome.db")
     intent = EventDraft(

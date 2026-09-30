@@ -608,6 +608,16 @@ def _validate_provider_reconciliation_event(event: Any, *, intent: Any, stream_i
         )
     ):
         raise EventContractError("ProviderCallReconciliationRecorded has invalid identity binding")
+    provider_correlation_id = payload.get("provider_correlation_id")
+    if (
+        payload.get("provider_adapter") != "openai_responses"
+        or not isinstance(provider_correlation_id, str)
+        or not provider_correlation_id
+        or len(provider_correlation_id) > 512
+        or not provider_correlation_id.isascii()
+        or not _safe_event_text(provider_correlation_id)
+    ):
+        raise EventContractError("ProviderCallReconciliationRecorded has invalid supported adapter")
     for name in ("provider_request_id",):
         value = payload.get(name)
         if value is not None and (
@@ -654,6 +664,7 @@ def _validate_provider_reconciliation_event(event: Any, *, intent: Any, stream_i
             or usage != exact_payload
             or exact_usage.run_id != payload["run_id"]
             or exact_usage.reservation_id != payload["budget_reservation_id"]
+            or exact_usage.status != "committed"
         ):
             raise EventContractError("ProviderCallReconciliationRecorded has invalid usage binding")
 
