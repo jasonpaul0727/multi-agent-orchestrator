@@ -31,6 +31,10 @@ class ProviderCallJournalConflict(RuntimeError):
     """A Provider reconciliation stream already contains a conflicting claim."""
 
 
+class ProviderCallOutcomeConflict(ValueError):
+    """A late Gateway outcome lost a race with another durable call claim."""
+
+
 class ProviderCallReconciliation(BaseModel):
     """Immutable combined Provider evidence and host-termination proof."""
 
@@ -281,7 +285,9 @@ class SQLiteProviderCallJournal:
         if prior is None:
             raise ValueError("provider call outcome requires a prior durable intent")
         if prior.status != "dispatching":
-            raise ValueError("provider call outcome conflicts with a terminal or reconciled call")
+            raise ProviderCallOutcomeConflict(
+                "provider call outcome conflicts with a terminal or reconciled call"
+            )
         payload: dict[str, object] = {
             "outcome": outcome,
             "provider_request_id": provider_request_id,
@@ -306,7 +312,9 @@ class SQLiteProviderCallJournal:
                 idempotency_key="provider-call-outcome:" + _stream_id(request),
             )
         except (StaleStream, IdempotencyConflict) as exc:
-            raise ValueError("provider call has no intent or already has a different outcome") from exc
+            raise ProviderCallOutcomeConflict(
+                "provider call has no intent or already has a different outcome"
+            ) from exc
 
     def read(self, request: ModelRequest) -> ProviderCallSnapshot | None:
         snapshot = self.read_call(_stream_id(request))
@@ -596,6 +604,7 @@ def _safe_text(value: str) -> bool:
 
 __all__ = [
     "ProviderCallJournal",
+    "ProviderCallOutcomeConflict",
     "ProviderCallJournalConflict",
     "ProviderCallReplayBlocked",
     "ProviderCallReconciliation",

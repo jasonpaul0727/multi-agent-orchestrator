@@ -39,9 +39,12 @@ from orchestrator.lifecycle import (
     validate_graph_append,
 )
 from orchestrator.lifecycle.models import AttemptState, NodeState, RunLifecycleState
-from orchestrator.models import ModelGatewayFailure
+from orchestrator.models import ModelGatewayFailure, ProviderCallReplayBlocked
 from orchestrator.models.gateway import CostSnapshotRefs, ModelMessage, ModelRequest
-from orchestrator.models.provider_calls import SQLiteProviderCallJournal
+from orchestrator.models.provider_calls import (
+    ProviderCallReconciliation,
+    SQLiteProviderCallJournal,
+)
 from orchestrator.persistence import EventDraft, SQLiteEventStore
 from orchestrator.provider_reconciliation import (
     ProviderEvidenceResult,
@@ -373,6 +376,162 @@ def accept(scheduler_, request, decision):
         accepted_at=NOW + timedelta(seconds=1),
         lease_expires_at=NOW + timedelta(minutes=1),
     )
+
+
+def _provider_call_request_for_crash(accepted, reg):
+    route = accepted.accepted_route
+    return ModelRequest(
+        request_id=f"provider-{route.attempt_id}",
+        idempotency_key=f"provider-idem-{route.attempt_id}",
+        run_id=route.run_id,
+        node_id=route.node_id,
+        attempt_id=route.attempt_id,
+        fencing_generation=route.fencing_generation,
+        budget_reservation_id=route.budget_reservation_id,
+        model_id=route.model_id,
+        accepted_route=route,
+        messages=(ModelMessage(role="user", content="private prompt crash test"),),
+        max_output_tokens=32,
+        reasoning_effort=route.reasoning_effort,
+        timeout_ms=5_000,
+        cost_snapshots=CostSnapshotRefs(
+            registry_manifest_hash=reg.content_hash,
+            tokenizer_snapshot_id=HASH,
+            fx_snapshot_id=HASH,
+            price_snapshot_id=reg.content_hash,
+            estimator_snapshot_id=HASH,
+        ),
+    )
+
+
+def _provider_reconciliation_crash_child(
+    database_path, crash_point, stream_id, raw_evidence
+):
+    store = SQLiteEventStore(database_path)
+    journal = SQLiteProviderCallJournal(store)
+    control = scheduler(store)
+
+    class _EvidenceVerifier:
+        def verify(self, call, evidence_bytes):
+            return ProviderEvidenceResult(
+                provider_call_stream_id=call.stream_id,
+                provider_adapter=call.provider_adapter,
+                provider_correlation_id=call.provider_correlation_id,
+                run_id=call.run_id,
+                node_id=call.node_id,
+                attempt_id=call.attempt_id,
+                fencing_generation=call.fencing_generation,
+                provider_id=call.provider_id,
+                model_id=call.model_id,
+                accepted_route_id=call.accepted_route_id,
+                budget_reservation_id=call.budget_reservation_id,
+                registry_manifest_hash=call.registry_manifest_hash,
+                request_hash=call.request_hash,
+                effect="not_received",
+                usage=None,
+                provider_request_id=None,
+                evidence_source="provider_signed_receipt",
+                evidence_digest="sha256:" + hashlib.sha256(evidence_bytes).hexdigest(),
+                observed_at=NOW + timedelta(minutes=2),
+            )
+
+    class _TerminationVerifier:
+        def verify_stopped(self, _call, _receipt):
+            return "sha256:" + "c" * 64
+
+    service = ProviderReconciliationService(
+        journal=journal,
+        scheduler=control,
+        evidence_verifier=_EvidenceVerifier(),
+        termination_verifier=_TerminationVerifier(),
+    )
+    if crash_point == "proof_append":
+        append = journal._append_reconciliation
+
+        def exit_after_proof(*args, **kwargs):
+            append(*args, **kwargs)
+            os._exit(78)
+
+        journal._append_reconciliation = exit_after_proof
+        service.reconcile(
+            stream_id,
+            raw_evidence=raw_evidence,
+            termination_receipt=b"private host receipt",
+            reconciled_at=NOW + timedelta(minutes=3),
+        )
+    else:
+        marker = journal._record_scheduler_settlement
+        if crash_point == "scheduler_commit":
+            def exit_before_marker(*_args, **_kwargs):
+                os._exit(78)
+
+            journal._record_scheduler_settlement = exit_before_marker
+        elif crash_point == "marker_commit":
+            def exit_after_marker(*args, **kwargs):
+                marker(*args, **kwargs)
+                os._exit(78)
+
+            journal._record_scheduler_settlement = exit_after_marker
+        else:
+            raise ValueError("unknown provider reconciliation crash point")
+        service.apply_pending_settlements()
+
+
+def _seed_provider_reconciliation_crash_case(database_path, *, with_proof):
+    store = SQLiteEventStore(database_path)
+    reg, _config, _lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    route_request, decision = routed_pair(reg, _config, manifest)
+    accepted = accept(control, route_request, decision)
+    control.finish_attempt(
+        run_id=route_request.run_id,
+        node_id=route_request.node_id,
+        attempt_id=route_request.attempt_id,
+        fencing_generation=route_request.fencing_generation,
+        completed_at=NOW + timedelta(minutes=1),
+        outcome="outcome_unknown",
+    )
+    request = _provider_call_request_for_crash(accepted, reg)
+    journal = SQLiteProviderCallJournal(store)
+    journal.record_intent(
+        request,
+        provider_id=accepted.accepted_route.provider_id,
+        provider_adapter="openai_responses",
+        request_body=b'{"prompt":"private prompt crash test"}',
+        provider_correlation_id="maestro-crash-test",
+    )
+    journal.record_outcome(request, outcome="unknown", failure_code="timeout")
+    call = journal.read(request)
+    assert call is not None
+    raw_evidence = b"private provider receipt bytes"
+    if with_proof:
+        proof = ProviderCallReconciliation(
+            provider_call_stream_id=call.stream_id,
+            provider_adapter=call.provider_adapter,
+            provider_correlation_id=call.provider_correlation_id,
+            run_id=call.run_id,
+            node_id=call.node_id,
+            attempt_id=call.attempt_id,
+            fencing_generation=call.fencing_generation,
+            provider_id=call.provider_id,
+            model_id=call.model_id,
+            accepted_route_id=call.accepted_route_id,
+            budget_reservation_id=call.budget_reservation_id,
+            registry_manifest_hash=call.registry_manifest_hash,
+            request_hash=call.request_hash,
+            effect="not_received",
+            usage=None,
+            provider_request_id=None,
+            evidence_source="provider_signed_receipt",
+            evidence_digest="sha256:" + hashlib.sha256(raw_evidence).hexdigest(),
+            termination_receipt_hash="sha256:" + "c" * 64,
+            observed_at=NOW + timedelta(minutes=2),
+        )
+        journal._append_reconciliation(
+            call.stream_id, proof, NOW + timedelta(minutes=3)
+        )
+    store.close()
+    return request, call.stream_id, raw_evidence
 
 
 def test_graph_validation_enforces_append_only_dependencies_count_and_depth():
@@ -1471,6 +1630,90 @@ def test_scheduler_reconciles_provider_no_delivery_and_charged_usage(
     assert sum(
         item.event_type == "ProviderCallSchedulerSettlementApplied" for item in provider_events
     ) == 1
+
+
+@pytest.mark.parametrize(
+    ("crash_point", "with_proof"),
+    [
+        ("proof_append", False),
+        ("scheduler_commit", True),
+        ("marker_commit", True),
+    ],
+)
+def test_provider_reconciliation_process_death_replays_each_durable_boundary(
+    tmp_path, crash_point, with_proof
+):
+    database = tmp_path / f"provider-crash-{crash_point}.db"
+    request, stream_id, raw_evidence = _seed_provider_reconciliation_crash_case(
+        database, with_proof=with_proof
+    )
+    context = multiprocessing.get_context("spawn")
+    child = context.Process(
+        target=_provider_reconciliation_crash_child,
+        args=(str(database), crash_point, stream_id, raw_evidence),
+    )
+    child.start()
+    child.join(timeout=20)
+    if child.is_alive():
+        child.terminate()
+        child.join(timeout=5)
+        pytest.fail(f"child hung at Provider reconciliation crash point {crash_point}")
+    assert child.exitcode == 78
+
+    store = SQLiteEventStore(database)
+    journal = SQLiteProviderCallJournal(store)
+    control = scheduler(store)
+    call = journal.read_call(stream_id)
+    assert call is not None
+    if crash_point == "marker_commit":
+        assert call.status == "reconciled"
+        assert call.settlement_applied
+    else:
+        assert call.status == "settlement_pending"
+        assert journal.pending_settlements() == (call,)
+    assert journal.unresolved() == ()
+
+    # Recovery has no raw evidence and deliberately uses unavailable defaults.
+    # A proof-only replay must not ask either verifier or dispatch the Provider.
+    service = ProviderReconciliationService(journal=journal, scheduler=control)
+    replayed = service.apply_pending_settlements()
+    assert replayed == (() if crash_point == "marker_commit" else (stream_id,))
+    settled = journal.read_call(stream_id)
+    assert settled is not None and settled.status == "reconciled"
+    scheduler_events = store.read_stream("scheduler", "global")
+    assert sum(event.event_type == "AttemptSlotReleased" for event in scheduler_events) == 1
+    cost_events = [
+        event
+        for event in BudgetLedger(store).read(request.run_id)
+        if event.event_type == "CostCommitted"
+    ]
+    assert len(cost_events) == 1
+    assert cost_events[0].payload["cost_minor"] == 0
+    provider_events = store.read_stream("provider_call", stream_id)
+    assert sum(
+        event.event_type == "ProviderCallReconciliationRecorded" for event in provider_events
+    ) == 1
+    assert sum(
+        event.event_type == "ProviderCallSchedulerSettlementApplied" for event in provider_events
+    ) == 1
+    serialized = json.dumps([event.payload for event in provider_events], sort_keys=True)
+    for private_text in (
+        "private prompt crash test",
+        "private model output crash test",
+        "private-provider-api-key",
+        raw_evidence.decode("ascii"),
+        "private host receipt",
+    ):
+        assert private_text not in serialized
+    with pytest.raises(ProviderCallReplayBlocked):
+        journal.record_intent(
+            request,
+            provider_id=request.accepted_route.provider_id,
+            provider_adapter="openai_responses",
+            request_body=b'{"prompt":"private prompt crash test"}',
+            provider_correlation_id="maestro-crash-test",
+        )
+    store.close()
 
 
 def test_scheduler_recovery_requires_accepted_and_durably_ended_source(tmp_path):

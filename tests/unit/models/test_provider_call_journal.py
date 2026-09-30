@@ -22,10 +22,17 @@ from orchestrator.config.models import ModelRegistryManifest, ModelSpec, Provide
 from orchestrator.budget.models import UsageRecord
 from orchestrator.models.provider_calls import (
     ProviderCallJournalConflict,
+    ProviderCallOutcomeConflict,
     ProviderCallReconciliation,
 )
 from orchestrator.models.transport import HTTPTransportResponse
-from orchestrator.persistence import EventContractError, EventDraft, SQLiteEventStore
+from orchestrator.persistence import (
+    EventContractError,
+    EventDraft,
+    IdempotencyConflict,
+    SQLiteEventStore,
+    StaleStream,
+)
 
 
 HASH = "sha256:" + "a" * 64
@@ -352,6 +359,80 @@ def test_provider_call_intent_is_single_winner_across_concurrent_store_connectio
     stream_ids = check.stream_ids("provider_call")
     assert len(stream_ids) == 1
     assert len(check.read_stream("provider_call", stream_ids[0])) == 1
+
+
+def test_late_success_and_provider_reconciliation_have_one_durable_winner(tmp_path):
+    registry = model_registry()
+    request = model_request(registry)
+    database = tmp_path / "late-success-reconciliation-race.db"
+    seed = SQLiteEventStore(database)
+    journal = SQLiteProviderCallJournal(seed)
+    journal.record_intent(
+        request,
+        provider_id="primary",
+        provider_adapter="openai_responses",
+        request_body=b'{"prompt":"private prompt"}',
+        provider_correlation_id="maestro-race-test",
+    )
+    call = journal.read(request)
+    assert call is not None
+    proof = _provider_reconciliation_for(call)
+    reconciled_at = datetime(2026, 9, 29, 13, tzinfo=timezone.utc)
+    stream_id = call.stream_id
+    seed.close()
+
+    barrier = Barrier(2)
+
+    def try_write(operation):
+        barrier.wait()
+        store = SQLiteEventStore(database)
+        writer = SQLiteProviderCallJournal(store)
+        try:
+            if operation == "outcome":
+                writer.record_outcome(request, outcome="known_success", http_status=200)
+            else:
+                writer._append_reconciliation(stream_id, proof, reconciled_at)
+            return "written"
+        except (
+            ProviderCallOutcomeConflict,
+            ProviderCallJournalConflict,
+            IdempotencyConflict,
+            StaleStream,
+        ):
+            return "conflict"
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = (
+            pool.submit(try_write, "outcome"),
+            pool.submit(try_write, "reconciliation"),
+        )
+        results = [future.result() for future in futures]
+
+    assert results.count("written") == 1
+    assert results.count("conflict") == 1
+    first_store = SQLiteEventStore(database)
+    first_journal = SQLiteProviderCallJournal(first_store)
+    snapshot = first_journal.read_call(stream_id)
+    assert snapshot is not None
+    assert snapshot.status in {"known_success", "settlement_pending"}
+    events = first_store.read_stream("provider_call", stream_id)
+    assert len(events) == 2
+    assert sum(event.event_type == "ProviderCallOutcomeRecorded" for event in events) + sum(
+        event.event_type == "ProviderCallReconciliationRecorded" for event in events
+    ) == 1
+    assert first_journal.unresolved() == ()
+    if snapshot.status == "settlement_pending":
+        assert first_journal.pending_settlements() == (snapshot,)
+    else:
+        assert first_journal.pending_settlements() == ()
+    first_store.close()
+
+
+def test_provider_conflict_exceptions_preserve_their_public_base_classes():
+    assert issubclass(ProviderCallJournalConflict, RuntimeError)
+    assert issubclass(ProviderCallOutcomeConflict, ValueError)
 
 
 def test_gateway_persists_success_and_blocks_same_request_replay(tmp_path):
