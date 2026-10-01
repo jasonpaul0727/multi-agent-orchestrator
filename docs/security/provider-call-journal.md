@@ -59,16 +59,21 @@ Scheduler idempotency for the cross-stream crash window, and never asks the
 Provider verifier again. A durable settlement marker projects the call as
 `reconciled`; replay does not duplicate budget events or release the slot.
 `pending_settlements()` reports proof waiting for Scheduler application, but
-neither projection authorizes Gateway replay. This API is not currently wired
-to application startup and is not exposed through CLI or MCP.
+neither projection authorizes Gateway replay. `ControlPlaneApplication` now
+applies pending proofs during its atomic startup transaction, before admission
+becomes available. Startup checks all Run/call bindings and rolls back the
+entire settlement batch on a failure. See [startup recovery](control-plane-startup.md).
+The APIs are not yet exposed through CLI or MCP.
 
 ## Production status and limits
 
 The default Provider evidence verifier and Attempt-termination verifier are
 intentionally unavailable and fail closed. There is no production OpenAI
 authoritative lookup or signed-receipt verifier wired to this service, and the
-existing systemd termination receipt is not yet bound to this
-`AttemptTerminationVerifier` in the application composition. Therefore this
+existing Worker systemd termination receipt does not prove the current host
+Gateway HTTP sender stopped: urllib can continue in a background thread after
+coroutine cancellation. An actual sender-bound termination verifier is still
+required. Therefore this
 slice defines and tests the reconciliation contract; it does **not** enable
 production Provider reconciliation. Without configured authoritative
 verifiers, unknown calls remain held and unresolved. The service does not
@@ -80,5 +85,6 @@ reconciliation CAS, restart recovery, privacy of prompts/output/credentials
 and raw evidence, malformed event rejection, exact usage/no-effect settlement,
 and spawned-process death after proof append, Scheduler settlement, and marker
 commit. Live authoritative Provider verification, production
-Attempt-bound termination wiring, and automatic startup recovery remain open
-P3/V1 gates.
+sender-bound termination wiring, functional Worker recovery, and CLI/MCP remain
+open P3/V1 gates. Pending-proof startup recovery is now implemented by the host
+application entry point.

@@ -534,6 +534,411 @@ def _seed_provider_reconciliation_crash_case(database_path, *, with_proof):
     return request, call.stream_id, raw_evidence
 
 
+def _application_limits():
+    return ConcurrencyLimits(
+        system_active_attempts=8, run_active_attempts=8,
+        provider_active_attempts=8, tool_active_attempts=8,
+    )
+
+
+def _application_startup_crash_child(database):
+    from orchestrator.application import ControlPlaneApplication
+
+    marker = SQLiteProviderCallJournal._record_scheduler_settlement
+
+    def die_before_bootstrap_commit(self, *args, **kwargs):
+        marker(self, *args, **kwargs)
+        os._exit(79)
+
+    SQLiteProviderCallJournal._record_scheduler_settlement = die_before_bootstrap_commit
+    ControlPlaneApplication(database, limits=_application_limits())
+
+
+def test_application_startup_automatically_settles_persisted_proof_once(tmp_path):
+    from orchestrator.application import ControlPlaneApplication
+
+    database = tmp_path / "application-startup.db"
+    request, stream_id, _raw = _seed_provider_reconciliation_crash_case(
+        database, with_proof=True
+    )
+    with ControlPlaneApplication(database, limits=_application_limits()) as app:
+        report = app.startup_report
+        assert report.run_ids == ("run-1",)
+        assert report.applied_provider_calls == (stream_id,)
+        assert report.unresolved_provider_calls == ()
+        assert report.held_attempts == 0
+        assert report.unknown_attempts == 0
+        assert app.recover_run("run-1").active_attempts == ()
+    with ControlPlaneApplication(database, limits=_application_limits()) as app:
+        assert app.startup_report.applied_provider_calls == ()
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).status == "reconciled"
+        assert sum(e.event_type == "AttemptSlotReleased" for e in check.read_stream("scheduler", "global")) == 1
+        costs = [e for e in BudgetLedger(check).read(request.run_id) if e.event_type == "CostCommitted"]
+        assert len(costs) == 1 and costs[0].payload["cost_minor"] == 0
+
+
+def test_application_startup_preserves_unknown_provider_holds(tmp_path):
+    from orchestrator.application import ControlPlaneApplication
+
+    database = tmp_path / "application-unknown.db"
+    request, stream_id, _raw = _seed_provider_reconciliation_crash_case(
+        database, with_proof=False
+    )
+    with ControlPlaneApplication(database, limits=_application_limits()) as app:
+        assert app.startup_report.applied_provider_calls == ()
+        assert app.startup_report.unresolved_provider_calls == (stream_id,)
+        assert app.startup_report.held_attempts == 1
+        assert app.startup_report.unknown_attempts == 1
+        assert app.recover_run(request.run_id).active_attempts[0].status == "outcome_unknown"
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).status == "unknown"
+        assert not any(e.event_type == "CostCommitted" for e in BudgetLedger(check).read(request.run_id))
+
+
+@pytest.mark.parametrize("invalid_input, message", [
+    ({"stream_id": ""}, "stream id is invalid"),
+    ({"raw_evidence": "not-bytes"}, "raw evidence bytes"),
+    ({"raw_evidence": b""}, "cannot be empty"),
+    ({"raw_evidence": b"x" * 65_537}, "64 KiB bound"),
+    ({"reconciled_at": NOW.replace(tzinfo=None)}, "timezone-aware"),
+])
+def test_application_explicit_reconciliation_rejects_invalid_inputs_without_mutation(
+    tmp_path, invalid_input, message
+):
+    from orchestrator.application import ControlPlaneApplication
+
+    database = tmp_path / "application-invalid-evidence.db"
+    request, stream_id, raw = _seed_provider_reconciliation_crash_case(database, with_proof=False)
+    inputs = {
+        "stream_id": stream_id, "raw_evidence": raw,
+        "termination_receipt": object(), "reconciled_at": NOW + timedelta(minutes=3),
+        **invalid_input,
+    }
+    with ControlPlaneApplication(database, limits=_application_limits()) as app:
+        with pytest.raises(ReconciliationRejected, match=message):
+            app.reconcile_provider_call(**inputs)
+        assert app.recover_run(request.run_id).active_attempts[0].status == "outcome_unknown"
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).status == "unknown"
+        assert not any(e.event_type == "CostCommitted" for e in BudgetLedger(check).read(request.run_id))
+
+
+def test_application_default_verifiers_preserve_unknown_call_on_explicit_reconciliation(tmp_path):
+    from orchestrator.application import ControlPlaneApplication
+    from orchestrator.provider_reconciliation import ProviderEvidenceUnsupported
+
+    database = tmp_path / "application-default-verifiers.db"
+    request, stream_id, raw = _seed_provider_reconciliation_crash_case(database, with_proof=False)
+    with ControlPlaneApplication(database, limits=_application_limits()) as app:
+        with pytest.raises(ProviderEvidenceUnsupported, match="no authoritative Provider evidence"):
+            app.reconcile_provider_call(
+                stream_id, raw_evidence=raw, termination_receipt=object(),
+                reconciled_at=NOW + timedelta(minutes=3),
+            )
+        assert len(app.recover_run(request.run_id).active_attempts) == 1
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).reconciliation is None
+        assert not any(e.event_type == "AttemptSlotReleased" for e in check.read_stream("scheduler", "global"))
+
+
+def test_application_explicit_reconciliation_uses_injected_verifiers_and_shared_scheduler(tmp_path):
+    from orchestrator.application import ControlPlaneApplication
+
+    database = tmp_path / "application-explicit-reconcile.db"
+    request, stream_id, raw = _seed_provider_reconciliation_crash_case(database, with_proof=False)
+    receipt = object()
+    verifier_calls = []
+
+    class EvidenceVerifier:
+        def verify(self, call, evidence_bytes):
+            verifier_calls.append("provider")
+            assert call.stream_id == stream_id and evidence_bytes == raw
+            fields = {name: getattr(call, name) for name in (
+                "provider_adapter", "provider_correlation_id", "run_id", "node_id",
+                "attempt_id", "fencing_generation", "provider_id", "model_id",
+                "accepted_route_id", "budget_reservation_id", "registry_manifest_hash", "request_hash",
+            )}
+            return ProviderEvidenceResult(
+                provider_call_stream_id=call.stream_id, **fields,
+                effect="not_received", evidence_source="provider_signed_receipt",
+                evidence_digest="sha256:" + hashlib.sha256(evidence_bytes).hexdigest(),
+                observed_at=NOW + timedelta(minutes=2),
+            )
+
+    class TerminationVerifier:
+        def verify_stopped(self, call, termination_receipt):
+            verifier_calls.append("termination")
+            assert call.stream_id == stream_id and termination_receipt is receipt
+            return "sha256:" + "c" * 64
+
+    with ControlPlaneApplication(
+        database, limits=_application_limits(),
+        evidence_verifier=EvidenceVerifier(), termination_verifier=TerminationVerifier(),
+    ) as app:
+        assert verifier_calls == []
+        settled = app.reconcile_provider_call(
+            stream_id, raw_evidence=raw, termination_receipt=receipt,
+            reconciled_at=NOW + timedelta(minutes=3),
+        )
+        assert settled.status == "reconciled" and settled.settlement_applied
+        assert verifier_calls == ["provider", "termination"]
+        assert app.recover_run(request.run_id).active_attempts == ()
+        # A startup report is historical metadata, not mutable replay authority.
+        assert app.startup_report.unresolved_provider_calls == (stream_id,)
+    with ControlPlaneApplication(database, limits=_application_limits()) as app:
+        assert app.startup_report.unresolved_provider_calls == ()
+        assert app.startup_report.held_attempts == 0
+    with SQLiteEventStore(database) as check:
+        assert sum(e.event_type == "AttemptSlotReleased" for e in check.read_stream("scheduler", "global")) == 1
+        costs = [e for e in BudgetLedger(check).read(request.run_id) if e.event_type == "CostCommitted"]
+        assert len(costs) == 1 and costs[0].payload["cost_minor"] == 0
+
+
+def test_application_admission_uses_recovered_state_and_closed_gate(tmp_path):
+    from orchestrator.application import ApplicationNotReady, ControlPlaneApplication
+
+    database = tmp_path / "application-admission.db"
+    with SQLiteEventStore(database) as seed:
+        reg, config, _lifecycle, manifest = run_setup(seed)
+        request, decision = routed_pair(reg, config, manifest)
+    app = ControlPlaneApplication(database, limits=_application_limits())
+    accepted = app.accept_routing(
+        request, decision, accepted_at=NOW,
+        lease_expires_at=NOW + timedelta(minutes=5),
+    )
+    assert accepted.accepted_route.attempt_id == request.attempt_id
+    assert app.recover_run(request.run_id).active_attempts[0].status == "active"
+    app.close()
+    app.close()
+    with pytest.raises(ApplicationNotReady):
+        app.recover_run(request.run_id)
+    with pytest.raises(ApplicationNotReady):
+        app.accept_routing(request, decision, accepted_at=NOW, lease_expires_at=NOW)
+    with pytest.raises(ApplicationNotReady):
+        app.reconcile_provider_call("invalid", raw_evidence=b"", termination_receipt=None, reconciled_at=NOW)
+
+
+@pytest.mark.parametrize("binding", ["decision_id", "registry_manifest_hash", "budget_reservation_id", "fencing_generation"])
+def test_application_startup_rejects_misbound_provider_call_before_settlement(tmp_path, binding):
+    from orchestrator.application import ControlPlaneApplication, StartupRecoveryFailed
+
+    database = tmp_path / f"application-misbound-{binding}.db"
+    request, stream_id, _raw = _seed_provider_reconciliation_crash_case(database, with_proof=True)
+    bad_value = 2 if binding == "fencing_generation" else ("sha256:" + "f" * 64 if binding == "registry_manifest_hash" else "wrong-binding")
+    bad_route = request.accepted_route.model_copy(update={binding: bad_value})
+    overrides = {"request_id": "misbound-call", "accepted_route": bad_route}
+    if binding in {"fencing_generation", "budget_reservation_id"}:
+        overrides[binding] = bad_value
+    bad_request = request.model_copy(update=overrides)
+    with SQLiteEventStore(database) as seed:
+        SQLiteProviderCallJournal(seed).record_intent(
+            bad_request, provider_id="primary", provider_adapter="openai_responses",
+            request_body=b"{}", provider_correlation_id="maestro-misbound",
+        )
+    with pytest.raises(StartupRecoveryFailed):
+        ControlPlaneApplication(database, limits=_application_limits())
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).status == "settlement_pending"
+        assert not any(e.event_type == "AttemptSlotReleased" for e in check.read_stream("scheduler", "global"))
+
+
+def test_application_rejects_provider_adapter_different_from_frozen_registry(tmp_path):
+    from orchestrator.application import ControlPlaneApplication, StartupRecoveryFailed
+
+    database = tmp_path / "application-misbound-adapter.db"
+    request, stream_id, _raw = _seed_provider_reconciliation_crash_case(database, with_proof=True)
+    with SQLiteEventStore(database) as seed:
+        SQLiteProviderCallJournal(seed).record_intent(
+            request.model_copy(update={"request_id": "wrong-adapter-call"}),
+            provider_id="primary", provider_adapter="anthropic_messages", request_body=b"{}",
+        )
+    with pytest.raises(StartupRecoveryFailed):
+        ControlPlaneApplication(database, limits=_application_limits())
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).status == "settlement_pending"
+        assert not any(e.event_type == "AttemptSlotReleased" for e in check.read_stream("scheduler", "global"))
+
+
+def test_application_startup_corrupt_unrelated_run_keeps_valid_proof_held(tmp_path):
+    from orchestrator.application import ControlPlaneApplication, StartupRecoveryFailed
+
+    database = tmp_path / "application-corrupt-run.db"
+    _request, stream_id, _raw = _seed_provider_reconciliation_crash_case(database, with_proof=True)
+    with SQLiteEventStore(database) as seed:
+        seed.append("run_lifecycle", "run-bad", 0, [EventDraft("RunInitialized", {
+            "run_id": "run-bad", "config_hash": HASH, "registry_hash": HASH,
+            "max_nodes": 8, "max_depth": 4,
+        })], "orphan-run-lifecycle")
+    with pytest.raises(StartupRecoveryFailed) as failure:
+        ControlPlaneApplication(database, limits=_application_limits())
+    assert failure.value.code == "startup_recovery_failed"
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).status == "settlement_pending"
+        assert not any(e.event_type == "AttemptSlotReleased" for e in check.read_stream("scheduler", "global"))
+
+
+def test_application_startup_late_failure_rolls_back_all_settlement_events(tmp_path, monkeypatch):
+    from orchestrator.application import ControlPlaneApplication, StartupRecoveryFailed
+
+    database = tmp_path / "application-rollback.db"
+    request, stream_id, _raw = _seed_provider_reconciliation_crash_case(database, with_proof=True)
+    marker = SQLiteProviderCallJournal._record_scheduler_settlement
+
+    def fail_after_marker(self, *args, **kwargs):
+        marker(self, *args, **kwargs)
+        raise RuntimeError("private-api-key and provider receipt")
+
+    monkeypatch.setattr(SQLiteProviderCallJournal, "_record_scheduler_settlement", fail_after_marker)
+    with pytest.raises(StartupRecoveryFailed) as failure:
+        ControlPlaneApplication(database, limits=_application_limits())
+    assert "private-api-key" not in str(failure.value)
+    assert failure.value.__suppress_context__
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).status == "settlement_pending"
+        recovered = RunRecoveryCoordinator(check).recover(request.run_id)
+        assert recovered.active_attempts[0].status == "outcome_unknown"
+        assert not any(e.event_type == "CostCommitted" for e in BudgetLedger(check).read(request.run_id))
+
+
+def test_application_startup_concurrent_connections_settle_once(tmp_path):
+    from orchestrator.application import ControlPlaneApplication
+
+    database = tmp_path / "application-concurrent.db"
+    _request, stream_id, _raw = _seed_provider_reconciliation_crash_case(database, with_proof=True)
+    barrier = Barrier(2)
+
+    def open_app():
+        barrier.wait()
+        with ControlPlaneApplication(database, limits=_application_limits()) as app:
+            return app.startup_report.applied_provider_calls
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [future.result() for future in (pool.submit(open_app), pool.submit(open_app))]
+    assert sorted(map(len, results)) == [0, 1]
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).status == "reconciled"
+        assert sum(e.event_type == "AttemptSlotReleased" for e in check.read_stream("scheduler", "global")) == 1
+
+
+def test_application_startup_process_death_rolls_back_until_outer_commit(tmp_path):
+    from orchestrator.application import ControlPlaneApplication
+
+    database = tmp_path / "application-process-death.db"
+    request, stream_id, _raw = _seed_provider_reconciliation_crash_case(database, with_proof=True)
+    child = multiprocessing.get_context("spawn").Process(
+        target=_application_startup_crash_child, args=(str(database),),
+    )
+    child.start()
+    child.join(timeout=20)
+    if child.is_alive():
+        child.terminate()
+        child.join(timeout=5)
+        pytest.fail("application bootstrap child hung")
+    assert child.exitcode == 79
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).status == "settlement_pending"
+        assert RunRecoveryCoordinator(check).recover(request.run_id).active_attempts[0].status == "outcome_unknown"
+    with ControlPlaneApplication(database, limits=_application_limits()) as app:
+        assert app.startup_report.applied_provider_calls == (stream_id,)
+        assert app.recover_run(request.run_id).active_attempts == ()
+
+
+def test_application_reports_frozen_run_with_interrupted_initialization(tmp_path):
+    from orchestrator.application import ControlPlaneApplication
+
+    database = tmp_path / "application-initializing.db"
+    with SQLiteEventStore(database) as seed:
+        reg = registry()
+        snapshot = ConfigManager(ConfigCandidate(resolved=effective_config(reg), registry=reg)).start_run("initializing-run", seed)
+    with ControlPlaneApplication(database, limits=_application_limits()) as app:
+        assert app.startup_report.run_ids == ()
+        assert app.startup_report.initializing_run_ids == ("initializing-run",)
+        assert app.startup_report.held_attempts == 0
+    with SQLiteEventStore(database) as check:
+        assert LifecycleController(check).config_snapshot("initializing-run") == snapshot
+        assert check.read_stream("run_lifecycle", "initializing-run") == []
+
+
+@pytest.mark.parametrize("stream_type", ["agent_registry", "budget"])
+def test_application_rejects_orphan_projection_inventory(tmp_path, stream_type):
+    from orchestrator.application import ControlPlaneApplication, StartupRecoveryFailed
+
+    database = tmp_path / f"application-orphan-{stream_type}.db"
+    with SQLiteEventStore(database) as seed:
+        seed.append(stream_type, "orphan-run", 0, [EventDraft("UnclaimedControlPlaneState", {})], "orphan-projection")
+    with pytest.raises(StartupRecoveryFailed):
+        ControlPlaneApplication(database, limits=_application_limits())
+
+
+def test_application_rejects_terminal_attempt_with_unresolved_provider_call(tmp_path):
+    from orchestrator.application import ControlPlaneApplication, StartupRecoveryFailed
+
+    database = tmp_path / "application-terminal-unknown.db"
+    request, stream_id, _raw = _seed_provider_reconciliation_crash_case(database, with_proof=False)
+    with SQLiteEventStore(database) as seed:
+        scheduler(seed).reconcile_attempt(
+            run_id=request.run_id, node_id=request.node_id, attempt_id=request.attempt_id,
+            fencing_generation=request.fencing_generation, reconciled_at=NOW + timedelta(minutes=3),
+            outcome="failed", known_no_effect=True,
+        )
+    with pytest.raises(StartupRecoveryFailed):
+        ControlPlaneApplication(database, limits=_application_limits())
+    with SQLiteEventStore(database) as check:
+        assert SQLiteProviderCallJournal(check).read_call(stream_id).status == "unknown"
+
+
+def test_application_rejects_settlement_marker_without_scheduler_settlement(tmp_path):
+    from orchestrator.application import ControlPlaneApplication, StartupRecoveryFailed
+
+    database = tmp_path / "application-orphan-marker.db"
+    _request, stream_id, _raw = _seed_provider_reconciliation_crash_case(database, with_proof=True)
+    with SQLiteEventStore(database) as seed:
+        journal = SQLiteProviderCallJournal(seed)
+        call = journal.read_call(stream_id)
+        journal._record_scheduler_settlement(stream_id, call.reconciliation_event_id)
+    with pytest.raises(StartupRecoveryFailed):
+        ControlPlaneApplication(database, limits=_application_limits())
+    with SQLiteEventStore(database) as check:
+        assert not any(e.event_type == "AttemptSlotReleased" for e in check.read_stream("scheduler", "global"))
+
+
+def test_application_bootstrap_never_queries_injected_verifiers(tmp_path):
+    from orchestrator.application import ControlPlaneApplication
+
+    database = tmp_path / "application-no-query.db"
+    _request, stream_id, _raw = _seed_provider_reconciliation_crash_case(database, with_proof=True)
+
+    class NoQueries:
+        def verify(self, *_args):
+            raise AssertionError("Provider query during bootstrap")
+
+        def verify_stopped(self, *_args):
+            raise AssertionError("new termination assertion during bootstrap")
+
+    with ControlPlaneApplication(
+        database, limits=_application_limits(),
+        evidence_verifier=NoQueries(), termination_verifier=NoQueries(),
+    ) as app:
+        assert app.startup_report.applied_provider_calls == (stream_id,)
+
+
+def test_application_verifies_published_artifacts_with_its_shared_store(tmp_path):
+    from orchestrator.application import ControlPlaneApplication, StartupRecoveryFailed
+
+    database = tmp_path / "application-artifacts.db"
+    root = tmp_path / "private-artifacts"
+    with SQLiteEventStore(database) as seed:
+        run_setup(seed, nodes=())
+        record = ArtifactStore(root, event_store=seed).publish_bytes(
+            b"independent verification output", source={"run_id": "run-1"}, artifact_type="verification-report",
+        )
+    with pytest.raises(StartupRecoveryFailed):
+        ControlPlaneApplication(database, limits=_application_limits())
+    with ControlPlaneApplication(database, limits=_application_limits(), artifact_root=root) as app:
+        assert app.recover_run("run-1").artifacts[0].digest == record.digest
+
+
 def test_graph_validation_enforces_append_only_dependencies_count_and_depth():
     root = NodeSpec(node_id="root", role="planner", planning_contract_hash=HASH)
     child = NodeSpec(

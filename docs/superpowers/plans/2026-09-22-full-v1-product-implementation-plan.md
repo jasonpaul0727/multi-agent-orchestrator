@@ -133,6 +133,18 @@ receipt is not yet bound to the verifier, and application-startup/Worker
 recovery, CLI/MCP, end-to-end security, and measured cost/token/rework evidence
 remain open. P3 and V1 are not delivered.
 
+2026-09-30 P3 application startup slice: `ControlPlaneApplication` owns the
+shared control-plane connection and validates frozen configs, all initialized
+Runs, orphan budget/Agent inventories, Provider route/Attempt/Registry bindings,
+and existing settlement markers before enabling admission. Pending proofs are
+applied inside the same bootstrap transaction, followed by postflight recovery;
+failure or process death rolls back the entire bootstrap batch. Config-only
+Runs remain frozen and are reported as initializing. The host Python API gates
+admission, Run recovery, and explicit reconciliation, but does not dispatch
+Workers, tools, or Providers at startup. A Worker systemd stop receipt cannot
+attest the host urllib background sender; sender-bound supervision and a live
+Provider evidence source remain production gates.
+
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 
 - [x] 建立 Run/Node/Attempt/Graph 生命周期投影；实现基础状态机与非法转换拒绝。
@@ -154,7 +166,8 @@ remain open. P3 and V1 are not delivered.
 - [x] 在 Artifact bytes 落盘前写入 `ArtifactPublicationIntent`，随后原子发布内容寻址对象和 `ArtifactPublished` 元数据；恢复时按 Run 查询带有对应 source provenance 的未完成意图并验证已存在对象的 digest/size/provenance。子进程死亡测试覆盖 intent 后、blob 后两个窗口。Worker publisher 必须提供 Run/node/Attempt-generation source。候选只列入 pending inventory，不被自动采纳或删除。
 - [ ] 扩展多进程中断矩阵覆盖全部跨流事务/副作用窗口；将 systemd 的验证后停止回执绑定到真实 Attempt/Worker sender，并配置 Provider 权威查询/签名回执验证源及其线上测试。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
 - [x] 实现脱敏、确定性的 Gateway 失败分类/指纹并交由 Recovery Controller 生成有界计划；Scheduler 持久化分类/计划，并在接纳恢复 Attempt 时重验 authorization、失败类别、retry level 和 exhausted model，再原子消费单次授权。未知结果保持 reconciliation 阻断。
-- [ ] 将持久化恢复计划与 `apply_pending_settlements()` 接入 Worker/application service 启动及运行时协调；完成重启后待处理计划自动恢复，但不得自动重放 `outcome_unknown` Provider 调用。
+- [x] 将已持久化 Provider pending-proof 结算接入 host application 启动；完整 Run/调用前后校验、原子批次回滚、初始化中断报告、双连接启动及进程死亡验收通过。
+- [ ] 将持久化恢复计划接入 functional Worker 与 application service 的运行时协调/自动派发；不得自动重放 `outcome_unknown` Provider 调用。CLI/MCP 尚未接入 host 入口。
 - [x] 实现 `OutcomeUnknown`/`AwaitingReconciliation`，显式对账前不释放预算与并发资源。
 
 验收：状态机/property tests、并发 CAS tests、多连接测试和进程中断矩阵通过；永不突破预算、并发、深度和 Agent 数上限；相同事件流确定性重建 Run/图/账本；迟到/重复结果不能覆盖被接受结果或触发重复副作用。

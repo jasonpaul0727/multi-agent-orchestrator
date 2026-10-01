@@ -211,6 +211,37 @@ def _service(journal, evidence_verifier, termination_verifier):
     )
 
 
+@pytest.mark.parametrize("failure_source", ["provider", "termination", "invalid-termination-digest"])
+def test_untrusted_verifier_failure_does_not_expose_private_receipts_or_settle(failure_source):
+    call = _call()
+    journal = _Journal(call)
+
+    class EvidenceVerifier:
+        def verify(self, _call, _raw):
+            if failure_source == "provider":
+                raise ValueError("private-api-key and private receipt bytes")
+            return _evidence_result(call)
+
+    class TerminationVerifier:
+        def verify_stopped(self, _call, _receipt):
+            if failure_source == "termination":
+                raise ValueError("private-api-key and private host receipt")
+            return "private-invalid-digest"
+
+    service = _service(journal, EvidenceVerifier(), TerminationVerifier())
+    with pytest.raises(ReconciliationRejected) as failure:
+        service.reconcile(
+            call.stream_id, raw_evidence=b"authenticated receipt bytes",
+            termination_receipt=object(),
+            reconciled_at=datetime(2026, 9, 29, 13, tzinfo=timezone.utc),
+        )
+    assert "private" not in str(failure.value)
+    assert failure.value.__suppress_context__ or failure_source == "invalid-termination-digest"
+    assert journal.call == call and journal.appended == []
+    assert not any(event.event_type == "CostCommitted" for event in
+                   service.scheduler.event_store.read_stream("budget", call.run_id))
+
+
 def test_unavailable_provider_evidence_verifier_leaves_call_unknown():
     call = _call()
     journal = _Journal(call)

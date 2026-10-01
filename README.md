@@ -5,7 +5,7 @@
 > **当前状态：P1/P2 已实现；P3 控制平面、P4 只读隔离/ToolGateway 与内部 workspace-write 候选发布切片已有实现；完整编排系统仍不可运行。**
 > 实施计划 Task 1–9 已完成，涵盖事件存储、快照恢复、Artifact Store、预算账本、脱敏投影、跨规格事件契约、崩溃/并发测试及打包验收。
 > 已完成严格四层配置及 Run 快照、Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件存储驱动的健康熔断/ProbeLease、Recovery Controller，以及三种 Provider codec 和受限 HTTPS transport。
-> P3 尚未完整：SQLite ProviderCallJournal 持久化派发意图/脱敏终态并阻止相同 Attempt 请求重放，但 Provider 权威查询/费用对账、完整跨进程崩溃矩阵和自动恢复循环仍缺。Scheduler 仍由 host service 显式驱动。
+> P3 尚未完整：ProviderCallJournal 已实现持久调用意图、脱敏终态及可信对账证明契约。`ControlPlaneApplication` 现可在一个启动事务中核对全部 Run/调用绑定、应用持久化待结算证明并在提交后开放调度；并发启动、失败回滚及启动中进程死亡测试通过。生产 Provider 权威证据源、真实 Gateway sender 停止证明、完整 Worker 崩溃矩阵和自动执行恢复循环仍缺。Host Python 入口说明见 [启动恢复](docs/security/control-plane-startup.md)。
 > P4 新增内部 `WorkspaceWriteGateway`：以专用 `workspace.write-candidate` 能力执行隔离候选，经 Attempt/策略重验、一次性能力/可选 Approval、工作区租约、持久发布意图和 journal publisher 后才写入工作区；真实 WSL2 systemd 候选→审计→发布集成测试通过。它尚未接入 Scheduler/Worker application service，Secret Broker 仍是进程内原型，产品 workspace-write 仍关闭。
 > P5 已有 blocked-only Worker IPC、Artifact 来源准入及独立只读格式 Verifier，**没有真正执行模型/工具任务的 Worker，也没有节点语义验收**。P6 CLI/MCP、P7 完整 E2E/安全验收仍未完成；离线基准评估器没有真实数据，默认 Provider broker 仍 fail-closed。
 > 本项目**不具备生产就绪状态**。

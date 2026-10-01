@@ -891,7 +891,8 @@ def test_provider_reconciliation_and_scheduler_marker_replays_are_exact(tmp_path
     assert len(journal.event_store.read_stream("provider_call", call.stream_id)) == 3
 
 
-def test_concurrent_provider_reconciliation_append_has_one_durable_winner(tmp_path):
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_concurrent_provider_reconciliation_append_has_one_durable_winner(tmp_path, conflicting):
     request = model_request(model_registry())
     database = tmp_path / "concurrent-reconciliation.db"
     first_store = SQLiteEventStore(database)
@@ -910,32 +911,38 @@ def test_concurrent_provider_reconciliation_append_has_one_durable_winner(tmp_pa
 
     barrier = Barrier(2)
 
-    def append_from_independent_connection():
-        store = SQLiteEventStore(database)
-        original_read_stream = store.read_stream
-        synchronized = False
+    other_proof = proof.model_copy(update={"evidence_digest": "sha256:" + "e" * 64}) if conflicting else proof
 
-        def synchronized_read_stream(stream_type, stream_id, after_version=0):
-            nonlocal synchronized
-            result = original_read_stream(stream_type, stream_id, after_version)
-            if stream_type == "provider_call" and not synchronized:
-                synchronized = True
-                barrier.wait(timeout=5)
-            return result
+    def append_from_independent_connection(candidate):
+        with SQLiteEventStore(database) as store:
+            original_append = store.append
 
-        store.read_stream = synchronized_read_stream
-        return SQLiteProviderCallJournal(store)._append_reconciliation(
-            call.stream_id, proof, reconciled_at
-        )
+            def synchronized_append(stream_type, stream_id, **kwargs):
+                # Both writers have finished all reads before either CAS commits.
+                assert stream_type == "provider_call" and stream_id == call.stream_id
+                assert kwargs["expected_version"] == 1
+                barrier.wait(timeout=10)
+                return original_append(stream_type, stream_id, **kwargs)
+
+            store.append = synchronized_append
+            try:
+                return SQLiteProviderCallJournal(store)._append_reconciliation(
+                    call.stream_id, candidate, reconciled_at
+                )
+            except ProviderCallJournalConflict:
+                return "conflict"
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(append_from_independent_connection)
-        second = pool.submit(append_from_independent_connection)
+        first = pool.submit(append_from_independent_connection, proof)
+        second = pool.submit(append_from_independent_connection, other_proof)
         event_ids = {first.result(), second.result()}
 
-    assert len(event_ids) == 1
+    assert len(event_ids) == (2 if conflicting else 1)
+    assert ("conflict" in event_ids) == conflicting
     events = first_store.read_stream("provider_call", call.stream_id)
     assert [event.event_type for event in events] == [
         "ProviderCallIntentRecorded",
         "ProviderCallReconciliationRecorded",
     ]
+    assert first_journal.read_call(call.stream_id).reconciliation in (proof, other_proof)
+    first_store.close()
