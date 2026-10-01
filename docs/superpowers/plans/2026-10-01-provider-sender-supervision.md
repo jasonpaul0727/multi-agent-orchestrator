@@ -148,7 +148,7 @@ git push origin codex/p3-systemd-termination-receipts
 - `SystemdProviderSenderSession.cancel() -> bool` signals only its unit; `wait() -> ProviderSenderResult` returns the child response only with a host-created stop receipt. The host reuses the existing inactive-unit/empty-cgroup verifier and retained-staging behavior.
 - Child IPC accepts one bounded, unique-key JSON frame, one credential-free HTTPS URL plus bounded request headers/body/response limit, and emits only status, approved response headers and base64 response bytes. Extra fields, including receipt-shaped data, are errors.
 
-- [ ] **Step 1: Write failing frame and launcher tests.**
+- [x] **Step 1: Write failing frame and launcher tests.**
 
 ```python
 def test_provider_sender_child_rejects_duplicate_keys_and_child_receipts():
@@ -167,13 +167,13 @@ state withholds the receipt and retains staging. The exact empty-cgroup fixture
 must produce a host receipt; an existing Worker profile test must continue to
 assert `PrivateNetwork=yes`.
 
-- [ ] **Step 2: Run the focused tests and verify they fail because the sender components are missing.**
+- [x] **Step 2: Run the focused tests and verify they fail because the sender components are missing.**
 
 Run: `python3 -m pytest tests/unit/runtime/test_provider_sender_process.py tests/unit/isolation/test_provider_sender.py -q`
 
 Expected: FAIL on missing provider sender APIs, not test collection errors.
 
-- [ ] **Step 3: Implement the fixed child protocol and separate network-enabled systemd sender launcher.**
+- [x] **Step 3: Implement the fixed child protocol and separate network-enabled systemd sender launcher.**
 
 ```python
 class SystemdProviderSenderLauncher:
@@ -186,7 +186,7 @@ existing Worker/Tool profile, use shell invocation, or trust child stop data.
 The host derives the expected cgroup before start and checks the exact unit and
 strict `cgroup.events` `populated 0` after exit or kill.
 
-- [ ] **Step 4: Run unit and live systemd sender tests.**
+- [x] **Step 4: Run unit and live systemd sender tests.**
 
 Run: `python3 -m pytest tests/unit/runtime/test_provider_sender_process.py tests/unit/isolation/test_provider_sender.py tests/integration/test_systemd_provider_sender.py -q`
 

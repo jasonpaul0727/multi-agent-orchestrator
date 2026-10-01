@@ -55,6 +55,11 @@ from .overlay_launcher import (
     OverlayCandidateSession,
     SystemdOverlayCandidateLauncher,
 )
+from .provider_sender import (
+    ProviderSenderResult,
+    SystemdProviderSenderLauncher,
+    SystemdProviderSenderSession,
+)
 
 __all__ = [
     "InvalidSandboxRequest",
@@ -65,6 +70,9 @@ __all__ = [
     "SandboxSession",
     "SystemdReadOnlyLauncher",
     "SystemdOverlayCandidateLauncher",
+    "ProviderSenderResult",
+    "SystemdProviderSenderLauncher",
+    "SystemdProviderSenderSession",
     "OverlayCandidateResult",
     "OverlayCandidateSession",
     "FsAccess",

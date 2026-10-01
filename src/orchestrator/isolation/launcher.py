@@ -24,6 +24,7 @@ _RUNTIME_PATH_TOKEN = "@maestro-runtime@/"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _SYSTEMD_UNIT = re.compile(
     r"^maestro-(?:attempt-[0-9a-f]{32}|candidate-[0-9a-f]{32})\.(?:service|scope)$"
+    r"|^maestro-provider-[0-9a-f]{32}\.service$"
 )
 
 
