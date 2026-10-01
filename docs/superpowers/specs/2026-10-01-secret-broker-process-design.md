@@ -14,6 +14,7 @@
 - Broker 与 Model Gateway 是宿主可信进程，运行在同一账户下。Broker 使用宿主私有 runtime 目录内的 Unix socket；peer UID 和一次性会话 nonce 用于限定本宿主会话。Unix socket 与这些校验**不**防御同 UID 的恶意宿主进程、宿主账户失陷或有权读取宿主进程内存的攻击者。
 - 当前 `SystemdReadOnlyLauncher` 已通过 `InaccessiblePaths=/run/user` 隐藏宿主 runtime socket。Provider sender 也隐藏该路径。`SystemdOverlayCandidateLauncher` 尚无此明确属性，必须在其 profile 加入同等屏蔽并通过实机测试后，才可声称候选代码不可访问 Broker。
 - Broker 不执行 Provider HTTP 请求。默认 Model Gateway transport 将已经校验的凭证绑定到 Provider HTTP 认证头，再交给固定 `SystemdProviderSenderLauncher` 子进程执行一次 HTTPS 请求；此 Broker IPC 路径不增加 urllib/thread fallback。该 sender 可接收必要的认证头，但不接收环境变量或 shell 命令；其输入限于现有有界 stdin IPC。
+- Sender 默认使用系统 TLS 信任配置。为让端到端测试验证 TLS sink 实际收到认证头，宿主侧 sender launcher 可显式配置一个只读 CA bundle 路径：该选项仅来自受信任的宿主配置，不得由 Worker、ModelRequest、Provider 响应或候选产物控制；在 sender systemd profile 中只读绑定，且默认未设置。未设置时保持现有 `ssl.create_default_context()` 系统信任行为；设置时只影响该 sender 请求的 TLS trust roots。CA bundle 是公开证书材料，不是凭证，不进入 Worker、审计或 Provider payload。
 - Python 字符串不能可靠清零。关闭 socket 和释放对象只能缩短凭证驻留时间，不构成内存擦除证明。
 
 ## 架构与生命周期
@@ -50,7 +51,7 @@
 - 单元/契约：合法请求完整字段绑定；错误 peer/nonce、错 Provider/ref/endpoint/purpose、重复 ID、并发同 ID 仅一个成功、重复 JSON 键、未知字段、损坏/超限帧、超时、无效/不可用 secret store、审计失败都拒绝且不返回 key。
 - 独立进程：真实 Unix socket client/server 跨进程往返；哨兵值只由 Broker 测试进程内存 store 提供；扫描 Broker/Gateway/Worker/sender `/proc/<pid>/cmdline` 与 `environ`、审计事件、错误、日志和 Artifact，确认均无哨兵值。测试不得声称能检查或清除 Python 进程内存。
 - 隔离实测：使用实际 systemd Worker/Tool/Verifier profile 和 overlay candidate profile 尝试访问 Broker socket，必须失败；专门回归验证 overlay 的 `/run/user` 不可见。不能用 mock 替代这项实测。
-- 端到端：Gateway → 独立 Broker → 现有 Provider sender → 本机 loopback TLS sink；sink 只接收测试认证头，断言一次请求、正确 endpoint/Attempt binding、sender stop receipt 有效、key 不进入 Worker/Shell/argv/environment/log/audit/Artifact。测试不得连接公共 Provider。
+- 端到端：Gateway → 独立 Broker → 现有 Provider sender → 本机 loopback TLS sink。测试生成仅用于本机的测试 CA 与服务端证书，通过宿主配置把 CA bundle 以只读方式提供给 sender，sink 验证 TLS 并只接收测试认证头；断言一次请求、正确 endpoint/Attempt binding、sender stop receipt 有效、key 不进入 Worker/Shell/argv/environment/log/audit/Artifact。CA 路径不得来自不可信输入；测试不得连接公共 Provider。生产默认 TLS trust roots 必须保持不变。
 - 全量项目验收继续执行项目覆盖率门（至少 90%）、`compileall`、`pip check`、wheel 构建和 diff 检查；本切片的新增边界必须有针对性覆盖。
 
 ## 明确不包含
