@@ -93,7 +93,13 @@ def test_provider_sender_launcher_uses_separate_network_enabled_profile(monkeypa
     assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in properties
     assert "NoNewPrivileges=yes" in properties
     binds = [value for value in properties if value.startswith("BindReadOnlyPaths=")]
-    assert len(binds) == 1 and ":/provider_sender_process.py" in binds[0]
+    assert len(binds) == 1
+    source, target = binds[0].removeprefix("BindReadOnlyPaths=").split(":", 1)
+    assert Path(source).is_file()
+    assert Path(target).is_file()
+    assert source != target
+    assert Path(target).parent.name == "runtime"
+    assert Path(target).parent.parent == Path(source).parent
     assert "workspace" not in " ".join(binds)
     assert "sender-secret-marker" not in rendered_arguments
     assert "sender-secret-marker" not in repr(launched["kwargs"]["env"])

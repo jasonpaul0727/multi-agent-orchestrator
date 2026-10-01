@@ -12,6 +12,8 @@ from orchestrator.models.provider_calls import (
     ProviderCallReconciliation,
     ProviderCallSnapshot,
 )
+from orchestrator.models.provider_sender import ProviderSenderTerminationReceipt
+import orchestrator.provider_reconciliation as reconciliation_module
 from orchestrator.provider_reconciliation import (
     ProviderEvidenceResult,
     ProviderEvidenceUnsupported,
@@ -209,6 +211,59 @@ def _service(journal, evidence_verifier, termination_verifier):
         evidence_verifier=evidence_verifier,
         termination_verifier=termination_verifier,
     )
+
+
+def _sender_receipt(call, **overrides):
+    values = {
+        "provider_call_stream_id": call.stream_id,
+        "run_id": call.run_id,
+        "node_id": call.node_id,
+        "attempt_id": call.attempt_id,
+        "fencing_generation": call.fencing_generation,
+        "accepted_route_id": call.accepted_route_id,
+        "budget_reservation_id": call.budget_reservation_id,
+        "provider_id": call.provider_id,
+        "model_id": call.model_id,
+        "registry_manifest_hash": call.registry_manifest_hash,
+        "request_hash": call.request_hash,
+        "unit_name": "maestro-provider-" + "a" * 32 + ".service",
+        "cgroup_path_hash": "sha256:" + "e" * 64,
+        "active_state": "inactive",
+        "cgroup_empty": True,
+        "observed_at": datetime(2026, 9, 29, 12, tzinfo=timezone.utc),
+    }
+    values.update(overrides)
+    return ProviderSenderTerminationReceipt(**values)
+
+
+def test_provider_sender_termination_verifier_requires_exact_persisted_receipt():
+    call = _call()
+    receipt = _sender_receipt(call)
+    persisted = replace(call, termination_receipt=receipt)
+    verifier_type = getattr(
+        reconciliation_module, "ProviderSenderTerminationVerifier", None
+    )
+    assert verifier_type is not None, "ProviderSenderTerminationVerifier is not implemented"
+    verifier = verifier_type(_Journal(persisted))
+
+    assert verifier.verify_stopped(persisted, receipt) == receipt.receipt_hash
+
+
+def test_provider_sender_termination_verifier_rejects_unpersisted_or_mismatched_receipt():
+    call = _call()
+    receipt = _sender_receipt(call)
+    verifier_type = getattr(
+        reconciliation_module, "ProviderSenderTerminationVerifier", None
+    )
+    assert verifier_type is not None, "ProviderSenderTerminationVerifier is not implemented"
+
+    with pytest.raises(ReconciliationRejected, match="persisted"):
+        verifier_type(_Journal(call)).verify_stopped(call, receipt)
+
+    persisted = replace(call, termination_receipt=receipt)
+    forged = receipt.model_copy(update={"attempt_id": "attempt-other"})
+    with pytest.raises(ReconciliationRejected):
+        verifier_type(_Journal(persisted)).verify_stopped(persisted, forged)
 
 
 @pytest.mark.parametrize("failure_source", ["provider", "termination", "invalid-termination-digest"])

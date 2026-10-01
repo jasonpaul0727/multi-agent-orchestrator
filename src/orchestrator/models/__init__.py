@@ -39,6 +39,7 @@ from .transport import (
     ProviderCredential,
     ProviderModelGateway,
     SecretBroker,
+    SystemdProviderHTTPSTransport,
     UnavailableSecretBroker,
     UrllibHTTPSTransport,
 )
@@ -95,6 +96,7 @@ __all__ = [
     "ProviderCallSnapshot",
     "ProviderSenderTerminationReceipt",
     "ProviderModelGateway",
+    "SystemdProviderHTTPSTransport",
     "SQLiteProviderCallJournal",
     "SecretBroker",
     "SecretAccessContext",

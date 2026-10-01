@@ -31,6 +31,7 @@ from orchestrator.models.provider_calls import (
     ProviderCallSnapshot,
     SQLiteProviderCallJournal,
 )
+from orchestrator.models.provider_sender import ProviderSenderTerminationReceipt
 from orchestrator.validation import revalidate_model
 
 
@@ -150,6 +151,56 @@ class UnavailableAttemptTerminationVerifier:
         raise ReconciliationRejected(
             "no Attempt-bound termination witness is configured"
         )
+
+
+class ProviderSenderTerminationVerifier:
+    """Accept only the exact host receipt durably stored for an unresolved call."""
+
+    def __init__(self, journal: _ReconciliationJournal | SQLiteProviderCallJournal) -> None:
+        self.journal = journal
+
+    def verify_stopped(self, call: ProviderCallSnapshot, receipt: object) -> str:
+        try:
+            call = _revalidate_call_snapshot(call, allow_reconciliation=True)
+            candidate = revalidate_model(ProviderSenderTerminationReceipt, receipt)
+            persisted = self.journal.read_call(call.stream_id)
+            if persisted is None:
+                raise ValueError("persisted Provider call is missing")
+            persisted = _revalidate_call_snapshot(persisted, allow_reconciliation=True)
+        except Exception:
+            raise ReconciliationRejected(
+                "persisted Provider sender receipt could not be validated"
+            ) from None
+        if (
+            call.status not in {"dispatching", "unknown"}
+            or persisted.status not in {"dispatching", "unknown"}
+            or persisted != call
+            or call.termination_receipt is None
+            or persisted.termination_receipt is None
+            or candidate != call.termination_receipt
+            or candidate != persisted.termination_receipt
+        ):
+            raise ReconciliationRejected(
+                "Provider sender receipt is not the exact persisted proof for this call"
+            )
+        bindings = (
+            (candidate.provider_call_stream_id, call.stream_id),
+            (candidate.run_id, call.run_id),
+            (candidate.node_id, call.node_id),
+            (candidate.attempt_id, call.attempt_id),
+            (candidate.fencing_generation, call.fencing_generation),
+            (candidate.accepted_route_id, call.accepted_route_id),
+            (candidate.budget_reservation_id, call.budget_reservation_id),
+            (candidate.provider_id, call.provider_id),
+            (candidate.model_id, call.model_id),
+            (candidate.registry_manifest_hash, call.registry_manifest_hash),
+            (candidate.request_hash, call.request_hash),
+        )
+        if any(receipt_value != call_value for receipt_value, call_value in bindings):
+            raise ReconciliationRejected(
+                "Provider sender receipt does not match the persisted call binding"
+            )
+        return candidate.receipt_hash
 
 
 class _ReconciliationJournal(Protocol):
@@ -445,6 +496,7 @@ def _revalidate_call_snapshot(
         http_status=value.http_status,
         failure_code=value.failure_code,
         usage=value.usage,
+        termination_receipt=value.termination_receipt,
         reconciliation=value.reconciliation,
         reconciliation_event_id=value.reconciliation_event_id,
         reconciled_at=value.reconciled_at,

@@ -29,7 +29,6 @@ from .launcher import (
 
 
 _MAX_OUTPUT_BYTES = 64 * 1024 * 1024
-_HELPER_TARGET = "/provider_sender_process.py"
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +183,9 @@ class SystemdProviderSenderLauncher:
 
         staging = _create_provider_staging()
         staging_path = Path(staging.name)
+        helper_mount = staging_path / "runtime"
+        staged_helper = staging_path / "provider_sender_process.py"
+        helper_target = helper_mount / "provider_sender_process.py"
         helper_source = (
             Path(__file__).resolve().parents[1]
             / "runtime"
@@ -193,9 +195,11 @@ class SystemdProviderSenderLauncher:
             helper_source = helper_source.resolve(strict=True)
             if not helper_source.is_file() or not _systemd_path_supported(helper_source):
                 raise OSError("trusted Provider helper is not an accepted file")
-            staged_helper = staging_path / "provider_sender_process.py"
+            helper_mount.mkdir(mode=0o700)
             shutil.copyfile(helper_source, staged_helper)
+            shutil.copyfile(helper_source, helper_target)
             os.chmod(staged_helper, 0o400)
+            os.chmod(helper_target, 0o400)
         except OSError as exc:
             staging.cleanup()
             raise IsolationUnavailable("trusted Provider sender helper cannot be staged") from exc
@@ -213,6 +217,7 @@ class SystemdProviderSenderLauncher:
         )
         properties = _provider_sender_service_properties(
             helper_path=staged_helper,
+            helper_target=helper_target,
             timeout_seconds=timeout_seconds,
             output_bytes=output_bytes,
             limits=limits,
@@ -227,7 +232,7 @@ class SystemdProviderSenderLauncher:
             "/usr/bin/python3",
             "-I",
             "-S",
-            _HELPER_TARGET,
+            str(helper_target),
         ]
         systemd_command = [
             self._systemd_run,
@@ -298,6 +303,7 @@ def _create_provider_staging() -> tempfile.TemporaryDirectory[str]:
 def _provider_sender_service_properties(
     *,
     helper_path: Path,
+    helper_target: Path,
     timeout_seconds: int,
     output_bytes: int,
     limits: SandboxLimits,
@@ -338,7 +344,7 @@ def _provider_sender_service_properties(
         "InaccessiblePaths=-/etc/credstore",
         "InaccessiblePaths=-/etc/credstore.encrypted",
         "InaccessiblePaths=-/etc/apt/auth.conf.d",
-        f"BindReadOnlyPaths={helper_path}:{_HELPER_TARGET}",
+        f"BindReadOnlyPaths={helper_path}:{helper_target}",
         "WorkingDirectory=/",
         f"MemoryMax={limits.memory_bytes}",
         "MemorySwapMax=0",
