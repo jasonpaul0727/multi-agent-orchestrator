@@ -70,6 +70,28 @@ def _provider_reconciliation_payload(**overrides):
     }
 
 
+def _provider_sender_receipt_payload(**overrides):
+    return {
+        "provider_call_stream_id": "call-stream-1",
+        "run_id": "run-1",
+        "node_id": "node-1",
+        "attempt_id": "attempt-1",
+        "fencing_generation": 1,
+        "accepted_route_id": "decision-1",
+        "budget_reservation_id": "reservation-1",
+        "provider_id": "primary",
+        "model_id": "model-1",
+        "registry_manifest_hash": "sha256:" + "b" * 64,
+        "request_hash": "sha256:" + "c" * 64,
+        "unit_name": "maestro-provider-" + "a" * 32 + ".service",
+        "cgroup_path_hash": "sha256:" + "d" * 64,
+        "active_state": "inactive",
+        "cgroup_empty": True,
+        "observed_at": "2026-10-01T00:00:00+00:00",
+        **overrides,
+    }
+
+
 def test_provider_call_intent_binds_adapter_and_correlation_schema(tmp_path):
     store = SQLiteEventStore(tmp_path / "provider-intent-schema.db")
     intent = EventDraft(
@@ -197,6 +219,75 @@ def test_provider_call_rejects_a_late_outcome_after_reconciliation(tmp_path):
         )
 
     assert store.current_version("provider_call", "call-stream-1") == 3
+
+
+def test_provider_call_outcome_accepts_a_sanitized_sender_receipt(tmp_path):
+    store = SQLiteEventStore(tmp_path / "provider-sender-receipt-event.db")
+    intent = EventDraft(
+        "ProviderCallIntentRecorded",
+        _provider_call_intent_payload(),
+        **_context(causation_id="decision-1"),
+    )
+    store.append("provider_call", "call-stream-1", 0, [intent], "provider-intent")
+    outcome = EventDraft(
+        "ProviderCallOutcomeRecorded",
+        {
+            "outcome": "unknown",
+            "provider_request_id": None,
+            "http_status": None,
+            "failure_code": "timeout",
+            "usage": None,
+            "termination_receipt": _provider_sender_receipt_payload(),
+        },
+        **_context(causation_id="decision-1"),
+    )
+
+    stored = store.append(
+        "provider_call", "call-stream-1", 1, [outcome], "provider-outcome"
+    )
+
+    assert stored[0].payload["termination_receipt"]["cgroup_empty"] is True
+
+
+@pytest.mark.parametrize(
+    ("receipt_overrides", "message"),
+    [
+        ({"attempt_id": "other-attempt"}, "receipt.*identity|binding"),
+        ({"fencing_generation": 2}, "receipt.*identity|binding"),
+        ({"cgroup_path_hash": "sha256:bad"}, "receipt|digest|hash"),
+        ({"active_state": "active"}, "receipt|state|inactive"),
+        ({"cgroup_empty": False}, "receipt|empty|cgroup"),
+    ],
+)
+def test_provider_call_outcome_rejects_invalid_sender_receipt(
+    tmp_path, receipt_overrides, message
+):
+    store = SQLiteEventStore(tmp_path / f"invalid-sender-receipt-{len(receipt_overrides)}.db")
+    intent = EventDraft(
+        "ProviderCallIntentRecorded",
+        _provider_call_intent_payload(),
+        **_context(causation_id="decision-1"),
+    )
+    store.append("provider_call", "call-stream-1", 0, [intent], "provider-intent")
+    outcome = EventDraft(
+        "ProviderCallOutcomeRecorded",
+        {
+            "outcome": "unknown",
+            "provider_request_id": None,
+            "http_status": None,
+            "failure_code": "timeout",
+            "usage": None,
+            "termination_receipt": _provider_sender_receipt_payload(**receipt_overrides),
+        },
+        **_context(causation_id="decision-1"),
+    )
+
+    with pytest.raises(EventContractError, match=message):
+        store.append(
+            "provider_call", "call-stream-1", 1, [outcome], "invalid-sender-outcome"
+        )
+
+    assert store.current_version("provider_call", "call-stream-1") == 1
 
 
 @pytest.mark.parametrize(

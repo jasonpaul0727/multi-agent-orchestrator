@@ -42,7 +42,7 @@
 - Produces an immutable `ProviderSenderTerminationReceipt` with full ProviderCall/Attempt binding, a random systemd unit name, a SHA-256 digest of the exact cgroup path, inactive/failed unit state, `cgroup_empty=True`, and an aware observation time. It persists no absolute path or credential.
 - `SQLiteProviderCallJournal.record_outcome(..., termination_receipt=None)` revalidates the optional receipt against its prior intent. `ProviderCallSnapshot.termination_receipt` exposes that durable proof after replay. Older outcomes without the optional field remain readable.
 
-- [ ] **Step 1: Write failing journal and contract tests.**
+- [x] **Step 1: Write failing journal and contract tests.**
 
 ```python
 def test_provider_call_journal_replays_attempt_bound_sender_receipt(tmp_path):
@@ -84,14 +84,14 @@ Also reject a receipt copied from another call or fencing generation and a
 malformed cgroup digest. Keep a legacy no-receipt outcome fixture and assert it
 replays with `termination_receipt is None`.
 
-- [ ] **Step 2: Run the focused tests and verify they fail for the missing receipt contract.**
+- [x] **Step 2: Run the focused tests and verify they fail for the missing receipt contract.**
 
 Run: `python3 -m pytest tests/unit/models/test_provider_call_journal.py tests/contract/test_cross_spec_events.py -k sender_receipt -q`
 
 Expected: FAIL because receipt schema/persistence is absent; any import, fixture,
 or unrelated test error must be corrected before implementation.
 
-- [ ] **Step 3: Implement the receipt model, snapshot replay, journal validation, and optional strict event payload.**
+- [x] **Step 3: Implement the receipt model, snapshot replay, journal validation, and optional strict event payload.**
 
 ```python
 def _validate_sender_receipt(call, receipt):
@@ -117,7 +117,7 @@ def _validate_sender_receipt(call, receipt):
 Reject every mismatched Attempt/call binding before append. Keep old event
 payloads valid and do not include request/response bytes or raw cgroup paths.
 
-- [ ] **Step 4: Run the focused journal and cross-spec tests; verify receipt replay and legacy compatibility pass.**
+- [x] **Step 4: Run the focused journal and cross-spec tests; verify receipt replay and legacy compatibility pass.**
 
 Run: `python3 -m pytest tests/unit/models/test_provider_call_journal.py tests/contract/test_cross_spec_events.py -q`
 

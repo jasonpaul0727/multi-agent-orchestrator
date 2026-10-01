@@ -48,6 +48,7 @@ from .provider_calls import (
     ProviderCallSnapshot,
     SQLiteProviderCallJournal,
 )
+from .provider_sender import ProviderSenderTerminationReceipt
 from .pricing import (
     CostingDataUnavailable,
     ExchangeRate,
@@ -92,6 +93,7 @@ __all__ = [
     "ProviderCallJournal",
     "ProviderCallReplayBlocked",
     "ProviderCallSnapshot",
+    "ProviderSenderTerminationReceipt",
     "ProviderModelGateway",
     "SQLiteProviderCallJournal",
     "SecretBroker",

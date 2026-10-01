@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from threading import Barrier
 
 import pytest
+from pydantic import ValidationError
+import orchestrator.models as model_exports
 
 from orchestrator.models import (
     AcceptedModelRoute,
@@ -206,6 +208,139 @@ def test_provider_call_intent_and_receipt_survive_restart_without_prompt_or_outp
     assert "private answer" not in serialized
     assert recovered.request_hash.startswith("sha256:")
     assert SQLiteProviderCallJournal(reopened).unresolved() == ()
+
+
+def _sender_termination_receipt(call, **overrides):
+    values = {
+        "provider_call_stream_id": call.stream_id,
+        "run_id": call.run_id,
+        "node_id": call.node_id,
+        "attempt_id": call.attempt_id,
+        "fencing_generation": call.fencing_generation,
+        "accepted_route_id": call.accepted_route_id,
+        "budget_reservation_id": call.budget_reservation_id,
+        "provider_id": call.provider_id,
+        "model_id": call.model_id,
+        "registry_manifest_hash": call.registry_manifest_hash,
+        "request_hash": call.request_hash,
+        "unit_name": "maestro-provider-" + "a" * 32 + ".service",
+        "cgroup_path_hash": "sha256:" + "b" * 64,
+        "active_state": "inactive",
+        "cgroup_empty": True,
+        "observed_at": datetime(2026, 10, 1, tzinfo=timezone.utc),
+    }
+    values.update(overrides)
+    return model_exports.ProviderSenderTerminationReceipt(**values)
+
+
+def test_provider_call_journal_replays_attempt_bound_sender_receipt(tmp_path):
+    store_path = tmp_path / "sender-receipt.db"
+    store = SQLiteEventStore(store_path)
+    request = model_request(model_registry())
+    journal = SQLiteProviderCallJournal(store)
+    journal.record_intent(
+        request, provider_id="primary", provider_adapter="openai_responses",
+        request_body=b"{}", provider_correlation_id="maestro-test",
+    )
+    call = journal.read(request)
+    assert call is not None
+    receipt = _sender_termination_receipt(call)
+    assert receipt.receipt_hash.startswith("sha256:")
+    assert len(receipt.receipt_hash) == 71
+
+    journal.record_outcome(
+        request, outcome="unknown", failure_code="timeout",
+        termination_receipt=receipt,
+    )
+    store.close()
+    with SQLiteEventStore(store_path) as reopened:
+        recovered = SQLiteProviderCallJournal(reopened).read(request)
+        assert recovered is not None and recovered.termination_receipt == receipt
+        outcome = reopened.read_stream("provider_call", call.stream_id)[1]
+        serialized = repr(outcome.payload)
+        assert str(receipt.receipt_hash) not in serialized
+        assert "/sys/fs/cgroup/" not in serialized
+
+
+@pytest.mark.parametrize(
+    "binding_override",
+    [
+        {"provider_call_stream_id": "other-call"},
+        {"attempt_id": "other-attempt"},
+        {"fencing_generation": 2},
+        {"accepted_route_id": "other-route"},
+    ],
+)
+def test_provider_call_journal_rejects_sender_receipt_from_another_call(
+    tmp_path, binding_override
+):
+    request = model_request(model_registry())
+    journal = SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / "sender-binding.db"))
+    journal.record_intent(
+        request, provider_id="primary", provider_adapter="openai_responses",
+        request_body=b"{}", provider_correlation_id="maestro-test",
+    )
+    call = journal.read(request)
+    assert call is not None
+    receipt = _sender_termination_receipt(call, **binding_override)
+
+    with pytest.raises(ValueError, match="sender receipt.*intent|binding"):
+        journal.record_outcome(
+            request, outcome="unknown", failure_code="timeout",
+            termination_receipt=receipt,
+        )
+
+    assert journal.read(request).status == "dispatching"
+
+
+def test_provider_call_journal_rejects_malformed_sender_cgroup_digest(tmp_path):
+    request = model_request(model_registry())
+    journal = SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / "sender-digest.db"))
+    journal.record_intent(
+        request, provider_id="primary", provider_adapter="openai_responses",
+        request_body=b"{}", provider_correlation_id="maestro-test",
+    )
+    call = journal.read(request)
+    assert call is not None
+
+    with pytest.raises(ValidationError):
+        _sender_termination_receipt(call, cgroup_path_hash="sha256:not-a-digest")
+
+
+def test_provider_call_journal_revalidates_sender_receipt_model_copy(tmp_path):
+    request = model_request(model_registry())
+    journal = SQLiteProviderCallJournal(SQLiteEventStore(tmp_path / "sender-copy.db"))
+    journal.record_intent(
+        request, provider_id="primary", provider_adapter="openai_responses",
+        request_body=b"{}", provider_correlation_id="maestro-test",
+    )
+    call = journal.read(request)
+    assert call is not None
+    forged = _sender_termination_receipt(call).model_copy(update={"cgroup_empty": False})
+
+    with pytest.raises(ValidationError):
+        journal.record_outcome(
+            request, outcome="unknown", failure_code="timeout",
+            termination_receipt=forged,
+        )
+
+    assert journal.read(request).status == "dispatching"
+
+
+def test_legacy_provider_outcome_replays_without_sender_receipt(tmp_path):
+    request = model_request(model_registry())
+    store = SQLiteEventStore(tmp_path / "legacy-no-sender-receipt.db")
+    journal = SQLiteProviderCallJournal(store)
+    journal.record_intent(
+        request, provider_id="primary", provider_adapter="openai_responses",
+        request_body=b"{}", provider_correlation_id="maestro-test",
+    )
+    journal.record_outcome(request, outcome="not_sent", failure_code="cancelled")
+
+    recovered = journal.read(request)
+
+    assert recovered is not None
+    assert recovered.termination_receipt is None
 
 
 def test_provider_call_outcome_must_match_the_entire_frozen_call_scope(tmp_path):

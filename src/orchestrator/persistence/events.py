@@ -237,7 +237,7 @@ def validate_event_contract(events: list[Any]) -> None:
                 or provider_call_terminal
                 or provider_call_reconciliation is not None
                 or event.stream_version != 2
-                or set(payload) != required_fields
+                or set(payload) not in (required_fields, required_fields | {"termination_receipt"})
                 or not all(execution_key)
                 or execution_key != (
                     provider_call_intent.run_id,
@@ -249,6 +249,12 @@ def validate_event_contract(events: list[Any]) -> None:
                 or payload.get("outcome") not in {"not_sent", "known_failure", "known_success", "unknown"}
             ):
                 raise EventContractError("ProviderCallOutcomeRecorded is orphaned, duplicated, or invalid")
+            if "termination_receipt" in payload:
+                _validate_provider_sender_termination_receipt(
+                    payload["termination_receipt"],
+                    intent=provider_call_intent,
+                    stream_id=event.stream_id,
+                )
             provider_request_id = payload.get("provider_request_id")
             if provider_request_id is not None and (
                 not isinstance(provider_request_id, str)
@@ -705,6 +711,68 @@ def _parse_event_datetime(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
+def _validate_provider_sender_termination_receipt(
+    value: Any, *, intent: Any, stream_id: str
+) -> None:
+    fields = {
+        "provider_call_stream_id",
+        "run_id",
+        "node_id",
+        "attempt_id",
+        "fencing_generation",
+        "accepted_route_id",
+        "budget_reservation_id",
+        "provider_id",
+        "model_id",
+        "registry_manifest_hash",
+        "request_hash",
+        "unit_name",
+        "cgroup_path_hash",
+        "active_state",
+        "cgroup_empty",
+        "observed_at",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise EventContractError("Provider sender receipt has invalid exact fields")
+    intent_payload = intent.payload
+    expected = {
+        "provider_call_stream_id": stream_id,
+        "run_id": intent_payload.get("run_id"),
+        "node_id": intent_payload.get("node_id"),
+        "attempt_id": intent_payload.get("attempt_id"),
+        "fencing_generation": intent_payload.get("fencing_generation"),
+        "accepted_route_id": intent_payload.get("accepted_route_id"),
+        "budget_reservation_id": intent_payload.get("budget_reservation_id"),
+        "provider_id": intent_payload.get("provider_id"),
+        "model_id": intent_payload.get("model_id"),
+        "registry_manifest_hash": intent_payload.get("registry_manifest_hash"),
+        "request_hash": intent_payload.get("request_hash"),
+    }
+    if any(value.get(name) != expected_value for name, expected_value in expected.items()):
+        raise EventContractError("Provider sender receipt has invalid identity binding")
+    receipt_generation = value.get("fencing_generation")
+    if isinstance(receipt_generation, bool) or not isinstance(receipt_generation, int):
+        raise EventContractError("Provider sender receipt has invalid identity binding")
+    if not isinstance(value.get("unit_name"), str) or re.fullmatch(
+        r"maestro-provider-[0-9a-f]{32}\.service", value["unit_name"], re.ASCII
+    ) is None:
+        raise EventContractError("Provider sender receipt has invalid unit name")
+    for name in ("registry_manifest_hash", "request_hash", "cgroup_path_hash"):
+        digest = value.get(name)
+        if not isinstance(digest, str) or not digest.startswith("sha256:"):
+            raise EventContractError("Provider sender receipt has invalid digest")
+        try:
+            _validate_sha256_hex(digest[7:], name)
+        except ValueError as exc:
+            raise EventContractError("Provider sender receipt has invalid digest") from exc
+    if value.get("active_state") not in {"inactive", "failed"}:
+        raise EventContractError("Provider sender receipt has invalid termination state")
+    if value.get("cgroup_empty") is not True:
+        raise EventContractError("Provider sender receipt cgroup must be confirmed empty")
+    if _parse_event_datetime(value.get("observed_at")) is None:
+        raise EventContractError("Provider sender receipt has invalid observation timestamp")
 
 
 def _validate_execution_context(model: Any, *, event_type: str) -> None:

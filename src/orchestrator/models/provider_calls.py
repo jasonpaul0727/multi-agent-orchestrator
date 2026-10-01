@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import hashlib
 import re
@@ -15,8 +15,10 @@ from orchestrator.budget.models import UsageRecord
 from orchestrator.config.models import ProviderAdapter
 from orchestrator.identifiers import new_id
 from orchestrator.models.gateway import ModelRequest, TokenUsage
+from orchestrator.models.provider_sender import ProviderSenderTerminationReceipt
 from orchestrator.persistence import EventDraft, IdempotencyConflict, SQLiteEventStore, StaleStream
 from orchestrator.persistence.sqlite_event_store import canonical_json
+from orchestrator.validation import revalidate_model
 
 
 ProviderCallStatus = Literal[
@@ -136,6 +138,7 @@ class ProviderCallJournal(Protocol):
         http_status: int | None = None,
         failure_code: str | None = None,
         usage: TokenUsage | Mapping[str, object] | None = None,
+        termination_receipt: ProviderSenderTerminationReceipt | Mapping[str, object] | None = None,
     ) -> None: ...
 
 
@@ -163,6 +166,7 @@ class ProviderCallSnapshot:
     http_status: int | None = None
     failure_code: str | None = None
     usage: Mapping[str, object] | None = None
+    termination_receipt: ProviderSenderTerminationReceipt | None = None
     reconciliation: ProviderCallReconciliation | None = None
     reconciliation_event_id: str | None = None
     reconciled_at: datetime | None = None
@@ -258,6 +262,7 @@ class SQLiteProviderCallJournal:
         http_status: int | None = None,
         failure_code: str | None = None,
         usage: TokenUsage | Mapping[str, object] | None = None,
+        termination_receipt: ProviderSenderTerminationReceipt | Mapping[str, object] | None = None,
     ) -> None:
         if outcome not in {"not_sent", "known_failure", "known_success", "unknown"}:
             raise ValueError("invalid provider call outcome")
@@ -288,6 +293,17 @@ class SQLiteProviderCallJournal:
             raise ProviderCallOutcomeConflict(
                 "provider call outcome conflicts with a terminal or reconciled call"
             )
+        verified_termination_receipt = None
+        if termination_receipt is not None:
+            if isinstance(termination_receipt, ProviderSenderTerminationReceipt):
+                verified_termination_receipt = revalidate_model(
+                    ProviderSenderTerminationReceipt, termination_receipt
+                )
+            else:
+                verified_termination_receipt = ProviderSenderTerminationReceipt.model_validate(
+                    termination_receipt
+                )
+            _assert_sender_receipt_matches_call(prior, verified_termination_receipt)
         payload: dict[str, object] = {
             "outcome": outcome,
             "provider_request_id": provider_request_id,
@@ -295,6 +311,10 @@ class SQLiteProviderCallJournal:
             "failure_code": failure_code,
             "usage": usage_payload,
         }
+        if verified_termination_receipt is not None:
+            payload["termination_receipt"] = verified_termination_receipt.model_dump(
+                mode="json"
+            )
         try:
             self.event_store.append(
                 "provider_call",
@@ -381,7 +401,7 @@ class SQLiteProviderCallJournal:
         else:
             status = "dispatching" if not terminal else terminal["outcome"]
         usage = terminal.get("usage")
-        return ProviderCallSnapshot(
+        snapshot = ProviderCallSnapshot(
             stream_id=intent.stream_id,
             run_id=payload["run_id"],
             node_id=payload["node_id"],
@@ -407,6 +427,17 @@ class SQLiteProviderCallJournal:
             reconciled_at=reconciled_at,
             settlement_applied=settlement_event is not None,
         )
+        receipt_payload = terminal.get("termination_receipt")
+        if receipt_payload is not None:
+            try:
+                termination_receipt = ProviderSenderTerminationReceipt.model_validate(
+                    receipt_payload
+                )
+                _assert_sender_receipt_matches_call(snapshot, termination_receipt)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("provider sender termination receipt projection is invalid") from exc
+            snapshot = replace(snapshot, termination_receipt=termination_receipt)
+        return snapshot
 
     def unresolved(self) -> tuple[ProviderCallSnapshot, ...]:
         """Return calls needing recovery/reconciliation after a restart."""
@@ -553,6 +584,26 @@ def _call_binding(call: ProviderCallSnapshot) -> dict[str, object]:
         "registry_manifest_hash": call.registry_manifest_hash,
         "request_hash": call.request_hash,
     }
+
+
+def _assert_sender_receipt_matches_call(
+    call: ProviderCallSnapshot, receipt: ProviderSenderTerminationReceipt
+) -> None:
+    expected = {
+        "provider_call_stream_id": call.stream_id,
+        "run_id": call.run_id,
+        "node_id": call.node_id,
+        "attempt_id": call.attempt_id,
+        "fencing_generation": call.fencing_generation,
+        "accepted_route_id": call.accepted_route_id,
+        "budget_reservation_id": call.budget_reservation_id,
+        "provider_id": call.provider_id,
+        "model_id": call.model_id,
+        "registry_manifest_hash": call.registry_manifest_hash,
+        "request_hash": call.request_hash,
+    }
+    if any(getattr(receipt, key) != value for key, value in expected.items()):
+        raise ValueError("sender receipt does not match ProviderCall intent binding")
 
 
 def _assert_proof_matches_call(
