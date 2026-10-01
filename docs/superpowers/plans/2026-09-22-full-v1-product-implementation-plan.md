@@ -142,8 +142,25 @@ failure or process death rolls back the entire bootstrap batch. Config-only
 Runs remain frozen and are reported as initializing. The host Python API gates
 admission, Run recovery, and explicit reconciliation, but does not dispatch
 Workers, tools, or Providers at startup. A Worker systemd stop receipt cannot
-attest the host urllib background sender; sender-bound supervision and a live
-Provider evidence source remain production gates.
+attest a Gateway HTTP sender; sender-bound supervision and a live Provider
+evidence source remain production gates.
+
+2026-10-01 P3 Provider sender supervision slice: the default
+`ProviderModelGateway` transport now dispatches one bounded HTTPS request using
+a fixed helper in a dedicated transient systemd service. The credential and
+request cross bounded stdin IPC; the host binds a stop receipt to the persisted
+Provider call and full Attempt only after verifying the exact unit/cgroup
+stopped. Cancellation/timeout waits for that proof, and an unverifiable stop
+leaves the call unresolved without an urllib/thread fallback. A live loopback
+TLS-sink test exercises the actual Gateway-to-systemd path and cancellation;
+it makes no paid Provider request. The local
+`ProviderSenderTerminationVerifier` is opt-in, and authoritative Provider
+receipt/usage lookup remains unavailable. The dedicated sender profile allows
+host networking for HTTPS and has no systemd egress-host allowlist. This does
+not prove Provider receipt/charges, stop a whole Worker, complete the
+cross-stream interruption matrix, or validate the résumé cost/token/rework
+targets. README and [Provider journal security notes](../../security/provider-call-journal.md)
+record the boundary and remaining gates.
 
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 
@@ -164,7 +181,7 @@ Provider evidence source remain production gates.
 - [x] 将 effect intent/receipt 与 ArtifactPublished stream 纳入统一 Run Recovery Coordinator；恢复时将缺回执的外部 effect 保持为 outcome_unknown、拒绝终态 Attempt 上的未决 effect，并验证有发布事件的 ArtifactStore 对象 digest/size 与可用 attempt provenance。只读恢复结果不重放副作用或暴露 artifact bytes。
 - [x] 增加全局只读 orphan blob inventory：按内容寻址文件名、常规文件类型和 SHA-256 校验；对每个候选使用正常 publication digest lock 并重读事件元数据，避免把正常并发发布误报为 orphan。此操作不自动删除，也不宣称 Run 级归属。
 - [x] 在 Artifact bytes 落盘前写入 `ArtifactPublicationIntent`，随后原子发布内容寻址对象和 `ArtifactPublished` 元数据；恢复时按 Run 查询带有对应 source provenance 的未完成意图并验证已存在对象的 digest/size/provenance。子进程死亡测试覆盖 intent 后、blob 后两个窗口。Worker publisher 必须提供 Run/node/Attempt-generation source。候选只列入 pending inventory，不被自动采纳或删除。
-- [ ] 扩展多进程中断矩阵覆盖全部跨流事务/副作用窗口；将 systemd 的验证后停止回执绑定到真实 Attempt/Worker sender，并配置 Provider 权威查询/签名回执验证源及其线上测试。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
+- [ ] 扩展多进程中断矩阵覆盖全部跨流事务/副作用窗口；将 systemd 停止证明接入并实测整个 Worker 生命周期协调，并配置 Provider 权威查询/签名回执验证源及其线上测试。Gateway 的 Provider request sender 已有独立 systemd 停止证明，但不能替代 Worker 停止/完整恢复。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
 - [x] 实现脱敏、确定性的 Gateway 失败分类/指纹并交由 Recovery Controller 生成有界计划；Scheduler 持久化分类/计划，并在接纳恢复 Attempt 时重验 authorization、失败类别、retry level 和 exhausted model，再原子消费单次授权。未知结果保持 reconciliation 阻断。
 - [x] 将已持久化 Provider pending-proof 结算接入 host application 启动；完整 Run/调用前后校验、原子批次回滚、初始化中断报告、双连接启动及进程死亡验收通过。
 - [ ] 将持久化恢复计划接入 functional Worker 与 application service 的运行时协调/自动派发；不得自动重放 `outcome_unknown` Provider 调用。CLI/MCP 尚未接入 host 入口。

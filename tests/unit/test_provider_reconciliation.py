@@ -535,6 +535,60 @@ def test_verified_provider_only_evidence_is_combined_with_host_digest():
     assert termination_verifier.calls[0][0] == call
 
 
+def test_persisted_sender_proof_can_be_replayed_after_settlement():
+    receipt_bytes = b"authenticated receipt bytes"
+    reconciled_at = datetime(2026, 9, 29, 13, tzinfo=timezone.utc)
+    call = _call(termination_receipt=None)
+    receipt = _sender_receipt(call)
+    call = replace(call, termination_receipt=receipt)
+    journal = _Journal(call)
+    verifier_type = getattr(
+        reconciliation_module, "ProviderSenderTerminationVerifier", None
+    )
+    assert verifier_type is not None, "ProviderSenderTerminationVerifier is not implemented"
+
+    first_service = _service(
+        journal,
+        FakeProviderEvidenceVerifier(_evidence_result(call)),
+        verifier_type(journal),
+    )
+    first_result = first_service.reconcile(
+        call.stream_id,
+        raw_evidence=receipt_bytes,
+        termination_receipt=receipt,
+        reconciled_at=reconciled_at,
+    )
+
+    journal.call = replace(journal.call, status="settlement_pending", settlement_applied=False)
+    replay_service = _service(
+        journal,
+        FakeProviderEvidenceVerifier(_evidence_result(call)),
+        verifier_type(journal),
+    )
+    replay_result = replay_service.reconcile(
+        call.stream_id,
+        raw_evidence=receipt_bytes,
+        termination_receipt=receipt,
+        reconciled_at=reconciled_at,
+    )
+    settled_replay_service = _service(
+        journal,
+        FakeProviderEvidenceVerifier(_evidence_result(call)),
+        verifier_type(journal),
+    )
+    settled_replay_result = settled_replay_service.reconcile(
+        call.stream_id,
+        raw_evidence=receipt_bytes,
+        termination_receipt=receipt,
+        reconciled_at=reconciled_at,
+    )
+
+    assert first_result.status == "reconciled"
+    assert replay_result.status == "reconciled"
+    assert settled_replay_result == first_result
+    assert len(journal.appended) == 1
+
+
 def test_provider_evidence_rejects_aggregate_only_or_malformed_usage():
     call = _call()
     usage = UsageRecord(

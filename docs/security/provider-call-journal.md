@@ -67,15 +67,26 @@ The APIs are not yet exposed through CLI or MCP.
 
 ## Production status and limits
 
-The default Provider evidence verifier and Attempt-termination verifier are
-intentionally unavailable and fail closed. There is no production OpenAI
-authoritative lookup or signed-receipt verifier wired to this service, and the
-existing Worker systemd termination receipt does not prove the current host
-Gateway HTTP sender stopped: urllib can continue in a background thread after
-coroutine cancellation. An actual sender-bound termination verifier is still
-required. Therefore this
-slice defines and tests the reconciliation contract; it does **not** enable
-production Provider reconciliation. Without configured authoritative
+The default Gateway transport is now `SystemdProviderHTTPSTransport`. It sends
+one bounded HTTPS request through the fixed helper in a dedicated transient
+systemd service. Credential and request bytes cross a bounded stdin frame;
+they are not stored in the journal. The Gateway maps a host-verified exact
+unit/cgroup stop result to a receipt bound to the persisted call, full Attempt,
+route, reservation, Registry, and request hash. On cancellation or timeout it
+waits for that stop result before returning. If systemd cannot prove the exact
+sender stopped, the Gateway supplies no receipt and leaves the call unresolved;
+it does not fall back to an urllib thread or another untracked sender.
+
+`ProviderSenderTerminationVerifier` can validate that a supplied receipt is
+the exact receipt already persisted for the unresolved call. It is opt-in:
+`ProviderReconciliationService` still defaults to unavailable Provider and
+Attempt verifiers. There is no production OpenAI authoritative lookup or
+signed-receipt verifier wired to the service. The local live integration test
+uses a loopback TLS sink to prove sender execution and cancellation/stop
+ordering; it makes no Provider request and incurs no Provider charge. A sender
+stop receipt does not prove that the Provider did not receive or charge the
+request, nor that the entire Worker stopped. Therefore this slice does **not**
+enable production Provider reconciliation. Without configured authoritative
 verifiers, unknown calls remain held and unresolved. The service does not
 automatically retry/replay a Provider call, resume a Worker, publish artifacts,
 or decide that a task succeeded.
@@ -84,7 +95,6 @@ The deterministic tests cover concurrent call claims, late-success versus
 reconciliation CAS, restart recovery, privacy of prompts/output/credentials
 and raw evidence, malformed event rejection, exact usage/no-effect settlement,
 and spawned-process death after proof append, Scheduler settlement, and marker
-commit. Live authoritative Provider verification, production
-sender-bound termination wiring, functional Worker recovery, and CLI/MCP remain
-open P3/V1 gates. Pending-proof startup recovery is now implemented by the host
-application entry point.
+commit. Live authoritative Provider verification, production Worker recovery,
+and CLI/MCP remain open P3/V1 gates. Pending-proof startup recovery is now
+implemented by the host application entry point.

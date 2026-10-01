@@ -154,7 +154,7 @@ class UnavailableAttemptTerminationVerifier:
 
 
 class ProviderSenderTerminationVerifier:
-    """Accept only the exact host receipt durably stored for an unresolved call."""
+    """Accept the exact stored receipt for an unresolved call or proof replay."""
 
     def __init__(self, journal: _ReconciliationJournal | SQLiteProviderCallJournal) -> None:
         self.journal = journal
@@ -171,9 +171,14 @@ class ProviderSenderTerminationVerifier:
             raise ReconciliationRejected(
                 "persisted Provider sender receipt could not be validated"
             ) from None
+        is_unresolved = call.status in {"dispatching", "unknown"}
+        is_exact_proof_replay = (
+            call.status in {"settlement_pending", "reconciled"}
+            and call.reconciliation is not None
+            and call.reconciliation.termination_receipt_hash == candidate.receipt_hash
+        )
         if (
-            call.status not in {"dispatching", "unknown"}
-            or persisted.status not in {"dispatching", "unknown"}
+            not (is_unresolved or is_exact_proof_replay)
             or persisted != call
             or call.termination_receipt is None
             or persisted.termination_receipt is None

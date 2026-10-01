@@ -299,6 +299,22 @@ class SystemdProviderHTTPSTransport:
         except Exception:
             raise HTTPTransportFailed(may_have_been_sent=False) from None
 
+        if cancellation is not None and cancellation.cancelled:
+            result = await self._cancel_and_wait(session)
+            receipt = (
+                _host_sender_receipt(call_binding, result)
+                if isinstance(result, ProviderSenderResult)
+                else None
+            )
+            raise HTTPTransportCancelled(
+                may_have_been_sent=(
+                    result.input_written
+                    if isinstance(result, ProviderSenderResult)
+                    else True
+                ),
+                termination_receipt=receipt,
+            ) from None
+
         wait_task = asyncio.create_task(asyncio.to_thread(session.wait))
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_ms / 1_000
