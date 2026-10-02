@@ -31,7 +31,9 @@ def test_secret_broker_request_and_response_round_trip_redacts_repr():
     response = SecretBrokerResponse(1, "request-1", "primary", "https://api.openai.com/v1", "model_inference", "credential", "authorization", "credential-generated-for-this-test")
 
     assert decode_secret_broker_request(encode_secret_broker_request(request)) == request
-    assert decode_secret_broker_response(encode_secret_broker_response(response)) == response
+    assert decode_secret_broker_response(
+        encode_secret_broker_response(response, adapter="openai_responses")
+    ) == response
     assert "nonce-9a2c" not in repr(request)
     assert "credential-generated-for-this-test" not in repr(response)
 
@@ -67,7 +69,7 @@ def test_secret_broker_codec_rejects_unsupported_versions_and_invalid_response_f
     }.items():
         object.__setattr__(invalid_response, name, value)
     with pytest.raises(ValueError):
-        encode_secret_broker_response(invalid_response)
+        encode_secret_broker_response(invalid_response, adapter="openai_responses")
 
 
 def test_secret_broker_request_decoder_rejects_non_exact_json_objects():
@@ -116,7 +118,9 @@ def test_secret_broker_encoders_emit_the_complete_fixed_wire_schema():
     )
 
     request_payload = json.loads(encode_secret_broker_request(request))
-    response_payload = json.loads(encode_secret_broker_response(response))
+    response_payload = json.loads(
+        encode_secret_broker_response(response, adapter="openai_responses")
+    )
     assert set(request_payload) == {
         "version", "session_nonce", "secret_ref", "provider_id", "endpoint", "purpose", "context"
     }
@@ -142,3 +146,24 @@ def test_secret_broker_nonce_accepts_urlsafe_leading_punctuation():
     )
 
     assert encode_secret_broker_request(request)
+
+
+def test_secret_broker_response_encoder_rejects_valid_header_for_wrong_adapter():
+    from orchestrator.secrets.ipc import SecretBrokerResponse, encode_secret_broker_response
+
+    response = SecretBrokerResponse(
+        1,
+        "request-1",
+        "primary",
+        "https://api.openai.com/v1",
+        "model_inference",
+        "credential",
+        "x-api-key",
+        "credential-generated-for-this-test",
+    )
+
+    with pytest.raises(ValueError):
+        encode_secret_broker_response(response, adapter="openai_responses")
+    with pytest.raises(ValueError):
+        encode_secret_broker_response(response)
+    assert encode_secret_broker_response(response, adapter="anthropic_messages")

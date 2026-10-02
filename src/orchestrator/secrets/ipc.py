@@ -10,7 +10,9 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
+from orchestrator.config.models import ProviderAdapter
 from orchestrator.models.gateway import SecretAccessContext
+from orchestrator.secrets.broker import _HEADER_BY_ADAPTER
 
 
 MAX_SECRET_BROKER_FRAME_BYTES = 16_384
@@ -100,7 +102,11 @@ def decode_secret_broker_request(frame: bytes) -> SecretBrokerRequest:
     return _validate_request_payload(payload)
 
 
-def encode_secret_broker_response(response: SecretBrokerResponse) -> bytes:
+def encode_secret_broker_response(
+    response: SecretBrokerResponse,
+    *,
+    adapter: ProviderAdapter | None = None,
+) -> bytes:
     try:
         if not isinstance(response, SecretBrokerResponse):
             raise ValueError
@@ -115,6 +121,12 @@ def encode_secret_broker_response(response: SecretBrokerResponse) -> bytes:
             "credential_value": response.credential_value,
         }
         validated = _validate_response_payload(payload)
+        if adapter is not None and adapter not in _HEADER_BY_ADAPTER:
+            raise ValueError
+        if validated.status == "credential" and (
+            adapter is None or validated.header_name != _HEADER_BY_ADAPTER[adapter]
+        ):
+            raise ValueError
         return _encode_payload(_response_payload(validated))
     except (AttributeError, TypeError, ValueError, ValidationError, RecursionError):
         raise ValueError("Secret Broker response is invalid") from None

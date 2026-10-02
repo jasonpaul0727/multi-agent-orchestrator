@@ -65,7 +65,7 @@
 **Interfaces:**
 - `SecretBrokerRequest` is immutable and contains `version: int`, `session_nonce: str`, `secret_ref: str`, `provider_id: str`, `endpoint: str`, `purpose: str`, and `context: SecretAccessContext`. Provider adapter/configuration is not caller data; it is frozen in the server bootstrap map.
 - `SecretBrokerResponse` is immutable and contains `version`, `request_id`, `provider_id`, `endpoint`, `purpose`, `status: Literal["credential", "denied", "unavailable"]`, `header_name: str | None`, and `credential_value: str | None`. Request reprs redact the session nonce; credential-bearing response reprs redact the header value.
-- `encode_secret_broker_request(request) -> bytes`, `decode_secret_broker_request(frame: bytes) -> SecretBrokerRequest`, `encode_secret_broker_response(response) -> bytes`, and `decode_secret_broker_response(frame: bytes) -> SecretBrokerResponse` accept one strict JSON object of at most 16,384 bytes. Every decoder rejects duplicate/unknown/missing keys, invalid UTF-8, non-finite numbers, unsupported versions, trailing JSON content, invalid identifiers, and values outside field bounds.
+- `encode_secret_broker_request(request) -> bytes`, `decode_secret_broker_request(frame: bytes) -> SecretBrokerRequest`, `encode_secret_broker_response(response, *, adapter: ProviderAdapter | None = None) -> bytes`, and `decode_secret_broker_response(frame: bytes) -> SecretBrokerResponse` accept one strict JSON object of at most 16,384 bytes. Credential responses require the trusted frozen `ProviderAdapter`; the encoder checks the exact adapter/header mapping without adding adapter data to the wire. Non-credential responses with no header or credential may omit it. Every decoder rejects duplicate/unknown/missing keys, invalid UTF-8, non-finite numbers, unsupported versions, trailing JSON content, invalid identifiers, and values outside field bounds.
 - `MAX_SECRET_BROKER_FRAME_BYTES == 16_384`; codec errors are generic and never include the frame or field values.
 - `_REQUEST_FIELDS: frozenset[str]` and `_RESPONSE_FIELDS: frozenset[str]` define the complete version-1 wire keys; no decoder accepts an extension field.
 - Internal codec helpers are `_decode_exact_json_object(frame: bytes, *, max_bytes: int) -> dict[str, object]`, `_validate_request_payload(payload: dict[str, object]) -> SecretBrokerRequest`, and `_validate_response_payload(payload: dict[str, object]) -> SecretBrokerResponse`.
@@ -87,7 +87,7 @@ def test_secret_broker_codec_rejects_duplicate_keys_unknown_fields_and_oversize(
         decode_secret_broker_request(b" " * (MAX_SECRET_BROKER_FRAME_BYTES + 1))
 ```
 
-Also round-trip one fully bound request/response, reject unsupported version and invalid response fields, and assert `repr(response)` does not contain a generated credential value. The client-level mismatch of response request/provider/endpoint/purpose is tested in Task 3 where the original request is available for comparison.
+Also round-trip one fully bound request/response, supplying the trusted `adapter="openai_responses"` when encoding its credential response; reject unsupported version and invalid response fields, and assert `repr(response)` does not contain a generated credential value. Include a valid but adapter-mismatched header case. The client-level mismatch of response request/provider/endpoint/purpose is tested in Task 3 where the original request is available for comparison.
 
 - [ ] **Step 2: Run the codec tests and verify they fail on missing symbols.**
 
@@ -108,7 +108,7 @@ def decode_secret_broker_request(frame: bytes) -> SecretBrokerRequest:
     return _validate_request_payload(payload)
 ```
 
-Use `object_pairs_hook` to reject duplicate keys; catch JSON/Unicode/recursion failures without echoing raw input; revalidate `SecretAccessContext` through its Pydantic model. Validate the credential-bearing response against the exact header name allowed for the frozen Provider adapter before encoding.
+Use `object_pairs_hook` to reject duplicate keys; catch JSON/Unicode/recursion failures without echoing raw input; revalidate `SecretAccessContext` through its Pydantic model. Credential response encoding requires the trusted keyword-only `ProviderAdapter` and checks the exact adapter/header mapping before JSON serialization. The adapter is not a response DTO field and is never serialized.
 
 - [ ] **Step 4: Run codec tests and verify schema, bounds and repr checks pass.**
 
@@ -137,7 +137,7 @@ git push origin codex/p3-systemd-termination-receipts
 - `UnixSecretBrokerServer(*, socket_path: Path, session_nonce: str, event_store_path: Path, rules: Sequence[SecretAccessRule], providers: Mapping[str, ProviderSpec], value_store: SecretValueStore, expected_uid: int, max_handlers: int = 8, backlog: int = 16, io_timeout_seconds: float = 10.0)` accepts only Linux `AF_UNIX/SOCK_SEQPACKET`; constructor validation rejects `max_handlers > 8` or `backlog > 16`. Production construction supplies `UnavailableSecretValueStore`; only test setup injects an in-memory store.
 - `UnixSecretBrokerServer.serve_forever(*, readiness_fd: int | None = None) -> None` creates the socket at mode `0600`, checks `SO_PEERCRED` UID and session nonce, reads exactly one bounded frame per connection, and schedules work on at most 8 handlers. The listener backlog is 16; read/write deadlines are finite.
 - Admission uses a 24-slot bound (8 running handlers plus at most 16 queued accepted sockets); if full, close/reject the new connection instead of growing an executor queue or thread count.
-- `UnixSecretBrokerServer.socket_path -> Path` exposes only the non-secret host pathname. `_recv_one_frame(connection: socket.socket) -> bytes`, `_peer_uid(connection: socket.socket) -> int`, `_handle_one_connection(connection: socket.socket) -> None`, and `_send_result(connection: socket.socket, response: SecretBrokerResponse) -> None` are the bounded one-connection operations. The readiness fd receives a four-byte big-endian length plus one JSON record of at most 1 KiB only after bind/chmod/self-check.
+- `UnixSecretBrokerServer.socket_path -> Path` exposes only the non-secret host pathname. `_recv_one_frame(connection: socket.socket) -> bytes`, `_peer_uid(connection: socket.socket) -> int`, `_handle_one_connection(connection: socket.socket) -> None`, and `_send_result(connection: socket.socket, response: SecretBrokerResponse, *, adapter: ProviderAdapter | None = None) -> None` are the bounded one-connection operations. Credential responses pass `provider.adapter` from the frozen Provider map to the Task 1 encoder; denied/unavailable responses without credentials may omit it. The readiness fd receives a four-byte big-endian length plus one JSON record of at most 1 KiB only after bind/chmod/self-check.
 - `_denied_response(request: SecretBrokerRequest) -> SecretBrokerResponse` and `_bound_response(request: SecretBrokerRequest, provider: ProviderSpec, credential: ProviderCredential | None) -> SecretBrokerResponse` construct exact-scope results; neither includes raw secret references in denial text or events.
 - Each request resolves `provider_id` only from the frozen non-secret `providers` map, opens a new thread-local `SQLiteEventStore(event_store_path)`, calls `AuditedSecretBroker.acquire_provider_credential(...)`, closes the store, and returns only a bound IPC response. Bootstrap contains only rules and public Provider descriptors (`id`, `adapter`, `endpoint`, `secret_ref`, `enabled`), never a secret value. Audit failure, store failure, request replay, or validation error returns no credential.
 - `close() -> None` stops accepting new work and drains active handlers for a finite grace period. The request ID is consumed durably by the existing `secret-access:<request_id>` Run-stream idempotency key.
@@ -240,7 +240,11 @@ def _handle_one_connection(self, connection: socket.socket) -> None:
         ))
     finally:
         events.close()
-    self._send_result(connection, _bound_response(request, provider, credential))
+    self._send_result(
+        connection,
+        _bound_response(request, provider, credential),
+        adapter=provider.adapter,
+    )
 ```
 
 The real implementation must remain synchronous inside bounded worker threads; do not share a thread-affine SQLite store across handlers. Use `recvmsg`/`MSG_TRUNC` or equivalent to detect oversized SOCK_SEQPACKET frames, set socket deadlines, close each accepted socket after one response, and never log request/response data or exception text. Keep `AuditedSecretBroker` as the only scope/audit policy implementation.
