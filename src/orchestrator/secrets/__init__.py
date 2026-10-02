@@ -10,6 +10,8 @@ from .broker import (
     UnavailableSecretValueStore,
 )
 from .server import UnixSecretBrokerServer
+from .client import UnixSocketSecretBroker
+from .process import SecretBrokerProcessManager, SecretBrokerProcessSession
 from .ipc import (
     MAX_SECRET_BROKER_FRAME_BYTES,
     SecretBrokerRequest,
@@ -32,6 +34,9 @@ __all__ = [
     "SecretValueStore",
     "UnavailableSecretValueStore",
     "UnixSecretBrokerServer",
+    "UnixSocketSecretBroker",
+    "SecretBrokerProcessManager",
+    "SecretBrokerProcessSession",
     "decode_secret_broker_request",
     "decode_secret_broker_response",
     "encode_secret_broker_request",

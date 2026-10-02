@@ -86,6 +86,7 @@ class UnixSecretBrokerServer:
         rules: Sequence[SecretAccessRule], providers: Mapping[str, ProviderSpec],
         value_store: SecretValueStore, expected_uid: int, max_handlers: int = 8,
         backlog: int = 16, io_timeout_seconds: float = 10.0,
+        unlink_on_close: bool = True,
     ) -> None:
         if sys.platform != "linux" or not hasattr(socket, "SO_PEERCRED"):
             raise RuntimeError("Secret Broker requires Linux Unix packet sockets")
@@ -110,6 +111,9 @@ class UnixSecretBrokerServer:
         if any(not isinstance(provider, ProviderSpec) or key != provider.id for key, provider in frozen_providers.items()):
             raise ValueError("Secret Broker Provider registry is invalid")
         self._socket_path = Path(socket_path)
+        if not isinstance(unlink_on_close, bool):
+            raise ValueError("Secret Broker cleanup ownership is invalid")
+        self._unlink_on_close = unlink_on_close
         self.session_nonce = session_nonce
         self.event_store_path = Path(event_store_path)
         self.rules = frozen_rules
@@ -269,7 +273,7 @@ class UnixSecretBrokerServer:
                         pass
                     connection.close()
             executor.shutdown(wait=False, cancel_futures=True)
-        if self._socket_identity is not None:
+        if self._unlink_on_close and self._socket_identity is not None:
             try:
                 info = self._socket_path.lstat()
                 if (info.st_dev, info.st_ino) == self._socket_identity:

@@ -270,6 +270,7 @@ git push origin codex/p3-systemd-termination-receipts
 - Create: `src/orchestrator/secrets/process.py`
 - Create: `src/orchestrator/secrets/_broker_child.py`
 - Modify: `src/orchestrator/secrets/__init__.py`
+- Modify: `src/orchestrator/secrets/server.py` (opt-in supervisor-owned socket cleanup)
 - Test: `tests/unit/secrets/test_process.py`
 - Test: `tests/integration/test_secret_broker_process.py`
 
@@ -282,6 +283,7 @@ git push origin codex/p3-systemd-termination-receipts
 - Client internals are `_exchange_one(request: SecretBrokerRequest) -> SecretBrokerResponse`, `_validate_response_binding(response: SecretBrokerResponse, request: SecretBrokerRequest, adapter: ProviderAdapter) -> None`, and `_credential_or_none(response: SecretBrokerResponse) -> ProviderCredential | None`.
 - Manager validates Linux, `runtime_root` owner/mode, an existing absolute regular EventStore file, and Unix path length. It creates a random private `0700` child directory, passes rules/provider descriptors/event path/nonce/expected parent PID only through a bounded inherited pipe, and launches one fixed child entrypoint with an explicit clean environment. No key or EnvironmentSecretStore crosses this channel.
 - `_broker_child.py` installs `PR_SET_PDEATHSIG=SIGTERM`, checks the configured parent PID, starts `UnixSecretBrokerServer` with `UnavailableSecretValueStore`, and emits a readiness frame only after socket bind, chmod and self-check. On close, the manager stops accepting requests, sends `SIGTERM`, waits at most `timeout_seconds`, escalates once to `SIGKILL`, and waits for process exit. It removes only the socket/directory whose captured inode still matches; unconfirmed stop or mismatched inode leaves the path in place and marks the session unavailable.
+- Lifecycle ownership ruling: `UnixSecretBrokerServer(..., unlink_on_close=True)` preserves standalone cleanup; the supervised child opts into `unlink_on_close=False`. Cover both modes in `test_server_socket_cleanup_obeys_lifecycle_owner`; only the manager may remove a supervised socket after confirmed child exit and matching socket/directory inodes.
 
 - [ ] **Step 1: Write failing manager/client lifecycle tests.**
 
@@ -344,7 +346,7 @@ Expected: PASS on Linux; `test_manager_exposes_client_only_after_ready_and_close
 - [ ] **Step 5: Commit and push Task 3.**
 
 ```bash
-git add src/orchestrator/secrets/client.py src/orchestrator/secrets/process.py src/orchestrator/secrets/_broker_child.py src/orchestrator/secrets/__init__.py tests/unit/secrets/test_process.py tests/integration/test_secret_broker_process.py
+git add src/orchestrator/secrets/client.py src/orchestrator/secrets/process.py src/orchestrator/secrets/_broker_child.py src/orchestrator/secrets/__init__.py src/orchestrator/secrets/server.py tests/unit/secrets/test_process.py tests/integration/test_secret_broker_process.py
 git commit -m "feat: supervise a local Secret Broker process"
 git push origin codex/p3-systemd-termination-receipts
 ```
