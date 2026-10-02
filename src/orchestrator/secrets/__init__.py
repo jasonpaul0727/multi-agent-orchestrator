@@ -7,7 +7,9 @@ from .broker import (
     SecretAccessRule,
     SecretBrokerUnavailable,
     SecretValueStore,
+    UnavailableSecretValueStore,
 )
+from .server import UnixSecretBrokerServer
 from .ipc import (
     MAX_SECRET_BROKER_FRAME_BYTES,
     SecretBrokerRequest,
@@ -28,6 +30,8 @@ __all__ = [
     "SecretBrokerResponse",
     "SecretBrokerUnavailable",
     "SecretValueStore",
+    "UnavailableSecretValueStore",
+    "UnixSecretBrokerServer",
     "decode_secret_broker_request",
     "decode_secret_broker_response",
     "encode_secret_broker_request",

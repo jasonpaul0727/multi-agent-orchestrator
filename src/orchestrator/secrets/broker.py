@@ -61,6 +61,13 @@ class SecretValueStore(Protocol):
     def read(self, secret_ref: str) -> str | None: ...
 
 
+class UnavailableSecretValueStore:
+    """Production default: no backing secret source is configured."""
+
+    def read(self, secret_ref: str) -> None:
+        return None
+
+
 class EnvironmentSecretStore:
     """Resolve an explicit env reference only when allowlisted by the host."""
 
@@ -302,4 +309,5 @@ __all__ = [
     "SecretAccessRule",
     "SecretBrokerUnavailable",
     "SecretValueStore",
+    "UnavailableSecretValueStore",
 ]
