@@ -356,20 +356,25 @@ git push origin codex/p3-systemd-termination-receipts
 
 **Files:**
 - Modify: `src/orchestrator/isolation/overlay_launcher.py`
+- Modify: `src/orchestrator/isolation/_overlay_bootstrap.py`
 - Modify: `tests/unit/isolation/test_overlay_launcher.py`
 - Modify: `tests/integration/test_overlay_candidate_launcher.py`
 
 **Interfaces:**
-- Extract `_candidate_service_properties(limits: SandboxLimits) -> tuple[str, ...]` from the inline unit argument construction. It includes `InaccessiblePaths=-/run/user` and preserves all existing properties.
+- Extract `_candidate_scope_properties(limits: SandboxLimits) -> tuple[str, ...]` from the inline scope argument construction and preserve all currently supported resource properties. Do not pass `InaccessiblePaths` to a scope: systemd 255 rejects that Service-only property for `systemd-run --scope`.
+- In the trusted candidate bootstrap's private chroot/mount namespace, mount an empty read-only `/run/user` tmpfs with mode `000`, `nosuid`, `nodev`, and `noexec`. Never bind the host `/run` or `/run/user`; mount failure is fail-closed. This gives the candidate an explicit private path barrier without changing scope/cgroup lifecycle.
 - Worker/Tool/Verifier and Provider sender retain their existing `InaccessiblePaths=-/run/user`; this task does not loosen their profiles or add the Broker socket to any untrusted mount.
 
 - [ ] **Step 1: Write failing profile and live candidate visibility tests.**
 
 ```python
 def test_overlay_candidate_hides_user_runtime_directory():
-    properties = module._candidate_service_properties(SandboxLimits())
-    assert "InaccessiblePaths=-/run/user" in properties
+    properties = module._candidate_scope_properties(SandboxLimits())
+    assert "MemoryMax=536870912" in properties
+    assert not any(value.startswith("InaccessiblePaths=") for value in properties)
 ```
+
+Add a deterministic bootstrap-mount test that observes an empty private `/run/user` tmpfs being mounted read-only with mode `000`, and verifies the host `/run/user` path is never used as a bind source. Keep the live test below as the acceptance proof.
 
 Extend the existing live candidate test on a host whose `XDG_RUNTIME_DIR` is under `/run/user`:
 
@@ -380,15 +385,23 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as host_listener:
     host_listener.listen(1)
     code = r'''
 import json, socket, sys
+import errno
 from pathlib import Path
 p = Path(sys.argv[1])
+try:
+    p.stat()
+    socket_hidden = False
+except OSError as exc:
+    if exc.errno not in {errno.ENOENT, errno.EACCES, errno.EPERM}:
+        raise
+    socket_hidden = True
 try:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     s.connect(str(p))
     connect_denied = False
 except OSError:
     connect_denied = True
-print(json.dumps({"broker_socket_hidden": not p.exists(), "broker_connect_denied": connect_denied}))
+print(json.dumps({"broker_socket_hidden": socket_hidden, "broker_connect_denied": connect_denied}))
 '''
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -404,16 +417,16 @@ print(json.dumps({"broker_socket_hidden": not p.exists(), "broker_connect_denied
 
 Keep the existing `unix_denied=True` assertion as a separate regression. Skip only when the host has no `/run/user` runtime path; a skipped test does not satisfy the live acceptance gate.
 
-- [ ] **Step 2: Run the unit test to verify the missing systemd property fails.**
+- [ ] **Step 2: Run the unit test to verify the missing supported scope helper and private runtime mount fail.**
 
 Run: `python3 -m pytest tests/unit/isolation/test_overlay_launcher.py -q`
 
-Expected: FAIL because the candidate profile does not explicitly hide `/run/user` yet.
+Expected: FAIL because the scope-property helper and explicit private `/run/user` mount are not present yet. The real socket test may pass against the existing chroot baseline; it is retained to prove the live boundary end-to-end.
 
-- [ ] **Step 3: Add the defense-in-depth inaccessible path.**
+- [ ] **Step 3: Add the defense-in-depth private mount without changing scope semantics.**
 
 ```python
-properties = _candidate_service_properties(limits)
+properties = _candidate_scope_properties(limits)
 args = [
     "systemd-run", "--user", "--scope", "--slice=app.slice", "--quiet", "--collect",
     *(f"--property={value}" for value in properties),
@@ -424,7 +437,7 @@ args = [
 ]
 ```
 
-Add the property to the central candidate profile builder rather than a test-only branch. Keep candidate seccomp's AF_UNIX denial and do not grant any socket FD.
+Add the private tmpfs inside `_prepare_root` before chroot and before the view is made read-only. Keep candidate seccomp's AF_UNIX denial and do not grant any socket FD. Keep the scope/cgroup lifecycle unchanged.
 
 - [ ] **Step 4: Run both deterministic and live overlay tests.**
 
@@ -435,7 +448,7 @@ Expected: PASS on the configured Ubuntu 24.04 / WSL2 / systemd host. If systemd 
 - [ ] **Step 5: Commit and push Task 4.**
 
 ```bash
-git add src/orchestrator/isolation/overlay_launcher.py tests/unit/isolation/test_overlay_launcher.py tests/integration/test_overlay_candidate_launcher.py
+git add src/orchestrator/isolation/overlay_launcher.py src/orchestrator/isolation/_overlay_bootstrap.py tests/unit/isolation/test_overlay_launcher.py tests/integration/test_overlay_candidate_launcher.py
 git commit -m "security: hide host runtime from overlay candidates"
 git push origin codex/p3-systemd-termination-receipts
 ```

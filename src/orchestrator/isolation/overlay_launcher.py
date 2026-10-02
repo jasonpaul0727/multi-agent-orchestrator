@@ -29,6 +29,17 @@ from .workspace import (
 _MAX_COMPLETION_BYTES = 16 * 1024 * 1024
 
 
+def _candidate_scope_properties(limits: SandboxLimits) -> tuple[str, ...]:
+    # Scopes enforce resources; filesystem barriers belong to the trusted
+    # namespace bootstrap. Service-only mount properties cannot be set here.
+    return (
+        f"MemoryMax={limits.memory_bytes}", "MemorySwapMax=0",
+        f"TasksMax={limits.tasks}", f"CPUQuota={limits.cpu_percent}%",
+        "CPUQuotaPeriodSec=100ms", f"RuntimeMaxSec={limits.timeout_seconds}s",
+        "TimeoutStopSec=1s",
+    )
+
+
 @dataclass(frozen=True)
 class OverlayCandidateResult:
     execution: SandboxResult
@@ -126,10 +137,7 @@ class SystemdOverlayCandidateLauncher:
                         f"MAESTRO_EXPECT_NOFILE={limits.nofile}", f"MAESTRO_EXPECT_FSIZE={limits.file_bytes}"]
             args = [
                 "systemd-run", "--user", "--scope", "--slice=app.slice", "--quiet", "--collect", f"--unit={unit}",
-                f"--property=MemoryMax={limits.memory_bytes}", "--property=MemorySwapMax=0",
-                f"--property=TasksMax={limits.tasks}", f"--property=CPUQuota={limits.cpu_percent}%",
-                "--property=CPUQuotaPeriodSec=100ms", f"--property=RuntimeMaxSec={limits.timeout_seconds}s",
-                "--property=TimeoutStopSec=1s",
+                *(f"--property={value}" for value in _candidate_scope_properties(limits)),
                 "--", "/usr/bin/env", "-i", *env_args,
                 "/usr/bin/unshare", "--user", "--map-root-user", "--mount", "--net",
                 "--pid", "--fork", "--mount-proc=/proc", "/usr/bin/python3", "-P", "-S", "-m",
