@@ -151,7 +151,8 @@ class UnixSecretBrokerServer:
             self._socket_identity = (info.st_dev, info.st_ino)
             os.chmod(self._socket_path, 0o600)
             info = self._socket_path.lstat()
-            if not stat.S_ISSOCK(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.getuid():
+            if (not stat.S_ISSOCK(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.getuid() or (info.st_dev, info.st_ino) != self._socket_identity):
                 raise RuntimeError("Secret Broker socket self-check failed")
             listener.listen(self._backlog)
             listener.settimeout(0.1)
@@ -159,7 +160,8 @@ class UnixSecretBrokerServer:
                 self._listener = listener
                 self._executor = ThreadPoolExecutor(max_workers=self._max_handlers, thread_name_prefix="secret-broker")
             if readiness_fd is not None:
-                record = json.dumps({"status": "ready"}, separators=(",", ":")).encode("utf-8")
+                record = json.dumps({"status": "ready", "socket_dev": self._socket_identity[0],
+                                     "socket_ino": self._socket_identity[1]}, separators=(",", ":")).encode("utf-8")
                 os.write(readiness_fd, struct.pack("!I", len(record)) + record)
                 os.close(readiness_fd)
                 readiness_fd = None

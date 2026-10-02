@@ -4,8 +4,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import select
+import signal
 import sys
-import time
 
 from orchestrator.config.models import ProviderSpec
 from orchestrator.models.gateway import SecretAccessContext
@@ -65,26 +66,22 @@ os._exit(0)
     parent = subprocess.Popen([sys.executable, "-c", code, str(manager._runtime_root), str(events)],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")})
-    child_pid = None
+    child_handle = None
     try:
         record = json.loads(parent.stdout.readline())
         child_pid = record["pid"]
+        child_handle = os.pidfd_open(child_pid)
         assert Path(record["socket"]).exists()
         parent.stdin.write(b"x"); parent.stdin.flush()
         assert parent.wait(timeout=5) == 0
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            state_path = Path(f"/proc/{child_pid}/stat")
-            if not state_path.exists() or state_path.read_text().split()[2] == "Z":
-                break
-            time.sleep(0.02)
-        else:
-            raise AssertionError("broker survived supervisor death")
+        assert select.select([child_handle], [], [], 5)[0], "broker survived supervisor death"
     finally:
         if parent.poll() is None:
             parent.kill(); parent.wait(timeout=5)
-        if child_pid is not None:
+        if child_handle is not None:
             try:
-                os.kill(child_pid, 9)
+                signal.pidfd_send_signal(child_handle, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            finally:
+                os.close(child_handle)

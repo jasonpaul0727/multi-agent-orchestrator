@@ -302,7 +302,7 @@ def test_readiness_rejects_changed_private_directory_permissions(tmp_path, monke
             session.close()
 
 
-def test_timeout_after_socket_bind_cleans_only_after_confirmed_exit(tmp_path, monkeypatch):
+def test_timeout_after_socket_bind_retains_path_without_attested_identity(tmp_path, monkeypatch):
     manager, runtime = _manager(tmp_path)
     provider, rule = _provider_and_rule("run-1")
     import orchestrator.secrets.process as process
@@ -313,5 +313,169 @@ def test_timeout_after_socket_bind_cleans_only_after_confirmed_exit(tmp_path, mo
     monkeypatch.setattr(process, "_read_frame", lose_readiness)
     with pytest.raises(RuntimeError):
         manager.start(rules=(rule,), providers={provider.id:provider})
-    assert list(runtime.iterdir()) == []
+    assert len(list(runtime.iterdir())) == 1
+    assert next(runtime.glob("*/broker.sock")).exists()
+
+
+@pytest.mark.parametrize("replacement_kind", ["socket", "file"])
+def test_readiness_replacement_is_never_adopted_for_cleanup(tmp_path, monkeypatch, replacement_kind):
+    # The current pathname must never supply the identity used to delete it.
+    manager, runtime = _manager(tmp_path)
+    provider, rule = _provider_and_rule("run-1")
+    import orchestrator.secrets.process as process
+    real_read = process._read_frame
+    replacement = None
+    path = None
+    replacement_identity = None
+    original_identity = None
+    def replace_before_validation(*args, **kwargs):
+        nonlocal replacement, path, replacement_identity, original_identity
+        record = real_read(*args, **kwargs)
+        path = next(runtime.glob("*/broker.sock"))
+        original_identity = (path.stat().st_dev, path.stat().st_ino)
+        path.rename(path.with_name("original.sock"))
+        if replacement_kind == "socket":
+            replacement = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            replacement.bind(str(path))
+        else:
+            path.write_text("replacement-owned-by-another-resource")
+        path.chmod(0o600)
+        replacement_identity = (path.stat().st_dev, path.stat().st_ino)
+        assert replacement_identity != original_identity
+        return record
+    monkeypatch.setattr(process, "_read_frame", replace_before_validation)
+    session = None
+    try:
+        try:
+            session = manager.start(rules=(rule,), providers={provider.id:provider})
+        except RuntimeError:
+            pass
+        finally:
+            if session is not None:
+                session.close()
+        assert path is not None and path.exists(), "startup cleanup removed a replacement pathname"
+        assert (path.stat().st_dev, path.stat().st_ino) == replacement_identity
+        assert path.with_name("original.sock").exists()
+        assert session is None, "readiness exposed a client for a replacement socket"
+    finally:
+        if replacement is not None:
+            replacement.close()
+
+
+def test_manager_rejects_readiness_without_child_socket_identity(tmp_path, monkeypatch):
+    manager, _ = _manager(tmp_path)
+    provider, rule = _provider_and_rule("run-1")
+    import orchestrator.secrets.process as process
+    real_read = process._read_frame
+    def strip_identity(*args, **kwargs):
+        real_read(*args, **kwargs)
+        return {"status": "ready"}
+    monkeypatch.setattr(process, "_read_frame", strip_identity)
+    with pytest.raises(RuntimeError):
+        session = manager.start(rules=(rule,), providers={provider.id:provider})
+        try:
+            pytest.fail("readiness lacking the child's inode exposed a client")
+        finally:
+            session.close()
+
+
+def test_server_does_not_emit_readiness_for_a_replaced_bound_socket(tmp_path, monkeypatch):
+    from orchestrator.secrets.server import UnixSecretBrokerServer
+    from orchestrator.secrets.broker import UnavailableSecretValueStore
+    provider, rule = _provider_and_rule("run-1")
+    path = tmp_path / "broker.sock"
+    server = UnixSecretBrokerServer(socket_path=path, session_nonce="a" * 64,
+        event_store_path=tmp_path / "events.db", rules=(rule,), providers={provider.id:provider},
+        value_store=UnavailableSecretValueStore(), expected_uid=os.getuid(), unlink_on_close=False)
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    real_chmod = os.chmod
+    def replace_during_self_check(target, mode):
+        Path(target).rename(path.with_name("original.sock"))
+        replacement.bind(str(path))
+        real_chmod(target, mode)
+    monkeypatch.setattr(os, "chmod", replace_during_self_check)
+    reader, writer = os.pipe()
+    def serve():
+        try:
+            server.serve_forever(readiness_fd=writer)
+        except RuntimeError:
+            pass
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        assert os.read(reader, 1024) == b"", "server attested readiness for a different inode"
+    finally:
+        os.close(reader); server.close(); thread.join(3); replacement.close()
+    assert not thread.is_alive() and path.exists()
+
+
+def test_parent_death_exits_child_with_a_blocked_active_store_read(tmp_path):
+    # Normal interpreter exit hangs joining this synchronous handler forever.
+    import select
+    import signal
+    manager, _ = _manager(tmp_path)
+    child_code = '''
+import threading
+from pathlib import Path
+from orchestrator.secrets import _broker_child as entrypoint
+class StalledStore:
+    def __init__(self, path): self.path = path
+    def read(self, secret_ref):
+        self.path.write_text("active")
+        threading.Event().wait()
+class HeldServer(entrypoint.UnixSecretBrokerServer):
+    def __init__(self, **kwargs):
+        kwargs["value_store"] = StalledStore(Path(str(kwargs["event_store_path"]) + ".active"))
+        super().__init__(**kwargs)
+entrypoint.UnixSecretBrokerServer = HeldServer
+raise SystemExit(entrypoint.main())
+'''
+    parent_code = '''
+import asyncio, json, os, subprocess, sys, threading, time
+from pathlib import Path
+from orchestrator.config.models import ProviderSpec
+from orchestrator.models.gateway import SecretAccessContext
+from orchestrator.secrets import SecretAccessRule, SecretBrokerProcessManager
+real_launch = subprocess.Popen
+def launch(args, **kwargs): return real_launch([sys.executable, "-c", sys.argv[3]], **kwargs)
+subprocess.Popen = launch
+p = ProviderSpec(id="primary", adapter="openai_responses", secret_ref="env:MODEL_KEY", enabled=True)
+r = SecretAccessRule(p.id, p.secret_ref, p.effective_endpoint, "model_inference", frozenset({"run-1"}))
+s = SecretBrokerProcessManager(runtime_root=Path(sys.argv[1]), event_store_path=Path(sys.argv[2])).start(rules=(r,), providers={p.id:p})
+c = SecretAccessContext(request_id="request-1", run_id="run-1", node_id="node-1", attempt_id="attempt-1", fencing_generation=1, accepted_route_id="route-1", budget_reservation_id="reservation-1")
+def acquire():
+    try: asyncio.run(s.client.acquire_provider_credential(secret_ref=p.secret_ref, provider=p, endpoint=p.effective_endpoint, purpose="model_inference", context=c))
+    except Exception: pass
+threading.Thread(target=acquire, daemon=True).start()
+marker = Path(sys.argv[2] + ".active")
+deadline = time.monotonic() + 5
+while not marker.exists():
+    if time.monotonic() > deadline: raise RuntimeError("handler did not enter")
+    time.sleep(0.01)
+print(json.dumps({"pid":s.process_pid}), flush=True)
+sys.stdin.read(1)
+os._exit(0)
+'''
+    parent = subprocess.Popen([sys.executable, "-c", parent_code, str(manager._runtime_root),
+        str(manager._event_store_path), child_code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(Path(__file__).resolve().parents[3] / "src")})
+    child_handle = None
+    try:
+        assert select.select([parent.stdout], [], [], 10)[0], "supervisor did not become ready"
+        record = json.loads(parent.stdout.readline())
+        child_handle = os.pidfd_open(record["pid"])
+        assert not select.select([child_handle], [], [], 0)[0]
+        parent.stdin.write(b"x"); parent.stdin.flush()
+        assert parent.wait(timeout=5) == 0
+        assert select.select([child_handle], [], [], 5)[0], "blocked handler prevented parent-death exit"
+    finally:
+        if parent.poll() is None:
+            parent.kill(); parent.wait(timeout=5)
+        if child_handle is not None:
+            try:
+                signal.pidfd_send_signal(child_handle, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            finally:
+                os.close(child_handle)
 

@@ -78,7 +78,12 @@ def main() -> int:
         stop.wait()
         server.close()
         thread.join(timeout=2)
-        return 0
+        # A synchronous handler can survive the socket drain. Interpreter
+        # shutdown would then join ThreadPoolExecutor workers indefinitely,
+        # including after PDEATHSIG when there is no manager left to escalate.
+        # This isolated process has finished its bounded drain; exit without
+        # running atexit worker joins or flushing any boundary data.
+        os._exit(0)
     except Exception:
         # Never print bootstrap, exceptions, descriptors, or credentials.
         return 1

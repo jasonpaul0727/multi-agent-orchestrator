@@ -223,10 +223,13 @@ class SecretBrokerProcessManager:
             _write_frame(process.stdin.fileno(), bootstrap, deadline=deadline)
             process.stdin.close()
             ready = _read_frame(process.stdout.fileno(), deadline=deadline, max_bytes=1024)
-            if ready != {"status": "ready"} or not session.is_alive:
+            if (set(ready) != {"status", "socket_dev", "socket_ino"} or ready["status"] != "ready"
+                or type(ready["socket_dev"]) is not int or not 0 <= ready["socket_dev"] < 2**64
+                or type(ready["socket_ino"]) is not int or not 0 < ready["socket_ino"] < 2**64):
                 raise RuntimeError("Secret Broker child did not become ready")
-            # Capture even an unsafe inode so startup cleanup has a proven target.
-            session._socket_identity = _identity(socket_path)
+            # Only the child's captured bind identity authorizes cleanup. Never
+            # adopt whatever now occupies this pathname, even on startup failure.
+            session._socket_identity = (ready["socket_dev"], ready["socket_ino"])
             checked = _checked_socket_identity(socket_path)
             directory_info = directory.lstat()
             if (checked != session._socket_identity or _identity(directory) != directory_identity
@@ -238,14 +241,6 @@ class SecretBrokerProcessManager:
             return session
         except Exception:
             if session is not None:
-                if session._socket_identity is None:
-                    try:
-                        # The child can bind before its readiness is delivered.
-                        # Capture its verified socket before requesting exit;
-                        # close still requires a confirmed wait and same inode.
-                        session._socket_identity = _checked_socket_identity(socket_path)
-                    except (OSError, RuntimeError):
-                        pass
                 session.close()
             elif process is not None:
                 # pidfd acquisition failed: Popen still owns this unreaped child.
