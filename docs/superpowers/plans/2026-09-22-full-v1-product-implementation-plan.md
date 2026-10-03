@@ -191,6 +191,23 @@ record the boundary and remaining gates.
 
 ## P4：OS 隔离、Tool Gateway、密钥与审批
 
+2026-10-02 Secret Broker process-boundary slice: Linux supervisor now starts
+a default-unavailable Broker daemon with bounded bootstrap/Unix packet IPC,
+peer UID/nonce checks, audit-before-read, durable one-shot request decisions,
+readiness/inode checks and confirmed child termination before cleanup. A
+test-only child generates a random sentinel in its own memory; real socket,
+ProviderModelGateway, systemd sender and loopback TLS sink exercise the full
+credential path. The sink checks intent durability via a fresh SQLite
+connection before replying. Tests scan process argv/environment and specified
+durable stores/logs/artifacts, cover Broker death/restart/replay and invalid
+binding, and reuse sender cancellation/unconfirmed-stop coverage. Live overlay
+candidates cannot access the Broker runtime/socket. The optional test CA is
+host-only; default TLS roots remain unchanged. This does not protect against
+same-UID host compromise or claim process memory inspection. Production secret
+backends, identity/revocation, functional Worker/Verifier, application-service
+recovery, CLI/MCP and paid benchmarks remain open, so neither overall P4 nor
+V1 is checked complete. See `docs/security/secrets.md` for measured boundaries.
+
 2026-09-28 internal workspace-write vertical slice: added a separate
 `WorkspaceWriteGateway`/`workspace.write-candidate` capability. It holds the
 exclusive workspace lease from before candidate snapshot through publication,
