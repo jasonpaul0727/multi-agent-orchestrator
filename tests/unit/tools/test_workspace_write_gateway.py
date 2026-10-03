@@ -10,6 +10,7 @@ from orchestrator.isolation import (
     OverlayCandidateResult,
     SandboxLimits,
     SandboxResult,
+    SandboxTerminationReceipt,
     WorkspacePublishError,
     WorkspaceLeaseBusy,
     acquire_workspace_write_lease,
@@ -137,12 +138,17 @@ def _fixture(
     (upper / "new.txt").write_text("private candidate data\n", encoding="utf-8")
     diff = export_overlay_diff(lower, upper, candidate_root / "validated")
     sandbox = SandboxResult(
-        unit_name="maestro-candidate-test.scope",
+        unit_name="maestro-candidate-" + "4" * 32 + ".scope",
         returncode=0,
         stdout=b"private output",
         stderr=b"",
         elapsed_seconds=0.01,
-        termination_confirmed=True,
+        termination_receipt=SandboxTerminationReceipt(
+            unit_name="maestro-candidate-" + "4" * 32 + ".scope",
+            control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/maestro-candidate-" + "4" * 32 + ".scope",
+            active_state="inactive",
+            cgroup_empty=True,
+        ),
         cancelled=False,
         timed_out=False,
         output_limited=False,

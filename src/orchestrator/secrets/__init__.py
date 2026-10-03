@@ -7,13 +7,38 @@ from .broker import (
     SecretAccessRule,
     SecretBrokerUnavailable,
     SecretValueStore,
+    UnavailableSecretValueStore,
+)
+from .server import UnixSecretBrokerServer
+from .client import UnixSocketSecretBroker
+from .process import SecretBrokerProcessManager, SecretBrokerProcessSession
+from .ipc import (
+    MAX_SECRET_BROKER_FRAME_BYTES,
+    SecretBrokerRequest,
+    SecretBrokerResponse,
+    decode_secret_broker_request,
+    decode_secret_broker_response,
+    encode_secret_broker_request,
+    encode_secret_broker_response,
 )
 
 __all__ = [
     "AuditedSecretBroker",
     "EnvironmentSecretStore",
+    "MAX_SECRET_BROKER_FRAME_BYTES",
     "SecretAccessDenied",
     "SecretAccessRule",
+    "SecretBrokerRequest",
+    "SecretBrokerResponse",
     "SecretBrokerUnavailable",
     "SecretValueStore",
+    "UnavailableSecretValueStore",
+    "UnixSecretBrokerServer",
+    "UnixSocketSecretBroker",
+    "SecretBrokerProcessManager",
+    "SecretBrokerProcessSession",
+    "decode_secret_broker_request",
+    "decode_secret_broker_response",
+    "encode_secret_broker_request",
+    "encode_secret_broker_response",
 ]

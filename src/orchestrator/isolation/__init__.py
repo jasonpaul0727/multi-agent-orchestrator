@@ -18,6 +18,7 @@ from .launcher import (
     IsolationUnavailable,
     SandboxLimits,
     SandboxResult,
+    SandboxTerminationReceipt,
     SandboxSession,
     SystemdReadOnlyLauncher,
 )
@@ -54,15 +55,24 @@ from .overlay_launcher import (
     OverlayCandidateSession,
     SystemdOverlayCandidateLauncher,
 )
+from .provider_sender import (
+    ProviderSenderResult,
+    SystemdProviderSenderLauncher,
+    SystemdProviderSenderSession,
+)
 
 __all__ = [
     "InvalidSandboxRequest",
     "IsolationUnavailable",
     "SandboxLimits",
     "SandboxResult",
+    "SandboxTerminationReceipt",
     "SandboxSession",
     "SystemdReadOnlyLauncher",
     "SystemdOverlayCandidateLauncher",
+    "ProviderSenderResult",
+    "SystemdProviderSenderLauncher",
+    "SystemdProviderSenderSession",
     "OverlayCandidateResult",
     "OverlayCandidateSession",
     "FsAccess",

@@ -7,10 +7,12 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 
 import pytest
 
@@ -37,6 +39,50 @@ def _systemd_available() -> bool:
 pytestmark = pytest.mark.skipif(
     not _systemd_available(), reason="live candidate backend requires Linux/systemd --user",
 )
+
+
+def test_candidate_cannot_see_or_connect_host_broker_socket(tmp_path: Path) -> None:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime is None or not Path(runtime).is_relative_to("/run/user"):
+        pytest.skip("live Broker boundary requires a /run/user runtime path")
+    socket_path = Path(runtime) / f"maestro-test-{uuid.uuid4().hex}.sock"
+    code = r'''
+import errno, json, socket, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+try:
+    p.stat()
+    broker_socket_hidden = False
+except OSError as exc:
+    if exc.errno not in {errno.ENOENT, errno.EACCES, errno.EPERM}:
+        raise
+    broker_socket_hidden = True
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as s:
+        s.connect(str(p))
+    connect_denied = False
+except OSError:
+    connect_denied = True
+print(json.dumps({"broker_socket_hidden": broker_socket_hidden, "broker_connect_denied": connect_denied}))
+'''
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as host_listener:
+            host_listener.bind(str(socket_path))
+            host_listener.listen(1)
+            assert socket_path.exists()
+            launcher = isolation.SystemdOverlayCandidateLauncher()
+            with launcher.launch(workspace, ["/usr/bin/python3", "-c", code, str(socket_path)]) as session:
+                result = session.wait()
+                assert result.execution.returncode == 0, result.execution.stderr.decode(errors="replace")
+                assert result.execution.termination_confirmed
+                assert json.loads(result.execution.stdout) == {
+                    "broker_connect_denied": True,
+                    "broker_socket_hidden": True,
+                }
+    finally:
+        socket_path.unlink(missing_ok=True)
 
 
 def test_candidate_write_is_private_and_command_has_no_host_authority(

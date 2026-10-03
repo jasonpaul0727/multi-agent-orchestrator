@@ -71,6 +71,11 @@ def _prepare_root(root: Path, config: dict) -> Path:
     _mount("--bind", str(view), str(view))
     for name in ("usr", "runtime", "workspace", "tmp", "dev", "etc", "proc", "run", "home"):
         (view / name).mkdir(mode=0o755)
+    # This is an empty private mount, never a bind of the host runtime. A
+    # failed barrier aborts setup before any untrusted command can execute.
+    (view / "run/user").mkdir(mode=0o700)
+    _mount("-t", "tmpfs", "-o", "size=4096,ro,mode=000,nosuid,nodev,noexec",
+           "tmpfs", str(view / "run/user"))
     _bind_readonly(root / "lower", root / "lower")
     _mount("-t", "overlay", "overlay", "-o",
            f"lowerdir={root / 'lower'},upperdir={buffer / 'upper'},workdir={buffer / 'work'},"

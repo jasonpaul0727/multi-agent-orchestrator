@@ -29,6 +29,17 @@ from .workspace import (
 _MAX_COMPLETION_BYTES = 16 * 1024 * 1024
 
 
+def _candidate_scope_properties(limits: SandboxLimits) -> tuple[str, ...]:
+    # Scopes enforce resources; filesystem barriers belong to the trusted
+    # namespace bootstrap. Service-only mount properties cannot be set here.
+    return (
+        f"MemoryMax={limits.memory_bytes}", "MemorySwapMax=0",
+        f"TasksMax={limits.tasks}", f"CPUQuota={limits.cpu_percent}%",
+        "CPUQuotaPeriodSec=100ms", f"RuntimeMaxSec={limits.timeout_seconds}s",
+        "TimeoutStopSec=1s",
+    )
+
+
 @dataclass(frozen=True)
 class OverlayCandidateResult:
     execution: SandboxResult
@@ -126,10 +137,7 @@ class SystemdOverlayCandidateLauncher:
                         f"MAESTRO_EXPECT_NOFILE={limits.nofile}", f"MAESTRO_EXPECT_FSIZE={limits.file_bytes}"]
             args = [
                 "systemd-run", "--user", "--scope", "--slice=app.slice", "--quiet", "--collect", f"--unit={unit}",
-                f"--property=MemoryMax={limits.memory_bytes}", "--property=MemorySwapMax=0",
-                f"--property=TasksMax={limits.tasks}", f"--property=CPUQuota={limits.cpu_percent}%",
-                "--property=CPUQuotaPeriodSec=100ms", f"--property=RuntimeMaxSec={limits.timeout_seconds}s",
-                "--property=TimeoutStopSec=1s",
+                *(f"--property={value}" for value in _candidate_scope_properties(limits)),
                 "--", "/usr/bin/env", "-i", *env_args,
                 "/usr/bin/unshare", "--user", "--map-root-user", "--mount", "--net",
                 "--pid", "--fork", "--mount-proc=/proc", "/usr/bin/python3", "-P", "-S", "-m",
@@ -155,6 +163,8 @@ class SystemdOverlayCandidateLauncher:
             output_limit=limits.output_bytes, timeout_seconds=limits.timeout_seconds,
             staging=retained, input_bytes=input_bytes,
             cancel_after_transport_exit=True, stop_grace_seconds=5,
+            scope_cgroup=scope_cgroup,
+            cleanup_on_termination=False,
         )
         return OverlayCandidateSession(transport, retained, stage, environment,
                                        self._candidate_entries, self._candidate_bytes,
@@ -202,7 +212,8 @@ class OverlayCandidateSession:
                 return self._result
             execution = self._transport.wait()
             stopped = execution.termination_confirmed and _scope_stopped(self.unit_name, self._environment, self._scope_cgroup)
-            execution = replace(execution, termination_confirmed=bool(stopped))
+            if not stopped:
+                execution = replace(execution, termination_receipt=None)
             diff = None
             error = "execution_failed"
             if not stopped:

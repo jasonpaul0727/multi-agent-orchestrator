@@ -95,11 +95,72 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 
 ## P3：生命周期状态机、事件驱动 DAG 与控制平面
 
-状态：Run/Node/Attempt + Scheduler + Agent Registry 首个垂直切片已实现；生命周期检查点/尾部重放和只读跨流一致性协调已加入。2026-09-23 又将 EffectIntent/Receipt 与 ArtifactPublished 元数据/对象完整性检查接入恢复 admission；无回执副作用保持 outcome_unknown，终态 Attempt 仍有未决副作用时 fail-closed。ArtifactStore 可并发安全地全局盘点裸 orphan blob；新的 artifact publish 在落盘前先记录 `ArtifactPublicationIntent`，Run Recovery 可按 Run 归属 incomplete intent、检查已落盘对象 digest/size/provenance，并覆盖进程死于 intent 后或 blob 后的测试窗口；它不自动采纳、删除，也无法归属没有 intent 的旧/裸 orphan。Gateway failure classification 与 RecoveryPlan 现可被 Scheduler 脱敏持久化；同节点恢复授权必须精确绑定 failure evidence、Retry/failure/exhaustion counters，且只可消费一次。另以子进程实测 Scheduler admission 和显式 Attempt reconciliation 在提交前死亡与提交后丢失 IPC 响应：提交前仍保留 unknown lease/预算/Agent，提交后可幂等重放单条结果。P3 仍未完成：完整跨进程 Worker 中断矩阵、Provider 侧查询/回执验证、真实 Worker/OS 终止回执及 Worker 自动恢复/调度对接仍缺，不得视作 P3 完成或可交付产品。Agent 记录冻结路由的 reasoning effort，Gateway accepted route 校验请求与所选 effort 一致。
+状态：Run/Node/Attempt + Scheduler + Agent Registry 首个垂直切片已实现；生命周期检查点/尾部重放和只读跨流一致性协调已加入。2026-09-23 又将 EffectIntent/Receipt 与 ArtifactPublished 元数据/对象完整性检查接入恢复 admission；无回执副作用保持 outcome_unknown，终态 Attempt 仍有未决副作用时 fail-closed。ArtifactStore 可并发安全地全局盘点裸 orphan blob；新的 artifact publish 在落盘前先记录 `ArtifactPublicationIntent`，Run Recovery 可按 Run 归属 incomplete intent、检查已落盘对象 digest/size/provenance，并覆盖进程死于 intent 后或 blob 后的测试窗口；它不自动采纳、删除，也无法归属没有 intent 的旧/裸 orphan。Gateway failure classification 与 RecoveryPlan 现可被 Scheduler 脱敏持久化；同节点恢复授权必须精确绑定 failure evidence、Retry/failure/exhaustion counters，且只可消费一次。另以子进程实测 Scheduler admission 和显式 Attempt reconciliation 在提交前死亡与提交后丢失 IPC 响应：提交前仍保留 unknown lease/预算/Agent，提交后可幂等重放单条结果。P3 仍未完成：完整跨进程 Worker 中断矩阵、生产 Provider 权威查询/回执验证源、systemd 停止回执与真实 Attempt/Worker sender 的绑定，以及 Worker/application-service 自动恢复接线仍缺，不得视作 P3 完成或可交付产品。Agent 记录冻结路由的 reasoning effort，Gateway accepted route 校验请求与所选 effort 一致。
 
 2026-09-23 P3 Planning 切片：新增可信 host-side `GraphPlanningService`，从 Run 冻结的 EffectiveConfig/Registry 和首次图追加冻结的完整 `PolicyManifest` 编译完整节点契约并与图事件一同持久化。重放校验 Run/config/Registry/policy/node/role/hash 绑定；动态规划不能改变 Run policy，任务原文不进入事件。该入口尚未接入非可信 Planner Worker 或用户 application service。
 
-2026-09-26 P3 Provider 调用日志切片：新增 `SQLiteProviderCallJournal`，Provider Gateway 在发送请求前持久化 attempt-scoped、带 fencing/route/budget/registry 绑定的请求体哈希意图；收到响应或传输错误后写入脱敏 usage/status/outcome。SQLite 事件契约校验先 intent 后单一 terminal receipt；多连接 CAS 只允许一个进程占有调用身份。重启可枚举 `dispatching`/`unknown` 项，同一身份重放 fail-closed；无 journal 时不取凭据、不发请求。凭据/提示/请求体/模型输出均不入日志。此为对账基础而不是 Provider reconciliation：尚无 Provider 查询/权威回执验证、预算自动 settlement、Scheduler/Worker 接线或自动恢复；unknown 仍保持未决。
+2026-09-26 P3 Provider 调用日志切片：新增 `SQLiteProviderCallJournal`，Provider Gateway 在发送请求前持久化 attempt-scoped、带 fencing/route/budget/registry 绑定的请求体哈希意图；收到响应或传输错误后写入脱敏 usage/status/outcome。SQLite 事件契约校验先 intent 后单一 terminal receipt；多连接 CAS 只允许一个进程占有调用身份。重启可枚举 `dispatching`/`unknown` 项，同一身份重放 fail-closed；无 journal 时不取凭据、不发请求。凭据/提示/请求体/模型输出均不入日志。该基础现由下方 P3 reconciliation contract 切片扩展；生产 Provider 查询/权威回执验证仍未配置，unknown 默认保持未决。
+
+Correction as of 2026-09-28 — P3 systemd termination receipt slice: the
+read-only launcher now binds each generated transient service to its validated
+`app.slice` cgroup and creates a host-only receipt only after systemd reports
+the exact unit inactive/failed and the exact cgroup is empty
+(`cgroup.events populated 0`, or systemd has removed the stopped cgroup).
+Child PID exit and accepted cancellation alone do not qualify. Unverified
+stops retain private staging and are rejected by Worker/Verifier transport
+admission. Live integration tests passed on Ubuntu 24.04 / WSL2, kernel
+`6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17`. This
+supersedes only the earlier “real Worker/OS termination receipt missing”
+status: the complete cross-process interruption matrix, Provider-authoritative
+reconciliation, Scheduler/Worker automatic recovery, and V1 delivery gates
+remain open and unchecked.
+
+2026-09-29 P3 Provider reconciliation contract slice: OpenAI Responses intents
+carry opaque task-scoped correlation IDs. `ProviderEvidenceResult` binds
+bounded raw evidence/digest, exact committed usage, and every call/Attempt
+identity; a separate fail-closed `AttemptTerminationVerifier` supplies the
+host-stop hash. The service requires the exact Scheduler `OutcomeUnknown`
+Attempt/fence, persists the combined proof first, then uses
+`Scheduler.reconcile_attempt()` to settle exact usage or a zero-cost no-effect
+reconciliation and releases the slot only after settlement. Both outcomes mark
+the Attempt failed because its lost output is unavailable. The explicit
+`apply_pending_settlements()` API replays only persisted proofs and is
+idempotent after process death at proof append, Scheduler commit, or marker
+commit; a two-connection late-success race has one journal winner. These tests
+use injected fake verifiers: default verifiers remain unavailable, no
+production Provider lookup/signed-receipt source is wired, the systemd stop
+receipt is not yet bound to the verifier, and application-startup/Worker
+recovery, CLI/MCP, end-to-end security, and measured cost/token/rework evidence
+remain open. P3 and V1 are not delivered.
+
+2026-09-30 P3 application startup slice: `ControlPlaneApplication` owns the
+shared control-plane connection and validates frozen configs, all initialized
+Runs, orphan budget/Agent inventories, Provider route/Attempt/Registry bindings,
+and existing settlement markers before enabling admission. Pending proofs are
+applied inside the same bootstrap transaction, followed by postflight recovery;
+failure or process death rolls back the entire bootstrap batch. Config-only
+Runs remain frozen and are reported as initializing. The host Python API gates
+admission, Run recovery, and explicit reconciliation, but does not dispatch
+Workers, tools, or Providers at startup. A Worker systemd stop receipt cannot
+attest a Gateway HTTP sender; sender-bound supervision and a live Provider
+evidence source remain production gates.
+
+2026-10-01 P3 Provider sender supervision slice: the default
+`ProviderModelGateway` transport now dispatches one bounded HTTPS request using
+a fixed helper in a dedicated transient systemd service. The credential and
+request cross bounded stdin IPC; the host binds a stop receipt to the persisted
+Provider call and full Attempt only after verifying the exact unit/cgroup
+stopped. Cancellation/timeout waits for that proof, and an unverifiable stop
+leaves the call unresolved without an urllib/thread fallback. A live loopback
+TLS-sink test exercises the actual Gateway-to-systemd path and cancellation;
+it makes no paid Provider request. The local
+`ProviderSenderTerminationVerifier` is opt-in, and authoritative Provider
+receipt/usage lookup remains unavailable. The dedicated sender profile allows
+host networking for HTTPS and has no systemd egress-host allowlist. This does
+not prove Provider receipt/charges, stop a whole Worker, complete the
+cross-stream interruption matrix, or validate the résumé cost/token/rework
+targets. README and [Provider journal security notes](../../security/provider-call-journal.md)
+record the boundary and remaining gates.
 
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 
@@ -115,18 +176,39 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 - [x] 实现 Run 取消门控：先拒绝新调度；只有活动 Attempt 收到停止回执且预算已结算/证明无副作用后才可释放；OutcomeUnknown 仍要求核对。
 - [x] lifecycle 初始化/图/Run/Attempt 边界自动检查点；重启优先校验快照 hash/schema/version/source-event anchor，再重放尾部；失效快照回退完整事件流。
 - [x] 增加只读 Run Recovery Coordinator，重放并交叉核对生命周期、Agent Registry、预算预留、scheduler lease/结果；新路由接纳前先运行一致性检查，发现分裂状态即 fail-closed。真实子进程中分别在接纳事务提交前、提交后丢响应并重开数据库，验证完整回滚、确定性重建和幂等重放。恢复器只返回活动/未知 lease，不猜测结果、不释放资源、不重派工作。
-- [x] 为 Provider Gateway 增加持久化调用意图/脱敏终态账本、并发单赢家、重启列出未决调用和同身份重放阻断；结果收据持久化失败时保留 unknown。Provider 侧查询/回执验证、Scheduler reconciliation 与真实 Worker 崩溃矩阵仍待完成。
+- [x] 为 Provider Gateway 增加持久化调用意图/脱敏终态账本、attempt-scoped OpenAI Responses correlation、并发单赢家、重启列出未决调用和同身份重放阻断；结果收据持久化失败时保留 unknown。迟到 Gateway 结果与 reconciliation proof 的同流竞争由 SQLite CAS 单赢家解决。
+- [x] 定义 fail-closed 的 Provider 权威证据与独立 Attempt 终止证明契约；proof-first 写入、通过现有 Scheduler API 结算 exact usage/zero-cost no-effect、应用结算标记，并通过多连接竞争及进程死亡矩阵验证显式 pending-proof 重放。当前仅有 fake verifier 测试实现，不代表生产对账源已启用。
 - [x] 将 effect intent/receipt 与 ArtifactPublished stream 纳入统一 Run Recovery Coordinator；恢复时将缺回执的外部 effect 保持为 outcome_unknown、拒绝终态 Attempt 上的未决 effect，并验证有发布事件的 ArtifactStore 对象 digest/size 与可用 attempt provenance。只读恢复结果不重放副作用或暴露 artifact bytes。
 - [x] 增加全局只读 orphan blob inventory：按内容寻址文件名、常规文件类型和 SHA-256 校验；对每个候选使用正常 publication digest lock 并重读事件元数据，避免把正常并发发布误报为 orphan。此操作不自动删除，也不宣称 Run 级归属。
 - [x] 在 Artifact bytes 落盘前写入 `ArtifactPublicationIntent`，随后原子发布内容寻址对象和 `ArtifactPublished` 元数据；恢复时按 Run 查询带有对应 source provenance 的未完成意图并验证已存在对象的 digest/size/provenance。子进程死亡测试覆盖 intent 后、blob 后两个窗口。Worker publisher 必须提供 Run/node/Attempt-generation source。候选只列入 pending inventory，不被自动采纳或删除。
-- [ ] 扩展多进程中断矩阵覆盖每个跨流事务/副作用窗口；接入能验证进程终止回执的真实 Worker/OS 终止器，并实现基于 Provider 权威查询/回执证据的 reconciliation。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
+- [ ] 扩展多进程中断矩阵覆盖全部跨流事务/副作用窗口；将 systemd 停止证明接入并实测整个 Worker 生命周期协调，并配置 Provider 权威查询/签名回执验证源及其线上测试。Gateway 的 Provider request sender 已有独立 systemd 停止证明，但不能替代 Worker 停止/完整恢复。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
 - [x] 实现脱敏、确定性的 Gateway 失败分类/指纹并交由 Recovery Controller 生成有界计划；Scheduler 持久化分类/计划，并在接纳恢复 Attempt 时重验 authorization、失败类别、retry level 和 exhausted model，再原子消费单次授权。未知结果保持 reconciliation 阻断。
-- [ ] 将持久化恢复计划接入 Worker/application service 自动驱动；完成 Provider reconciliation 与重启后待处理计划恢复，不得自动重放 outcome_unknown。
+- [x] 将已持久化 Provider pending-proof 结算接入 host application 启动；完整 Run/调用前后校验、原子批次回滚、初始化中断报告、双连接启动及进程死亡验收通过。
+- [ ] 将持久化恢复计划接入 functional Worker 与 application service 的运行时协调/自动派发；不得自动重放 `outcome_unknown` Provider 调用。CLI/MCP 尚未接入 host 入口。
 - [x] 实现 `OutcomeUnknown`/`AwaitingReconciliation`，显式对账前不释放预算与并发资源。
 
 验收：状态机/property tests、并发 CAS tests、多连接测试和进程中断矩阵通过；永不突破预算、并发、深度和 Agent 数上限；相同事件流确定性重建 Run/图/账本；迟到/重复结果不能覆盖被接受结果或触发重复副作用。
 
 ## P4：OS 隔离、Tool Gateway、密钥与审批
+
+2026-10-02 Secret Broker process-boundary slice: Linux supervisor now starts
+a default-unavailable Broker daemon with bounded bootstrap/Unix packet IPC,
+peer UID/nonce checks, audit-before-read, durable one-shot request decisions,
+readiness/inode checks and confirmed child termination before cleanup. A
+test-only child generates a random sentinel in its own memory; real socket,
+ProviderModelGateway, systemd sender and loopback TLS sink exercise the full
+credential path. The sink checks intent durability via a fresh SQLite
+connection before replying. Tests scan process argv/environment and specified
+durable stores/logs/artifacts, cover Broker death/restart/replay and invalid
+binding, and reuse sender cancellation/unconfirmed-stop coverage. A live
+overlay candidate hides a test-created Unix socket under `/run/user` and
+rejects connection; this tests the mount-profile path boundary, not a socket
+created by `SecretBrokerProcessManager`. The optional test CA is host-only;
+default TLS roots remain unchanged. This does not protect against
+same-UID host compromise or claim process memory inspection. Production secret
+backends, identity/revocation, functional Worker/Verifier, application-service
+recovery, CLI/MCP and paid benchmarks remain open, so neither overall P4 nor
+V1 is checked complete. See `docs/security/secrets.md` for measured boundaries.
 
 2026-09-28 internal workspace-write vertical slice: added a separate
 `WorkspaceWriteGateway`/`workspace.write-candidate` capability. It holds the

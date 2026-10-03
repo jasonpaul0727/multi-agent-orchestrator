@@ -8,6 +8,8 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
+from orchestrator.isolation import ProviderSenderResult
+from orchestrator.isolation.launcher import SandboxTerminationReceipt
 from orchestrator.config.models import ModelRegistryManifest, ModelSpec, ProviderSpec
 from orchestrator.models import (
     AcceptedModelRoute,
@@ -32,6 +34,12 @@ from orchestrator.models.transport import (
     HTTPTransportTimedOut,
     UrllibHTTPSTransport,
 )
+import orchestrator.models.transport as transport_module
+from orchestrator.runtime.provider_sender_process import (
+    ProviderSenderResponse,
+    decode_provider_sender_request,
+)
+import orchestrator.runtime.provider_sender_process as provider_sender_process
 from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
 from orchestrator.secrets import AuditedSecretBroker, EnvironmentSecretStore, SecretAccessRule
 
@@ -373,6 +381,427 @@ class _FakeTransport:
     async def post_json(self, **values):
         self.calls.append(values)
         return self.response
+
+
+_SENDER_UNIT = "maestro-provider-" + "a" * 32 + ".service"
+_SENDER_RECEIPT = SandboxTerminationReceipt(
+    unit_name=_SENDER_UNIT,
+    control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/" + _SENDER_UNIT,
+    active_state="inactive",
+    cgroup_empty=True,
+)
+
+
+class _ControlledSenderSession:
+    def __init__(self, result_factory):
+        self.result_factory = result_factory
+        self.wait_started = threading.Event()
+        self.release_wait = threading.Event()
+        self.cancel_count = 0
+        self.wait_started_before_cancel = None
+
+    def wait(self):
+        self.wait_started_before_cancel = self.cancel_count == 0
+        self.wait_started.set()
+        if not self.release_wait.wait(5):
+            raise TimeoutError("controlled sender wait was not released")
+        return self.result_factory()
+
+    def cancel(self):
+        self.cancel_count += 1
+        return True
+
+
+class _ControlledSenderLauncher:
+    def __init__(self, session, *, start_gate=None):
+        self.session = session
+        self.start_gate = start_gate
+        self.launch_started = threading.Event()
+        self.calls = []
+
+    def launch(self, frame, *, timeout_seconds, output_bytes):
+        self.calls.append((frame, timeout_seconds, output_bytes))
+        self.launch_started.set()
+        if self.start_gate is not None and not self.start_gate.wait(5):
+            raise TimeoutError("controlled sender startup was not released")
+        return self.session
+
+
+class _FailingSenderLauncher:
+    def launch(self, _frame, *, timeout_seconds, output_bytes):
+        raise OSError("systemd launch unavailable")
+
+
+class _WaitingFailingSenderLauncher:
+    def __init__(self):
+        self.launch_started = threading.Event()
+        self.release_launch = threading.Event()
+
+    def launch(self, _frame, *, timeout_seconds, output_bytes):
+        self.launch_started.set()
+        if not self.release_launch.wait(5):
+            raise TimeoutError("controlled sender startup was not released")
+        raise OSError("systemd startup failed before a sender handle existed")
+
+
+def _sender_result(
+    response=None,
+    *,
+    input_written=True,
+    returncode=0,
+    termination_receipt=_SENDER_RECEIPT,
+    timed_out=False,
+    output_limited=False,
+):
+    return ProviderSenderResult(
+        unit_name=_SENDER_UNIT,
+        response=response,
+        termination_receipt=termination_receipt,
+        returncode=returncode,
+        elapsed_seconds=0.05,
+        cancelled=returncode != 0,
+        timed_out=timed_out,
+        output_limited=output_limited,
+        input_written=input_written,
+    )
+
+
+def _systemd_gateway(
+    tmp_path,
+    session,
+    *,
+    request=None,
+    registry=None,
+    start_gate=None,
+    journal_name="provider-call-journal.db",
+    sender_launcher=None,
+):
+    if not hasattr(transport_module, "SystemdProviderHTTPSTransport"):
+        pytest.fail("SystemdProviderHTTPSTransport is not implemented")
+    registry = model_registry() if registry is None else registry
+    request = model_request(registry) if request is None else request
+    launcher = (
+        sender_launcher
+        if sender_launcher is not None
+        else _ControlledSenderLauncher(session, start_gate=start_gate)
+    )
+    transport = transport_module.SystemdProviderHTTPSTransport(launcher=launcher)
+    journal = _provider_call_journal(tmp_path, name=journal_name)
+    gateway = ProviderModelGateway(
+        registry=registry,
+        accepted_route_verifier=_Verifier(),
+        secret_broker=_Broker(),
+        transport=transport,
+        provider_call_journal=journal,
+    )
+    return gateway, request, journal, launcher
+
+
+def test_systemd_transport_encoding_and_launcher_errors_fail_closed(tmp_path, monkeypatch):
+    session = _ControlledSenderSession(lambda: _sender_result())
+    gateway, request, journal, _launcher = _systemd_gateway(tmp_path, session)
+
+    def invalid_frame(**_values):
+        raise ValueError("invalid bounded frame")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(provider_sender_process, "encode_provider_sender_request", invalid_frame)
+        failure = _gateway_error(gateway, request)
+    call = journal.read(request)
+    assert failure.outcome == "not_sent"
+    assert call is not None and call.status == "not_sent"
+
+    registry = model_registry()
+    request = model_request(registry)
+    session = _ControlledSenderSession(lambda: _sender_result())
+    session.release_wait.set()
+    gateway, request, journal, _launcher = _systemd_gateway(
+        tmp_path,
+        session,
+        request=request,
+        registry=registry,
+        journal_name="launcher-failure.db",
+    )
+    gateway.transport = transport_module.SystemdProviderHTTPSTransport(
+        launcher=_FailingSenderLauncher()
+    )
+    failure = _gateway_error(gateway, request)
+    call = journal.read(request)
+    assert failure.outcome == "not_sent"
+    assert call is not None and call.status == "not_sent"
+
+
+def test_cancellation_waits_for_failed_sender_startup_and_reports_not_sent(tmp_path):
+    registry = model_registry()
+    request = model_request(registry)
+    launcher = _WaitingFailingSenderLauncher()
+    gateway, request, journal, _launcher = _systemd_gateway(
+        tmp_path,
+        _ControlledSenderSession(lambda: _sender_result()),
+        request=request,
+        registry=registry,
+        sender_launcher=launcher,
+    )
+
+    async def cancel_while_systemd_is_starting():
+        invocation = asyncio.create_task(gateway.invoke(request))
+        assert await asyncio.to_thread(launcher.launch_started.wait, 2)
+        invocation.cancel()
+        await asyncio.sleep(0.05)
+        assert not invocation.done()
+        launcher.release_launch.set()
+        with pytest.raises(ModelGatewayError) as failure:
+            await invocation
+        assert failure.value.failure.outcome == "not_sent"
+
+    asyncio.run(cancel_while_systemd_is_starting())
+
+    call = journal.read(request)
+    assert call is not None and call.status == "not_sent"
+
+
+def test_systemd_transport_rejects_untyped_sender_result_as_unknown(tmp_path):
+    session = _ControlledSenderSession(lambda: object())
+    session.release_wait.set()
+    gateway, request, journal, _launcher = _systemd_gateway(tmp_path, session)
+
+    failure = _gateway_error(gateway, request)
+
+    call = journal.read(request)
+    assert failure.outcome == "unknown"
+    assert call is not None and call.status == "unknown"
+    assert call.termination_receipt is None
+
+
+def test_systemd_transport_refuses_success_without_host_stop_receipt(tmp_path):
+    session = _ControlledSenderSession(
+        lambda: _sender_result(_valid_sender_response(), termination_receipt=None)
+    )
+    session.release_wait.set()
+    gateway, request, journal, _launcher = _systemd_gateway(tmp_path, session)
+
+    failure = _gateway_error(gateway, request)
+
+    call = journal.read(request)
+    assert failure.outcome == "unknown"
+    assert call is not None and call.status == "unknown"
+    assert call.termination_receipt is None
+
+
+def test_systemd_transport_maps_supervisor_timeout_after_verified_stop(tmp_path):
+    session = _ControlledSenderSession(
+        lambda: _sender_result(None, returncode=1, timed_out=True)
+    )
+    session.release_wait.set()
+    gateway, request, journal, _launcher = _systemd_gateway(tmp_path, session)
+
+    failure = _gateway_error(gateway, request)
+
+    call = journal.read(request)
+    assert failure.code == "timeout"
+    assert call is not None and call.status == "unknown"
+    assert call.termination_receipt is not None
+
+
+def _valid_sender_response():
+    return ProviderSenderResponse(
+        status=200,
+        headers=(("x-request-id", "sender-response-1"),),
+        body=json.dumps(
+            {
+                "id": "resp_1",
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+            }
+        ).encode(),
+    )
+
+
+def test_systemd_gateway_persists_success_and_call_bound_sender_receipt(tmp_path):
+    session = _ControlledSenderSession(lambda: _sender_result(_valid_sender_response()))
+    session.release_wait.set()
+    gateway, request, journal, launcher = _systemd_gateway(tmp_path, session)
+
+    result = asyncio.run(gateway.invoke(request))
+
+    call = journal.read(request)
+    assert result.output_text == "ok"
+    assert call is not None and call.status == "known_success"
+    assert call.termination_receipt is not None
+    assert call.termination_receipt.attempt_id == request.attempt_id
+    assert call.termination_receipt.provider_call_stream_id == call.stream_id
+    assert call.termination_receipt.cgroup_empty is True
+    assert launcher.calls and b"Bearer secret-value" in launcher.calls[0][0]
+    sender_request = decode_provider_sender_request(launcher.calls[0][0])
+    header_names = [name for name, _value in sender_request.headers]
+    assert header_names.count("accept") == 1
+    assert header_names.count("content-type") == 1
+
+
+def test_cancelled_gateway_waits_for_sender_stop_before_recording_unknown(tmp_path):
+    session = _ControlledSenderSession(lambda: _sender_result(None, returncode=1))
+    gateway, request, journal, _launcher = _systemd_gateway(tmp_path, session)
+
+    async def cancel_gateway_after_sender_starts():
+        invocation = asyncio.create_task(gateway.invoke(request))
+        assert await asyncio.to_thread(session.wait_started.wait, 2)
+        invocation.cancel()
+        await asyncio.sleep(0.05)
+        assert not invocation.done()
+        assert session.cancel_count >= 1
+        invocation.cancel()
+        await asyncio.sleep(0.05)
+        assert not invocation.done()
+        session.release_wait.set()
+        with pytest.raises(ModelGatewayError, match="cancelled"):
+            await invocation
+
+    asyncio.run(cancel_gateway_after_sender_starts())
+
+    call = journal.read(request)
+    assert call is not None and call.status == "unknown"
+    assert call.termination_receipt is not None
+    assert call.termination_receipt.attempt_id == request.attempt_id
+    assert call.termination_receipt.cgroup_empty is True
+
+
+def test_sender_startup_cancellation_waits_for_handle_and_does_not_claim_send(tmp_path):
+    session = _ControlledSenderSession(
+        lambda: _sender_result(None, input_written=False, returncode=1)
+    )
+    start_gate = threading.Event()
+    gateway, request, journal, launcher = _systemd_gateway(
+        tmp_path, session, start_gate=start_gate
+    )
+
+    async def cancel_during_sender_startup():
+        invocation = asyncio.create_task(gateway.invoke(request))
+        assert await asyncio.to_thread(launcher.launch_started.wait, 2)
+        invocation.cancel()
+        invocation.cancel()
+        await asyncio.sleep(0.05)
+        assert not invocation.done()
+        start_gate.set()
+        assert await asyncio.to_thread(session.wait_started.wait, 2)
+        assert session.cancel_count >= 1
+        session.release_wait.set()
+        with pytest.raises(ModelGatewayError, match="cancelled") as failure:
+            await invocation
+        assert failure.value.failure.outcome == "not_sent"
+
+    asyncio.run(cancel_during_sender_startup())
+
+    call = journal.read(request)
+    assert call is not None and call.status == "not_sent"
+    assert call.termination_receipt is not None
+
+
+def test_cancellation_signal_during_sender_startup_prevents_input_write(tmp_path):
+    session = _ControlledSenderSession(
+        lambda: _sender_result(None, input_written=False, returncode=1)
+    )
+    start_gate = threading.Event()
+    gateway, request, journal, launcher = _systemd_gateway(
+        tmp_path, session, start_gate=start_gate
+    )
+    cancellation = _Cancellation()
+
+    async def signal_cancellation_while_sender_starts():
+        invocation = asyncio.create_task(gateway.invoke(request, cancellation=cancellation))
+        assert await asyncio.to_thread(launcher.launch_started.wait, 2)
+        cancellation.cancelled = True
+        start_gate.set()
+        assert await asyncio.to_thread(session.wait_started.wait, 2)
+        wait_started_before_cancel = session.wait_started_before_cancel
+        session.release_wait.set()
+        with pytest.raises(ModelGatewayError) as failure:
+            await invocation
+        assert failure.value.failure.outcome == "not_sent"
+        assert wait_started_before_cancel is False
+
+    asyncio.run(signal_cancellation_while_sender_starts())
+
+    call = journal.read(request)
+    assert call is not None and call.status == "not_sent"
+
+
+def test_systemd_gateway_timeout_waits_for_stop_and_keeps_unknown_holds(tmp_path):
+    registry = model_registry()
+    request = model_request(registry).model_copy(update={"timeout_ms": 40})
+    session = _ControlledSenderSession(lambda: _sender_result(None, returncode=1))
+    gateway, request, journal, _launcher = _systemd_gateway(
+        tmp_path, session, registry=registry, request=request
+    )
+
+    async def finish_sender_after_timeout_requests_stop():
+        invocation = asyncio.create_task(gateway.invoke(request))
+        assert await asyncio.to_thread(session.wait_started.wait, 2)
+        await asyncio.sleep(0.08)
+        assert not invocation.done()
+        assert session.cancel_count >= 1
+        session.release_wait.set()
+        with pytest.raises(ModelGatewayError, match="timeout"):
+            await invocation
+
+    asyncio.run(finish_sender_after_timeout_requests_stop())
+
+    call = journal.read(request)
+    assert call is not None and call.status == "unknown"
+    assert call.termination_receipt is not None
+
+
+def test_unverifiable_sender_stop_records_unknown_without_receipt_or_replay(tmp_path):
+    session = _ControlledSenderSession(lambda: (_ for _ in ()).throw(OSError("no receipt")))
+    session.release_wait.set()
+    gateway, request, journal, _launcher = _systemd_gateway(tmp_path, session)
+
+    failure = _gateway_error(gateway, request)
+
+    call = journal.read(request)
+    assert failure.outcome == "unknown"
+    assert call is not None and call.status == "unknown"
+    assert call.termination_receipt is None
+    assert journal.unresolved() == (call,)
+
+
+def test_outcome_journal_failure_does_not_fabricate_persisted_sender_receipt(tmp_path):
+    session = _ControlledSenderSession(lambda: _sender_result(_valid_sender_response()))
+    session.release_wait.set()
+    gateway, request, journal, _launcher = _systemd_gateway(tmp_path, session)
+    journal.record_outcome = lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk unavailable"))
+
+    failure = _gateway_error(gateway, request)
+
+    call = journal.read(request)
+    assert failure.code == "outcome_unknown"
+    assert call is not None and call.status == "dispatching"
+    assert call.termination_receipt is None
+    assert journal.unresolved() == (call,)
+
+
+def test_legacy_injected_response_remains_valid_without_sender_receipt(tmp_path):
+    registry = model_registry()
+    request = model_request(registry)
+    journal = _provider_call_journal(tmp_path)
+    gateway = ProviderModelGateway(
+        registry=registry,
+        accepted_route_verifier=_Verifier(),
+        secret_broker=_Broker(),
+        transport=_FakeTransport(HTTPTransportResponse(
+            status=200,
+            headers=(),
+            body=_valid_sender_response().body,
+        )),
+        provider_call_journal=journal,
+    )
+
+    result = asyncio.run(gateway.invoke(request))
+
+    call = journal.read(request)
+    assert result.output_text == "ok"
+    assert call is not None and call.status == "known_success"
+    assert call.termination_receipt is None
 
 
 def test_gateway_never_reads_secrets_and_uses_only_verified_route_and_broker(tmp_path):
@@ -862,3 +1291,45 @@ def _adapter_response(value):
     from orchestrator.models import AdapterResponse
 
     return AdapterResponse(http_status=200, body_json=json.dumps(value))
+
+
+def test_openai_compatible_gateway_never_sends_provider_correlation_header(tmp_path):
+    registry = model_registry("openai_compatible")
+    request = model_request(registry)
+
+    class _CompatibilityBroker:
+        async def acquire_provider_credential(
+            self, *, secret_ref, provider, endpoint, purpose, context
+        ):
+            return ProviderCredential(
+                header_name="Authorization",
+                value="compat-secret",
+                provider_id=provider.id,
+                endpoint=endpoint,
+                purpose=purpose,
+            )
+
+    response = HTTPTransportResponse(
+        status=200,
+        headers=(),
+        body=json.dumps(
+            {
+                "id": "chatcmpl_1",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+            }
+        ).encode(),
+    )
+    transport = _FakeTransport(response)
+    gateway = ProviderModelGateway(
+        registry=registry,
+        accepted_route_verifier=_Verifier(),
+        secret_broker=_CompatibilityBroker(),
+        transport=transport,
+        provider_call_journal=_provider_call_journal(tmp_path),
+    )
+
+    asyncio.run(gateway.invoke(request))
+
+    header_names = {name for name, _value in transport.calls[0]["headers"]}
+    assert "X-Client-Request-Id" not in header_names

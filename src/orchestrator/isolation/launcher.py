@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import platform
+import re
 import selectors
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
-from typing import Sequence
+from typing import Literal, Sequence
 import uuid
 
 from .workspace import WorkspaceBoundaryError, snapshot_workspace
@@ -20,6 +21,11 @@ from .workspace import WorkspaceBoundaryError, snapshot_workspace
 
 _MAX_INPUT_BYTES = 1_048_576
 _RUNTIME_PATH_TOKEN = "@maestro-runtime@/"
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_SYSTEMD_UNIT = re.compile(
+    r"^maestro-(?:attempt-[0-9a-f]{32}|candidate-[0-9a-f]{32})\.(?:service|scope)$"
+    r"|^maestro-provider-[0-9a-f]{32}\.service$"
+)
 
 
 class IsolationUnavailable(RuntimeError):
@@ -59,6 +65,35 @@ class SandboxLimits:
 
 
 @dataclass(frozen=True)
+class SandboxTerminationReceipt:
+    """Host-observed proof that one exact systemd attempt scope is stopped."""
+
+    unit_name: str
+    control_group: str
+    active_state: Literal["inactive", "failed"]
+    cgroup_empty: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.unit_name, str) or not _SYSTEMD_UNIT.fullmatch(self.unit_name):
+            raise ValueError("termination receipt unit name is invalid")
+        if not isinstance(self.active_state, str) or self.active_state not in {"inactive", "failed"}:
+            raise ValueError("termination receipt requires an inactive systemd unit")
+        if self.cgroup_empty is not True:
+            raise ValueError("termination receipt requires an empty cgroup")
+        if not isinstance(self.control_group, str):
+            raise ValueError("termination receipt cgroup path is invalid")
+        path = Path(self.control_group)
+        if (
+            not path.is_absolute()
+            or path.as_posix() != self.control_group
+            or path.name != self.unit_name
+            or path.parent.name != "app.slice"
+            or ".." in path.parts
+        ):
+            raise ValueError("termination receipt cgroup path is invalid")
+
+
+@dataclass(frozen=True)
 class SandboxResult:
     """Bounded output and terminal status from an isolated command."""
 
@@ -67,11 +102,43 @@ class SandboxResult:
     stdout: bytes
     stderr: bytes
     elapsed_seconds: float
-    termination_confirmed: bool
+    termination_receipt: SandboxTerminationReceipt | None
     cancelled: bool
     timed_out: bool
     output_limited: bool
     input_written: bool = True
+
+    def __post_init__(self) -> None:
+        if self.termination_receipt is not None:
+            if not isinstance(self.termination_receipt, SandboxTerminationReceipt):
+                raise ValueError("sandbox termination receipt must be host verified")
+            if self.termination_receipt.unit_name != self.unit_name:
+                raise ValueError("termination receipt does not match the sandbox unit")
+
+    @property
+    def termination_confirmed(self) -> bool:
+        """Compatibility view derived solely from verified host receipt data."""
+
+        return self.termination_receipt is not None
+
+
+class _RetainedStaging:
+    """Private staging that only the owning session may explicitly release."""
+
+    def __init__(self, temporary: tempfile.TemporaryDirectory[str]) -> None:
+        self._temporary = temporary
+        self.path = Path(temporary.name)
+        self._released = False
+        temporary._finalizer.detach()
+
+    def cleanup(self) -> None:
+        return None
+
+    def discard(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._temporary.cleanup()
 
 
 class SystemdReadOnlyLauncher:
@@ -123,6 +190,7 @@ class SystemdReadOnlyLauncher:
             raise IsolationUnavailable("systemd user manager probe failed") from exc
         if probe.returncode != 0:
             raise IsolationUnavailable("a usable systemd user manager is required")
+        cgroup_parent = _systemd_cgroup_parent(self._systemctl, client_env)
 
         staging = _create_staging(root)
         mount_root = Path(staging.name)
@@ -153,6 +221,7 @@ class SystemdReadOnlyLauncher:
             raise InvalidSandboxRequest("workspace paths with spaces or systemd separators are unsupported")
 
         unit_name = f"maestro-attempt-{uuid.uuid4().hex}.service"
+        scope_cgroup = cgroup_parent / unit_name
         properties = _service_properties(
             root=workspace_snapshot,
             runtime_source=runtime_source,
@@ -193,6 +262,7 @@ class SystemdReadOnlyLauncher:
         systemd_command = [
             self._systemd_run,
             "--user",
+            "--slice=app.slice",
             "--quiet",
             "--wait",
             "--pipe",
@@ -202,6 +272,7 @@ class SystemdReadOnlyLauncher:
             "--",
             *exec_command,
         ]
+        retained_staging = _RetainedStaging(staging)
         try:
             process = subprocess.Popen(
                 systemd_command,
@@ -213,7 +284,7 @@ class SystemdReadOnlyLauncher:
                 close_fds=True,
             )
         except OSError as exc:
-            staging.cleanup()
+            retained_staging.discard()
             raise IsolationUnavailable("systemd transient unit could not be started") from exc
         return SandboxSession(
             process=process,
@@ -222,8 +293,10 @@ class SystemdReadOnlyLauncher:
             client_env=client_env,
             output_limit=limits.output_bytes,
             timeout_seconds=limits.timeout_seconds,
-            staging=staging,
+            staging=retained_staging,
             input_bytes=input_bytes,
+            scope_cgroup=scope_cgroup,
+            cleanup_on_termination=True,
         )
 
 
@@ -243,6 +316,8 @@ class SandboxSession:
         input_bytes: bytes | None = None,
         cancel_after_transport_exit: bool = False,
         stop_grace_seconds: float | None = None,
+        scope_cgroup: Path | None = None,
+        cleanup_on_termination: bool = True,
     ) -> None:
         self.unit_name = unit_name
         self._process = process
@@ -250,7 +325,11 @@ class SandboxSession:
         self._client_env = client_env
         self._output_limit = output_limit
         self._timeout_seconds = timeout_seconds
+        if scope_cgroup is not None and isinstance(staging, tempfile.TemporaryDirectory):
+            staging = _RetainedStaging(staging)
         self._staging = staging
+        self._scope_cgroup = scope_cgroup
+        self._cleanup_on_termination = cleanup_on_termination
         self._input_bytes = input_bytes
         self._cancel_after_transport_exit = cancel_after_transport_exit
         self._stop_grace_seconds = stop_grace_seconds
@@ -295,7 +374,16 @@ class SandboxSession:
             if self._result is not None:
                 return self._result
             try:
-                self._result = self._collect()
+                result = self._collect()
+                if self._scope_cgroup is not None:
+                    receipt = _read_termination_receipt(
+                        unit_name=self.unit_name,
+                        expected_cgroup=self._scope_cgroup,
+                        client_env=self._client_env,
+                        systemctl=self._systemctl,
+                    )
+                    result = replace(result, termination_receipt=receipt)
+                self._result = result
                 return self._result
             except BaseException:
                 self.cancel()
@@ -306,7 +394,11 @@ class SandboxSession:
                 raise
             finally:
                 if self._process.poll() is not None:
-                    self._staging.cleanup()
+                    if self._scope_cgroup is None:
+                        self._staging.cleanup()
+                    elif self._cleanup_on_termination and self._result is not None:
+                        if self._result.termination_confirmed:
+                            _discard_staging(self._staging)
 
     def _collect(self) -> SandboxResult:
         assert self._process.stdout is not None and self._process.stderr is not None
@@ -406,7 +498,7 @@ class SandboxSession:
             stdout=bytes(streams[self._process.stdout]),
             stderr=bytes(streams[self._process.stderr]),
             elapsed_seconds=elapsed,
-            termination_confirmed=self._process.returncode is not None,
+            termination_receipt=None,
             cancelled=cancel_signal_accepted and not timed_out and not output_limited,
             timed_out=timed_out,
             output_limited=output_limited,
@@ -464,6 +556,194 @@ def _validated_workspace(workspace: str | Path) -> Path:
     if not _systemd_path_supported(resolved):
         raise InvalidSandboxRequest("workspace path uses unsupported systemd property characters")
     return resolved
+
+
+def _discard_staging(staging) -> None:
+    discard = getattr(staging, "discard", None)
+    if callable(discard):
+        discard()
+    else:
+        staging.cleanup()
+
+
+def _systemd_cgroup_parent(systemctl: str, client_env: dict[str, str]) -> Path:
+    """Resolve the trusted user app.slice below the cgroup-v2 mount."""
+
+    try:
+        result = subprocess.run(
+            [systemctl, "--user", "show", "app.slice", "--property=ControlGroup"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env=client_env,
+            check=False,
+            timeout=3,
+        )
+        properties = _parse_systemd_properties(result.stdout, {"ControlGroup"})
+        control_group = None if properties is None else properties["ControlGroup"]
+        if result.returncode != 0 or not control_group or not control_group.startswith("/"):
+            raise ValueError("systemd app.slice has no cgroup path")
+        components = control_group.removeprefix("/").split("/")
+        if any(part in {"", ".", ".."} for part in components) or components[-1] != "app.slice":
+            raise ValueError("systemd app.slice cgroup path is invalid")
+        parent = _CGROUP_ROOT.joinpath(*components)
+        descriptor = _open_cgroup_directory(parent)
+        os.close(descriptor)
+        return parent
+    except (OSError, subprocess.TimeoutExpired, UnicodeError, ValueError) as exc:
+        raise IsolationUnavailable("the app.slice cgroup cannot be verified") from exc
+
+
+def _parse_systemd_properties(
+    payload: bytes, required: set[str]
+) -> dict[str, str] | None:
+    try:
+        lines = payload.decode("ascii", errors="strict").splitlines()
+    except (AttributeError, UnicodeError):
+        return None
+    values: dict[str, str] = {}
+    for line in lines:
+        if not line or "=" not in line:
+            return None
+        name, value = line.split("=", 1)
+        if not name or name in values or name not in required:
+            return None
+        values[name] = value
+    if values.keys() != required:
+        return None
+    return values
+
+
+def _read_termination_receipt(
+    *,
+    unit_name: str,
+    expected_cgroup: Path,
+    client_env: dict[str, str],
+    timeout_seconds: float = 2.0,
+    systemctl: str = "systemctl",
+) -> SandboxTerminationReceipt | None:
+    """Poll systemd and cgroup v2 for a bounded proof of complete stop."""
+
+    if (
+        not isinstance(unit_name, str)
+        or not _SYSTEMD_UNIT.fullmatch(unit_name)
+        or isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not 0 < timeout_seconds <= 10
+    ):
+        return None
+    try:
+        relative = expected_cgroup.relative_to(_CGROUP_ROOT)
+        if (
+            not relative.parts
+            or relative.name != unit_name
+            or relative.parent.name != "app.slice"
+            or ".." in relative.parts
+        ):
+            return None
+        expected_control_group = "/" + relative.as_posix()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            result = subprocess.run(
+                [
+                    systemctl, "--user", "show", unit_name,
+                    "--property=ActiveState", "--property=LoadState", "--property=ControlGroup",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                env=client_env,
+                check=False,
+                timeout=min(3, max(0.001, deadline - time.monotonic())),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        properties = _parse_systemd_properties(
+            result.stdout, {"ActiveState", "LoadState", "ControlGroup"}
+        )
+        if result.returncode != 0 or properties is None:
+            return None
+        active_state = properties["ActiveState"]
+        load_state = properties["LoadState"]
+        control_group = properties["ControlGroup"]
+        if load_state == "loaded":
+            if control_group != expected_control_group:
+                return None
+        elif load_state == "not-found":
+            if control_group:
+                return None
+        else:
+            return None
+        if active_state in {"inactive", "failed"} and _cgroup_is_empty(expected_cgroup):
+            return SandboxTerminationReceipt(
+                unit_name=unit_name,
+                control_group=expected_control_group,
+                active_state=active_state,
+                cgroup_empty=True,
+            )
+        if active_state not in {"active", "activating", "deactivating", "inactive", "failed"}:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _open_cgroup_directory(path: Path) -> int:
+    """Open a cgroup directory component-by-component without following links."""
+
+    try:
+        relative = path.relative_to(_CGROUP_ROOT)
+    except ValueError as exc:
+        raise ValueError("cgroup path escaped the cgroup-v2 mount") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("cgroup path is malformed")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open(_CGROUP_ROOT, flags)
+    try:
+        for component in relative.parts:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _cgroup_is_empty(path: Path) -> bool:
+    """Return true only for a safely opened scope with populated 0, or removal."""
+
+    try:
+        descriptor = _open_cgroup_directory(path)
+    except FileNotFoundError:
+        # systemd may remove the cgroup after it becomes empty.
+        return True
+    except (OSError, ValueError):
+        return False
+    try:
+        events = os.open(
+            "cgroup.events",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            dir_fd=descriptor,
+        )
+        with os.fdopen(events, "rb") as stream:
+            payload = stream.read(4097)
+        if len(payload) > 4096:
+            return False
+        properties: dict[str, str] = {}
+        for line in payload.decode("ascii", errors="strict").splitlines():
+            fields = line.split()
+            if len(fields) != 2 or fields[0] in properties or fields[1] not in {"0", "1"}:
+                return False
+            properties[fields[0]] = fields[1]
+        return properties.get("populated") == "0"
+    except (OSError, UnicodeError):
+        return False
+    finally:
+        os.close(descriptor)
+
 
 
 def _systemd_path_supported(path: Path) -> bool:

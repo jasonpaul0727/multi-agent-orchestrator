@@ -11,10 +11,52 @@ import tempfile
 
 import pytest
 
-from orchestrator.isolation import InvalidSandboxRequest, IsolationUnavailable, SandboxLimits, SandboxResult
+from orchestrator.isolation import InvalidSandboxRequest, IsolationUnavailable, SandboxLimits, SandboxResult, SandboxTerminationReceipt
 from orchestrator.isolation import overlay_launcher as module
+from orchestrator.isolation import _overlay_bootstrap as bootstrap
 from orchestrator.isolation._overlay_bootstrap import _write_completion
 from orchestrator.isolation.workspace import export_overlay_diff
+
+
+def test_overlay_candidate_scope_retains_supported_resource_limits() -> None:
+    properties = module._candidate_scope_properties(SandboxLimits())
+    assert "MemoryMax=536870912" in properties
+    assert not any(value.startswith("InaccessiblePaths=") for value in properties)
+
+
+def test_overlay_candidate_mounts_empty_readonly_private_user_runtime(monkeypatch, tmp_path: Path) -> None:
+    (tmp_path / "lower").mkdir()
+    operations = []
+    monkeypatch.setattr(bootstrap, "_mount", lambda *args: operations.append(args))
+    view = bootstrap._prepare_root(
+        tmp_path, {"candidate_bytes": 4096, "scratch_bytes": 8192, "runtime_source": "/trusted/runtime"},
+    )
+    private_runtime = view / "run/user"
+    mounts = [args for args in operations if args[-1] == str(private_runtime)]
+    assert len(mounts) == 1
+    mount, = mounts
+    assert mount[:3] == ("-t", "tmpfs", "-o")
+    assert {"ro", "mode=000", "nosuid", "nodev", "noexec"} <= set(mount[3].split(","))
+    assert mount[4] == "tmpfs"
+    assert private_runtime.is_dir() and list(private_runtime.iterdir()) == []
+    assert not any(args[0] == "--bind" and args[1] in {"/run", "/run/user"} for args in operations)
+
+
+def test_private_user_runtime_mount_failure_aborts_candidate_setup(monkeypatch, tmp_path: Path) -> None:
+    (tmp_path / "lower").mkdir()
+    operations = []
+
+    def mount(*args):
+        operations.append(args)
+        if args[-1] == str(tmp_path / "rootfs/run/user"):
+            raise bootstrap._MountSetupError("private runtime mount denied")
+
+    monkeypatch.setattr(bootstrap, "_mount", mount)
+    with pytest.raises(bootstrap._MountSetupError, match="private runtime"):
+        bootstrap._prepare_root(
+            tmp_path, {"candidate_bytes": 4096, "scratch_bytes": 8192, "runtime_source": "/trusted/runtime"},
+        )
+    assert operations[-1][-1] == str(tmp_path / "rootfs/run/user")
 
 
 def _candidate(root: Path):
@@ -29,12 +71,19 @@ def _candidate(root: Path):
 
 
 def _execution(**updates):
-    return replace(SandboxResult("candidate.scope", 0, b"untrusted stdout", b"", 0.01,
-                                 True, False, False, False), **updates)
+    unit = "maestro-candidate-" + "d" * 32 + ".scope"
+    receipt = SandboxTerminationReceipt(
+        unit_name=unit,
+        control_group="/user.slice/user-1000.slice/user@1000.service/app.slice/" + unit,
+        active_state="inactive",
+        cgroup_empty=True,
+    )
+    return replace(SandboxResult(unit, 0, b"untrusted stdout", b"", 0.01,
+                                 receipt, False, False, False), **updates)
 
 
 class _Transport:
-    unit_name = "candidate.scope"
+    unit_name = "maestro-candidate-" + "d" * 32 + ".scope"
 
     def __init__(self, result):
         self.result = result

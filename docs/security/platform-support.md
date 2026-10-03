@@ -11,6 +11,19 @@ full security acceptance suite are integrated and pass.
 | Other Linux distributions | Not measured | Unverified; do not infer support from the presence of systemd. | Unsupported | Unsupported/unverified. |
 | Windows and macOS | Not measured | Unsupported by this backend | Unsupported | Unsupported. |
 
+Provider HTTPS dispatch has a separate measured profile on the same Ubuntu
+24.04/WSL2/systemd host. `ProviderModelGateway` defaults to a fixed bounded
+helper in a per-call systemd service; the helper receives the credential and
+request only through stdin, and the host creates a call-bound termination
+receipt only after verifying the exact unit/cgroup stopped. Cancellation waits
+for that proof, while an unverifiable stop remains unresolved. This profile
+intentionally has `PrivateNetwork=no` to permit HTTPS: systemd does not impose
+an egress-host allowlist here, so trusted Registry endpoint configuration is
+part of the boundary. The live test uses only a local TLS sink and proves
+transport/cancellation behavior, not connectivity, authorization, billing, or
+reconciliation against a real Provider. This sender profile does not make the
+platform a supported V1 execution target.
+
 The backend currently accepts absolute workspace paths without spaces, colon,
 backslash, or line breaks because those characters require a separately
 verified systemd property-escaping path. The trusted runtime installation path

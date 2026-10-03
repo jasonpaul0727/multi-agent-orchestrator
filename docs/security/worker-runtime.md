@@ -41,6 +41,26 @@ input writes, malformed output, child errors, unconfirmed termination, and
 any unauthorized candidate. This is a process-boundary smoke test, not a
 functional Agent; the Worker cannot yet publish output.
 
+## Host-verified termination and staging
+
+For the systemd launcher, child/transport exit and an accepted `systemctl kill`
+are not termination proof. `SandboxResult.termination_confirmed` is derived
+only from an immutable host-side `SandboxTerminationReceipt` binding the
+generated unit to its exact systemd `ControlGroup` below `app.slice`, an
+`inactive`/`failed` unit state, and a kernel cgroup-v2 `cgroup.events` witness
+with `populated 0` (or a cgroup already removed after stop). Cgroup paths are
+opened beneath `/sys/fs/cgroup` without following symlinks; malformed,
+mismatched, timed-out, unavailable, or still-populated evidence fails closed.
+
+The session caches its first result. Private staging is explicitly discarded
+only after a valid receipt; if stop cannot be verified, staging is retained
+and Worker/Verifier transport checks reject the proposal. The live
+`tests/integration/test_systemd_launcher.py` suite exercised clean exit,
+output-limit stop, runtime timeout, and cancellation of a descendant tree on
+Ubuntu 24.04 / WSL2 with systemd 255. This establishes only the launcher stop
+boundary: it does not complete the full Worker interruption/recovery matrix,
+Provider reconciliation, or V1 activation.
+
 `IsolatedVerifierProcess` is a separate host-to-child path. The host first
 requires each candidate digest, size, type, media type, Run, Node, Attempt,
 fencing generation, and Agent ID to match a verified ArtifactStore
@@ -85,5 +105,7 @@ security proof for a process boundary. `test_worker_process.py`,
 `tests/integration/test_isolated_worker_process.py` cover the blocked-only
 Worker IPC and host artifact admission boundaries. The Verifier has focused
 unit tests plus `tests/integration/test_isolated_verifier_process.py`, which
-exercises the real systemd child when systemd --user is available. This is
-platform-specific integration evidence, not a general platform certification.
+exercises the real systemd child when systemd --user is available. Termination
+receipt requirements and staging retention also have focused tests in
+`tests/unit/isolation/test_launcher.py`. This is platform-specific integration
+evidence, not a general platform certification.
