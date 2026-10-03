@@ -57,9 +57,12 @@ Python 字符串内存不保证可靠清零；下面的实测也不声称检查/
 这些路径均无 Provider intent/成功记录、无 sink Authorization，也不因重试启动第二调用。
 sender 的 malformed response、取消与未确认停止复用既有 sender/transport 测试。
 
-`tests/integration/test_overlay_candidate_launcher.py` 在真实隔离候选中验证宿主
-Broker runtime/socket 和 `/run/user` 不可访问。固定 read-only tool 与候选写 profile
-拒绝这些宿主路径；这份证据不等于尚未实现的功能性 Worker 验收。
+`tests/integration/test_overlay_candidate_launcher.py` 在真实隔离候选中验证
+`XDG_RUNTIME_DIR`（该测试要求它位于 `/run/user`）中的宿主 Unix socket 路径不可见、
+且无法连接。该用例由测试 fixture 创建 stand-in socket；它没有启动
+`SecretBrokerProcessManager`，也未检查 Broker 实际创建的 socket。它验证的是候选
+mount profile 对该宿主路径的边界，不等于实际 Broker socket 集成或尚未实现的功能性
+Worker 验收。
 
 `SystemdProviderSenderLauncher(ca_bundle_path=...)` 是可信宿主的显式测试 CA 选项。
 launcher 安全读取公共 CA 有界快照，再以只读方式挂载到固定 sender。CA/host 路径不能
@@ -73,8 +76,11 @@ python3 -m pytest tests/unit/secrets tests/integration/test_secret_broker_proces
 python3 -m pytest --cov=orchestrator --cov-report=term-missing --cov-fail-under=90
 ```
 
-2026-10-02 实测：完整定向进程/隔离/sender 套件 129 passed，另有新增 child contract
-18 passed；最终全量 1,475 passed，总覆盖率 90.06%，无跳过的 live-systemd 检查。
+2026-10-02 实测：在新增 `test_child_contract.py` 前，定向进程/隔离/sender 套件
+129 passed；新增后该 child contract 文件单独运行 18 passed。最终全量测试运行同时包含
+两组测试，1,475 passed，总覆盖率 90.06%，无跳过的 live-systemd 检查。上方所列定向命令
+是包含当前全部 `tests/unit/secrets` 用例的验收命令；129 和 18 是先后两次运行的历史计数，
+不是同一次定向运行的结果。
 首次全量覆盖率为 89.77%，补齐 descriptor/default-backend 行为测试后恢复门槛；一次
 既有 overlay 时限测试的临时失败及隔离重跑/最终全量通过证据保留在 Task 6 报告。
 支持环境为现有 Linux/WSL2 systemd user manager。非 Linux/缺少隔离能力时

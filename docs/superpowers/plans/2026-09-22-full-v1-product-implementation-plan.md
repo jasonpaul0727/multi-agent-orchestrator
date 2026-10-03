@@ -200,9 +200,11 @@ ProviderModelGateway, systemd sender and loopback TLS sink exercise the full
 credential path. The sink checks intent durability via a fresh SQLite
 connection before replying. Tests scan process argv/environment and specified
 durable stores/logs/artifacts, cover Broker death/restart/replay and invalid
-binding, and reuse sender cancellation/unconfirmed-stop coverage. Live overlay
-candidates cannot access the Broker runtime/socket. The optional test CA is
-host-only; default TLS roots remain unchanged. This does not protect against
+binding, and reuse sender cancellation/unconfirmed-stop coverage. A live
+overlay candidate hides a test-created Unix socket under `/run/user` and
+rejects connection; this tests the mount-profile path boundary, not a socket
+created by `SecretBrokerProcessManager`. The optional test CA is host-only;
+default TLS roots remain unchanged. This does not protect against
 same-UID host compromise or claim process memory inspection. Production secret
 backends, identity/revocation, functional Worker/Verifier, application-service
 recovery, CLI/MCP and paid benchmarks remain open, so neither overall P4 nor
