@@ -292,13 +292,24 @@ def decode_provider_sender_response(
     return ProviderSenderResponse(status=status, headers=tuple(headers), body=body)
 
 
-def _perform_https_post(request: ProviderSenderRequest) -> ProviderSenderResponse:
+def _make_sender_tls_context(ca_bundle_path: str | None) -> ssl.SSLContext:
+    """Use system roots by default, or the host's explicit staged CA file."""
+
+    if ca_bundle_path is None:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=str(ca_bundle_path))
+
+
+def _perform_https_post(
+    request: ProviderSenderRequest, *, ca_bundle_path: str | None = None
+) -> ProviderSenderResponse:
     parsed = urlsplit(request.url)
+    context = _make_sender_tls_context(ca_bundle_path)
     connection = http.client.HTTPSConnection(
         parsed.hostname,
         parsed.port,
         timeout=request.timeout_ms / 1000,
-        context=ssl.create_default_context(),
+        context=context,
     )
     target = parsed.path or "/"
     try:
@@ -331,13 +342,22 @@ def _encode_provider_sender_response(response: ProviderSenderResponse) -> bytes:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Read one frame, issue at most one HTTPS POST, and emit one bounded frame."""
 
-    frame = sys.stdin.buffer.read(MAX_PROVIDER_SENDER_FRAME_BYTES + 1)
     try:
+        arguments = [] if argv is None else argv
+        ca_bundle_path = None
+        if arguments:
+            if len(arguments) != 2 or arguments[0] != "--ca-bundle" or not arguments[1]:
+                return 1
+            ca_bundle_path = arguments[1]
+        frame = sys.stdin.buffer.read(MAX_PROVIDER_SENDER_FRAME_BYTES + 1)
         request = decode_provider_sender_request(frame)
-        response = _perform_https_post(request)
+        response = (
+            _perform_https_post(request) if ca_bundle_path is None
+            else _perform_https_post(request, ca_bundle_path=ca_bundle_path)
+        )
         encoded = _encode_provider_sender_response(response)
         sys.stdout.buffer.write(encoded)
         sys.stdout.buffer.flush()
@@ -348,7 +368,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
 
 
 __all__ = [

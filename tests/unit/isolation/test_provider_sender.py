@@ -45,7 +45,8 @@ def _request_frame(runtime_module, *, url="https://api.example.test/v1/responses
     )
 
 
-def test_provider_sender_launcher_uses_separate_network_enabled_profile(monkeypatch, tmp_path):
+@pytest.mark.parametrize("configured_ca", [False, True])
+def test_provider_sender_launcher_uses_separate_network_enabled_profile(monkeypatch, tmp_path, configured_ca):
     sender_module = _sender_module()
     runtime_module = importlib.import_module("orchestrator.runtime.provider_sender_process")
     frame = _request_frame(runtime_module)
@@ -76,8 +77,11 @@ def test_provider_sender_launcher_uses_separate_network_enabled_profile(monkeypa
         lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
     )
     monkeypatch.setattr(sender_module.subprocess, "Popen", popen)
+    ca_bundle = tmp_path / "test-ca.pem"
+    ca_bundle.write_text("host CA bytes")
+    options = {"ca_bundle_path": ca_bundle} if configured_ca else {}
     launcher = sender_module.SystemdProviderSenderLauncher(
-        systemd_run="systemd-run-test", systemctl="systemctl-test"
+        systemd_run="systemd-run-test", systemctl="systemctl-test", **options
     )
 
     session = launcher.launch(frame, timeout_seconds=3, output_bytes=4_096)
@@ -93,7 +97,7 @@ def test_provider_sender_launcher_uses_separate_network_enabled_profile(monkeypa
     assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in properties
     assert "NoNewPrivileges=yes" in properties
     binds = [value for value in properties if value.startswith("BindReadOnlyPaths=")]
-    assert len(binds) == 1
+    assert len(binds) == (2 if configured_ca else 1)
     source, target = binds[0].removeprefix("BindReadOnlyPaths=").split(":", 1)
     assert Path(source).is_file()
     assert Path(target).is_file()
@@ -103,6 +107,17 @@ def test_provider_sender_launcher_uses_separate_network_enabled_profile(monkeypa
     assert "workspace" not in " ".join(binds)
     assert "sender-secret-marker" not in rendered_arguments
     assert "sender-secret-marker" not in repr(launched["kwargs"]["env"])
+    if configured_ca:
+        ca_source, ca_target = binds[1].removeprefix("BindReadOnlyPaths=").split(":", 1)
+        assert ca_source != str(ca_bundle)
+        assert Path(ca_source).read_bytes() == b"host CA bytes"
+        assert Path(ca_source).stat().st_mode & 0o777 == 0o400
+        assert Path(ca_target).name == "ca-bundle.pem"
+        assert Path(ca_target).parent == Path(target).parent
+        assert arguments[-2:] == ["--ca-bundle", ca_target]
+        assert str(ca_bundle) not in rendered_arguments
+    else:
+        assert "--ca-bundle" not in arguments
     assert launched["kwargs"]["stdin"] == subprocess.PIPE
     assert launched["kwargs"]["env"] == client_env
     assert "PrivateNetwork=yes" in _service_properties(
@@ -113,6 +128,59 @@ def test_provider_sender_launcher_uses_separate_network_enabled_profile(monkeypa
         limits=SandboxLimits(),
     )
     session._sandbox_session._staging.discard()
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "symlink", "unsupported", "unreadable", "fifo", "empty", "oversized", "parent-symlink"])
+def test_ca_bundle_invalid_host_path_fails_before_sender_launch(monkeypatch, tmp_path, kind):
+    import os
+
+    sender_module = _sender_module()
+    runtime_module = importlib.import_module("orchestrator.runtime.provider_sender_process")
+    ca_bundle = tmp_path / ("bad path.pem" if kind == "unsupported" else "ca.pem")
+    if kind == "directory":
+        ca_bundle.mkdir()
+    elif kind == "symlink":
+        target = tmp_path / "target.pem"
+        target.write_text("CA")
+        ca_bundle.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(ca_bundle)
+    elif kind == "parent-symlink":
+        directory = tmp_path / "certificates"
+        directory.mkdir()
+        (directory / "ca.pem").write_text("CA")
+        alias = tmp_path / "alias"
+        alias.symlink_to(directory, target_is_directory=True)
+        ca_bundle = alias / "ca.pem"
+    elif kind == "oversized":
+        with ca_bundle.open("wb") as stream:
+            stream.truncate(16 * 1024 * 1024 + 1)
+    elif kind == "empty":
+        ca_bundle.touch()
+    elif kind != "missing":
+        ca_bundle.write_text("CA")
+        if kind == "unreadable":
+            ca_bundle.chmod(0)
+    monkeypatch.setattr(sender_module.subprocess, "run", lambda *_a, **_k: pytest.fail("invalid CA reached systemd"))
+    monkeypatch.setattr(sender_module.subprocess, "Popen", lambda *_a, **_k: pytest.fail("invalid CA launched child"))
+    try:
+        with pytest.raises(InvalidSandboxRequest, match="CA bundle"):
+            sender_module.SystemdProviderSenderLauncher(ca_bundle_path=ca_bundle).launch(
+                _request_frame(runtime_module), timeout_seconds=3, output_bytes=4096
+            )
+    finally:
+        if kind == "unreadable":
+            ca_bundle.chmod(0o600)
+
+
+def test_ca_bundle_nonlinux_launcher_fails_closed_before_path_read(monkeypatch):
+    sender_module = _sender_module()
+    runtime_module = importlib.import_module("orchestrator.runtime.provider_sender_process")
+    monkeypatch.setattr(sender_module.platform, "system", lambda: "Windows")
+    with pytest.raises(IsolationUnavailable, match="Linux-only"):
+        sender_module.SystemdProviderSenderLauncher(ca_bundle_path="/unavailable/ca.pem").launch(
+            _request_frame(runtime_module), timeout_seconds=3, output_bytes=4096
+        )
 
 
 def test_provider_sender_launcher_rejects_invalid_frame_and_bounds_before_systemd(monkeypatch):

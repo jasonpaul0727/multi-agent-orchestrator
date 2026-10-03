@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import shutil
 import socket
+import ssl
+import subprocess
 import sys
 import threading
 
@@ -30,6 +33,60 @@ pytestmark = pytest.mark.skipif(
     not _usable_systemd_user_manager(),
     reason="integrated Provider sender tests require Linux and systemd --user",
 )
+
+
+def test_live_provider_sender_trusts_loopback_tls_only_with_host_ca_bundle(tmp_path):
+    from orchestrator.runtime.provider_sender_process import encode_provider_sender_request
+
+    ca_key, ca_cert = tmp_path / "ca.key", tmp_path / "ca.pem"
+    server_key, server_csr, server_cert = tmp_path / "server.key", tmp_path / "server.csr", tmp_path / "server.pem"
+    commands = [
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-keyout", str(ca_key), "-out", str(ca_cert), "-subj", "/CN=Maestro test-only CA"],
+        ["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", str(server_key), "-out", str(server_csr), "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+        ["openssl", "x509", "-req", "-in", str(server_csr), "-CA", str(ca_cert), "-CAkey", str(ca_key), "-CAcreateserial", "-out", str(server_cert), "-days", "1", "-copy_extensions", "copy"],
+    ]
+    for command in commands:
+        subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=15)
+
+    observed = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            observed.append((self.path, self.headers.get_all("Authorization"), self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(server_cert), str(server_key))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    frame = encode_provider_sender_request(
+        url=f"https://127.0.0.1:{server.server_port}/v1/responses",
+        headers=(("authorization", "Bearer local-sentinel"), ("content-type", "application/json")),
+        body=b"{}", timeout_ms=3000, max_response_bytes=1024,
+    )
+    try:
+        untrusted = isolation_exports.SystemdProviderSenderLauncher().launch(frame, timeout_seconds=6, output_bytes=4096).wait()
+        assert untrusted.response is None
+        assert untrusted.returncode != 0
+        assert observed == []
+        trusted = isolation_exports.SystemdProviderSenderLauncher(ca_bundle_path=ca_cert).launch(frame, timeout_seconds=6, output_bytes=4096).wait()
+        assert trusted.response is not None
+        assert trusted.response.status == 200
+        assert trusted.response.body == b"{}"
+        assert trusted.termination_receipt.cgroup_empty
+        assert observed == [("/v1/responses", ["Bearer local-sentinel"], b"{}")]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_live_provider_sender_stops_exact_unit_after_loopback_connection_refusal():

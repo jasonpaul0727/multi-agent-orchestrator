@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import stat
 import subprocess
 import tempfile
 from typing import TYPE_CHECKING
@@ -118,10 +119,12 @@ class SystemdProviderSenderLauncher:
     """
 
     def __init__(
-        self, *, systemd_run: str | None = None, systemctl: str | None = None
+        self, *, systemd_run: str | None = None, systemctl: str | None = None,
+        ca_bundle_path: str | Path | None = None,
     ) -> None:
         self._systemd_run = systemd_run or shutil.which("systemd-run")
         self._systemctl = systemctl or shutil.which("systemctl")
+        self._ca_bundle_path = ca_bundle_path
 
     def launch(
         self, frame: bytes, *, timeout_seconds: int, output_bytes: int
@@ -161,6 +164,10 @@ class SystemdProviderSenderLauncher:
             )
         if platform.system().lower() != "linux":
             raise IsolationUnavailable("the systemd Provider sender is Linux-only")
+        ca_bundle = (
+            _read_host_ca_bundle(self._ca_bundle_path)
+            if self._ca_bundle_path is not None else None
+        )
         if not self._systemd_run or not self._systemctl:
             raise IsolationUnavailable("systemd-run and systemctl are required")
 
@@ -186,6 +193,8 @@ class SystemdProviderSenderLauncher:
         helper_mount = staging_path / "runtime"
         staged_helper = staging_path / "provider_sender_process.py"
         helper_target = helper_mount / "provider_sender_process.py"
+        staged_ca = staging_path / "ca-bundle.pem" if ca_bundle is not None else None
+        ca_target = helper_mount / "ca-bundle.pem" if ca_bundle is not None else None
         helper_source = (
             Path(__file__).resolve().parents[1]
             / "runtime"
@@ -200,6 +209,12 @@ class SystemdProviderSenderLauncher:
             shutil.copyfile(helper_source, helper_target)
             os.chmod(staged_helper, 0o400)
             os.chmod(helper_target, 0o400)
+            if ca_bundle is not None:
+                assert staged_ca is not None and ca_target is not None
+                staged_ca.write_bytes(ca_bundle)
+                ca_target.write_bytes(ca_bundle)
+                os.chmod(staged_ca, 0o400)
+                os.chmod(ca_target, 0o400)
         except OSError as exc:
             staging.cleanup()
             raise IsolationUnavailable("trusted Provider sender helper cannot be staged") from exc
@@ -221,6 +236,8 @@ class SystemdProviderSenderLauncher:
             timeout_seconds=timeout_seconds,
             output_bytes=output_bytes,
             limits=limits,
+            ca_bundle_path=staged_ca,
+            ca_bundle_target=ca_target,
         )
         child_command = [
             "/usr/bin/env",
@@ -234,6 +251,8 @@ class SystemdProviderSenderLauncher:
             "-S",
             str(helper_target),
         ]
+        if ca_target is not None:
+            child_command.extend(["--ca-bundle", str(ca_target)])
         systemd_command = [
             self._systemd_run,
             "--user",
@@ -278,6 +297,30 @@ class SystemdProviderSenderLauncher:
         )
 
 
+def _read_host_ca_bundle(path: str | Path) -> bytes:
+    """Read only an explicit, supported, non-symlink regular host file."""
+
+    try:
+        requested = Path(path).absolute()
+        resolved = requested.resolve(strict=True)
+        if requested != resolved or not _systemd_path_supported(resolved):
+            raise OSError("unsupported CA path")
+        descriptor = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o444:
+                raise OSError("CA file is not readable and regular")
+            maximum = 16 * 1024 * 1024
+            if metadata.st_size > maximum:
+                raise OSError("CA file exceeds its bound")
+            contents = stream.read(maximum + 1)
+            if not contents or len(contents) > maximum:
+                raise OSError("CA file is outside its bound")
+            return contents
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise InvalidSandboxRequest("host CA bundle is unavailable or unsupported") from exc
+
+
 def _create_provider_staging() -> tempfile.TemporaryDirectory[str]:
     """Create a private staging directory outside any user workspace."""
 
@@ -307,6 +350,8 @@ def _provider_sender_service_properties(
     timeout_seconds: int,
     output_bytes: int,
     limits: SandboxLimits,
+    ca_bundle_path: Path | None = None,
+    ca_bundle_target: Path | None = None,
 ) -> tuple[str, ...]:
     """Dedicated outbound-TCP profile; never relaxes the Worker/Tool profile."""
 
@@ -345,6 +390,7 @@ def _provider_sender_service_properties(
         "InaccessiblePaths=-/etc/credstore.encrypted",
         "InaccessiblePaths=-/etc/apt/auth.conf.d",
         f"BindReadOnlyPaths={helper_path}:{helper_target}",
+        *((f"BindReadOnlyPaths={ca_bundle_path}:{ca_bundle_target}",) if ca_bundle_path is not None else ()),
         "WorkingDirectory=/",
         f"MemoryMax={limits.memory_bytes}",
         "MemorySwapMax=0",

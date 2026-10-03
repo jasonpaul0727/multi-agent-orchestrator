@@ -19,6 +19,51 @@ def _process_module():
     return importlib.import_module(_MODULE)
 
 
+def test_sender_tls_context_keeps_system_defaults_unless_host_ca_is_configured(monkeypatch, tmp_path):
+    module = _process_module()
+    calls = []
+    monkeypatch.setattr(module.ssl, "create_default_context", lambda **kwargs: calls.append(kwargs) or object())
+    module._make_sender_tls_context(None)
+    ca_bundle = tmp_path / "test-ca.pem"
+    ca_bundle.write_text("not parsed by launcher")
+    module._make_sender_tls_context(ca_bundle)
+    assert calls == [{}, {"cafile": str(ca_bundle)}]
+
+
+def test_ca_bundle_malformed_pem_fails_before_https_connection(monkeypatch, tmp_path):
+    module = _process_module()
+    ca_bundle = tmp_path / "bad.pem"
+    ca_bundle.write_text("not a PEM certificate")
+    request = module.decode_provider_sender_request(_request_frame(_request_payload()))
+    monkeypatch.setattr(module.http.client, "HTTPSConnection", lambda *_a, **_k: pytest.fail("malformed CA attempted network"))
+    with pytest.raises(module.ssl.SSLError):
+        module._perform_https_post(request, ca_bundle_path=str(ca_bundle))
+
+
+def test_ca_bundle_cannot_be_supplied_in_provider_frame():
+    module = _process_module()
+    with pytest.raises(ValueError, match="unexpected"):
+        module.decode_provider_sender_request(_request_frame(_request_payload(ca_bundle_path="/tmp/attacker.pem")))
+
+
+def test_ca_bundle_child_option_is_host_only_and_unknown_options_fail_closed(monkeypatch):
+    module = _process_module()
+    frame = _request_frame(_request_payload())
+    stdout = io.BytesIO()
+    monkeypatch.setattr(module.sys, "stdin", type("Input", (), {"buffer": io.BytesIO(frame)})())
+    monkeypatch.setattr(module.sys, "stdout", type("Output", (), {"buffer": stdout})())
+
+    def perform(request, *, ca_bundle_path):
+        assert request.body == b'{"model":"test"}'
+        assert ca_bundle_path == "/trusted/runtime/ca-bundle.pem"
+        return module.ProviderSenderResponse(200, (), b"ok")
+
+    monkeypatch.setattr(module, "_perform_https_post", perform)
+    assert module.main(["--ca-bundle", "/trusted/runtime/ca-bundle.pem"]) == 0
+    for arguments in (["--ca-bundle"], ["--other", "value"], ["--ca-bundle", "a", "--ca-bundle", "b"]):
+        assert module.main(arguments) == 1
+
+
 def _request_payload(**overrides):
     return {
         "version": 1,
