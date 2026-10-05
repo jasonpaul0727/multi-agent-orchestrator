@@ -55,6 +55,51 @@ plans.
 
 ## Verification and remaining P3 work
 
+### 2026-10-05 offline process-death evidence (scoped)
+
+On Ubuntu 24.04.4 LTS under WSL2 (kernel `6.6.87.2-microsoft-standard-WSL2`,
+systemd `255.4-1ubuntu8.17`, Python 3.12.3), the focused crash/recovery,
+Approval, budget, workspace-publication, systemd-launcher and blocked-Worker
+targets completed with **266 passed and no skips**. The full coverage gate
+completed with **1,536 passed and 90.15% total coverage**. The focused command
+was:
+
+```bash
+python3 -m pytest -o addopts= tests/integration/test_crash_matrix.py tests/integration/test_approval_tool_gateway.py tests/unit/approvals tests/unit/budget tests/unit/lifecycle/test_scheduler.py tests/unit/isolation/test_workspace_publish.py tests/integration/test_systemd_launcher.py tests/integration/test_isolated_worker_process.py -q
+```
+
+The matrix uses parent-issued `SIGKILL` and fresh stores/connections to prove:
+
+- budget reservation and usage settlement rollback before SQLite `COMMIT`;
+  post-commit response loss replays one durable result;
+- an `ApprovalGrantBound` grant killed before consumption remains bound and
+  unusable (a fresh approval is required); pre/post-commit consume deaths do
+  not launch the tool, and committed consumption cannot replay the request;
+- an external test receiver that applied an effect before the caller died
+  without `EffectReceiptRecorded` remains `outcome_unknown`, with budget and
+  active-slot holds retained and no recovery re-invocation;
+- artifact deaths after intent and after blob installation remain pending as
+  `missing` and `orphaned_blob`, respectively, preserving Run/Node/Attempt/
+  fencing-generation provenance without admission or cleanup; and
+- the retained fake Provider dispatch case refuses same-identity replay
+  before Broker access or transport.
+
+The base test environment initially lacked pytest-cov; the exact coverage
+command was rerun in a temporary `/tmp` validation environment with
+pytest-cov 7.1.0 and coverage 7.16.2. This did not change project dependency
+metadata. Exact full gate and ancillary commands/results:
+
+```bash
+python3 -m pytest --cov=orchestrator --cov-report=term-missing --cov-fail-under=90  # 1,536 passed; 90.15%
+python3 -m compileall -q src                                                   # passed
+python3 -m pip check                                                           # No broken requirements found.
+python3 -m pip wheel . --no-deps --wheel-dir /tmp/maestro-p3-crash-wheel      # built multi_agent_orchestrator-0.1.0-py3-none-any.whl
+```
+
+The wheel SHA-256 was `0e15cef23e2cd84b427d6715437c4a1de3d9b483b356a1b88394920b5ae315df`.
+It proves packaging only, not runtime deployment compatibility. No live/paid
+Provider request or production Provider-authority evidence was used.
+
 Unit/restart tests cover unknown-to-receipted effect projection, terminal
 unknown-effect rejection, missing verifier, artifact content tampering, and
 reopening the same database/artifact directory. Abrupt subprocess-death tests
@@ -85,9 +130,10 @@ replay checks those bindings again. This is a bounded recovery-control API, not
 an automatic Worker retry loop; the host still has to decide to call it and
 route the next Attempt.
 
-The complete cross-process interruption matrix, real Worker/OS termination
-receipt, bounded retry integration, and provider-side effect reconciliation
-remain unimplemented. Run-scoped artifact accounting covers only durable
-publication intents; legacy or bare filesystem orphans remain unattributable.
-This slice is not full crash recovery and does not satisfy the P3 or V1
-delivery gate by itself.
+The measured 2026-10-05 matrix covers only the specified offline durable
+boundaries. Functional Worker/OS lifecycle stop coordination, bounded retry
+execution through a Worker/application service, and provider-side effect
+reconciliation remain unimplemented. Run-scoped artifact accounting covers
+only durable publication intents; legacy or bare filesystem orphans remain
+unattributable. This is not full crash recovery and does not satisfy the P3 or
+V1 delivery gate by itself.

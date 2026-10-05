@@ -162,6 +162,44 @@ cross-stream interruption matrix, or validate the résumé cost/token/rework
 targets. README and [Provider journal security notes](../../security/provider-call-journal.md)
 record the boundary and remaining gates.
 
+2026-10-05 P3 offline cross-process crash matrix (scoped evidence): on Ubuntu
+24.04.4 LTS / WSL2, kernel `6.6.87.2-microsoft-standard-WSL2`, systemd
+`255.4-1ubuntu8.17`, Python 3.12.3, the focused acceptance command completed
+**266 passed with no skips**:
+
+```bash
+python3 -m pytest -o addopts= tests/integration/test_crash_matrix.py tests/integration/test_approval_tool_gateway.py tests/unit/approvals tests/unit/budget tests/unit/lifecycle/test_scheduler.py tests/unit/isolation/test_workspace_publish.py tests/integration/test_systemd_launcher.py tests/integration/test_isolated_worker_process.py -q
+```
+
+The full coverage gate was:
+
+```bash
+python3 -m pytest --cov=orchestrator --cov-report=term-missing --cov-fail-under=90
+```
+
+It completed **1,536 passed, 90.15% total coverage**. Parent-
+issued SIGKILL and fresh-store assertions cover budget reserve/settlement
+before and after COMMIT; ApprovalGrant binding before consumption and atomic
+consume before/after COMMIT; an external test receiver action before a missing
+EffectReceipt; and ArtifactPublicationIntent-only / installed-blob-before-
+Published windows. Recovery retains unknown effect budget/slot holds, refuses
+to repeat the external action, and reports pending artifacts as `missing` or
+`orphaned_blob` with exact Run/Node/Attempt/fencing-generation provenance.
+The bound-but-unconsumed grant stays bound and unusable, so proceeding needs a
+fresh approval. The existing fake Provider dispatch replay rejection remains
+in the focused target; no real or paid Provider call or production Provider
+authority was involved.
+
+The system Python initially lacked pytest-cov, so the specified coverage gate
+was rerun after activating a temporary `/tmp` validation environment with
+pytest-cov 7.1.0 and coverage 7.16.2; project dependency metadata was not
+changed. `compileall`, `pip check`, wheel build, and `git diff --check` passed.
+The wheel result establishes packaging only, not deployment compatibility.
+This matrix does **not** implement or verify a functional Worker, whole Worker
+stop/recovery lifecycle, Provider-authoritative reconciliation, CLI/MCP,
+end-to-end security acceptance, or the cost/token/rework benchmarks. The P3
+and V1 delivery checklists remain open.
+
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 
 - [x] 建立 Run/Node/Attempt/Graph 生命周期投影；实现基础状态机与非法转换拒绝。
@@ -181,7 +219,7 @@ record the boundary and remaining gates.
 - [x] 将 effect intent/receipt 与 ArtifactPublished stream 纳入统一 Run Recovery Coordinator；恢复时将缺回执的外部 effect 保持为 outcome_unknown、拒绝终态 Attempt 上的未决 effect，并验证有发布事件的 ArtifactStore 对象 digest/size 与可用 attempt provenance。只读恢复结果不重放副作用或暴露 artifact bytes。
 - [x] 增加全局只读 orphan blob inventory：按内容寻址文件名、常规文件类型和 SHA-256 校验；对每个候选使用正常 publication digest lock 并重读事件元数据，避免把正常并发发布误报为 orphan。此操作不自动删除，也不宣称 Run 级归属。
 - [x] 在 Artifact bytes 落盘前写入 `ArtifactPublicationIntent`，随后原子发布内容寻址对象和 `ArtifactPublished` 元数据；恢复时按 Run 查询带有对应 source provenance 的未完成意图并验证已存在对象的 digest/size/provenance。子进程死亡测试覆盖 intent 后、blob 后两个窗口。Worker publisher 必须提供 Run/node/Attempt-generation source。候选只列入 pending inventory，不被自动采纳或删除。
-- [ ] 扩展多进程中断矩阵覆盖全部跨流事务/副作用窗口；将 systemd 停止证明接入并实测整个 Worker 生命周期协调，并配置 Provider 权威查询/签名回执验证源及其线上测试。Gateway 的 Provider request sender 已有独立 systemd 停止证明，但不能替代 Worker 停止/完整恢复。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
+- [ ] 扩展多进程中断矩阵覆盖全部跨流事务/副作用窗口；2026-10-05 已对本计划列出的离线 durable boundary 完成真实 SIGKILL/reopen 验收，但这不包含 functional Worker 的完整运行/取消/恢复矩阵。仍需将 systemd 停止证明接入并实测整个 Worker 生命周期协调，并配置 Provider 权威查询/签名回执验证源及其线上测试。Gateway 的 Provider request sender 已有独立 systemd 停止证明，但不能替代 Worker 停止/完整恢复。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
 - [x] 实现脱敏、确定性的 Gateway 失败分类/指纹并交由 Recovery Controller 生成有界计划；Scheduler 持久化分类/计划，并在接纳恢复 Attempt 时重验 authorization、失败类别、retry level 和 exhausted model，再原子消费单次授权。未知结果保持 reconciliation 阻断。
 - [x] 将已持久化 Provider pending-proof 结算接入 host application 启动；完整 Run/调用前后校验、原子批次回滚、初始化中断报告、双连接启动及进程死亡验收通过。
 - [ ] 将持久化恢复计划接入 functional Worker 与 application service 的运行时协调/自动派发；不得自动重放 `outcome_unknown` Provider 调用。CLI/MCP 尚未接入 host 入口。
