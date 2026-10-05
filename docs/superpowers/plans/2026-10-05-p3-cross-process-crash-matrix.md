@@ -220,7 +220,7 @@ git diff --check
 
 Expected: every command exits 0; coverage is at least 90.00%; the designated Linux run has no skips for new crash tests. Record exact test counts, coverage, and platform in the evidence docs; report the wheel build result without claiming it proves runtime deployment compatibility.
 
-- [ ] **Step 4: Review the branch, commit docs/evidence, push, and verify remote state**
+- [x] **Step 4: Review the branch, commit docs/evidence, push, and verify remote state**
 
 Inspect `git diff --stat` and the full diff. Confirm there are no production failpoints, no live Provider calls, no new dependency, no changes to secret policy/idempotency semantics, and the P3/V1 completion boxes remain unchecked. Commit only the documentation/evidence files for this task, push to `origin codex/p3-systemd-termination-receipts`, compare local HEAD with `git ls-remote`, and require a clean tracked worktree.
 
