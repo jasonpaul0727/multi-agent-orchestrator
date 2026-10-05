@@ -174,7 +174,7 @@ class ControlPlaneApplication:
                 raise StartupRecoveryFailed("Provider call does not bind an accepted route")
             config = self._scheduler.lifecycle.config_snapshot(call.run_id)
             provider = next(p for p in config.registry_manifest.providers if p.id == call.provider_id)
-            if provider.adapter != call.provider_adapter:
+            if call.provider_adapter is not None and provider.adapter != call.provider_adapter:
                 raise StartupRecoveryFailed("Provider adapter differs from the frozen Registry")
             node = runs[call.run_id].lifecycle.node(call.node_id)
             attempt = next(a for a in node.attempts if a.attempt_id == call.attempt_id)

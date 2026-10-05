@@ -23,6 +23,7 @@ from .launcher import (
     SandboxResult,
     SandboxSession,
     SandboxTerminationReceipt,
+    _RetainedStaging,
     _systemd_cgroup_parent,
     _systemd_client_environment,
     _systemd_path_supported,
@@ -266,6 +267,7 @@ class SystemdProviderSenderLauncher:
             "--",
             *child_command,
         ]
+        retained_staging = _RetainedStaging(staging)
         try:
             process = subprocess.Popen(
                 systemd_command,
@@ -277,7 +279,7 @@ class SystemdProviderSenderLauncher:
                 close_fds=True,
             )
         except OSError as exc:
-            staging.cleanup()
+            retained_staging.discard()
             raise IsolationUnavailable("Provider sender transient unit could not start") from exc
 
         sandbox_session = SandboxSession(
@@ -287,7 +289,7 @@ class SystemdProviderSenderLauncher:
             client_env=client_env,
             output_limit=output_bytes,
             timeout_seconds=timeout_seconds,
-            staging=staging,
+            staging=retained_staging,
             input_bytes=frame,
             scope_cgroup=scope_cgroup,
             cleanup_on_termination=True,
@@ -378,6 +380,7 @@ def _provider_sender_service_properties(
         "LockPersonality=yes",
         "MemoryDenyWriteExecute=yes",
         "InaccessiblePaths=-/run/user",
+        "InaccessiblePaths=-/mnt/wslg/run/user",
         "InaccessiblePaths=-/run/dbus",
         "InaccessiblePaths=-/etc/shadow",
         "InaccessiblePaths=-/etc/gshadow",

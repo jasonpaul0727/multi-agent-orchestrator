@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 import os
 from pathlib import Path
 import platform
@@ -315,10 +316,17 @@ class SandboxSession:
         staging: tempfile.TemporaryDirectory[str],
         input_bytes: bytes | None = None,
         cancel_after_transport_exit: bool = False,
-        stop_grace_seconds: float | None = None,
+        stop_grace_seconds: float = 2.0,
         scope_cgroup: Path | None = None,
         cleanup_on_termination: bool = True,
     ) -> None:
+        if (
+            isinstance(stop_grace_seconds, bool)
+            or not isinstance(stop_grace_seconds, (int, float))
+            or not math.isfinite(stop_grace_seconds)
+            or not 0 < stop_grace_seconds <= 30
+        ):
+            raise InvalidSandboxRequest("sandbox stop grace must be finite and bounded")
         self.unit_name = unit_name
         self._process = process
         self._systemctl = systemctl
@@ -429,7 +437,7 @@ class SandboxSession:
                 if now >= deadline:
                     timed_out = True
                 if cancelled or timed_out or output_limited:
-                    if stop_deadline is None and self._stop_grace_seconds is not None:
+                    if stop_deadline is None:
                         stop_deadline = now + self._stop_grace_seconds
                     if stop_deadline is not None and now >= stop_deadline:
                         break
@@ -474,7 +482,7 @@ class SandboxSession:
                         self.cancel()
                         cancelled = True
             if stop_deadline is None or time.monotonic() < stop_deadline:
-                self._process.wait()
+                self._process.wait(timeout=self._stop_grace_seconds)
         finally:
             selector.close()
             if input_stream is not None and not input_stream.closed:
@@ -830,6 +838,7 @@ def _service_properties(
         "LockPersonality=yes",
         "MemoryDenyWriteExecute=yes",
         "InaccessiblePaths=-/run/user",
+        "InaccessiblePaths=-/mnt/wslg/run/user",
         "InaccessiblePaths=-/run/dbus",
         "InaccessiblePaths=-/etc/shadow",
         "InaccessiblePaths=-/etc/gshadow",

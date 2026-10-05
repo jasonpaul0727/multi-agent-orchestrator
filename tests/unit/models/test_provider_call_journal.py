@@ -464,6 +464,34 @@ def test_provider_journal_idempotency_collision_cannot_claim_second_body(tmp_pat
         journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses", request_body=b"different-body", provider_correlation_id="maestro-test")
 
 
+def test_known_outcome_between_reconciliation_snapshot_and_append_is_typed_conflict(tmp_path, monkeypatch):
+    request = model_request(model_registry())
+    path = tmp_path / "late-outcome.db"
+    with SQLiteEventStore(path) as store:
+        journal = SQLiteProviderCallJournal(store)
+        stream_id = journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses",
+                                          request_body=b"{}", provider_correlation_id="maestro-race")
+        proof = _provider_reconciliation_for(journal.read_call(stream_id))
+        original_read = store.read_stream
+        injected = []
+
+        def read_then_commit_outcome(*args, **kwargs):
+            events = original_read(*args, **kwargs)
+            if args == ("provider_call", stream_id) and not injected:
+                injected.append(True)
+                with SQLiteEventStore(path) as competing:
+                    SQLiteProviderCallJournal(competing).record_outcome(
+                        request, outcome="known_success", http_status=200,
+                    )
+            return events
+
+        monkeypatch.setattr(store, "read_stream", read_then_commit_outcome)
+        with pytest.raises(ProviderCallJournalConflict):
+            journal._append_reconciliation(stream_id, proof, datetime(2026, 9, 29, 15, tzinfo=timezone.utc))
+        assert journal.read_call(stream_id).status == "known_success"
+        assert len(original_read("provider_call", stream_id)) == 2
+
+
 def test_provider_call_intent_is_single_winner_across_concurrent_store_connections(tmp_path):
     registry = model_registry()
     request = model_request(registry)

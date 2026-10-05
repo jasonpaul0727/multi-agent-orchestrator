@@ -78,6 +78,30 @@ def test_scope_collection_has_bounded_stop_grace_even_with_held_pipes(monkeypatc
     assert result.returncode == (0 if leader_exited else 125)
 
 
+def test_collection_error_cleanup_wait_is_bounded_by_default(monkeypatch):
+    class Transport:
+        def poll(self):
+            return None
+        def wait(self, timeout=None):
+            assert timeout is not None and 0 < timeout <= 5, "cleanup wait has no finite deadline"
+            raise subprocess.TimeoutExpired("held", timeout)
+    session = SandboxSession(
+        process=Transport(), unit_name="unit.service", systemctl="ctl", client_env={},
+        output_limit=1024, timeout_seconds=1, staging=type("Stage", (), {"cleanup": lambda _s: None})(),
+    )
+    monkeypatch.setattr(session, "_collect", lambda: (_ for _ in ()).throw(OSError("collector failed")))
+    monkeypatch.setattr(subprocess, "run", lambda args, **_kw: subprocess.CompletedProcess(args, 1))
+    with pytest.raises(OSError, match="collector failed"):
+        session.wait()
+
+
+@pytest.mark.parametrize("grace", [None, True, 0, -1, float("inf"), float("nan")])
+def test_session_rejects_unbounded_stop_grace(grace):
+    with pytest.raises(InvalidSandboxRequest, match="stop grace"):
+        SandboxSession(process=None, unit_name="unit.service", systemctl="ctl", client_env={},
+                       output_limit=1024, timeout_seconds=1, staging=None, stop_grace_seconds=grace)
+
+
 @pytest.mark.parametrize("command", [[], "echo hi", [""], ["echo", "bad\x00arg"]])
 def test_commands_reject_ambiguous_or_invalid_arguments(command) -> None:
     with pytest.raises(InvalidSandboxRequest):

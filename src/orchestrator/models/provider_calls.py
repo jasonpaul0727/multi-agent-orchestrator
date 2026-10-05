@@ -18,6 +18,7 @@ from orchestrator.models.gateway import ModelRequest, TokenUsage
 from orchestrator.models.provider_sender import ProviderSenderTerminationReceipt
 from orchestrator.persistence import EventDraft, IdempotencyConflict, SQLiteEventStore, StaleStream
 from orchestrator.persistence.sqlite_event_store import canonical_json
+from orchestrator.persistence.events import StoredEvent, validate_event_contract
 from orchestrator.validation import revalidate_model
 
 
@@ -156,7 +157,7 @@ class ProviderCallSnapshot:
     accepted_route_id: str
     budget_reservation_id: str
     provider_id: str
-    provider_adapter: ProviderAdapter
+    provider_adapter: ProviderAdapter | None
     provider_correlation_id: str | None
     model_id: str
     registry_manifest_hash: str
@@ -367,10 +368,14 @@ class SQLiteProviderCallJournal:
         if not isinstance(stream_id, str) or not stream_id:
             raise ValueError("provider call stream id is invalid")
         events = self.event_store.read_stream("provider_call", stream_id)
+        return self._project_call(events)
+
+    def _project_call(self, events: list[StoredEvent]) -> ProviderCallSnapshot | None:
         if not events:
             return None
         if len(events) > 4 or events[0].event_type != "ProviderCallIntentRecorded":
             raise ValueError("provider call stream violates the journal contract")
+        validate_event_contract(events)
         intent = events[0]
         payload = intent.payload
         outcome_event = next(
@@ -412,8 +417,8 @@ class SQLiteProviderCallJournal:
             accepted_route_id=payload["accepted_route_id"],
             budget_reservation_id=payload["budget_reservation_id"],
             provider_id=payload["provider_id"],
-            provider_adapter=payload["provider_adapter"],
-            provider_correlation_id=payload["provider_correlation_id"],
+            provider_adapter=payload.get("provider_adapter"),
+            provider_correlation_id=payload.get("provider_correlation_id"),
             model_id=payload["model_id"],
             registry_manifest_hash=payload["registry_manifest_hash"],
             request_hash=payload["request_hash"],
@@ -471,7 +476,8 @@ class SQLiteProviderCallJournal:
         if not isinstance(proof, ProviderCallReconciliation):
             proof = ProviderCallReconciliation.model_validate(proof)
         _require_aware_datetime(reconciled_at, "reconciled_at")
-        snapshot = self.read_call(stream_id)
+        events = self.event_store.read_stream("provider_call", stream_id)
+        snapshot = self._project_call(events)
         if snapshot is None:
             raise ProviderCallJournalConflict("provider call intent is missing")
         _assert_proof_matches_call(snapshot, proof)
@@ -493,12 +499,11 @@ class SQLiteProviderCallJournal:
             "observed_at": proof.observed_at.isoformat(),
             "reconciled_at": reconciled_at.isoformat(),
         }
-        events = self.event_store.read_stream("provider_call", stream_id)
         try:
             stored = self.event_store.append(
                 "provider_call",
                 stream_id,
-                expected_version=len(events),
+                expected_version=events[-1].stream_version,
                 events=[EventDraft(
                     "ProviderCallReconciliationRecorded",
                     payload,

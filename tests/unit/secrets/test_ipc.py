@@ -49,13 +49,30 @@ def test_secret_broker_codec_rejects_duplicate_keys_unknown_fields_and_oversize(
         decode_secret_broker_request(b" " * (MAX_SECRET_BROKER_FRAME_BYTES + 1))
 
 
-def test_secret_broker_codec_rejects_unsupported_versions_and_invalid_response_fields():
-    from orchestrator.secrets.ipc import SecretBrokerResponse, decode_secret_broker_request, decode_secret_broker_response, encode_secret_broker_response
+@pytest.mark.parametrize("version", [2, True, 1.0, "1"])
+def test_secret_broker_codec_rejects_only_version_changed_in_complete_frames(version):
+    import json
+    from orchestrator.secrets.ipc import (
+        SecretBrokerRequest, SecretBrokerResponse, decode_secret_broker_request,
+        decode_secret_broker_response, encode_secret_broker_request,
+        encode_secret_broker_response,
+    )
 
-    with pytest.raises(ValueError):
-        decode_secret_broker_request(b'{"version":2}')
-    with pytest.raises(ValueError):
-        decode_secret_broker_response(b'{"version":2}')
+    request = SecretBrokerRequest(1, "nonce-9a2c", "env:MODEL_KEY", "primary", "https://api.openai.com/v1", "model_inference", _context())
+    response = SecretBrokerResponse(1, "request-1", "primary", "https://api.openai.com/v1", "model_inference", "unavailable", None, None)
+    for frame, decoder in (
+        (encode_secret_broker_request(request), decode_secret_broker_request),
+        (encode_secret_broker_response(response), decode_secret_broker_response),
+    ):
+        decoder(frame)
+        payload = json.loads(frame)
+        payload["version"] = version
+        with pytest.raises(ValueError, match="payload version is unsupported"):
+            decoder(json.dumps(payload).encode())
+
+
+def test_secret_broker_codec_rejects_invalid_response_fields():
+    from orchestrator.secrets.ipc import SecretBrokerResponse, encode_secret_broker_response
     invalid_response = SecretBrokerResponse.__new__(SecretBrokerResponse)
     for name, value in {
         "version": 1,

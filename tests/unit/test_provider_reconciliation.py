@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import tempfile
+import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -295,6 +296,47 @@ def test_untrusted_verifier_failure_does_not_expose_private_receipts_or_settle(f
     assert journal.call == call and journal.appended == []
     assert not any(event.event_type == "CostCommitted" for event in
                    service.scheduler.event_store.read_stream("budget", call.run_id))
+
+
+@pytest.mark.parametrize("source", ["provider", "termination"])
+@pytest.mark.parametrize("error_type", [ProviderEvidenceUnsupported, ReconciliationRejected])
+@pytest.mark.parametrize("chained", [False, True])
+def test_typed_verifier_failures_redact_messages_and_chains(source, error_type, chained):
+    call = _call()
+    journal = _Journal(call)
+    sentinel = "private-verifier-sentinel-79b"
+
+    def reject():
+        if chained:
+            try:
+                raise ValueError(sentinel)
+            except ValueError as cause:
+                raise error_type(sentinel) from cause
+        raise error_type(sentinel)
+
+    class EvidenceVerifier:
+        def verify(self, _call, _raw):
+            if source == "provider":
+                reject()
+            return _evidence_result(call)
+
+    class TerminationVerifier:
+        def verify_stopped(self, _call, _receipt):
+            reject()
+
+    service = _service(journal, EvidenceVerifier(), TerminationVerifier())
+    before = service.scheduler.event_store.read_stream("budget", call.run_id)
+    expected_type = ProviderEvidenceUnsupported if source == "provider" and error_type is ProviderEvidenceUnsupported else ReconciliationRejected
+    with pytest.raises(expected_type) as failure:
+        service.reconcile(
+            call.stream_id, b"authenticated receipt bytes", object(),
+            datetime(2026, 9, 29, 13, tzinfo=timezone.utc),
+        )
+    assert sentinel not in str(failure.value)
+    assert sentinel not in "".join(traceback.format_exception(failure.value))
+    assert failure.value.__suppress_context__
+    assert journal.call == call and journal.appended == []
+    assert service.scheduler.event_store.read_stream("budget", call.run_id) == before
 
 
 def test_unavailable_provider_evidence_verifier_leaves_call_unknown():

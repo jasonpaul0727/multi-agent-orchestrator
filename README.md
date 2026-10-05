@@ -6,7 +6,7 @@
 > 实施计划 Task 1–9 已完成，涵盖事件存储、快照恢复、Artifact Store、预算账本、脱敏投影、跨规格事件契约、崩溃/并发测试及打包验收。
 > 已完成严格四层配置及 Run 快照、Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件存储驱动的健康熔断/ProbeLease、Recovery Controller，以及三种 Provider codec 和受限 HTTPS transport。
 > P3 尚未完整：ProviderCallJournal 已实现持久调用意图、脱敏终态及可信对账证明契约；Gateway 默认 HTTPS transport 现由独立 systemd sender 子进程执行，并把宿主验证的停止收据绑定到调用及 Attempt。`ControlPlaneApplication` 可在一个启动事务中核对 Run/调用绑定并恢复待结算证明。生产 Provider 权威证据源/费用对账、Worker 完整崩溃矩阵和自动执行恢复循环仍缺。Host Python 入口说明见 [启动恢复](docs/security/control-plane-startup.md)。
-> P4 新增内部 `WorkspaceWriteGateway`：以专用 `workspace.write-candidate` 能力执行隔离候选，经 Attempt/策略重验、一次性能力/可选 Approval、工作区租约、持久发布意图和 journal publisher 后才写入工作区；真实 WSL2 systemd 候选→审计→发布集成测试通过。它尚未接入 Scheduler/Worker application service，Secret Broker 仍是进程内原型，产品 workspace-write 仍关闭。
+> P4 新增内部 `WorkspaceWriteGateway`：以专用 `workspace.write-candidate` 能力执行隔离候选，经 Attempt/策略重验、一次性能力/可选 Approval、工作区租约、持久发布意图和 journal publisher 后才写入工作区；真实 WSL2 systemd 候选→审计→发布集成测试通过。`SecretBrokerProcessManager` 已提供独立 Linux Broker、私有 Unix socket、有界 IPC 和精确子进程监督；生产 credential backend 仍固定 unavailable。它们尚未接入完整 Scheduler/Worker application service，产品 workspace-write 仍关闭。
 > P5 已有 blocked-only Worker IPC、Artifact 来源准入及独立只读格式 Verifier，**没有真正执行模型/工具任务的 Worker，也没有节点语义验收**。P6 CLI/MCP、P7 完整 E2E/安全验收仍未完成；离线基准评估器没有真实数据，默认 Provider broker 仍 fail-closed。
 > 本项目**不具备生产就绪状态**。
 

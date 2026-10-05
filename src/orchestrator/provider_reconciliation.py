@@ -292,9 +292,9 @@ class ProviderReconciliationService:
             provider_result = self.evidence_verifier.verify(call, raw_evidence)
             provider_result = revalidate_model(ProviderEvidenceResult, provider_result)
         except ProviderEvidenceUnsupported:
-            raise
-        except ReconciliationRejected:
-            raise
+            raise ProviderEvidenceUnsupported(
+                "no authoritative Provider evidence source is available"
+            ) from None
         except Exception:
             raise ReconciliationRejected(
                 "Provider evidence verifier rejected the receipt"
@@ -333,8 +333,6 @@ class ProviderReconciliationService:
             termination_digest = self.termination_verifier.verify_stopped(
                 call, termination_receipt
             )
-        except ReconciliationRejected:
-            raise
         except Exception:
             raise ReconciliationRejected(
                 "Attempt termination witness was rejected"
@@ -529,10 +527,12 @@ def _revalidate_call_snapshot(
         isinstance(call.fencing_generation, bool)
         or not isinstance(call.fencing_generation, int)
         or call.fencing_generation < 1
-        or not isinstance(call.provider_adapter, str)
-        or call.provider_adapter not in (
+        or (call.provider_adapter is not None and (
+            not isinstance(call.provider_adapter, str)
+            or call.provider_adapter not in (
             "openai_responses", "anthropic_messages", "openai_compatible"
-        )
+            )
+        ))
         or not isinstance(call.status, str)
         or call.status not in (
             "dispatching", "not_sent", "known_failure", "known_success", "unknown",

@@ -317,6 +317,24 @@ def test_unavailable_default_never_reads_environment(monkeypatch):
     assert UnavailableSecretValueStore().read("env:MAESTRO_TEST_KEY") is None
 
 
+@pytest.mark.parametrize("allowed", [False, True])
+def test_denied_and_unavailable_decisions_need_no_post_audit_stream_scan(tmp_path, monkeypatch, allowed):
+    server, _ = make_server(tmp_path, value_store=UnavailableSecretValueStore())
+    history_reads = []
+
+    def no_stream_scan(*_args, **_kwargs):
+        history_reads.append(True)
+        raise AssertionError("response classification reread the Run history")
+
+    monkeypatch.setattr(SQLiteEventStore, "read_stream", no_stream_scan)
+    req = request()
+    if not allowed:
+        req = replace(req, endpoint="https://other.example.test/v1")
+    with running(server):
+        assert _exchange_one_frame(server.socket_path, req).status == ("unavailable" if allowed else "denied")
+    assert history_reads == []
+
+
 def test_provider_map_is_frozen_and_trusted_adapter_selects_header(tmp_path):
     provider = ProviderSpec(id="test-provider", adapter="anthropic_messages",
                             secret_ref=PROVIDER.secret_ref, enabled=True)

@@ -24,6 +24,16 @@ blocked, even after process restart. If a late terminal receipt races with a
 reconciliation proof, the provider-call stream CAS allows only one event to
 follow the intent; the loser receives a typed journal conflict.
 
+New Provider events use event/payload schema version 2. Replay also accepts
+authentic schema-1 BASE intents lacking adapter/correlation and the expanded
+schema-1 intents written before this version boundary. Only those complete
+historical shapes are accepted; history and payload hashes are never rewritten.
+Legacy absent adapter/correlation project as `None`, with no derivation from
+current Provider configuration. Startup checks their exact accepted route and
+frozen Registry, preserves unresolved holds and blocks redispatch. Such calls
+remain unsupported for authoritative evidence reconciliation. A new outcome
+can append to a legacy intent, but cannot create missing historical correlation.
+
 ## Reconciliation contract
 
 `SQLiteProviderCallJournal.unresolved()` exposes only calls in `dispatching` or
@@ -73,8 +83,9 @@ systemd service. Credential and request bytes cross a bounded stdin frame;
 they are not stored in the journal. The Gateway maps a host-verified exact
 unit/cgroup stop result to a receipt bound to the persisted call, full Attempt,
 route, reservation, Registry, and request hash. On cancellation or timeout it
-waits for that stop result before returning. If systemd cannot prove the exact
+waits for that stop result within a finite host grace before returning. If systemd cannot prove the exact
 sender stopped, the Gateway supplies no receipt and leaves the call unresolved;
+private staging is retained, including an interrupted uncertain start;
 it does not fall back to an urllib thread or another untracked sender.
 
 `ProviderSenderTerminationVerifier` can validate that a supplied receipt is

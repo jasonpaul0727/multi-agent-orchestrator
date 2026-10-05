@@ -225,17 +225,14 @@ class UnixSecretBrokerServer:
             # Construct, use and close a thread-affine store in this handler.
             with SQLiteEventStore(self.event_store_path) as events:
                 broker = AuditedSecretBroker(event_store=events, value_store=self.value_store, rules=self.rules)
-                credential = asyncio.run(broker.acquire_provider_credential(
+                decision = asyncio.run(broker.acquire_provider_credential_decision(
                     secret_ref=request.secret_ref, provider=provider, endpoint=request.endpoint,
                     purpose=request.purpose, context=request.context,
                 ))
-                response = _bound_response(request, provider, credential)
-                if credential is None:
-                    # The existing broker returns None for both policy denial
-                    # and unavailable values. Its durable decision is authoritative.
-                    if any(event.event_type == "SecretAccessDenied" and event.idempotency_key == f"secret-access:{request.context.request_id}"
-                           for event in events.read_stream("security", request.context.run_id)):
-                        response = _denied_response(request)
+                response = (
+                    _denied_response(request) if decision.status == "denied"
+                    else _bound_response(request, provider, decision.credential)
+                )
         except SecretAccessDenied:
             response = _denied_response(request)
         except Exception:

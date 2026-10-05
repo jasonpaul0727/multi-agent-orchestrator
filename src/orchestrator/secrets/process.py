@@ -32,6 +32,40 @@ def _identity(path: Path) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
+def _require_hidden_mount_aliases(runtime: Path, private_area: Path) -> None:
+    # A subtree bind preserves inodes but changes the path under which the
+    # socket is reachable. Project every mount's filesystem-root mapping; only
+    # the barriers hidden by all shipped profiles may expose the runtime tree.
+    mounts = []
+    for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if len(fields) < 10 or "-" not in fields or fields.index("-") < 6:
+            raise ValueError
+        device = fields[2].split(":")
+        if len(device) != 2 or not all(part.isdigit() for part in device):
+            raise ValueError
+        paths = []
+        for field in fields[3:5]:
+            for encoded, decoded in ((r"\040", " "), (r"\011", "\t"), (r"\012", "\n"), (r"\134", "\\")):
+                field = field.replace(encoded, decoded)
+            path = Path(field)
+            if not path.is_absolute() or ".." in path.parts:
+                raise ValueError
+            paths.append(path)
+        mounts.append((fields[2], *paths))
+    containing = [mount for mount in mounts if runtime.is_relative_to(mount[2])]
+    if not containing:
+        raise ValueError
+    device, filesystem_root, mountpoint = max(containing, key=lambda mount: len(mount[2].parts))
+    filesystem_path = filesystem_root / runtime.relative_to(mountpoint)
+    hidden = (private_area, Path("/mnt/wslg/run/user") / str(os.getuid()))
+    for other_device, other_root, other_mountpoint in mounts:
+        if device == other_device and filesystem_path.is_relative_to(other_root):
+            alias = other_mountpoint / filesystem_path.relative_to(other_root)
+            if not any(alias.is_relative_to(barrier) for barrier in hidden):
+                raise ValueError
+
+
 def _checked_socket_identity(path: Path) -> tuple[int, int]:
     info = path.lstat()
     if (not stat.S_ISSOCK(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
@@ -186,6 +220,34 @@ class SecretBrokerProcessManager:
         if (not self._runtime_root.is_absolute() or not stat.S_ISDIR(root.st_mode)
             or stat.S_IMODE(root.st_mode) != 0o700 or root.st_uid != os.getuid()):
             raise ValueError("Secret Broker runtime root is unsafe")
+        try:
+            private_area = Path("/run/user") / str(os.getuid())
+            resolved = self._runtime_root.resolve(strict=True)
+            if (resolved != self._runtime_root or private_area.resolve(strict=True) != private_area
+                or not resolved.is_relative_to(private_area)):
+                raise ValueError
+            # Every ancestor within the private user area must be private and
+            # canonical. Environment-selected XDG aliases cannot weaken the
+            # /run/user barrier shared by all shipped sandbox profiles.
+            private_paths = [resolved]
+            while private_paths[-1] != private_area:
+                private_paths.append(private_paths[-1].parent)
+            for path in private_paths:
+                info = path.lstat()
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                    raise ValueError
+            source = Path(__file__).resolve().parents[2]
+            if resolved.is_relative_to(source):
+                raise ValueError
+            # Resolve source symlinks and detect bind aliases by inode as well
+            # as pathname, including source ancestors mounted into a sandbox.
+            source_identities = {_identity(path) for path in (source, *source.parents) if path.exists()}
+            if any(_identity(path) in source_identities for path in private_paths):
+                raise ValueError
+            _require_hidden_mount_aliases(resolved, private_area)
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError("Secret Broker runtime root is outside the protected private area or aliased into the runtime") from None
         if not self._event_store_path.is_absolute() or not stat.S_ISREG(event.st_mode):
             raise ValueError("Secret Broker EventStore must be an absolute regular file")
         if len(os.fsencode(self._runtime_root / ("broker-" + "x" * 16) / "broker.sock")) > 107:
