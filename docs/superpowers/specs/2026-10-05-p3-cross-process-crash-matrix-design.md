@@ -1,6 +1,6 @@
 # P3 Cross-Process Crash Matrix Design
 
-**Status:** Amended draft for user review
+**Status:** User-approved design (including the ApprovalGrantBound amendment)
 **Date:** 2026-10-05  
 **Target:** P3 offline process-death coverage for already implemented durable control-plane and publication boundaries
 
