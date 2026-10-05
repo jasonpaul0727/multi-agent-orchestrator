@@ -42,31 +42,32 @@
 - Produces `block_at_crash_point(pipe: Connection, point: str) -> None` and `kill_at_crash_point(process: BaseProcess, pipe: Connection, *, expected_point: str, timeout_seconds: float = 10.0) -> None`, importing those types from `multiprocessing.connection` and `multiprocessing.process`. The child sends the validated ASCII point name with `send_bytes` then blocks on `recv_bytes(1)`; the parent polls for at most the timeout, reads at most 96 bytes, requires the exact point, sends `SIGKILL`, joins within the timeout, and requires exit code `-signal.SIGKILL`. On any assertion/error it still kills and joins a live child before raising.
 - Consumes the current `SQLiteEventStore`, `BudgetLedger.reserve`, `BudgetLedger.commit_usage`, and `BudgetLedger.available` contracts.
 
-- [ ] **Step 1: Write the real-kill reservation and settlement tests**
+- [ ] **Step 1: Write the real-kill reservation and settlement tests before helper extraction**
 
-Replace the response-loss-only assertion in `test_crash_after_budget_reservation_commit_replays_one_hold` with parameterized `before_commit` and `after_commit` children. Add the same two boundaries for `BudgetLedger.commit_usage`. Use `multiprocessing.get_context("fork")`, a duplex pipe, an actual SQLite path, `RunLimit(max_cost_minor=100, max_tokens=100)`, and `CostEstimate(amount_minor=12, currency="USD", token_limit=8)`. For settlement, seed the reservation in the parent before closing its store and let the child commit usage `{"input_tokens": 4, "cost_minor": 3}` with settlement key `"settlement-1"`.
+Replace the response-loss-only assertion in `test_crash_after_budget_reservation_commit_replays_one_hold` with parameterized `before_commit` and `after_commit` children. Add the same two boundaries for `BudgetLedger.commit_usage`. Use `multiprocessing.get_context("fork")`, a duplex pipe, an actual SQLite path, `RunLimit(max_cost_minor=100, max_tokens=100)`, and `CostEstimate(amount_minor=12, currency="USD", token_limit=8)`. For settlement, seed the reservation in the parent before closing its store and let the child commit usage `{"input_tokens": 4, "cost_minor": 3}` with settlement key `"settlement-1"`. Use small inline pipe barriers in this test file for the first pass; do not import the not-yet-created shared helper. This is characterization of existing product behavior, so a valid crash-boundary test is expected to pass without production-code changes.
 
-The child arms `SQLiteEventStore._connection.set_trace_callback()` only after opening the database and completing setup. At the pre-commit case, the callback blocks only when the normalized SQL is `COMMIT`; at the post-commit case, call the real Ledger method and block immediately after it returns. Example child barrier:
+The child arms `SQLiteEventStore._connection.set_trace_callback()` only after opening the database and completing setup. At the pre-commit case, the callback blocks only when the normalized SQL is `COMMIT`; at the post-commit case, call the real Ledger method and block immediately after it returns. The inline child barrier sends the point name with `pipe.send_bytes(point.encode("ascii"))`, then blocks on `pipe.recv_bytes(1)`:
 
 ```python
 def _trace_before_commit(pipe, point):
     def trace(statement):
         if statement.strip().upper() == "COMMIT":
-            block_at_crash_point(pipe, point)
+            pipe.send_bytes(point.encode("ascii"))
+            pipe.recv_bytes(1)
     return trace
 ```
 
-Every test parent must call `kill_at_crash_point(...)`; it must not use `RuntimeError`, `os._exit`, or a sleep to simulate death.
+Every test parent must issue `SIGKILL` after receiving the exact point name; it must not use `RuntimeError`, `os._exit`, or a sleep to simulate death.
 
-- [ ] **Step 2: Run the new tests and confirm they fail before adding the helper**
+- [ ] **Step 2: Run the new characterization tests before adding the shared helper**
 
 Run: `python3 -m pytest tests/integration/test_crash_matrix.py -k 'budget_reservation_sigkill or budget_settlement_sigkill' -q`
 
-Expected: collection fails because `tests.support.process_crash` and its barrier functions do not exist yet. This is the intentional RED state.
+Expected: the four crash-boundary cases execute and pass against the existing ledger/recovery implementation using the inline test-only barriers. A collection/import failure is not an acceptable RED result; if the semantic assertions fail, investigate that durable-state defect before continuing.
 
-- [ ] **Step 3: Implement the test-only process barrier helper**
+- [ ] **Step 3: Extract the test-only process barrier helper without changing product behavior**
 
-Create `tests/support/process_crash.py` with the two signatures above. Validate point names as non-empty ASCII up to 96 bytes. `block_at_crash_point` sends exactly that name and then blocks on `recv_bytes(1)`. `kill_at_crash_point` polls for at most `timeout_seconds`, rejects a mismatched point, sends `os.kill(process.pid, signal.SIGKILL)`, joins for at most `timeout_seconds`, and checks `process.exitcode == -signal.SIGKILL`. In a `finally` block, kill and join any still-live process. Do not include payloads, credentials, or arbitrary exception text in barrier messages.
+After the inline tests pass, create `tests/support/process_crash.py` with the two signatures above and replace the local pipe/kill code with this shared helper. Validate point names as non-empty ASCII up to 96 bytes. `block_at_crash_point` sends exactly that name and then blocks on `recv_bytes(1)`. `kill_at_crash_point` polls for at most `timeout_seconds`, rejects a mismatched point, sends `os.kill(process.pid, signal.SIGKILL)`, joins for at most `timeout_seconds`, and checks `process.exitcode == -signal.SIGKILL`. In a `finally` block, kill and join any still-live process. Do not include payloads, credentials, or arbitrary exception text in barrier messages; keep all existing assertions green during this test-only refactor.
 
 - [ ] **Step 4: Verify budget recovery from a fresh EventStore**
 
@@ -101,21 +102,21 @@ git push origin codex/p3-systemd-termination-receipts
 - Consumes `_approval_fixture(tmp_path, approval_attempt_authority=..., launcher=...)`, `_tool_request(...)`, `ApprovalService.approve`, `ApprovalService.bind_to_attempt`, `ApprovalService.consume_and_intend`, and `ToolGateway.execute`; extend the fixture with these optional parameters while retaining `_ApprovalAuthority` and `_Launcher` as their defaults.
 - The child reopens the same database, recreates the real host service fixture, and injects only a test-local barrier around the selected method/SQLite COMMIT. The normal ToolGateway/ApprovalService logic still produces all persisted records.
 
-- [ ] **Step 1: Write the bound-but-unconsumed regression skeleton**
+- [ ] **Step 1: Write the bound-but-unconsumed process-death regression**
 
-In a new integration test, use `_approval_fixture(tmp_path)`. First call `gateway.execute` with origin Attempt `attempt-1`/generation 2, require `awaiting_approval`, and call `approvals.approve(..., "human-1", reason="approve exact read")`. Close the parent store. In the child, reopen `_approval_fixture` with a marker-writing launcher whose `launch(...)` creates the marker exclusively, then call `ToolGateway.execute` for `attempt-2`/generation 3 with the issued grant. Do not add the barrier wrapper yet; this is the baseline RED test showing the normal path proceeds beyond the target boundary.
+In a new integration test, use `_approval_fixture(tmp_path)`. First call `gateway.execute` with origin Attempt `attempt-1`/generation 2, require `awaiting_approval`, and call `approvals.approve(..., "human-1", reason="approve exact read")`. Close the parent store. In the child, reopen `_approval_fixture` with a marker-writing launcher whose `launch(...)` creates the marker exclusively, wrap `bind_to_attempt` to call the real method and then block at `approval.bound-before-consume`, and call `ToolGateway.execute` for `attempt-2`/generation 3 with the issued grant. This is a characterization test for the approved fail-closed behavior; no product behavior change is intended.
 
-The parent expects `approval.bound-before-consume`; before Step 3 the bounded wait must fail because the child never reports that point. After the barrier is inserted in Step 3, assert one ApprovalGrantBound, zero EffectIntentRecorded, zero ApprovalGrantConsumed, zero BudgetReserved, no ToolExecutionStarted event, and no launcher marker file. Then assert binding the same grant to attempt-2 again raises `ApprovalInvalid`; create a reopened ApprovalService using the fixture's optional test authority that considers attempt-3/generation 4 current and assert that rebinding there also raises `ApprovalInvalid`. No code may remove the binding or manufacture a replacement grant.
+The parent hard-kills at the named boundary and asserts one ApprovalGrantBound, zero EffectIntentRecorded, zero ApprovalGrantConsumed, zero BudgetReserved, no ToolExecutionStarted event, and no launcher marker file. Then assert binding the same grant to attempt-2 again raises `ApprovalInvalid`; create a reopened ApprovalService using the fixture's optional test authority that considers attempt-3/generation 4 current and assert that rebinding there also raises `ApprovalInvalid`. No code may remove the binding or manufacture a replacement grant.
 
-- [ ] **Step 2: Run that test and confirm it fails before wiring the barrier**
+- [ ] **Step 2: Run the binding characterization test**
 
 Run: `python3 -m pytest tests/integration/test_approval_tool_gateway.py -k 'sigkill_after_binding_before_consume' -q`
 
-Expected: FAIL because the child runs through the existing path without reporting `approval.bound-before-consume`; the bounded parent wait must fail and reap it. Do not accept an in-memory exception as process death.
+Expected: PASS: the existing ApprovalService/Gateway path leaves the grant bound but unconsumed after a real parent-issued `SIGKILL`. Do not replace the process death with an in-memory exception.
 
-- [ ] **Step 3: Add the bound/consume barriers and write atomic-consumption pre/post-COMMIT tests**
+- [ ] **Step 3: Add consume pre/post-COMMIT barriers and tests**
 
-For the bound-before-consume case, wrap `bind_to_attempt`, call the real method, then report and block at `approval.bound-before-consume`. For the consume pre-COMMIT case, wrap `bind_to_attempt`, call the real method, arm the SQLite trace callback only after its security-stream append has returned, and block at `approval.consume-before-commit` when the later budget-stream transaction traces COMMIT. For the consume post-COMMIT case, wrap the real `consume_and_intend`, call it, then report and block at `approval.consume-after-commit` before returning to ToolGateway. Each independent case starts from a fresh temporary database with equivalent Gateway request IDs, grant scope, policy, and Attempt identities as the existing approval success test. Use the marker-writing test launcher plus persisted `ToolExecutionStarted` checks to prove none reaches launch.
+Add test-local consume barriers without changing production methods. For the consume pre-COMMIT case, arm the SQLite trace callback only after the `approval-bind:<grant>` security-stream append has returned, then block at `approval.consume-before-commit` when the later budget-stream transaction traces COMMIT. For the consume post-COMMIT case, wrap the real `consume_and_intend`, call it, then report and block at `approval.consume-after-commit` before returning to ToolGateway. Each independent case starts from a fresh temporary database with equivalent Gateway request IDs, grant scope, policy, and Attempt identities as the existing approval success test. Use the marker-writing test launcher plus persisted `ToolExecutionStarted` checks to prove neither case reaches launch; valid characterization tests are expected to pass with current product code.
 
 Expected pre-COMMIT state: the binding exists, but no EffectIntentRecorded, ApprovalGrantConsumed, or BudgetReserved exists; no ToolExecutionStarted event or launcher marker exists. Expected post-COMMIT state: exactly one EffectIntentRecorded, one ApprovalGrantConsumed, and one BudgetReserved exist; no EffectReceiptRecorded, ToolExecutionStarted event, or launcher marker exists because the child was killed before launch. Replaying the same ToolRequest must raise `ToolRequestAlreadyUsed` before the launcher and must not add events.
 
@@ -144,21 +145,21 @@ git push origin codex/p3-systemd-termination-receipts
 - Consumes the module fixtures `run_setup`, `scheduler`, `routed_pair`, and `accept`; the production `RunRecoveryCoordinator.recover(run_id)` API; `ArtifactStore.publish_bytes`; and the current internal test hooks `_record_intent`/`_record_metadata`.
 - Adds a test-local durable receiver with `apply(effect_id: str) -> None` backed by a SQLite file separate from the Maestro EventStore. Create `invocations(effect_id TEXT NOT NULL)` and `effects(effect_id TEXT PRIMARY KEY)` tables; each `apply` call uses `BEGIN IMMEDIATE`, inserts one invocation row, inserts into `effects` with `ON CONFLICT DO NOTHING`, then commits. This lets the test distinguish a repeated call from the receiver's idempotent final state across process restart.
 
-- [ ] **Step 1: Write the external-action-before-receipt test skeleton**
+- [ ] **Step 1: Write the external-action-before-receipt process-death test**
 
-Seed a real Run, accepted Attempt, and budget reservation in the parent using `run_setup`, `routed_pair`, `scheduler`, and `accept`. In the child, reopen the EventStore and receiver database, append one exact Attempt-bound EffectIntentRecorded event to the budget stream, commit one call to the separate durable receiver, and omit both EffectReceiptRecorded and the crash barrier. The test parent already waits for `effect.applied-before-receipt`, so this initial skeleton must fail because the child never reports that boundary. After Step 3, add the barrier and fresh-store recovery assertions: the parent hard-kills, opens new EventStore and receiver connections, calls `RunRecoveryCoordinator.recover("run-1")`, closes and reopens the EventStore, and calls recovery again so both reads use fresh connections.
+Seed a real Run, accepted Attempt, and budget reservation in the parent using `run_setup`, `routed_pair`, `scheduler`, and `accept`. In the child, reopen the EventStore and receiver database, append one exact Attempt-bound EffectIntentRecorded event to the budget stream, commit one call to the separate durable receiver, report and block at `effect.applied-before-receipt`, and omit EffectReceiptRecorded. The parent hard-kills, opens new EventStore and receiver connections, calls `RunRecoveryCoordinator.recover("run-1")`, closes and reopens the EventStore, and calls recovery again so both reads use fresh connections. This characterizes already-implemented no-replay semantics; no product behavior change is intended.
 
 Assert the recovered effect is `outcome_unknown`, the accepted Attempt still occupies one active slot, `recovered.budget.reserved_minor` still includes the accepted Attempt's reservation, no EffectReceiptRecorded exists, and the receiver has exactly one invocation row and one effect row. Repeating read-only recovery must leave both sink counts unchanged. This test does not claim to prove a real Provider effect or supply authority to settle it.
 
-- [ ] **Step 2: Run the test in RED and confirm it fails before adding the barrier**
+- [ ] **Step 2: Run the external-effect characterization test**
 
 Run: `python3 -m pytest tests/unit/lifecycle/test_scheduler.py -k 'external_action_before_receipt_sigkill' -q`
 
-Expected: FAIL because the child does not report `effect.applied-before-receipt`; the bounded helper wait must kill/reap it. The durable receiver fixture is test-only, not a Provider emulator or evidence authority. A test that directly appends EffectReceiptRecorded or runs recovery in the child does not satisfy this case.
+Expected: PASS: after the fake receiver action commits but before a receipt is written, recovery keeps the effect unknown and does not invoke the receiver again. The durable receiver fixture is test-only, not a Provider emulator or evidence authority. A test that directly appends EffectReceiptRecorded or runs recovery in the child does not satisfy this case.
 
-- [ ] **Step 3: Wire the effect barrier and convert Artifact recovery points to parent-issued SIGKILL**
+- [ ] **Step 3: Convert Artifact recovery points to parent-issued SIGKILL**
 
-Add `block_at_crash_point` immediately after the separate receiver's committed `apply(effect_id)` returns and before any receipt write. Modify `test_run_recovery_attributes_interrupted_artifact_publications` so its child wrapper calls `block_at_crash_point` after `_record_intent(record)` and after the blob has been installed but before `_record_metadata(record)`. The parent uses `kill_at_crash_point` at `artifact.after-intent` and `artifact.after-blob`; require `-SIGKILL` rather than `os._exit` return codes. Retain assertions for `pending_artifacts`, exact `missing`/`orphaned_blob` state, Run/Node provenance, and read-only orphan inventory. Do not call candidate admission or artifact deletion.
+Modify `test_run_recovery_attributes_interrupted_artifact_publications` so its child wrapper calls `block_at_crash_point` after `_record_intent(record)` and after the blob has been installed but before `_record_metadata(record)`. The parent uses `kill_at_crash_point` at `artifact.after-intent` and `artifact.after-blob`; require `-SIGKILL` rather than `os._exit` return codes. Retain assertions for `pending_artifacts`, exact `missing`/`orphaned_blob` state, Run/Node provenance, and read-only orphan inventory. Do not call candidate admission or artifact deletion.
 
 - [ ] **Step 4: Verify fresh-process recovery for effects and artifacts**
 
