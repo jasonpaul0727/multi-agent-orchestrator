@@ -572,4 +572,3 @@ os._exit(0)
                 pass
             finally:
                 os.close(child_handle)
-
