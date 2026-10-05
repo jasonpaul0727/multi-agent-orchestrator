@@ -6,8 +6,9 @@ import time
 
 import pytest
 
-from orchestrator.budget import BudgetLedger, CostEstimate, RunLimit
+from orchestrator.budget import BudgetLedger, CostEstimate, RunLimit, UsageRecord
 from orchestrator.persistence import EventDraft, SQLiteEventStore
+from tests.support.process_crash import block_at_crash_point, kill_at_crash_point
 
 
 def _context(*, causation_id="event-parent"):
@@ -67,25 +68,94 @@ def _provider_call_child(database, dispatched_marker, registry, request):
         store.close()
 
 
-class _CommitThenLoseResponse:
-    """Simulate a process losing the reply after a durable append commits."""
+def _trace_before_commit(pipe, point):
+    def trace(statement):
+        if statement.strip().upper() == "COMMIT":
+            block_at_crash_point(pipe, point)
+    return trace
 
-    def __init__(self, delegate, key_prefix):
-        self.delegate = delegate
-        self.key_prefix = key_prefix
-        self.lost = False
 
-    def __getattr__(self, name):
-        return getattr(self.delegate, name)
-
-    def append_checked(self, stream_type, stream_id, idempotency_key, decide):
-        result = self.delegate.append_checked(
-            stream_type, stream_id, idempotency_key, decide
+def _budget_reservation_child(database, pipe, boundary):
+    with SQLiteEventStore(database) as store:
+        ledger = BudgetLedger(
+            store,
+            run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
         )
-        if not self.lost and idempotency_key.startswith(self.key_prefix):
-            self.lost = True
-            raise RuntimeError("simulated process interruption after commit")
-        return result
+        point = f"budget_reservation_{boundary}"
+        if boundary == "before_commit":
+            store._connection.set_trace_callback(_trace_before_commit(pipe, point))
+        _reserve_budget(ledger)
+        block_at_crash_point(pipe, point)
+
+
+def _budget_settlement_child(database, pipe, boundary, reservation_id):
+    with SQLiteEventStore(database) as store:
+        ledger = BudgetLedger(store)
+        point = f"budget_settlement_{boundary}"
+        if boundary == "before_commit":
+            store._connection.set_trace_callback(_trace_before_commit(pipe, point))
+        ledger.commit_usage(
+            reservation_id,
+            {"input_tokens": 4, "cost_minor": 3},
+            settlement_key="settlement-1",
+        )
+        block_at_crash_point(pipe, point)
+
+
+def _reserve_budget(ledger):
+    return ledger.reserve(
+        "run-1",
+        CostEstimate(amount_minor=12, currency="USD", token_limit=8),
+        idempotency_key="provider-call-1",
+        node_id="node-1",
+        attempt_id="attempt-1",
+        fencing_generation=2,
+        correlation_id="corr-1",
+        causation_id="routing-1",
+    )
+
+
+@pytest.mark.parametrize("point", ["", "x" * 97, "non-ascii-\N{LATIN SMALL LETTER E WITH ACUTE}"])
+def test_crash_barrier_rejects_invalid_point_without_sending(point):
+    parent_pipe, child_pipe = multiprocessing.Pipe(duplex=True)
+    try:
+        with pytest.raises(ValueError, match="non-empty ASCII"):
+            block_at_crash_point(child_pipe, point)
+        assert not parent_pipe.poll(0)
+    finally:
+        parent_pipe.close()
+        child_pipe.close()
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "timeout", "oversize"])
+def test_crash_barrier_failure_still_kills_and_reaps_child(failure):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("hard process termination requires the fork start method")
+    context = multiprocessing.get_context("fork")
+    parent_pipe, child_pipe = context.Pipe(duplex=True)
+
+    def blocked_child():
+        if failure == "timeout":
+            child_pipe.recv_bytes(1)
+        else:
+            # Oversize exercises the parent's bounded receive failure path.
+            child_pipe.send_bytes(b"x" * 97 if failure == "oversize" else b"wrong-point")
+            child_pipe.recv_bytes(1)
+
+    child = context.Process(target=blocked_child)
+    child.start()
+    child_pipe.close()
+    try:
+        expected_error = OSError if failure == "oversize" else AssertionError
+        with pytest.raises(expected_error):
+            kill_at_crash_point(
+                child, parent_pipe, expected_point="expected-point", timeout_seconds=1
+            )
+        assert child.exitcode == -signal.SIGKILL
+        assert not child.is_alive()
+    finally:
+        parent_pipe.close()
+        child.close()
 
 
 class _CommitThenLoseAppendResponse:
@@ -164,45 +234,47 @@ def test_crash_after_intent_and_receipt_response_loss_is_idempotent(tmp_path):
     assert provider_effects == {"provider-key-1": "receipt-1"}
 
 
-def test_crash_after_budget_reservation_commit_replays_one_hold(tmp_path):
-    database = tmp_path / "budget-response-loss.db"
-    initial_store = SQLiteEventStore(database)
-    interrupted_store = _CommitThenLoseResponse(initial_store, "reserve:")
-    first_ledger = BudgetLedger(
-        interrupted_store,
-        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+@pytest.mark.parametrize("boundary", ["before_commit", "after_commit"])
+def test_budget_reservation_sigkill_replays_one_hold(tmp_path, boundary):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("hard process termination requires the fork start method")
+    database = tmp_path / "budget-sigkill.db"
+    context = multiprocessing.get_context("fork")
+    parent_pipe, child_pipe = context.Pipe(duplex=True)
+    child = context.Process(
+        target=_budget_reservation_child, args=(database, child_pipe, boundary)
     )
-    estimate = CostEstimate(amount_minor=12, currency="USD", token_limit=8)
-
-    with pytest.raises(RuntimeError, match="process interruption"):
-        first_ledger.reserve(
-            "run-1",
-            estimate,
-            idempotency_key="provider-call-1",
-            node_id="node-1",
-            attempt_id="attempt-1",
-            fencing_generation=2,
-            correlation_id="corr-1",
-            causation_id="routing-1",
+    child.start()
+    child_pipe.close()
+    try:
+        kill_at_crash_point(
+            child, parent_pipe, expected_point=f"budget_reservation_{boundary}"
         )
-    initial_store.close()
+    finally:
+        parent_pipe.close()
+        child.close()
 
-    restarted_store = SQLiteEventStore(database)
-    restarted_ledger = BudgetLedger(restarted_store)
-    reservation = restarted_ledger.reserve(
-        "run-1",
-        estimate,
-        idempotency_key="provider-call-1",
-        node_id="node-1",
-        attempt_id="attempt-1",
-        fencing_generation=2,
-        correlation_id="corr-1",
-        causation_id="routing-1",
-    )
-
-    assert restarted_store.current_version("budget", "run-1") == 1
-    assert reservation.attempt_id == "attempt-1"
-    assert restarted_ledger.available("run-1").reserved_minor == 12
+    with SQLiteEventStore(database) as recovered:
+        ledger = BudgetLedger(
+            recovered,
+            run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+        )
+        events = recovered.read_stream("budget", "run-1")
+        if boundary == "before_commit":
+            assert events == []
+            assert ledger.available("run-1").reserved_minor == 0
+        else:
+            assert [event.event_type for event in events] == ["BudgetReserved"]
+            assert ledger.available("run-1").reserved_minor == 12
+        reservation = _reserve_budget(ledger)
+        if boundary == "after_commit":
+            assert reservation.reservation_id == events[0].payload["reservation_id"]
+        assert _reserve_budget(ledger) == reservation
+        assert [event.event_type for event in recovered.read_stream("budget", "run-1")] == [
+            "BudgetReserved"
+        ]
+        assert reservation.attempt_id == "attempt-1"
+        assert ledger.available("run-1").reserved_minor == 12
 
 
 @pytest.mark.parametrize("failure_point", ["before_receipt", "after_receipt"])
@@ -287,40 +359,70 @@ def test_crash_after_approval_consumption_replays_atomic_pair_once(tmp_path):
     assert restarted.current_version("run", "run-1") == 2
 
 
-def test_crash_after_settlement_commit_retries_without_double_charge(tmp_path):
-    database = tmp_path / "settlement-response-loss.db"
-    initial = SQLiteEventStore(database)
-    estimate = CostEstimate(amount_minor=10, currency="USD", token_limit=10)
-    reservation = BudgetLedger(
-        initial,
-        run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
-    ).reserve("run-1", estimate, idempotency_key="reserve-1")
-    interrupted = _CommitThenLoseResponse(initial, "settle:")
-    with pytest.raises(RuntimeError, match="process interruption"):
-        BudgetLedger(interrupted).commit_usage(
+@pytest.mark.parametrize("boundary", ["before_commit", "after_commit"])
+def test_budget_settlement_sigkill_retries_without_double_charge(tmp_path, boundary):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("hard process termination requires the fork start method")
+    database = tmp_path / "settlement-sigkill.db"
+    with SQLiteEventStore(database) as initial:
+        reservation = _reserve_budget(BudgetLedger(
+            initial,
+            run_limits={"run-1": RunLimit(max_cost_minor=100, max_tokens=100)},
+        ))
+    context = multiprocessing.get_context("fork")
+    parent_pipe, child_pipe = context.Pipe(duplex=True)
+    child = context.Process(
+        target=_budget_settlement_child,
+        args=(database, child_pipe, boundary, reservation.reservation_id),
+    )
+    child.start()
+    child_pipe.close()
+    try:
+        kill_at_crash_point(
+            child, parent_pipe, expected_point=f"budget_settlement_{boundary}"
+        )
+    finally:
+        parent_pipe.close()
+        child.close()
+
+    with SQLiteEventStore(database) as recovered:
+        ledger = BudgetLedger(recovered)
+        events = recovered.read_stream("budget", "run-1")
+        balance = ledger.available("run-1")
+        if boundary == "before_commit":
+            assert [event.event_type for event in events] == ["BudgetReserved"]
+            assert balance.reserved_minor == 12
+            assert balance.used_minor == 0
+        else:
+            assert balance.used_minor == 3
+            assert balance.reserved_minor == 0
+            assert [event.event_type for event in events].count("CostCommitted") == 1
+        first = ledger.commit_usage(
             reservation.reservation_id,
             {"input_tokens": 4, "cost_minor": 3},
-            settlement_key="provider-settlement-1",
+            settlement_key="settlement-1",
         )
-    initial.close()
-
-    restarted = SQLiteEventStore(database)
-    ledger = BudgetLedger(restarted)
-    first = ledger.commit_usage(
-        reservation.reservation_id,
-        {"input_tokens": 4, "cost_minor": 3},
-        settlement_key="provider-settlement-1",
-    )
-    second = ledger.commit_usage(
-        reservation.reservation_id,
-        {"input_tokens": 4, "cost_minor": 3},
-        settlement_key="provider-settlement-1",
-    )
-    assert first == second
-    assert ledger.available("run-1").used_minor == 3
-    assert [event.event_type for event in restarted.read_stream("budget", "run-1")].count(
-        "CostCommitted"
-    ) == 1
+        if boundary == "after_commit":
+            committed = next(event for event in events if event.event_type == "CostCommitted")
+            assert first == UsageRecord(
+                reservation_id=committed.payload["reservation_id"],
+                run_id="run-1",
+                settlement_key="settlement-1",
+                currency="USD",
+                input_tokens=4,
+                cost_minor=3,
+                status="committed",
+            )
+        assert ledger.commit_usage(
+            reservation.reservation_id,
+            {"input_tokens": 4, "cost_minor": 3},
+            settlement_key="settlement-1",
+        ) == first
+        assert ledger.available("run-1").used_minor == 3
+        assert ledger.available("run-1").reserved_minor == 0
+        assert [event.event_type for event in recovered.read_stream("budget", "run-1")].count(
+            "CostCommitted"
+        ) == 1
 
 
 def test_gateway_does_not_replay_after_process_dies_during_provider_dispatch(tmp_path):
