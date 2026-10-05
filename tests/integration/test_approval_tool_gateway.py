@@ -1,7 +1,11 @@
 from datetime import datetime, timezone
 import hashlib
+import multiprocessing
+
+import pytest
 
 from orchestrator.approvals import (
+    ApprovalInvalid,
     ApprovalPolicyState,
     ApprovalPrincipal,
     ApprovalService,
@@ -11,7 +15,8 @@ from orchestrator.budget import BudgetLedger, RunLimit
 from orchestrator.isolation import SandboxResult, SandboxTerminationReceipt
 from orchestrator.persistence import SQLiteEventStore
 from orchestrator.security.policy import PolicyAuthority, PolicyManifest
-from orchestrator.tools import PolicyState, ToolGateway, ToolRequest
+from orchestrator.tools import PolicyState, ToolGateway, ToolRequest, ToolRequestAlreadyUsed
+from tests.support.process_crash import block_at_crash_point, kill_at_crash_point
 
 
 _NOW = datetime(2026, 9, 26, 18, 0, tzinfo=timezone.utc)
@@ -99,7 +104,10 @@ class _Launcher:
         return _Session()
 
 
-def _approval_fixture(tmp_path, *, tool_authority=None, service_adapter=None, currency="USD"):
+def _approval_fixture(
+    tmp_path, *, tool_authority=None, service_adapter=None, currency="USD",
+    approval_attempt_authority=None, launcher=None,
+):
     store = SQLiteEventStore(tmp_path / "approval-additional.db")
     ledger = BudgetLedger(
         store,
@@ -113,11 +121,11 @@ def _approval_fixture(tmp_path, *, tool_authority=None, service_adapter=None, cu
             principal_type="human",
             permissions=frozenset({"approval:approve"}),
         ),
-        attempt_authority=_ApprovalAuthority(),
+        attempt_authority=approval_attempt_authority or _ApprovalAuthority(),
         policy_state=lambda request: ApprovalPolicyState(1, 4),
         now=lambda: _NOW,
     )
-    launcher = _Launcher()
+    launcher = launcher if launcher is not None else _Launcher()
     gateway = ToolGateway(
         run_id="run-1",
         workspace=tmp_path,
@@ -416,6 +424,177 @@ def launcher_not_started(store):
         event.event_type == "ToolExecutionStarted"
         for event in store.read_stream("security", "run-1")
     )
+
+
+class _MarkerLauncher(_Launcher):
+    def __init__(self, marker):
+        super().__init__()
+        self.marker = marker
+
+    def launch(self, *args, **kwargs):
+        # Exclusive creation detects launch across process/service lifetimes.
+        with self.marker.open("x") as output:
+            output.write("launch called\n")
+        return super().launch(*args, **kwargs)
+
+
+def _execute_approval_until_crash(tmp_path, grant_id, marker, pipe, point):
+    store, approvals, _launcher, gateway = _approval_fixture(
+        tmp_path, launcher=_MarkerLauncher(marker),
+    )
+    try:
+        if point == "approval.bound-before-consume":
+            real_bind = approvals.bind_to_attempt
+
+            def bind_then_block(*args, **kwargs):
+                result = real_bind(*args, **kwargs)
+                block_at_crash_point(pipe, point)
+                return result
+
+            approvals.bind_to_attempt = bind_then_block
+        elif point == "approval.consume-before-commit":
+            real_append = store.append_checked
+            in_budget_append = False
+
+            def trace_commit(statement):
+                if in_budget_append and statement.strip().upper() == "COMMIT":
+                    block_at_crash_point(pipe, point)
+
+            def append_and_arm(stream_type, stream_id, key, decide):
+                nonlocal in_budget_append
+                in_budget_append = stream_type == "budget"
+                try:
+                    result = real_append(stream_type, stream_id, key, decide)
+                finally:
+                    in_budget_append = False
+                if stream_type == "security" and key == f"approval-bind:{grant_id}":
+                    # The binding COMMIT has returned. Only the later budget
+                    # transaction's COMMIT can reach this crash barrier.
+                    store._connection.set_trace_callback(trace_commit)
+                return result
+
+            store.append_checked = append_and_arm
+        elif point == "approval.consume-after-commit":
+            real_consume = approvals.consume_and_intend
+
+            def consume_then_block(*args, **kwargs):
+                result = real_consume(*args, **kwargs)
+                block_at_crash_point(pipe, point)
+                return result
+
+            approvals.consume_and_intend = consume_then_block
+        else:
+            raise AssertionError("unexpected approval crash point")
+
+        gateway.execute(_tool_request(
+            tmp_path, request_id="tool-request-2", attempt_id="attempt-2", generation=3,
+        ), approval_grant_id=grant_id)
+        raise AssertionError("approval execution returned without reaching crash point")
+    finally:
+        store.close()
+        pipe.close()
+
+
+class _NewerApprovalAuthority:
+    def is_current(self, attempt):
+        return attempt.attempt_id == "attempt-3" and attempt.fencing_generation == 4
+
+
+@pytest.mark.parametrize("point, consumed", [
+    pytest.param("approval.bound-before-consume", False,
+                 id="sigkill_after_binding_before_consume_leaves_grant_unusable"),
+    pytest.param("approval.consume-before-commit", False,
+                 id="sigkill_consume_before_commit_leaves_grant_unusable"),
+    pytest.param("approval.consume-after-commit", True,
+                 id="sigkill_consume_after_commit_blocks_replay"),
+])
+def test_approval_sigkill_binding_and_consumption(tmp_path, point, consumed):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("hard process termination requires the fork start method")
+    # Each parameter gets an independent DB and grant, with the exact successful
+    # execution scope. A bound but unconsumed grant cannot be revived by retry.
+    marker = tmp_path / "launcher-called"
+    store, approvals, launcher, gateway = _approval_fixture(tmp_path)
+    try:
+        waiting = gateway.execute(_tool_request(
+            tmp_path, request_id="tool-request-1", attempt_id="attempt-1", generation=2,
+        ))
+        assert waiting.outcome == "awaiting_approval"
+        assert waiting.approval_request_id is not None
+        issued = approvals.approve(
+            waiting.approval_request_id, "human-1", reason="approve exact read",
+        )
+        assert launcher.calls == []
+    finally:
+        store.close()
+
+    context = multiprocessing.get_context("fork")
+    parent_pipe, child_pipe = context.Pipe()
+    child = context.Process(target=_execute_approval_until_crash, args=(
+        tmp_path, issued.approval_grant_id, marker, child_pipe, point,
+    ))
+    child.start()
+    child_pipe.close()
+    try:
+        kill_at_crash_point(child, parent_pipe, expected_point=point, timeout_seconds=10.0)
+    finally:
+        parent_pipe.close()
+        child.close()
+
+    # Recovery uses a new connection and real services, never inherited state.
+    store, approvals, launcher, gateway = _approval_fixture(
+        tmp_path, launcher=_MarkerLauncher(marker),
+    )
+    try:
+        security = store.read_stream("security", "run-1")
+        budget = store.read_stream("budget", "run-1")
+        bound = [event for event in security if event.event_type == "ApprovalGrantBound"]
+        assert len(bound) == 1
+        assert bound[0].payload["approval_grant_id"] == issued.approval_grant_id
+        assert bound[0].payload["attempt_id"] == "attempt-2"
+        assert bound[0].payload["fencing_generation"] == 3
+        assert [event.event_type for event in budget] == (
+            ["EffectIntentRecorded", "ApprovalGrantConsumed", "BudgetReserved"]
+            if consumed else []
+        )
+        assert launcher_not_started(store)
+        assert not marker.exists()
+
+        if not consumed:
+            with pytest.raises(ApprovalInvalid, match="already bound"):
+                approvals.bind_to_attempt(issued.approval_grant_id, ExecutionAttempt(
+                    run_id="run-1", node_id="node-1", attempt_id="attempt-2",
+                    fencing_generation=3,
+                    isolation_profile_hash=_hash("measured-readonly-profile"),
+                ))
+
+        with pytest.raises(ToolRequestAlreadyUsed):
+            gateway.execute(_tool_request(
+                tmp_path, request_id="tool-request-2", attempt_id="attempt-2", generation=3,
+            ), approval_grant_id=issued.approval_grant_id)
+        assert store.read_stream("security", "run-1") == security
+        assert store.read_stream("budget", "run-1") == budget
+        assert launcher.calls == []
+        assert not marker.exists()
+    finally:
+        store.close()
+
+    if not consumed:
+        store, approvals, _launcher, _gateway = _approval_fixture(
+            tmp_path, approval_attempt_authority=_NewerApprovalAuthority(),
+        )
+        try:
+            with pytest.raises(ApprovalInvalid, match="already bound"):
+                approvals.bind_to_attempt(issued.approval_grant_id, ExecutionAttempt(
+                    run_id="run-1", node_id="node-1", attempt_id="attempt-3",
+                    fencing_generation=4,
+                    isolation_profile_hash=_hash("measured-readonly-profile"),
+                ))
+            assert store.read_stream("security", "run-1") == security
+            assert store.read_stream("budget", "run-1") == budget
+            assert not marker.exists()
+        finally:
+            store.close()
 
 
 def test_approval_tool_gateway_uses_run_budget_currency_for_zero_cost_effect(tmp_path):
