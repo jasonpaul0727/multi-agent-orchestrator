@@ -1,10 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import multiprocessing
 import os
+import sqlite3
 from threading import Barrier
 
 import pytest
@@ -68,6 +70,7 @@ from orchestrator.scheduler import (
 )
 from orchestrator.scheduler.core import _verify_persisted_recovery_authorization
 from orchestrator.security import PolicyAuthority, PolicyEngine, PolicyManifest, PolicyRequest
+from tests.support.process_crash import block_at_crash_point, kill_at_crash_point
 
 
 NOW = datetime(2026, 9, 23, 12, tzinfo=timezone.utc)
@@ -376,6 +379,82 @@ def accept(scheduler_, request, decision):
         accepted_at=NOW + timedelta(seconds=1),
         lease_expires_at=NOW + timedelta(minutes=1),
     )
+
+
+class _DurableTestEffectReceiver:
+    """A separate SQLite sink that records calls and idempotent effects."""
+
+    def __init__(self, database_path):
+        self._database_path = str(database_path)
+        with closing(sqlite3.connect(self._database_path)) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS invocations(effect_id TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS effects(effect_id TEXT PRIMARY KEY)"
+            )
+            connection.commit()
+
+    def apply(self, effect_id: str) -> None:
+        with sqlite3.connect(self._database_path, isolation_level=None) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "INSERT INTO invocations(effect_id) VALUES (?)", (effect_id,)
+                )
+                connection.execute(
+                    "INSERT INTO effects(effect_id) VALUES (?) "
+                    "ON CONFLICT(effect_id) DO NOTHING",
+                    (effect_id,),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def counts(self, effect_id: str) -> tuple[int, int]:
+        with closing(sqlite3.connect(self._database_path)) as connection:
+            invocations = connection.execute(
+                "SELECT COUNT(*) FROM invocations WHERE effect_id = ?", (effect_id,)
+            ).fetchone()[0]
+            effects = connection.execute(
+                "SELECT COUNT(*) FROM effects WHERE effect_id = ?", (effect_id,)
+            ).fetchone()[0]
+        return invocations, effects
+
+
+def _external_action_before_receipt_child(
+    database_path,
+    receiver_path,
+    run_id,
+    node_id,
+    attempt_id,
+    fencing_generation,
+    decision_hash,
+    pipe,
+):
+    child_store = SQLiteEventStore(database_path)
+    effect_id = "effect-before-receipt"
+    child_store.append(
+        "budget",
+        run_id,
+        child_store.current_version("budget", run_id),
+        [
+            EventDraft(
+                "EffectIntentRecorded",
+                {"effect_id": effect_id, "recovery_class": "manual_only"},
+                run_id=run_id,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                fencing_generation=fencing_generation,
+                causation_id=decision_hash,
+            )
+        ],
+        "effect-intent-before-receipt-crash-test",
+    )
+    child_store.close()
+    _DurableTestEffectReceiver(receiver_path).apply(effect_id)
+    block_at_crash_point(pipe, "effect.applied-before-receipt")
 
 
 def _provider_call_request_for_crash(accepted, reg):
@@ -2971,6 +3050,74 @@ def test_run_recovery_replays_effect_state_after_process_death(tmp_path):
         reopened.close()
 
 
+def test_run_recovery_does_not_replay_external_action_before_receipt_sigkill(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("the crash-injection harness currently requires fork")
+
+    database = tmp_path / "run-recovery-effect-before-receipt.db"
+    receiver_database = tmp_path / "durable-test-effect-receiver.db"
+    store = SQLiteEventStore(database)
+    reg, config, _lifecycle, manifest = run_setup(store)
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accepted = accept(control, request, decision)
+    store.close()
+
+    receiver = _DurableTestEffectReceiver(receiver_database)
+    context = multiprocessing.get_context("fork")
+    parent_pipe, child_pipe = context.Pipe(duplex=True)
+    process = context.Process(
+        target=_external_action_before_receipt_child,
+        args=(
+            str(database),
+            str(receiver_database),
+            request.run_id,
+            request.node_id,
+            request.attempt_id,
+            request.fencing_generation,
+            decision.decision_hash,
+            child_pipe,
+        ),
+    )
+    process.start()
+    child_pipe.close()
+    try:
+        kill_at_crash_point(
+            process,
+            parent_pipe,
+            expected_point="effect.applied-before-receipt",
+        )
+    finally:
+        parent_pipe.close()
+
+    effect_id = "effect-before-receipt"
+    assert receiver.counts(effect_id) == (1, 1)
+    with SQLiteEventStore(database) as reopened:
+        recovered = RunRecoveryCoordinator(reopened).recover(request.run_id)
+        assert len(recovered.effects) == 1
+        assert recovered.effects[0].effect_id == effect_id
+        assert recovered.effects[0].status == "outcome_unknown"
+        assert recovered.effects[0].attempt_id == request.attempt_id
+        assert recovered.effects[0].fencing_generation == request.fencing_generation
+        assert len(recovered.active_attempts) == 1
+        assert recovered.active_attempts[0].attempt_id == request.attempt_id
+        assert recovered.active_attempts[0].status == "active"
+        assert recovered.budget.reserved_minor == accepted.reservation.reserved_minor
+        assert not any(
+            event.event_type == "EffectReceiptRecorded"
+            for event in reopened.read_stream("budget", request.run_id)
+        )
+    assert receiver.counts(effect_id) == (1, 1)
+
+    # A second recovery uses a new EventStore connection and must remain read-only.
+    with SQLiteEventStore(database) as reopened_again:
+        recovered_again = RunRecoveryCoordinator(reopened_again).recover(request.run_id)
+        assert recovered_again.effects[0].status == "outcome_unknown"
+        assert len(recovered_again.active_attempts) == 1
+        assert recovered_again.budget.reserved_minor == accepted.reservation.reserved_minor
+    assert receiver.counts(effect_id) == (1, 1)
+
+
 def test_run_recovery_verifies_artifact_after_publisher_process_death(tmp_path):
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("the crash-injection harness currently requires fork")
@@ -3014,50 +3161,80 @@ def test_run_recovery_attributes_interrupted_artifact_publications(tmp_path):
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("the crash-injection harness currently requires fork")
 
-    def interrupt_publication(database, artifact_root, crash_point):
+    def interrupt_publication(
+        database,
+        artifact_root,
+        crash_point,
+        run_id,
+        node_id,
+        attempt_id,
+        fencing_generation,
+        pipe,
+    ):
         child_store = SQLiteEventStore(database)
         artifacts = ArtifactStore(artifact_root, event_store=child_store)
         if crash_point == "after_intent":
             record_intent = artifacts._record_intent
 
-            def intent_then_die(record):
+            def intent_then_block(record):
                 record_intent(record)
-                os._exit(79)
+                block_at_crash_point(pipe, "artifact.after-intent")
 
-            artifacts._record_intent = intent_then_die
+            artifacts._record_intent = intent_then_block
         else:
-            def metadata_then_die(_record):
-                os._exit(80)
+            def metadata_then_block(_record):
+                block_at_crash_point(pipe, "artifact.after-blob")
 
-            artifacts._record_metadata = metadata_then_die
+            artifacts._record_metadata = metadata_then_block
         artifacts.publish_bytes(
             b"candidate interrupted during artifact publication",
-            source={"run_id": "run-1", "node_id": "node-1"},
+            source={
+                "run_id": run_id,
+                "node_id": node_id,
+                "attempt_id": attempt_id,
+                "fencing_generation": str(fencing_generation),
+            },
             artifact_type="worker-output",
         )
-        os._exit(81)
 
-    for crash_point, expected_state, expected_exit in (
-        ("after_intent", "missing", 79),
-        ("after_blob", "orphaned_blob", 80),
+    for crash_point, expected_state, rendezvous_point in (
+        ("after_intent", "missing", "artifact.after-intent"),
+        ("after_blob", "orphaned_blob", "artifact.after-blob"),
     ):
         database = tmp_path / f"run-artifact-intent-{crash_point}.db"
         artifact_root = tmp_path / f"run-artifact-intent-{crash_point}"
         store = SQLiteEventStore(database)
-        run_setup(store, nodes=())
+        reg, config, _lifecycle, manifest = run_setup(store)
+        control = scheduler(store)
+        request, decision = routed_pair(reg, config, manifest)
+        accepted = accept(control, request, decision)
         store.close()
 
-        process = multiprocessing.get_context("fork").Process(
+        context = multiprocessing.get_context("fork")
+        parent_pipe, child_pipe = context.Pipe(duplex=True)
+        process = context.Process(
             target=interrupt_publication,
-            args=(str(database), str(artifact_root), crash_point),
+            args=(
+                str(database),
+                str(artifact_root),
+                crash_point,
+                request.run_id,
+                request.node_id,
+                request.attempt_id,
+                request.fencing_generation,
+                child_pipe,
+            ),
         )
         process.start()
-        process.join(timeout=20)
-        if process.is_alive():
-            process.kill()
-            process.join()
-            pytest.fail(f"artifact publication child timed out at {crash_point}")
-        assert process.exitcode == expected_exit
+        child_pipe.close()
+        try:
+            kill_at_crash_point(
+                process,
+                parent_pipe,
+                expected_point=rendezvous_point,
+            )
+        finally:
+            parent_pipe.close()
 
         reopened = SQLiteEventStore(database)
         artifacts = ArtifactStore(artifact_root, event_store=reopened)
@@ -3067,11 +3244,24 @@ def test_run_recovery_attributes_interrupted_artifact_publications(tmp_path):
         assert recovered.artifacts == ()
         assert len(recovered.pending_artifacts) == 1
         assert recovered.pending_artifacts[0].content_state == expected_state
-        assert recovered.pending_artifacts[0].node_id == "node-1"
+        assert recovered.pending_artifacts[0].node_id == request.node_id
+        assert recovered.pending_artifacts[0].attempt_id == request.attempt_id
+        assert len(recovered.active_attempts) == 1
+        assert recovered.active_attempts[0].attempt_id == request.attempt_id
+        assert recovered.budget.reserved_minor == accepted.reservation.reserved_minor
+        [pending_publication] = artifacts.pending_publications_for_run("run-1")
+        assert pending_publication.record.source == {
+            "run_id": request.run_id,
+            "node_id": request.node_id,
+            "attempt_id": request.attempt_id,
+            "fencing_generation": str(request.fencing_generation),
+        }
         digest = recovered.pending_artifacts[0].digest
-        assert artifacts.find_orphan_blobs() == (
+        expected_orphans = (
             (digest,) if expected_state == "orphaned_blob" else ()
         )
+        assert artifacts.find_orphan_blobs() == expected_orphans
+        assert artifacts.find_orphan_blobs() == expected_orphans
         reopened.close()
 
 
