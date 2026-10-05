@@ -1,6 +1,6 @@
 # P3 Cross-Process Crash Matrix Design
 
-**Status:** Draft for user review  
+**Status:** Amended draft for user review
 **Date:** 2026-10-05  
 **Target:** P3 offline process-death coverage for already implemented durable control-plane and publication boundaries
 
@@ -22,15 +22,18 @@ The current branch already contains substantial process-death tests:
 
 There is also response-loss-only coverage in `tests/integration/test_crash_matrix.py`: `RuntimeError` wrappers model losing the return after budget reservation, ApprovalGrant consumption, settlement, EffectIntent, or EffectReceipt writes. Those tests establish idempotent API behavior but are not equivalent to killing the process. The Scheduler EffectIntent recovery tests persist control-plane events directly and do not execute a separate external-effect receiver. Existing isolated Worker IPC always returns `blocked`; there is no functional Worker whose complete dispatch/cancel/recovery lifecycle could be tested.
 
+The approved-Tool path has another separately committed window. `ToolGateway.execute()` persists `ApprovalGrantBound` in the security stream before `ApprovalService.consume_and_intend()` atomically persists `EffectIntentRecorded`, `ApprovalGrantConsumed`, and `BudgetReserved` in the budget stream. If the host dies after the binding commit but before that atomic consume commit, the grant remains bound to the old Attempt; current `ApprovalService.bind_to_attempt()` rejects an already-bound grant, so it cannot be rebound even to that same Attempt. No external effect has launched and no effect reservation exists at this point, but the previous approval cannot be reused.
+
 ## Goals and non-goals
 
 ### Goals
 
 1. Add true process-death coverage for the currently response-loss-only durable commit points where recovery correctness matters: budget reservation/settlement and atomic ApprovalGrant-plus-budget consumption.
-2. Model an external effect with a test-only durable receiver separate from the Maestro EventStore. Kill the caller after the receiver applies the idempotency key but before the receipt is committed; prove restart leaves the effect unresolved and does not invoke the receiver again.
-3. Exercise Artifact publication death windows after the durable publication intent and after the content-addressed blob is installed but before its Published event. Reopen the store and prove the candidate remains pending and is neither accepted nor automatically deleted.
-4. Retain the existing real-kill Provider dispatch case as part of the matrix and verify unresolved calls still fail before credentials or transport on attempted replay.
-5. Keep every failure point deterministic, bounded, and observable by a new process and a fresh database connection.
+2. Kill between the separately committed `ApprovalGrantBound` and atomic consumption. Prove the grant remains fail-closed and unused, with no effect or budget reservation; do not add automatic unbind/rebind.
+3. Model an external effect with a test-only durable receiver separate from the Maestro EventStore. Kill the caller after the receiver applies the idempotency key but before the receipt is committed; prove restart leaves the effect unresolved and does not invoke the receiver again.
+4. Exercise Artifact publication death windows after the durable publication intent and after the content-addressed blob is installed but before its Published event. Reopen the store and prove the candidate remains pending and is neither accepted nor automatically deleted.
+5. Retain the existing real-kill Provider dispatch case as part of the matrix and verify unresolved calls still fail before credentials or transport on attempted replay.
+6. Keep every failure point deterministic, bounded, and observable by a new process and a fresh database connection.
 
 ### Explicit non-goals
 
@@ -55,6 +58,7 @@ The matrix has four assertion classes:
 
 | Boundary | Kill point(s) | Required restart invariant |
 |---|---|---|
+| Approval binding before consumption | After `ApprovalGrantBound` commits in the security stream; before `consume_and_intend()` commits the budget-stream transaction | No `EffectIntentRecorded`, `ApprovalGrantConsumed`, or `BudgetReserved` event exists and no launcher/receiver ran. The grant remains bound to its original Attempt and is rejected for reuse/rebinding. Recovery never removes the binding; another execution requires a new approval request/grant. |
 | Budget and Approval transactions | Before/after Budget reserve commit; before/after Budget settlement commit; before/after the atomic ApprovalGrant-plus-budget append commit | Pre-commit death leaves no partial events or changed projection. Post-commit death is idempotently replayed with exactly one reservation, settlement, or grant-consumption pair. |
 | External effect and receipt | After durable EffectIntent; after a test-only durable receiver applies the exact idempotency key but before EffectReceipt commits | Recovery reports an unresolved/unknown effect and preserves budget/slot holds. No startup/recovery operation calls the receiver or replays the action. A later explicit operator/reconciliation path is not implemented by this slice. |
 | Artifact publication | After `ArtifactPublicationIntent`; after blob installation but before Published metadata; existing complete-publication case | Recovery lists the exact Attempt-bound artifact as pending with `missing` or `orphaned_blob` content state as appropriate. It does not accept the candidate or automatically delete the object. A completed publication remains digest/size/provenance verified. |
@@ -66,6 +70,7 @@ The external-effect receiver is a test fixture with its own durable idempotency 
 
 - Every wait for a child, marker, database lock, or systemd operation is bounded. A timeout is a test failure; cleanup kills and joins the child and reports the exact fault point.
 - A killed process before a durable transaction commit must not leave a partial cross-stream state. A process killed after commit but before response must not create a duplicate event on retry.
+- A crash after an ApprovalGrant binding but before its atomic consume transaction leaves a one-use grant stranded on the bound Attempt. This slice proves no action or budget reservation occurred and preserves fail-closed semantics; it does not silently unbind, transfer, or revive the grant. A fresh approval flow is required to proceed.
 - An external action without a durable EffectReceipt stays `outcome_unknown`; its budget reservation and Scheduler slot remain held. The test must prove no recovery path silently executes it again.
 - A pending ArtifactPublicationIntent never becomes an accepted result solely because a digest-shaped blob exists. Existing global orphan inventory remains read-only and no crash test invokes cleanup/delete behavior.
 - A Provider dispatch without terminal outcome or authoritative evidence stays unresolved; sender termination evidence alone does not prove Provider acceptance, billing, or no effect.
@@ -87,11 +92,11 @@ Production source changes are conditional on a failing test demonstrating incorr
 
 1. A designated Linux test run covers every newly claimed hard-kill point without skips. Unsupported hosts may skip only live systemd checks according to existing platform policy; such a run is not evidence that the Linux/systemd acceptance passed.
 2. Recovery uses fresh processes/connections and the product's normal journal, ledger, ArtifactStore, Gateway, or Run Recovery APIs.
-3. The assertions in the matrix above pass, including exact event counts, reservation/slot state, pending artifact state, receiver invocation count, and no second Provider credential/transport call.
+3. The assertions in the matrix above pass, including the stranded-but-unconsumed ApprovalGrant case, exact event counts, reservation/slot state, pending artifact state, receiver invocation count, and no second Provider credential/transport call.
 4. Existing cancellation/termination receipt tests continue to prove that the host receipt is returned only after the exact transient systemd unit is inactive and its cgroup is empty. This remains launcher evidence, not whole Worker lifecycle acceptance.
 5. Run affected suites and the complete project gate: test coverage at least 90%, `compileall`, `pip check`, wheel build, and `git diff --check`. Report actual skips and failures; do not round a sub-90% result up.
 6. Push the reviewed change to `codex/p3-systemd-termination-receipts`, verify the remote tip and clean tracked worktree, and do not merge to `main`.
 
 ## Remaining P3/V1 blockers after this slice
 
-Passing this matrix closes only the offline process-death cases described here. It does not close the P3 checklist item for production Provider authority/signature verification or full Worker lifecycle coordination, and it does not provide a functional Worker, automatic recovery dispatcher, CLI/MCP, production Secret Broker backend, or paid Provider benchmark evidence. Unknown external effects remain unknown until a separately approved authoritative reconciliation path is configured.
+Passing this matrix closes only the offline process-death cases described here. It does not close the P3 checklist item for production Provider authority/signature verification or full Worker lifecycle coordination, and it does not provide a functional Worker, automatic recovery dispatcher, CLI/MCP, production Secret Broker backend, or paid Provider benchmark evidence. Unknown external effects remain unknown until a separately approved authoritative reconciliation path is configured. The bound-but-unconsumed ApprovalGrant remains a known liveness limitation: automatic safe recovery would require a separately designed append-only revoke/abandon-and-reapprove flow.
