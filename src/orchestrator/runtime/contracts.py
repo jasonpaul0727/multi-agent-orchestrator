@@ -23,13 +23,17 @@ from pydantic import (
     model_validator,
 )
 
+from .verifier_process import (
+    BUILTIN_VERIFICATION_CONTRACT_ID,
+    BUILTIN_VERIFIER_ID,
+    SUPPORTED_VERIFICATION_CHECK_IDS,
+)
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$", re.ASCII)
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
 _MAX_IPC_BYTES = 1_048_576
 _MAX_ARTIFACTS = 128
 _MAX_CHECKS = 256
-
 
 class RuntimeContractError(ValueError):
     """An IPC message is malformed, oversized, or bound to another attempt."""
@@ -270,6 +274,18 @@ def validate_verification_evidence(
         raise RuntimeContractError("Verifier cannot reject a candidate when all checks passed")
 
 
+def validate_verification_task(task: VerificationTask) -> None:
+    """Restrict the built-in read-only verifier to its fixed contract/check set."""
+
+    if task.acceptance_contract != BUILTIN_VERIFICATION_CONTRACT_ID:
+        raise RuntimeContractError("unsupported built-in verification acceptance contract")
+    if (
+        any(check_id not in SUPPORTED_VERIFICATION_CHECK_IDS for check_id in task.required_check_ids)
+        or "artifact-integrity" not in task.required_check_ids
+    ):
+        raise RuntimeContractError("verification task requests an unsupported deterministic check")
+
+
 def decode_worker_result(payload: bytes) -> WorkerResult:
     return _decode_message(payload, WorkerResult)
 
@@ -308,7 +324,10 @@ def _reject_json_constant(_value: str) -> None:
 __all__ = [
     "AttemptContext",
     "ArtifactRef",
+    "BUILTIN_VERIFICATION_CONTRACT_ID",
+    "BUILTIN_VERIFIER_ID",
     "RuntimeContractError",
+    "SUPPORTED_VERIFICATION_CHECK_IDS",
     "ToolCapabilityRef",
     "VerificationCheck",
     "VerificationEvidence",
@@ -318,5 +337,6 @@ __all__ = [
     "decode_verification_evidence",
     "decode_worker_result",
     "validate_verification_evidence",
+    "validate_verification_task",
     "validate_worker_result",
 ]
