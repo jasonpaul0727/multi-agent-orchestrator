@@ -15,18 +15,26 @@
 - [x] Task 1: proposal journal implementation, independent review and measured
   implementation gate complete; committed and pushed as
   `3f744311e931d20b6f7ad79a37354a265fae8a50`.
-- [ ] Task 2: documentation candidate prepared; independent documentation review
-  and final whole-slice verification/remote-tip check remain pending.
-- [ ] Close this narrow proposal-journal plan after Task 2 review and the final
-  gate. Broader P5 and V1 remain incomplete; their unchecked items stay open.
+- [x] Task 2: documentation independently approved; the controller's final
+  whole-slice verification and remote-tip check passed.
+- [x] Close this narrow proposal-journal plan after Task 2 review and the final
+  gate. This closure does not complete broader P5 or V1; their unchecked items
+  stay open.
 
 Task 1's post-review gate recorded 1,567 passed, zero skipped, total coverage
 90.12% and journal-module coverage 87.73%. Focused runtime/live Verifier
 integration recorded 211 passed, zero skipped. `compileall`, `pip check`,
-wheel build and branch whitespace checks passed. These are the measured
-implementation results, not a substitute for Task 2's final whole-slice gate.
+wheel build and branch whitespace checks passed.
 Journal-module coverage is below 90%; the configured 90% gate applies to total
 coverage, and no module-specific threshold is configured.
+
+The controller's final whole-slice gate also passed: 211 focused runtime/live
+Verifier integration tests and 1,567 full-suite tests, zero skips in either
+suite, 90.12% total coverage and 87.73% journal-module coverage. `compileall`,
+`pip check`, wheel build, full-branch `git diff --check` and remote-tip
+verification all passed. This closes only durable Verifier proposal replay;
+Node acceptance, lifecycle/Scheduler integration and all broader P5/V1
+completion requirements remain open.
 
 ## Task 1: Implement the proposal journal with restart and concurrency tests
 
