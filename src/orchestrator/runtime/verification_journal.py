@@ -267,7 +267,9 @@ def _decode_event(
         context: AttemptContext = task.context
         expected_key = _idempotency_key(context, expected_payload["task_sha256"])
         if (
-            event.run_id != context.run_id
+            context.run_id != run_id
+            or payload["run_id"] != run_id
+            or event.run_id != context.run_id
             or event.node_id != context.node_id
             or event.attempt_id != context.attempt_id
             or event.fencing_generation != context.fencing_generation

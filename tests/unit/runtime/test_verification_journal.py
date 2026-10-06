@@ -327,6 +327,25 @@ def test_read_run_checks_header_bindings_after_event_store_returns_valid_event(t
     store.close()
 
 
+def test_read_run_rejects_valid_run_event_remapped_to_another_stream_id(tmp_path, monkeypatch):
+    store, journal = _reopened(tmp_path / "events.db")
+    task = _task(run_id="run-a")
+    journal.record(task, _evidence(task))
+    read_stream = store.read_stream_with_version
+
+    def remap_run_a_event_to_run_b(stream_type, stream_id, after_version=0):
+        if stream_type == "verification_proposals" and stream_id == "run-b":
+            events, version = read_stream(stream_type, "run-a", after_version)
+            return [event.model_copy(update={"stream_id": "run-b"}) for event in events], version
+        return read_stream(stream_type, stream_id, after_version)
+
+    monkeypatch.setattr(store, "read_stream_with_version", remap_run_a_event_to_run_b)
+
+    with pytest.raises(VerifierProposalJournalError):
+        journal.read_run("run-b")
+    store.close()
+
+
 def test_read_run_rejects_payload_hash_or_binding_corruption_even_with_valid_event_hash(tmp_path):
     database = tmp_path / "events.db"
     store, journal, task, evidence = _seed_journal(database)
