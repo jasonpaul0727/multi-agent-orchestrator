@@ -75,10 +75,38 @@ The built-in acceptance contract `maestro.artifact-verification/v1` supports
 `artifact-integrity` (required), `utf8-text`, `json`, and `python-syntax` checks.
 The Python check parses source but does not import or execute it. A result is
 validated against the exact Attempt and candidate digest set in the host and
-remains a proposal: this module does not persist verification events, accept a
-Node, or notify the Scheduler. The checks prove byte/format properties only;
+remains a proposal: the process module does not persist verification events,
+accept a Node, or notify the Scheduler. The separate host journal described
+below persists proposals only. The checks prove byte/format properties only;
 they are not semantic code review, test-suite execution, documentation
 acceptance, or Final Review.
+
+## Durable Verifier proposal replay
+
+`VerifierProposalJournal` records validated task/evidence pairs in the existing
+`SQLiteEventStore`, on a dedicated per-Run `verification_proposals` stream as
+`VerifierProposalRecorded` events. It supports durable replay after restart,
+not durable acceptance. It accepts only the fixed built-in verifier and
+`maestro.artifact-verification/v1` contract with the supported check set;
+arbitrary acceptance-contract text and artifact bytes are not stored.
+
+The journal reparses caller-supplied models and revalidates their exact
+Attempt/artifact bindings before append and during replay. Replay treats
+durable payloads and event metadata as untrusted: it verifies canonical
+task/evidence hashes, JSON types, Run/Node/Attempt/fencing generation/graph
+bindings, artifact digests, schema and stream versions, event headers,
+correlation/causation IDs, and the derived idempotency key. EventStore
+CAS/idempotency makes identical retries a no-op and rejects conflicting
+same-identity proposals. A record is limited to 1 MiB before append; a Run
+is limited to 1,024 proposals and 16 MiB of aggregate canonical payload bytes
+under the EventStore write lock. Replay enforces the same limits.
+
+This is a trusted-host caller boundary. The caller must obtain evidence
+through the isolated Verifier path before recording it; matching verifier IDs,
+hashes and bindings do not attest to the process that produced the evidence.
+The journal does not re-read or modify ArtifactStore bytes, re-run checks,
+accept a Node, write lifecycle state, or affect the Scheduler. Proposal replay
+does not provide Worker/Run crash recovery or control-plane acceptance.
 
 Worker model/tool execution, artifact publication from Worker, Gateway /
 Approval / Secret Broker mediation, durable evidence acceptance, crash
@@ -109,3 +137,13 @@ exercises the real systemd child when systemd --user is available. Termination
 receipt requirements and staging retention also have focused tests in
 `tests/unit/isolation/test_launcher.py`. This is platform-specific integration
 evidence, not a general platform certification.
+
+`tests/unit/runtime/test_verification_journal.py` covers real SQLite restart,
+separate-connection concurrent writes, idempotency at the caps, conflicting
+proposals, payload/header tampering (including JSON numeric/boolean type
+substitution), and unchanged lifecycle/Scheduler streams and ArtifactStore
+bytes. The reviewed 2026-10-05 implementation gate recorded 1,567 passed,
+zero skipped, and 90.12% total coverage; journal-module coverage was 87.73%.
+Focused runtime/live Verifier integration (211 passed, zero skipped),
+`compileall`, `pip check`, wheel build, and branch whitespace checks passed.
+These measurements cover this proposal-only slice; P5 and V1 remain incomplete.

@@ -333,6 +333,24 @@ Evidence is still only a proposal: no durable verifier event, node acceptance,
 semantic review, test-suite execution, Final Review, or Worker-produced
 candidate path exists. P5 remains open.
 
+2026-10-05 durable proposal replay slice: `VerifierProposalJournal` now stores
+bounded task/evidence proposals in the existing SQLiteEventStore and replays
+them after restart, revalidating canonical hashes, strict payload types,
+Attempt/artifact bindings, event headers and idempotency. Identical retries
+are a no-op; per-record and atomic per-Run count/byte caps bound persistence.
+This supersedes the earlier absence of durable verifier proposal events only.
+The trusted host caller must obtain evidence through the isolated Verifier;
+the journal does not attest to verifier process origin, re-read ArtifactStore
+bytes, accept a Node, write lifecycle state, or affect the Scheduler. The
+reviewed implementation gate recorded 1,567 passed, zero skipped, 90.12%
+total coverage and 87.73% journal-module coverage; focused runtime/live
+Verifier integration (211 passed, zero skipped), compileall, pip check, wheel
+build and branch whitespace checks passed. Documentation review and the final
+whole-slice gate remain pending in the narrow subplan. Worker execution,
+control-plane evidence acceptance, semantic review/test execution, Final
+Review and application-service/recovery wiring remain open. No P5 checklist
+item or broader P5/V1 completion gate is closed by this milestone.
+
 - [ ] Worker 仅获得当前 attempt 的最小输入、CapabilityGrant 引用和工具请求接口；不得拿到 EventStore/控制目录句柄或写最终状态。
 - [ ] 实现 Model Gateway：按 accepted RoutingDecision 调用 adapter，通过 Secret Broker 请求凭据，做超时/取消/有限重试、usage 采集、预算结算和响应脱敏。
 - [ ] 实现 Planner 生成初始 DAG、Worker 候选结果、Reviewer、Director 和文档分析 Agent 契约；模型输出只能成为提案/候选，由控制层验证后追加事件。

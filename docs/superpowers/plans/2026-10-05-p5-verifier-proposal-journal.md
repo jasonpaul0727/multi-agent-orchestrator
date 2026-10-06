@@ -10,6 +10,24 @@
 
 **Binding design:** `docs/superpowers/specs/2026-10-05-p5-verifier-proposal-journal-design.md`.
 
+## Progress — 2026-10-05
+
+- [x] Task 1: proposal journal implementation, independent review and measured
+  implementation gate complete; committed and pushed as
+  `3f744311e931d20b6f7ad79a37354a265fae8a50`.
+- [ ] Task 2: documentation candidate prepared; independent documentation review
+  and final whole-slice verification/remote-tip check remain pending.
+- [ ] Close this narrow proposal-journal plan after Task 2 review and the final
+  gate. Broader P5 and V1 remain incomplete; their unchecked items stay open.
+
+Task 1's post-review gate recorded 1,567 passed, zero skipped, total coverage
+90.12% and journal-module coverage 87.73%. Focused runtime/live Verifier
+integration recorded 211 passed, zero skipped. `compileall`, `pip check`,
+wheel build and branch whitespace checks passed. These are the measured
+implementation results, not a substitute for Task 2's final whole-slice gate.
+Journal-module coverage is below 90%; the configured 90% gate applies to total
+coverage, and no module-specific threshold is configured.
+
 ## Task 1: Implement the proposal journal with restart and concurrency tests
 
 **Files:**
