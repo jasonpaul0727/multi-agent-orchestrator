@@ -51,12 +51,17 @@ generated unit to its exact systemd `ControlGroup` below `app.slice`, an
 with `populated 0` (or a cgroup already removed after stop). Cgroup paths are
 opened beneath `/sys/fs/cgroup` without following symlinks; malformed,
 mismatched, timed-out, unavailable, or still-populated evidence fails closed.
+Receipt issuance additionally requires the owning host launch/transport process
+to have exited. An absent unit/cgroup while `systemd-run` is still alive is an
+unconfirmed launch, not proof of stop: that process can submit the unit later.
+Grace expiry remains bounded, with no receipt and retained staging.
 
 The session caches its first result. Private staging is explicitly discarded
 only after a valid receipt; if stop cannot be verified, staging is retained
 and Worker/Verifier transport checks reject the proposal. The live
 `tests/integration/test_systemd_launcher.py` suite exercised clean exit,
-output-limit stop, runtime timeout, and cancellation of a descendant tree on
+output-limit stop, runtime timeout, cancellation of a descendant tree, and a
+gated real unit submission after an unconfirmed wait on
 Ubuntu 24.04 / WSL2 with systemd 255. This establishes only the launcher stop
 boundary: it does not complete the full Worker interruption/recovery matrix,
 Provider reconciliation, or V1 activation.

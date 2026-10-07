@@ -47,6 +47,13 @@ matching stopped sender. Provider evidence alone can never assert that the
 Worker stopped, and a local stop receipt alone can never establish Provider
 charges.
 
+Before proof persistence and every pending-proof settlement, the call's Registry
+hash must equal the immutable accepted Scheduler route's Registry hash; missing
+or mismatched identity fails closed with unknown budget/slot holds intact. If an
+unknown outcome already records a Provider request ID, evidence and durable proof
+must match it exactly, including during event validation and replay. Evidence may
+supply a newly discovered request ID only when the call did not record one.
+
 Before appending proof, the service requires the corresponding Scheduler
 Attempt to be `OutcomeUnknown` at the exact fence and rejects a reconciliation
 timestamp older than that event. It then appends

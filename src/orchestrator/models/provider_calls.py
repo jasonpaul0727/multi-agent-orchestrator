@@ -615,6 +615,8 @@ def _assert_proof_matches_call(
     call: ProviderCallSnapshot, proof: ProviderCallReconciliation
 ) -> None:
     expected = _call_binding(call)
+    if call.provider_request_id is not None:
+        expected["provider_request_id"] = call.provider_request_id
     if any(getattr(proof, name) != value for name, value in expected.items()):
         raise ProviderCallJournalConflict("Provider reconciliation identity binding does not match call")
 

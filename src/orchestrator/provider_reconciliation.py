@@ -456,7 +456,7 @@ class ProviderReconciliationService:
 
 
 def _provider_call_binding(call: ProviderCallSnapshot) -> dict[str, object]:
-    return {
+    binding = {
         "provider_call_stream_id": call.stream_id,
         "provider_adapter": call.provider_adapter,
         "provider_correlation_id": call.provider_correlation_id,
@@ -471,6 +471,9 @@ def _provider_call_binding(call: ProviderCallSnapshot) -> dict[str, object]:
         "registry_manifest_hash": call.registry_manifest_hash,
         "request_hash": call.request_hash,
     }
+    if call.provider_request_id is not None:
+        binding["provider_request_id"] = call.provider_request_id
+    return binding
 
 
 def _revalidate_call_snapshot(
@@ -676,6 +679,7 @@ def _require_scheduler_evidence(
             or route["provider_id"] != call.provider_id
             or route["model_id"] != call.model_id
             or route["decision_id"] != call.accepted_route_id
+            or route["registry_manifest_hash"] != call.registry_manifest_hash
             or unknown_at.tzinfo is None
             or unknown_at.utcoffset() is None
         ):

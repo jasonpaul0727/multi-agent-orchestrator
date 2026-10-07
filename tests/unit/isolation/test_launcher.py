@@ -95,6 +95,45 @@ def test_collection_error_cleanup_wait_is_bounded_by_default(monkeypatch):
         session.wait()
 
 
+def test_live_launcher_cannot_issue_not_found_stop_receipt(monkeypatch):
+    class PendingLaunch:
+        stdin = None
+        returncode = None
+
+        def __init__(self):
+            self.writers = []
+            for name in ("stdout", "stderr"):
+                reader, writer = os.pipe()
+                setattr(self, name, os.fdopen(reader, "rb", buffering=0))
+                self.writers.append(writer)
+
+        def poll(self):
+            return None
+
+    def systemctl(arguments, **_kwargs):
+        if "show" in arguments:
+            return subprocess.CompletedProcess(arguments, 0, stdout=b"ActiveState=inactive\nLoadState=not-found\nControlGroup=\n")
+        return subprocess.CompletedProcess(arguments, 1)
+
+    monkeypatch.setattr(subprocess, "run", systemctl)
+    process = PendingLaunch()
+    unit, cgroup = _attempt_identity()
+    staging = _TrackingStaging()
+    session = SandboxSession(process=process, unit_name=unit, systemctl="systemctl",
+        client_env={}, output_limit=1024, timeout_seconds=10, staging=staging,
+        scope_cgroup=cgroup, stop_grace_seconds=0.01)
+    session._cancel_requested.set()
+    try:
+        result = session.wait()
+        assert not result.termination_confirmed
+        assert result.returncode == 125 and result.elapsed_seconds < 1
+        assert session.wait() is result
+        assert staging.discard_count == staging.cleanup_count == 0
+    finally:
+        for writer in process.writers:
+            os.close(writer)
+
+
 @pytest.mark.parametrize("grace", [None, True, 0, -1, float("inf"), float("nan")])
 def test_session_rejects_unbounded_stop_grace(grace):
     with pytest.raises(InvalidSandboxRequest, match="stop grace"):

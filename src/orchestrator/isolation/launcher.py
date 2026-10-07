@@ -383,7 +383,10 @@ class SandboxSession:
                 return self._result
             try:
                 result = self._collect()
-                if self._scope_cgroup is not None:
+                # An absent unit is not a stop witness while systemd-run can
+                # still submit it. Retain staging and withhold proof until the
+                # owning host launch/transport operation has ended.
+                if self._scope_cgroup is not None and self._process.poll() is not None:
                     receipt = _read_termination_receipt(
                         unit_name=self.unit_name,
                         expected_cgroup=self._scope_cgroup,

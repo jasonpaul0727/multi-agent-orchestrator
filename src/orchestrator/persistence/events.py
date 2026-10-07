@@ -315,6 +315,12 @@ def validate_event_contract(events: list[Any]) -> None:
                 intent=provider_call_intent,
                 stream_id=event.stream_id,
             )
+            provider_request_id = (
+                None if provider_call_outcome is None
+                else provider_call_outcome.payload.get("provider_request_id")
+            )
+            if provider_request_id is not None and payload.get("provider_request_id") != provider_request_id:
+                raise EventContractError("ProviderCallReconciliationRecorded has conflicting provider request id")
             provider_call_reconciliation = event
         elif event_type == "ProviderCallSchedulerSettlementApplied":
             if (
