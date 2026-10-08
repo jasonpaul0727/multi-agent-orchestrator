@@ -419,6 +419,34 @@ def test_resolve_active_attempt_reloads_exact_durable_snapshot_without_writes(tm
     assert _resolver_durable_state(store) == before
 
 
+@pytest.mark.parametrize("run_state", ["paused", "awaiting_user"])
+def test_resolve_active_attempt_preserves_active_lease_when_scheduling_waits(tmp_path, run_state):
+    store = SQLiteEventStore(tmp_path / "resolve-scheduling-waits.db")
+    reg, config, lifecycle, manifest = run_setup(store)
+    request, decision = routed_pair(reg, config, manifest)
+    control = scheduler(store)
+    accepted = accept(control, request, decision)
+    if run_state == "paused":
+        lifecycle.pause_run("run-1", reason_code="user_request")
+    else:
+        lifecycle.await_user(
+            "run-1", request_id="input-1", reason_code="clarify_scope", context_hash=HASH,
+        )
+    before = _resolver_durable_state(store)
+
+    snapshot = control.resolve_active_attempt(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, as_of=NOW + timedelta(seconds=2),
+    )
+
+    assert snapshot.accepted_route == accepted.accepted_route
+    assert snapshot.reservation == accepted.reservation
+    assert snapshot.agent_instance_id == accepted.agent_instance_id
+    assert snapshot.lease_expires_at == NOW + timedelta(minutes=1)
+    assert lifecycle.replay("run-1").status == run_state
+    assert _resolver_durable_state(store) == before
+
+
 @pytest.mark.parametrize("overrides", [
     {"run_id": "another-run"},
     {"node_id": "another-node"},

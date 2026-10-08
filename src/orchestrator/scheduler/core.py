@@ -195,7 +195,7 @@ class Scheduler:
             node = recovered.lifecycle.node(node_id)
             attempt = next(item for item in node.attempts if item.attempt_id == attempt_id)
             if (
-                recovered.lifecycle.status != "running"
+                recovered.lifecycle.status in {"cancelling", "cancelled"}
                 or lease is None
                 or datetime.fromisoformat(lease.lease_expires_at) != lease_expires_at
                 or datetime.fromisoformat(attempt.lease_expires_at) != lease_expires_at
