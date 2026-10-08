@@ -82,6 +82,18 @@ class AcceptedAttempt(BaseModel):
         return value
 
 
+class ActiveAttemptSnapshot(BaseModel):
+    """Durable authority for one accepted, unexpired Attempt."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    accepted_route: AcceptedModelRoute
+    reservation: BudgetReservation
+    agent_instance_id: str
+    accepted_at: datetime
+    lease_expires_at: datetime
+
+
 class Scheduler:
     """Coordinate the selected model attempt with its durable resource holds.
 
@@ -103,6 +115,126 @@ class Scheduler:
         self.lifecycle = LifecycleController(event_store)
         self.agents = AgentRegistry(event_store)
         self.recovery = RunRecoveryCoordinator(event_store, artifact_store=artifact_store)
+
+    def resolve_active_attempt(
+        self,
+        *,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        fencing_generation: int,
+        as_of: datetime,
+    ) -> ActiveAttemptSnapshot:
+        """Resolve exact accepted authority without changing durable state.
+
+        The no-op checked callback holds SQLite's serialization lock across
+        journal, recovery, and budget reads, and shares a caller's existing
+        transaction when nested inside a later control-plane operation.
+        """
+
+        if (
+            any(not isinstance(value, str) or not value.strip()
+                for value in (run_id, node_id, attempt_id))
+            or type(fencing_generation) is not int
+            or fencing_generation <= 0
+            or not isinstance(as_of, datetime)
+        ):
+            raise SchedulerError("active Attempt resolution has invalid execution context")
+        result: ActiveAttemptSnapshot | None = None
+        attempt_ref = _attempt_ref(run_id, node_id, attempt_id)
+
+        def resolve(events: list[StoredEvent], _version: int):
+            nonlocal result
+            accepted = next(
+                (event for event in events
+                 if event.event_type == "RoutingDecisionAccepted"
+                 and event.payload.get("attempt_ref") == attempt_ref),
+                None,
+            )
+            if accepted is None:
+                raise SchedulerError("Attempt has no durable route acceptance")
+            payload = accepted.payload
+            route = AcceptedModelRoute.model_validate(payload.get("accepted_route"))
+            decision_hash = payload.get("decision_hash")
+            if (
+                accepted.run_id != run_id
+                or accepted.node_id != node_id
+                or accepted.attempt_id != attempt_id
+                or accepted.fencing_generation != fencing_generation
+                or accepted.correlation_id != run_id
+                or accepted.causation_id != decision_hash
+                or payload.get("run_id") != run_id
+                or payload.get("node_id") != node_id
+                or payload.get("attempt_id") != attempt_id
+                or route.run_id != run_id
+                or route.node_id != node_id
+                or route.attempt_id != attempt_id
+                or route.fencing_generation != fencing_generation
+                or not isinstance(decision_hash, str)
+                or route.decision_id != "decision-" + decision_hash.removeprefix("sha256:")
+                or route.budget_reservation_id != payload.get("reservation_id")
+                or route.provider_id != payload.get("provider_id")
+            ):
+                raise SchedulerError("accepted route and event execution bindings disagree")
+            accepted_at = _aware(datetime.fromisoformat(payload["accepted_at"]), "accepted_at")
+            lease_expires_at = _aware(
+                datetime.fromisoformat(payload["lease_expires_at"]), "lease_expires_at"
+            )
+            if not accepted_at <= as_of < lease_expires_at:
+                raise SchedulerError("Attempt is not accepted and unexpired at the trusted time")
+            recovered = self.recovery.recover(run_id)
+            lease = next(
+                (item for item in recovered.active_attempts
+                 if item.attempt_ref == attempt_ref
+                 and item.node_id == node_id
+                 and item.attempt_id == attempt_id
+                 and item.fencing_generation == fencing_generation
+                 and item.status == "active"),
+                None,
+            )
+            node = recovered.lifecycle.node(node_id)
+            attempt = next(item for item in node.attempts if item.attempt_id == attempt_id)
+            if (
+                recovered.lifecycle.status != "running"
+                or lease is None
+                or datetime.fromisoformat(lease.lease_expires_at) != lease_expires_at
+                or datetime.fromisoformat(attempt.lease_expires_at) != lease_expires_at
+                or payload.get("agent_instance_id") != attempt.agent_instance_id
+            ):
+                raise SchedulerError("Attempt no longer holds its exact active lease")
+            reservation = self._ledger_for_run(run_id).get_reservation(
+                route.budget_reservation_id, run_id=run_id
+            )
+            if (
+                reservation.status != "reserved"
+                or reservation.run_id != run_id
+                or reservation.node_id != node_id
+                or reservation.attempt_id != attempt_id
+                or reservation.fencing_generation != fencing_generation
+                or reservation.correlation_id != run_id
+                or reservation.causation_id != decision_hash
+            ):
+                raise SchedulerError("Attempt budget reservation bindings disagree")
+            result = ActiveAttemptSnapshot(
+                accepted_route=route,
+                reservation=reservation,
+                agent_instance_id=attempt.agent_instance_id,
+                accepted_at=accepted_at,
+                lease_expires_at=lease_expires_at,
+            )
+            return None
+
+        try:
+            as_of = _aware(as_of, "as_of")
+            self.event_store.append_checked(
+                _SCHEDULER_STREAM, _SCHEDULER_ID, f"resolve:{attempt_ref}", resolve
+            )
+        except SchedulerError:
+            raise
+        except Exception as exc:
+            raise SchedulerError("active Attempt resolution failed a durable-state invariant") from exc
+        assert result is not None
+        return result
 
     def accept_routing(
         self,
@@ -1173,6 +1305,7 @@ def _validate_usage(usage: UsageRecord, *, run_id: str, reservation_id: str) -> 
 
 __all__ = [
     "AcceptedAttempt",
+    "ActiveAttemptSnapshot",
     "ConcurrencyLimitExceeded",
     "ConcurrencyLimits",
     "Scheduler",

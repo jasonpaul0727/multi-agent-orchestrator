@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -379,6 +379,231 @@ def accept(scheduler_, request, decision):
         accepted_at=NOW + timedelta(seconds=1),
         lease_expires_at=NOW + timedelta(minutes=1),
     )
+
+
+def _resolver_durable_state(store):
+    return (
+        tuple(store._connection.execute(
+            "SELECT stream_type, stream_id, current_version FROM stream_versions "
+            "ORDER BY stream_type, stream_id"
+        ).fetchall()),
+        store._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+        store._connection.execute("SELECT COUNT(*) FROM idempotency_records").fetchone()[0],
+    )
+
+
+def test_resolve_active_attempt_reloads_exact_durable_snapshot_without_writes(tmp_path):
+    database = tmp_path / "resolve-active.db"
+    store = SQLiteEventStore(database)
+    reg, config, _, manifest = run_setup(store)
+    request, decision = routed_pair(reg, config, manifest)
+    accepted = accept(scheduler(store), request, decision)
+    store.close()
+    store = SQLiteEventStore(database)
+    control = scheduler(store)
+    before = _resolver_durable_state(store)
+
+    snapshot = control.resolve_active_attempt(
+        run_id="run-1", node_id="node-1", attempt_id="attempt-node-1-1",
+        fencing_generation=1, as_of=NOW + timedelta(seconds=2),
+    )
+
+    assert snapshot.accepted_route == accepted.accepted_route
+    assert snapshot.reservation == accepted.reservation
+    assert snapshot.reservation.status == "reserved"
+    assert snapshot.agent_instance_id == accepted.agent_instance_id
+    assert snapshot.accepted_at == NOW + timedelta(seconds=1)
+    assert snapshot.lease_expires_at == NOW + timedelta(minutes=1)
+    with pytest.raises(ValueError):
+        snapshot.agent_instance_id = "another-agent"
+    assert _resolver_durable_state(store) == before
+
+
+@pytest.mark.parametrize("overrides", [
+    {"run_id": "another-run"},
+    {"node_id": "another-node"},
+    {"attempt_id": "another-attempt"},
+    {"fencing_generation": 2},
+    {"fencing_generation": True},
+    {"as_of": NOW},
+    {"as_of": NOW + timedelta(minutes=1)},
+    {"as_of": NOW + timedelta(minutes=2)},
+    {"as_of": NOW.replace(tzinfo=None)},
+])
+def test_resolve_active_attempt_rejects_wrong_identity_or_time_without_writes(tmp_path, overrides):
+    store = SQLiteEventStore(tmp_path / "resolve-wrong-binding.db")
+    reg, config, _, manifest = run_setup(store)
+    request, decision = routed_pair(reg, config, manifest)
+    control = scheduler(store)
+    accept(control, request, decision)
+    before = _resolver_durable_state(store)
+    arguments = dict(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, as_of=NOW + timedelta(seconds=2),
+    )
+    arguments.update(overrides)
+
+    with pytest.raises(SchedulerError):
+        control.resolve_active_attempt(**arguments)
+
+    assert _resolver_durable_state(store) == before
+
+
+@pytest.mark.parametrize("state", ["released", "outcome_unknown", "cancelling", "cancelled"])
+def test_resolve_active_attempt_rejects_ended_or_cancelled_state_without_writes(tmp_path, state):
+    store = SQLiteEventStore(tmp_path / "resolve-ended.db")
+    reg, config, lifecycle, manifest = run_setup(store)
+    request, decision = routed_pair(reg, config, manifest)
+    control = scheduler(store)
+    accept(control, request, decision)
+    if state in {"released", "outcome_unknown"}:
+        control.finish_attempt(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=1, completed_at=NOW + timedelta(seconds=3),
+            outcome="failed" if state == "released" else "outcome_unknown",
+            known_no_effect=state == "released",
+        )
+    else:
+        lifecycle.request_cancel("run-1", reason_code="resolver_test")
+        if state == "cancelled":
+            control.acknowledge_cancellation(
+                run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+                fencing_generation=1, stopped_at=NOW + timedelta(seconds=3),
+                stop_receipt_hash=HASH, no_effect_receipt_hash=HASH,
+            )
+    before = _resolver_durable_state(store)
+
+    with pytest.raises(SchedulerError):
+        control.resolve_active_attempt(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=1, as_of=NOW + timedelta(seconds=4),
+        )
+
+    assert _resolver_durable_state(store) == before
+
+
+@pytest.mark.parametrize("section, field, value", [
+    ("route", "run_id", "another-run"),
+    ("route", "node_id", "another-node"),
+    ("route", "attempt_id", "another-attempt"),
+    ("route", "fencing_generation", 2),
+    ("route", "decision_id", "another-decision"),
+    ("route", "budget_reservation_id", "another-reservation"),
+    ("route", "model_id", "another-model"),
+    ("route", "provider_id", "another-provider"),
+    ("route", "registry_manifest_hash", HASH),
+    ("route", "reasoning_effort", "none"),
+    ("payload", "accepted_route", {"model_id": "invalid"}),
+    ("payload", "attempt_ref", HASH),
+    ("payload", "run_id", "another-run"),
+    ("payload", "node_id", "another-node"),
+    ("payload", "attempt_id", "another-attempt"),
+    ("payload", "agent_instance_id", "another-agent"),
+    ("payload", "provider_id", "another-provider"),
+    ("payload", "reservation_id", "another-reservation"),
+    ("payload", "decision_hash", HASH),
+    ("payload", "accepted_at", "invalid"),
+    ("payload", "accepted_at", "2026-09-23T12:00:01"),
+    ("payload", "lease_expires_at", "invalid"),
+    ("payload", "lease_expires_at", "2026-09-23T12:00:00+00:00"),
+    ("event", "run_id", "another-run"),
+    ("event", "node_id", "another-node"),
+    ("event", "attempt_id", "another-attempt"),
+    ("event", "fencing_generation", 2),
+    ("event", "correlation_id", "another-run"),
+    ("event", "causation_id", HASH),
+    ("reservation", "node_id", "another-node"),
+    ("reservation", "attempt_id", "another-attempt"),
+    ("reservation", "fencing_generation", 2),
+    ("reservation", "correlation_id", "another-run"),
+    ("reservation", "causation_id", HASH),
+])
+def test_resolve_active_attempt_rejects_corrupt_durable_bindings_without_writes(
+    tmp_path, section, field, value,
+):
+    store = SQLiteEventStore(tmp_path / "resolve-corrupt.db")
+    reg, config, _, manifest = run_setup(store)
+    request, decision = routed_pair(reg, config, manifest)
+    control = scheduler(store)
+    accept(control, request, decision)
+    event = store.read_stream("scheduler", "global")[0]
+    # Simulate stored corruption while preserving the payload integrity hash,
+    # so the semantic binding checks must reject otherwise valid event rows.
+    store._connection.execute("DROP TRIGGER events_immutable_update")
+    if section in {"route", "payload"}:
+        payload = dict(event.payload)
+        if section == "route":
+            payload["accepted_route"] = {**payload["accepted_route"], field: value}
+        else:
+            payload[field] = value
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        store._connection.execute(
+            "UPDATE events SET payload_json = ?, payload_hash = ? WHERE event_id = ?",
+            (encoded, hashlib.sha256(encoded.encode()).hexdigest(), event.event_id),
+        )
+    else:
+        event_id = (
+            store.read_stream("budget", "run-1")[0].event_id
+            if section == "reservation" else event.event_id
+        )
+        store._connection.execute(
+            f"UPDATE events SET {field} = ? WHERE event_id = ?", (value, event_id),
+        )
+    before = _resolver_durable_state(store)
+
+    with pytest.raises(SchedulerError):
+        control.resolve_active_attempt(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=1, as_of=NOW + timedelta(seconds=2),
+        )
+
+    assert _resolver_durable_state(store) == before
+
+
+def test_resolve_active_attempt_serializes_reads_with_concurrent_settlement(tmp_path, monkeypatch):
+    database = tmp_path / "resolve-consistent.db"
+    store = SQLiteEventStore(database)
+    reg, config, _, manifest = run_setup(store)
+    request, decision = routed_pair(reg, config, manifest)
+    control = scheduler(store)
+    accepted = accept(control, request, decision)
+    ready = Barrier(2)
+    barrier = Barrier(2)
+    recover = control.recovery.recover
+
+    def settle():
+        competing = SQLiteEventStore(database)
+        try:
+            ready.wait(timeout=5)
+            barrier.wait(timeout=5)
+            scheduler(competing).finish_attempt(
+                run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+                fencing_generation=1, completed_at=NOW + timedelta(seconds=3),
+                outcome="failed", known_no_effect=True,
+            )
+        finally:
+            competing.close()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        settlement = pool.submit(settle)
+        ready.wait(timeout=5)
+
+        def recover_during_settlement(run_id):
+            recovered = recover(run_id)
+            barrier.wait(timeout=5)
+            with pytest.raises(FutureTimeoutError):
+                settlement.result(timeout=0.1)
+            return recovered
+
+        monkeypatch.setattr(control.recovery, "recover", recover_during_settlement)
+        snapshot = control.resolve_active_attempt(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=1, as_of=NOW + timedelta(seconds=2),
+        )
+        settlement.result(timeout=5)
+
+    assert snapshot.reservation == accepted.reservation
+    assert RunRecoveryCoordinator(store).recover("run-1").active_attempts == ()
 
 
 class _DurableTestEffectReceiver:
