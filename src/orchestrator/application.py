@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from orchestrator.artifacts import ArtifactStore
+from orchestrator.artifacts import ArtifactStore, EphemeralArtifactGrantAuthority
 from orchestrator.models import AcceptedModelRoute
 from orchestrator.models.provider_calls import ProviderCallSnapshot, SQLiteProviderCallJournal
 from orchestrator.persistence import SQLiteEventStore
@@ -74,8 +74,14 @@ class ControlPlaneApplication:
             limits = revalidate_model(ConcurrencyLimits, limits)
             store = SQLiteEventStore(database)
             self._event_store = store
-            artifacts = ArtifactStore(artifact_root, event_store=store) if artifact_root is not None else None
-            self._scheduler = Scheduler(store, limits=limits, artifact_store=artifacts)
+            self._artifact_grants = EphemeralArtifactGrantAuthority()
+            self._artifact_store = (
+                ArtifactStore(
+                    artifact_root, event_store=store, grant_verifier=self._artifact_grants.verify,
+                )
+                if artifact_root is not None else None
+            )
+            self._scheduler = Scheduler(store, limits=limits, artifact_store=self._artifact_store)
             self._journal = SQLiteProviderCallJournal(store)
             self._reconciliation = ProviderReconciliationService(
                 journal=self._journal,

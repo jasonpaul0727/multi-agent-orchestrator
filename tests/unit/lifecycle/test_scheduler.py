@@ -11,7 +11,7 @@ from threading import Barrier
 
 import pytest
 
-from orchestrator.artifacts import ArtifactRecord, ArtifactStore
+from orchestrator.artifacts import ArtifactAccessDenied, ArtifactRecord, ArtifactStore
 from orchestrator.budget import BudgetExhausted, BudgetLedger, CostEstimate, UsageRecord
 from orchestrator.agents import (
     AgentConcurrencyLimitExceeded,
@@ -1016,6 +1016,13 @@ def test_application_verifies_published_artifacts_with_its_shared_store(tmp_path
         ControlPlaneApplication(database, limits=_application_limits())
     with ControlPlaneApplication(database, limits=_application_limits(), artifact_root=root) as app:
         assert app.recover_run("run-1").artifacts[0].digest == record.digest
+        grant = app._artifact_grants.issue(
+            digest=record.digest, run_id="run-1",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+        assert app._artifact_store.read_bytes(record.digest, grant=grant) == b"independent verification output"
+        with pytest.raises(ArtifactAccessDenied):
+            app._artifact_store.read_bytes(record.digest, grant=grant)
 
 
 def test_graph_validation_enforces_append_only_dependencies_count_and_depth():
