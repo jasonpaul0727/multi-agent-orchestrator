@@ -1611,6 +1611,38 @@ def test_application_verifies_published_artifacts_with_its_shared_store(tmp_path
             app._artifact_store.read_bytes(record.digest, grant=grant)
 
 
+@pytest.mark.parametrize("admission", [
+    {"input_manifest_hash": ADMISSION["input_manifest_hash"]},
+    {"verification_contract": ADMISSION["verification_contract"]},
+    {"required_check_ids": ADMISSION["required_check_ids"]},
+])
+def test_application_verification_admission_is_all_or_none(tmp_path, admission):
+    from orchestrator.application import ControlPlaneApplication
+
+    with ControlPlaneApplication(tmp_path / "admission.db", limits=_application_limits()) as app:
+        reg, config, _, manifest, contract = run_setup_with_frozen_contract(app._event_store)
+        request, decision = routed_pair(reg, config, manifest, contract_hash=contract.contract_hash)
+        before = _resolver_durable_state(app._event_store)
+        with pytest.raises(SchedulerError):
+            app.accept_routing(request, decision, accepted_at=NOW + timedelta(seconds=1),
+                lease_expires_at=NOW + timedelta(minutes=1), **admission)
+        assert _resolver_durable_state(app._event_store) == before
+
+
+def test_application_cannot_retrofit_original_unbound_admission(tmp_path):
+    from orchestrator.application import ControlPlaneApplication
+
+    with ControlPlaneApplication(tmp_path / "no-retrofit.db", limits=_application_limits()) as app:
+        reg, config, _, manifest, contract = run_setup_with_frozen_contract(app._event_store)
+        request, decision = routed_pair(reg, config, manifest, contract_hash=contract.contract_hash)
+        times = dict(accepted_at=NOW + timedelta(seconds=1), lease_expires_at=NOW + timedelta(minutes=1))
+        app.accept_routing(request, decision, **times)
+        before = _resolver_durable_state(app._event_store)
+        with pytest.raises(SchedulerError):
+            app.accept_routing(request, decision, **times, **ADMISSION)
+        assert _resolver_durable_state(app._event_store) == before
+
+
 def test_graph_validation_enforces_append_only_dependencies_count_and_depth():
     root = NodeSpec(node_id="root", role="planner", planning_contract_hash=HASH)
     child = NodeSpec(

@@ -21,6 +21,12 @@ from orchestrator.provider_reconciliation import (
 )
 from orchestrator.recovery import RecoveredRun
 from orchestrator.routing import RoutingDecision, RoutingRequest
+from orchestrator.runtime.acceptance_coordinator import (
+    AttemptExecutionCoordinator, AttemptUsageSource, ProposalAcceptanceError,
+    UnavailableAttemptUsageSource,
+)
+from orchestrator.runtime.verification_journal import VerifierProposalJournal, VerifierProposalRecord
+from orchestrator.runtime.verifier_process import IsolatedVerifierProcess
 from orchestrator.scheduler import AcceptedAttempt, ConcurrencyLimits, Scheduler
 from orchestrator.validation import revalidate_model
 
@@ -66,15 +72,18 @@ class ControlPlaneApplication:
         artifact_root: str | Path | None = None,
         evidence_verifier: ProviderEvidenceVerifier | None = None,
         termination_verifier: AttemptTerminationVerifier | None = None,
+        usage_source: AttemptUsageSource | None = None,
     ) -> None:
         self._ready = False
         self._closed = False
         store = None
         try:
+            if usage_source is not None and not isinstance(usage_source, AttemptUsageSource):
+                raise TypeError("usage_source must implement the trusted AttemptUsageSource service")
             limits = revalidate_model(ConcurrencyLimits, limits)
             store = SQLiteEventStore(database)
             self._event_store = store
-            self._artifact_grants = EphemeralArtifactGrantAuthority()
+            self._artifact_grants = EphemeralArtifactGrantAuthority() if artifact_root is not None else None
             self._artifact_store = (
                 ArtifactStore(
                     artifact_root, event_store=store, grant_verifier=self._artifact_grants.verify,
@@ -82,6 +91,14 @@ class ControlPlaneApplication:
                 if artifact_root is not None else None
             )
             self._scheduler = Scheduler(store, limits=limits, artifact_store=self._artifact_store)
+            self._acceptance_coordinator = (
+                AttemptExecutionCoordinator(
+                    scheduler=self._scheduler, artifact_store=self._artifact_store,
+                    verifier=IsolatedVerifierProcess(), journal=VerifierProposalJournal(store),
+                    grants=self._artifact_grants,
+                    usage_source=usage_source if usage_source is not None else UnavailableAttemptUsageSource(),
+                ) if self._artifact_store is not None else None
+            )
             self._journal = SQLiteProviderCallJournal(store)
             self._reconciliation = ProviderReconciliationService(
                 journal=self._journal,
@@ -206,10 +223,27 @@ class ControlPlaneApplication:
     def accept_routing(
         self, request: RoutingRequest, decision: RoutingDecision, *,
         accepted_at: datetime, lease_expires_at: datetime,
+        input_manifest_hash: str | None = None,
+        verification_contract: str | None = None,
+        required_check_ids: tuple[str, ...] | None = None,
     ) -> AcceptedAttempt:
         self._require_ready()
         return self._scheduler.accept_routing(
-            request, decision, accepted_at=accepted_at, lease_expires_at=lease_expires_at
+            request, decision, accepted_at=accepted_at, lease_expires_at=lease_expires_at,
+            input_manifest_hash=input_manifest_hash, verification_contract=verification_contract,
+            required_check_ids=required_check_ids,
+        )
+
+    def accept_verifier_proposal(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, task_sha256: str,
+    ) -> VerifierProposalRecord:
+        self._require_ready()
+        if self._acceptance_coordinator is None:
+            raise ProposalAcceptanceError("proposal acceptance ArtifactStore is unavailable")
+        return self._acceptance_coordinator.accept_proposal(
+            run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+            fencing_generation=fencing_generation, task_sha256=task_sha256,
         )
 
     def recover_run(self, run_id: str) -> RecoveredRun:

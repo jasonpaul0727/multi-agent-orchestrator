@@ -205,11 +205,23 @@ git push origin codex/p3-systemd-termination-receipts
 
 ## Task 4: Add the proposal acceptance coordinator and compose it in the application
 
+Execution clarification: use Task 3's shared
+`Scheduler.resolve_verification_binding(*, run_id, node_id, attempt_id,
+fencing_generation, as_of) -> VerificationBinding` rather than reconstructing
+frozen authority from the proposal. Forward the optional all-or-none host
+admission binding through `ControlPlaneApplication.accept_routing`; do not add
+raw-result or per-Attempt usage inputs. Include a real systemd coordinator test
+with real SQLite, host-published ArtifactStore bytes, durable proposal, default
+isolated Verifier, and test-only trusted usage source; it must reach the
+proof-bound terminal/budget/Agent/slot result. A standalone Verifier test or fake
+coordinator verifier does not replace this integration assertion.
+
 **Files:**
 - Create: `src/orchestrator/runtime/acceptance_coordinator.py`
 - Modify: `src/orchestrator/application.py`
 - Create: `tests/unit/runtime/test_attempt_execution_coordinator.py`
 - Modify: `tests/unit/lifecycle/test_scheduler.py`
+- Modify: `tests/integration/test_isolated_verifier_process.py`
 
 **Interfaces:**
 - Produces a private `AttemptExecutionCoordinator` with `accept_proposal(*, run_id: str, node_id: str, attempt_id: str, fencing_generation: int, task_sha256: str) -> VerifierProposalRecord`.

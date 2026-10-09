@@ -96,3 +96,36 @@ def test_real_isolated_verifier_checks_exact_host_artifact(tmp_path):
     assert evidence.outcome == "accepted"
     assert evidence.inspected_digests == (record.digest,)
     assert all(item.passed for item in evidence.checks)
+
+
+def test_real_systemd_coordinator_commits_proof_usage_agent_and_slot(tmp_path):
+    from tests.unit.runtime.test_attempt_execution_coordinator import prepare_application, assert_success
+
+    value = prepare_application(tmp_path, live=True)
+    try:
+        returned = value.app.accept_verifier_proposal(
+            **value.identity, task_sha256=value.proposal.task_sha256,
+        )
+        assert_success(value, returned)
+    finally:
+        value.app.close()
+
+
+def test_real_systemd_rejected_proposal_keeps_attempt_and_budget_held(tmp_path):
+    from orchestrator.budget import BudgetLedger
+    from orchestrator.runtime.acceptance_coordinator import ProposalAcceptanceError
+    from tests.unit.runtime.test_attempt_execution_coordinator import prepare_application
+    from tests.unit.lifecycle.test_scheduler import _resolver_durable_state
+
+    value = prepare_application(tmp_path, live=True, content=b'not-json')
+    try:
+        assert value.proposal.evidence.outcome == "rejected"
+        before = _resolver_durable_state(value.app._event_store)
+        balance = BudgetLedger(value.app._event_store).available("run-1")
+        with pytest.raises(ProposalAcceptanceError):
+            value.app.accept_verifier_proposal(**value.identity, task_sha256=value.proposal.task_sha256)
+        assert _resolver_durable_state(value.app._event_store) == before
+        assert BudgetLedger(value.app._event_store).available("run-1") == balance
+        assert value.app._scheduler.agents.replay("run-1").active_count == 1
+    finally:
+        value.app.close()
