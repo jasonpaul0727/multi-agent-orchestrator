@@ -352,13 +352,21 @@ Expected: all tests pass with zero skips, coverage is at least 90.00%, compile/d
 
 Measured 2026-10-09 on source/test commit `04d5d2d380509d5179db84e6bc8fed5731d294c9`, including the startup policy-commitment fix: focused acceptance command (with `--override-ini=addopts=`) passed 391 tests in 91.92s; full `coverage run -m pytest --override-ini=addopts= -q` passed 1,786 tests in 308.42s. Both had zero skips and no warnings. `coverage report` passed: 16,946 statements, 1,645 missing, 90.29% total; coordinator 98.55%, Scheduler core 90.43%, application 97.16%. The 26 fully covered files suppressed by the report are not skipped tests. Required systemd integration ran. Compileall, pip check (`No broken requirements found.`), wheel build (`dist/multi_agent_orchestrator-0.1.0-py3-none-any.whl`) and complete branch-range diff check passed; dirty documentation whitespace is checked before the local commit. No production/test code or shared dependencies changed for Task 6.
 
-Steps 5–7 remain open for the controller's fresh whole-slice review, final documentation push and remote-tip/clean-worktree verification. The implementer prepares only the local documentation commit and records its SHA in the ignored Task 6 handoff report; passing the implementation gate does not claim those controller actions or V1 completion.
+### Delivery record — 2026-10-09
 
-- [ ] **Step 5: Perform a fresh whole-slice review before pushing the final documentation**
+The preceding 1,786-test / 391-focused measurement is the original Task 6 gate on `04d5d2d380509d5179db84e6bc8fed5731d294c9`, retained as dated historical evidence. The controller subsequently completed the whole-slice review of `5bb9e58699b8f86ddb54a497fde273a19af35bac..3348abec05804e9d3054e8cea20a70533f2cbb8c`, covering all 88/88 changed files and the named existing integration boundaries. The single final fix commit `e3e7e1f1b38b4a04f16a0b1403f5fbec946c287d` addressed I1 (independent transactional startup validation of every proposal stream), M1 (consumed/expired grant cleanup), and M2 (README boundary accuracy). Independent scoped re-review closed I1/M1/M2 with no new Critical/Important breakage or residual fix finding.
+
+The newer final exact-code gate for `e3e7e1f1b38b4a04f16a0b1403f5fbec946c287d` passed 1,797 full tests with zero skips and 90.29% total coverage (16,958 statements, 1,647 missing), plus 497 focused affected tests. Required real systemd isolation tests ran. `compileall -q src tests`, `pip check`, the normal isolated wheel build, and the complete branch-range whitespace check passed. No source/test change followed that full gate; the suppressed fully covered file rows are not skipped tests, and parent coverage does not imply sanitized child-process instrumentation.
+
+The controller completed the documentation/fix push and remote verification: the tracked worktree was clean and local HEAD equaled `origin/codex/p3-systemd-termination-receipts` at `e3e7e1f1b38b4a04f16a0b1403f5fbec946c287d`. Steps 5–7 below record those completed acceptance-foundation delivery gates. This later bookkeeping update receives its own local documentation commit and controller review/push; the recorded equality describes the verified delivery tip before that update.
+
+Only the acceptance foundation is delivered. Production `IsolatedWorkerProcess` remains blocked-only and default usage remains unavailable/fail-closed. Functional Worker execution, task-input retention/recovery, candidate byte publisher, Gateway/effect integration, CLI/MCP, full security acceptance, semantic/project-test verification and real cost/token/rework benchmarks remain open. No paid Provider calls, merge, deployment or V1 completion claim is established by this delivery record.
+
+- [x] **Step 5: Perform a fresh whole-slice review before pushing the final documentation**
 
 Review the complete diff from `git merge-base origin/main HEAD`, including tests and existing acceptance/reconciliation paths. Verify every `succeeded` writer is gated, every startup proof is reloaded from the journal, and no test-only adapter is exposed as a production application input. Fix findings and re-run the owning tests before proceeding.
 
-- [ ] **Step 6: Commit and push the documentation/gate results**
+- [x] **Step 6: Commit and push the documentation/gate results**
 
 ```bash
 git add docs/security/worker-runtime.md docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md docs/superpowers/plans/2026-10-07-p5-verified-attempt-acceptance.md
@@ -366,7 +374,7 @@ git commit -m "docs: record verified attempt acceptance boundary"
 git push origin codex/p3-systemd-termination-receipts
 ```
 
-- [ ] **Step 7: Verify remote tip and clean worktree**
+- [x] **Step 7: Verify remote tip and clean worktree**
 
 Run: `git fetch origin && git status --short --branch && git rev-parse HEAD && git rev-parse origin/codex/p3-systemd-termination-receipts`.
 Expected: local and remote commit IDs match and the tracked worktree is clean. Report that production Worker execution remains blocked and V1 is not complete.
