@@ -106,3 +106,44 @@ def test_concurrent_verification_consumes_grant_once():
 
     assert results.count(True) == 1
     assert results.count(False) == 3
+    assert authority._bindings == {}
+
+
+def test_consumed_grant_binding_is_released_while_live_grant_is_retained():
+    authority = EphemeralArtifactGrantAuthority()
+    expires = datetime.now(timezone.utc) + timedelta(minutes=1)
+    consumed = authority.issue(digest=DIGEST, run_id="run-a", expires_at=expires)
+    live = authority.issue(digest=DIGEST, run_id="run-b", expires_at=expires)
+
+    assert authority.verify(consumed) is True
+    assert consumed.signature not in authority._bindings
+    assert live.signature in authority._bindings
+    assert authority.verify(consumed) is False
+    assert authority.verify(live) is True
+    assert authority._bindings == {}
+
+
+@pytest.mark.parametrize("operation", ["issue", "verify"])
+def test_expired_unused_bindings_are_pruned_without_losing_live_grants(monkeypatch, operation):
+    import orchestrator.artifacts.grants as grants_module
+
+    authority = EphemeralArtifactGrantAuthority()
+    now = datetime.now(timezone.utc)
+    expired = authority.issue(digest=DIGEST, run_id="run-a", expires_at=now + timedelta(seconds=1))
+    live = authority.issue(digest=DIGEST, run_id="run-b", expires_at=now + timedelta(minutes=1))
+
+    class LaterClock:
+        @staticmethod
+        def now(_timezone):
+            return now + timedelta(seconds=2)
+
+    monkeypatch.setattr(grants_module, "datetime", LaterClock)
+    if operation == "issue":
+        fresh = authority.issue(digest=DIGEST, run_id="run-c", expires_at=now + timedelta(minutes=1))
+        assert fresh.signature in authority._bindings
+    else:
+        assert authority.verify(live.model_copy(update={"issuer": "wrong"})) is False
+    assert expired.signature not in authority._bindings
+    assert live.signature in authority._bindings
+    assert authority.verify(expired) is False
+    assert authority.verify(live) is True

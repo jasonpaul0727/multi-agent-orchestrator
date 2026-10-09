@@ -150,6 +150,9 @@ digest and one concrete Run, with issuer and aware expiry bound in host memory.
 Valid verification consumes it once; replay, mutation, wrong issuer, wrong
 scope/digest, or expiry cannot authorize another read. Tokens do not survive
 authority replacement/restart and are not signing keys or durable credentials.
+Consumed bindings are removed under the same lock; issuance and verification
+prune expired unused bindings while retaining live grants. This bounds retention
+of obsolete grants, not the number of simultaneously live grants.
 The coordinator uses the active lease expiry for these per-artifact grants;
 exact Attempt/generation/Agent provenance is checked separately by the
 Verifier's ArtifactStore admission gate.
@@ -183,6 +186,13 @@ duplicated, corrupted, stale, mismatched, or proofless legacy success raises
 proposal-only crash to success or rewrites legacy history. The authentic
 archived BASE Provider fixture/generator intentionally retain their proofless
 success; startup rejects it, with no migration or grandfathering policy.
+
+Independently of successful releases, startup replays every durable Verifier
+proposal stream through the journal's schema, integrity and size/count checks,
+and requires its Run to have a valid frozen config and recovered lifecycle.
+This check shares the startup transaction with pending Provider settlement;
+failure rolls back settlement writes and prevents readiness. Historical
+proposals do not require a currently active lease and are never promoted.
 
 The acceptance foundation is implemented; final whole-slice review and push
 remain controller gates. Worker model/tool execution, task-input retention and

@@ -13,7 +13,6 @@ class _GrantBinding:
     digest: str
     scope: tuple[str, ...]
     expires_at: datetime
-    consumed: bool = False
 
 
 class EphemeralArtifactGrantAuthority:
@@ -43,6 +42,7 @@ class EphemeralArtifactGrantAuthority:
             self._bindings[grant.signature] = _GrantBinding(
                 digest=grant.digest, scope=grant.scope, expires_at=grant.expires_at,
             )
+            self._prune_expired(datetime.now(timezone.utc))
         return grant
 
     def verify(self, grant: ArtifactAccessGrant) -> bool:
@@ -50,19 +50,24 @@ class EphemeralArtifactGrantAuthority:
         if not isinstance(grant, ArtifactAccessGrant) or not isinstance(grant.signature, str):
             return False
         with self._lock:
+            self._prune_expired(datetime.now(timezone.utc))
             binding = self._bindings.get(grant.signature)
             if (
                 binding is None
-                or binding.consumed
                 or grant.issuer != self._issuer
                 or grant.digest != binding.digest
                 or grant.scope != binding.scope
                 or grant.expires_at != binding.expires_at
-                or binding.expires_at <= datetime.now(timezone.utc)
             ):
                 return False
-            binding.consumed = True
+            del self._bindings[grant.signature]
             return True
+
+    def _prune_expired(self, now: datetime) -> None:
+        """Release obsolete bindings while the caller holds the authority lock."""
+        expired = [token for token, binding in self._bindings.items() if binding.expires_at <= now]
+        for token in expired:
+            del self._bindings[token]
 
 
 __all__ = ["EphemeralArtifactGrantAuthority"]

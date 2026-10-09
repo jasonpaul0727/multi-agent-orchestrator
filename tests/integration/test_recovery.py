@@ -78,6 +78,101 @@ def _replace_proof_payload(store, event, payload):
     )
 
 
+@pytest.mark.parametrize("fault", [
+    "corrupt-proposal", "corrupt-tail", "stream-version", "no-run", "config-only",
+    "lifecycle-no-config", "invalid-config",
+])
+def test_fresh_startup_rejects_proposal_only_corruption_or_orphan_without_writes(tmp_path, fault):
+    from orchestrator.runtime.verification_journal import VerifierProposalJournal
+
+    store, control, _, request, _, _ = _proof_attempt(tmp_path, **ADMISSION)
+    orphan = fault in {"no-run", "config-only"}
+    proposal_for_attempt(control, run_id="run-1", node_id="node-1",
+                         attempt_id=request.attempt_id,
+                         context_changes={"run_id": "orphan"} if orphan else None)
+    run_id = "orphan" if orphan else "run-1"
+    if orphan:
+        # A canonical proposal on its own has no lifecycle authority.
+        assert len(VerifierProposalJournal(store).read_run(run_id)) == 1
+    event = store.read_stream("verification_proposals", run_id)[0]
+    if fault == "corrupt-proposal":
+        _replace_proof_payload(store, event, {**event.payload, "evidence_sha256": "sha256:" + "f" * 64})
+    elif fault == "corrupt-tail":
+        store.append("verification_proposals", run_id, 1,
+                     [EventDraft("MalformedProposal", {})], "malformed-tail")
+    elif fault == "stream-version":
+        store._connection.execute("UPDATE stream_versions SET current_version = 2 "
+                                  "WHERE stream_type = 'verification_proposals'")
+    elif fault == "config-only":
+        config = store.read_stream("run", "run-1")[0]
+        store.append("run", "orphan", 0, [EventDraft("RunCreated", config.payload)], "orphan-config")
+    elif fault == "lifecycle-no-config":
+        store._connection.execute("DROP TRIGGER events_immutable_delete")
+        store._connection.execute("DELETE FROM events WHERE stream_type = 'run'")
+    elif fault == "invalid-config":
+        config = store.read_stream("run", "run-1")[0]
+        _replace_proof_payload(store, config, {"config_snapshot": {}})
+    store.close()
+    database = tmp_path / "proof.db"
+    before = _durable_rows(database)
+    assert _fresh_startup(database) == ("rejected", None)
+    assert _durable_rows(database) == before
+
+
+def _late_proposal_failure_startup(database, stream_id, output):
+    from orchestrator.models.provider_calls import SQLiteProviderCallJournal
+    from orchestrator.runtime.verification_journal import VerifierProposalJournal
+
+    observed = []
+    replay = VerifierProposalJournal.read_run
+
+    def observe_real_settlement_then_replay(self, run_id):
+        store = self._event_store
+        call = SQLiteProviderCallJournal(store).read_call(stream_id)
+        observed.append((store._connection.in_transaction, call.settlement_applied,
+                         any(e.event_type == "CostCommitted" for e in store.read_stream("budget", "run-1")),
+                         any(e.event_type == "AttemptSlotReleased" for e in store.read_stream("scheduler", "global"))))
+        return replay(self, run_id)
+
+    VerifierProposalJournal.read_run = observe_real_settlement_then_replay
+    with SQLiteEventStore(database) as store:
+        limits = scheduler(store).limits
+    try:
+        with ControlPlaneApplication(database, limits=limits):
+            output.put(("ready", observed))
+    except StartupRecoveryFailed:
+        output.put(("rejected", observed))
+
+
+def test_fresh_startup_proposal_validation_rolls_back_real_pending_settlement(tmp_path):
+    from orchestrator.models.provider_calls import SQLiteProviderCallJournal
+    from tests.unit.lifecycle.test_scheduler import _seed_provider_reconciliation_crash_case
+
+    database = tmp_path / "rollback.db"
+    _request, stream_id, _raw = _seed_provider_reconciliation_crash_case(database, with_proof=True)
+    with SQLiteEventStore(database) as store:
+        store.append("verification_proposals", "run-1", 0,
+                     [EventDraft("MalformedProposal", {})], "malformed-proposal")
+        assert SQLiteProviderCallJournal(store).read_call(stream_id).status == "settlement_pending"
+    before = _durable_rows(database)
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    child = context.Process(target=_late_proposal_failure_startup, args=(str(database), stream_id, output))
+    child.start()
+    child.join(20)
+    if child.is_alive():
+        child.kill()
+        child.join()
+        pytest.fail("late proposal validation child timed out")
+    assert child.exitcode == 0
+    assert output.get(timeout=5) == ("rejected", [(True, True, True, True)])
+    output.close()
+    assert _durable_rows(database) == before
+    with SQLiteEventStore(database) as store:
+        assert SQLiteProviderCallJournal(store).read_call(stream_id).status == "settlement_pending"
+        assert scheduler(store).recovery.recover("run-1").active_attempts[0].status == "outcome_unknown"
+
+
 @pytest.mark.parametrize("commit", [False, True], ids=["proposal_only", "committed_success_proof"])
 def test_fresh_process_replays_proposal_only_or_committed_success_proof(tmp_path, commit):
     child = multiprocessing.get_context("spawn").Process(

@@ -25,7 +25,9 @@ from orchestrator.runtime.acceptance_coordinator import (
     AttemptExecutionCoordinator, AttemptUsageSource, ProposalAcceptanceError,
     UnavailableAttemptUsageSource,
 )
-from orchestrator.runtime.verification_journal import VerifierProposalJournal, VerifierProposalRecord
+from orchestrator.runtime.verification_journal import (
+    VERIFICATION_PROPOSAL_STREAM_TYPE, VerifierProposalJournal, VerifierProposalRecord,
+)
 from orchestrator.runtime.verifier_process import IsolatedVerifierProcess
 from orchestrator.scheduler import AcceptedAttempt, ConcurrencyLimits, Scheduler
 from orchestrator.validation import revalidate_model
@@ -130,6 +132,7 @@ class ControlPlaneApplication:
             applied = self._reconciliation.apply_pending_settlements()
             after = self._recover_all_runs()
             self._validate_provider_calls(after)
+            self._validate_verifier_proposals(after)
             if self._journal.pending_settlements():
                 raise StartupRecoveryFailed("startup left an unapplied Provider proof")
             held = tuple(lease for run in after.values() for lease in run.active_attempts)
@@ -170,6 +173,16 @@ class ControlPlaneApplication:
             run_id: self._scheduler.recovery.recover(run_id)
             for run_id in sorted(run_ids)
         }
+
+    def _validate_verifier_proposals(self, runs: dict[str, RecoveredRun]) -> None:
+        # Proposals are non-authoritative, including historical proposals whose
+        # leases have expired. Replay every stream independently of successes;
+        # its Run must still have a valid frozen config and lifecycle projection.
+        journal = VerifierProposalJournal(self._event_store)
+        for run_id in self._event_store.stream_ids(VERIFICATION_PROPOSAL_STREAM_TYPE):
+            journal.read_run(run_id)
+            if run_id not in runs:
+                raise StartupRecoveryFailed("Verifier proposal has no recovered Run")
 
     def _validate_provider_calls(self, runs: dict[str, RecoveredRun]) -> None:
         routes = {}

@@ -104,7 +104,9 @@ Run lifecycle 在初始化、图变更、Run 状态和 Attempt 变化后写入�
 
 `SystemdOverlayCandidateLauncher` 是内部命令执行后端：冻结 lower 快照，在有界 tmpfs Overlay 层中执行，保留候选直到显式关闭 session；整个进程树停止、卸载并导出后，宿主再验证 diff。命令使用私有 user/mount/net/PID namespace、空 capabilities、Landlock 和默认拒绝的 seccomp；受信启动器禁止从工作区导入同名包。停止证明同时要求 systemd 状态和冻结 cgroup 的内核空组证据，未知启动/停止保留现场。只读启动器也已修复同名包导入边界。接口及限制见 [workspace-write 边界](docs/security/workspace-write.md)。
 
-仍未实现：workspace-write 与 Scheduler/Worker 的安全服务接线、Secret Broker 与真实 Worker 的端到端接线、能生成候选产物的功能 Worker、节点语义验收与持久化 Verifier 证据、CLI、MCP Server、Provider 权威查询和费用对账、跨流完整崩溃恢复与性能基准证据。未决发布意图会 fail-closed，但没有自动跨流 reconciliation service。当前内置 Verifier 只在 systemd 只读沙箱检查 ArtifactStore 精确 Attempt 产物的哈希/大小、UTF-8、JSON 或 Python 语法；它不运行项目测试、不作语义审查，也不接受 lifecycle 成功状态。因此当前交付仍不是可完整运行的多 Agent 产品。
+已实现确定性 Verifier proposal 的持久化、完整 journal 重放与宿主 proof-gated acceptance：宿主重验冻结上下文、精确产物来源和内置 Verifier 证据，在同一 SQLite 事务里提交生命周期成功、Agent 完成、预算结算与 slot 释放；proposal 本身不授权成功，启动会校验所有 proposal 流且不会自动提升 proposal-only 结果。当前内置 Verifier 只在 systemd 只读沙箱检查 ArtifactStore 精确 Attempt 产物的哈希/大小、UTF-8、JSON 或 Python 语法；它不运行项目测试、不作语义审查。
+
+仍未实现：workspace-write 与 Scheduler/Worker 的安全服务接线、Secret Broker 与真实 Worker 的端到端接线、能生成候选产物的功能 Worker、候选发布与 task-input 保留/恢复设计、节点语义验收与项目测试验证、Gateway/effect 的完整 Worker 集成、CLI、MCP Server、完整安全验收、真实 Provider 基准及跨流完整崩溃恢复。Provider 对账已有可信服务边界，但生产权威查询/费用后端仍不可用；未决发布意图会 fail-closed，但没有自动跨流 reconciliation service。V1 仍未完成，当前交付仍不是可完整运行的多 Agent 产品。
 
 ### 预算生命周期
 
