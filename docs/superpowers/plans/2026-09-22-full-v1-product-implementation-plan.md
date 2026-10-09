@@ -345,17 +345,61 @@ bytes, accept a Node, write lifecycle state, or affect the Scheduler. The
 reviewed implementation gate recorded 1,567 passed, zero skipped, 90.12%
 total coverage and 87.73% journal-module coverage; focused runtime/live
 Verifier integration (211 passed, zero skipped), compileall, pip check, wheel
-build and branch whitespace checks passed. Documentation review and the final
-whole-slice gate remain pending in the narrow subplan. Worker execution,
-control-plane evidence acceptance, semantic review/test execution, Final
-Review and application-service/recovery wiring remain open. No P5 checklist
-item or broader P5/V1 completion gate is closed by this milestone.
+build and branch whitespace checks passed. Those measurements apply to the
+proposal-only milestone. The later acceptance foundation below supersedes
+the earlier absence of control-plane evidence acceptance and startup proof
+validation; broader P5/V1 completion remains open.
+
+2026-10-09 verified Attempt acceptance foundation: the ready-gated application
+method `accept_verifier_proposal(*, run_id, node_id, attempt_id,
+fencing_generation, task_sha256)` accepts only identity and task hash. The
+private coordinator resolves the original trusted admission's frozen graph,
+input manifest, complete AttemptContext and deterministic check contract,
+then loads a fully validated durable proposal. It re-runs the built-in
+isolated Verifier over exact host-published bytes/provenance using one-use
+Run/digest/issuer/expiry-bound grants and requires matching canonical evidence.
+Caller evidence, usage, completion times, Worker output and paths cannot
+authorize acceptance. A composition-time trusted `AttemptUsageSource` supplies
+reservation-bound usage; the default is unavailable and fails closed. No
+production Provider usage backend exists.
+
+Scheduler rechecks durable proof, original admission, cancellation, fencing,
+lease and usage inside one existing SQLite `append_checked` transaction that
+commits lifecycle success, Agent completion, budget settlement and slot
+release with task/evidence hash references. Ordinary finish, Provider
+reconciliation and public Lifecycle success writers reject unproved success.
+Before readiness, a read-only historical audit reloads every exact proposal
+and checks all Scheduler/lifecycle successes against original context and
+completion history, including the independent Attempt policy commitment.
+Proposal-only crashes remain unaccepted; missing/corrupt/duplicated or
+proofless legacy success fails startup. The archived BASE fixture/generator
+intentionally preserve authentic legacy proofless success; there is no
+migration or silent rewrite.
+
+This narrow foundation is implemented; final whole-slice review/push gates
+remain in the acceptance subplan. Production `IsolatedWorkerProcess` stays
+blocked-only. `NodeProposal.task_text` remains consumed but unpersisted, so
+functional Worker dispatch still needs a separate task-input retention and
+restart-resupply design. Worker byte publication, Gateway/Approval/Secret
+Broker wiring, functional Worker recovery, CLI/MCP, full end-to-end security,
+semantic review/project tests/Final Review, and real cost/token/rework
+benchmarks remain incomplete. This does not complete P5 or V1.
+
+Final implementation test/build gate on 2026-10-09: 391 focused acceptance
+tests and 1,786 full suite tests passed, zero skips, 90.29% total coverage;
+compileall, pip check, wheel build and complete branch whitespace checks
+passed. These results include the startup Attempt-policy commitment fix and
+real systemd integration. Final whole-slice review and documentation push
+remain pending controller gates; the broader product checklist stays open.
+
+- [x] 完成受限的 verified Attempt acceptance foundation：独立冻结上下文、产物重验、持久化 proof、原子资源结算与 startup 历史证明审计；production Worker 仍 blocked-only，默认 usage 不可用。
+- [ ] 为 functional Worker 设计 task-input 保留/重启重供，并接入候选字节 publisher、Gateway/Approval/Secret Broker；覆盖完整 Worker 运行/取消/恢复。
 
 - [ ] Worker 仅获得当前 attempt 的最小输入、CapabilityGrant 引用和工具请求接口；不得拿到 EventStore/控制目录句柄或写最终状态。
 - [ ] 实现 Model Gateway：按 accepted RoutingDecision 调用 adapter，通过 Secret Broker 请求凭据，做超时/取消/有限重试、usage 采集、预算结算和响应脱敏。
 - [ ] 实现 Planner 生成初始 DAG、Worker 候选结果、Reviewer、Director 和文档分析 Agent 契约；模型输出只能成为提案/候选，由控制层验证后追加事件。
 - [ ] 实现 Agent 动态拆分：Graph Manager 校验依赖/契约/权限/预算/深度/累计数量后追加子图；新增能力必须形成具有新安全契约的节点。
-- [ ] 扩展独立 Verifier：现有只读进程仅覆盖 Artifact hash/size、UTF-8、JSON 和 Python 语法，不运行项目测试或语义审查；仍需按节点验收契约生成、持久化证据并由控制层决定是否接受。
+- [ ] 扩展独立 Verifier：已实现 Artifact hash/size、UTF-8、JSON 和 Python 语法的持久化提案与 proof-gated 控制层接受；仍需节点语义验收、项目测试及真实 Worker 端到端接线。
 - [ ] 实现 Final Review：冻结 review graph version 与 input manifest，核验原始目标、必需产物、证据、风险、账本；repair 必须有界返工并重新审查最新 generation。
 
 验收：离线 fake-model + fake-tool 模式跑通成功、失败、重试、升级、拆分、审批等待和恢复流程；Worker 无法伪造状态/访问控制面/绕过 Gateway；Verifier 与 Final Review 的每个判定可追溯到事件和产物哈希。

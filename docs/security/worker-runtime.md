@@ -82,7 +82,8 @@ The Python check parses source but does not import or execute it. A result is
 validated against the exact Attempt and candidate digest set in the host and
 remains a proposal: the process module does not persist verification events,
 accept a Node, or notify the Scheduler. The separate host journal described
-below persists proposals only. The checks prove byte/format properties only;
+below persists proposals only; acceptance uses the additional host gate below.
+The checks prove byte/format properties only;
 they are not semantic code review, test-suite execution, documentation
 acceptance, or Final Review.
 
@@ -113,10 +114,84 @@ The journal does not re-read or modify ArtifactStore bytes, re-run checks,
 accept a Node, write lifecycle state, or affect the Scheduler. Proposal replay
 does not provide Worker/Run crash recovery or control-plane acceptance.
 
-Worker model/tool execution, artifact publication from Worker, Gateway /
-Approval / Secret Broker mediation, durable evidence acceptance, crash
-recovery, and CLI/MCP application services remain unimplemented. No
-production Worker profile is enabled by this slice.
+## Proof-gated Attempt acceptance
+
+The acceptance foundation adds a private `AttemptExecutionCoordinator` and
+`ControlPlaneApplication.accept_verifier_proposal(*, run_id: str, node_id: str,
+attempt_id: str, fencing_generation: int, task_sha256: str) ->
+VerifierProposalRecord`. This ready-gated application API accepts only the
+exact Attempt identity and proposal task hash. Evidence, usage, completion
+time, Worker results, paths, and no-effect claims are not request inputs.
+Missing artifacts/dependencies, unavailable usage/audit/store, mismatched
+proof, ambiguous settlement, stale generation, cancellation or lease expiry
+fail closed without accepting the Attempt or releasing its resource holds.
+
+Trusted host routing admission may supply `input_manifest_hash`,
+`verification_contract`, and `required_check_ids`, all together or all absent.
+For success, a full frozen PlanningNodeContract and this original admission
+binding are required. Admission captures the graph version and constructs the
+complete AttemptContext independently of the proposal, including Run, Node,
+Attempt, generation, Agent, input manifest, EffectiveConfig, Registry, policy,
+routing, and planning commitments. A missing binding cannot be retrofitted;
+admission retries must match the original binding. The input hash commits to
+host input identity, not to the content of undisclosed inputs.
+
+The coordinator resolves that durable active state and its accepted check
+contract, then loads the exact proposal through full-stream journal validation.
+It compares the proposal to the independently frozen context, requires an
+accepted `builtin.readonly-v1` result for `maestro.artifact-verification/v1`,
+and re-runs `IsolatedVerifierProcess`. That path rechecks candidate bytes and
+exact publication provenance, not Worker-supplied paths, before staging. Only
+the supported deterministic checks, including required `artifact-integrity`,
+are admitted. Fresh canonical evidence must match the durable evidence hash.
+
+`EphemeralArtifactGrantAuthority` issues a fresh opaque token for exactly one
+digest and one concrete Run, with issuer and aware expiry bound in host memory.
+Valid verification consumes it once; replay, mutation, wrong issuer, wrong
+scope/digest, or expiry cannot authorize another read. Tokens do not survive
+authority replacement/restart and are not signing keys or durable credentials.
+The coordinator uses the active lease expiry for these per-artifact grants;
+exact Attempt/generation/Agent provenance is checked separately by the
+Verifier's ArtifactStore admission gate.
+
+Usage comes from the trusted composition-time `AttemptUsageSource` service,
+whose `usage_for(ActiveAttemptSnapshot) -> UsageRecord` binds settlement to the
+accepted reservation. `ControlPlaneApplication(..., usage_source=None)` uses
+`UnavailableAttemptUsageSource`: default usage is unavailable and acceptance
+fails closed. There is no production Provider usage backend in this slice;
+deterministic sources are test fixtures. The internal UTC clock supplies both
+initial validation and completion time, so callers cannot backdate completion.
+
+`Scheduler.finish_verified_attempt` reloads the exact durable proposal inside
+the existing SQLite `append_checked` transaction. It rechecks original
+admission, context/check contract, accepted evidence, cancellation, fencing,
+lease validity, and reservation/usage before committing lifecycle success,
+Agent completion, budget settlement, and slot release together. The success
+event records `task_sha256` and `evidence_sha256`; identical retries are
+idempotent and conflicting decisions or nested-write faults leave no partial
+settlement. Ordinary finish, Provider reconciliation, and public Lifecycle
+completion APIs cannot write `succeeded` without this proof-bearing path.
+
+Before readiness or startup settlement, `Scheduler.validate_success_proofs()`
+audits all historical Scheduler and lifecycle successes, including earlier
+Nodes and events hidden by current snapshots. It reloads each exact proposal
+and checks original admission, historical graph/context (including independent
+Attempt policy commitment), lease/completion bindings, and recorded hashes.
+Later graph expansion does not invalidate an earlier valid success. Missing,
+duplicated, corrupted, stale, mismatched, or proofless legacy success raises
+`StartupRecoveryFailed`. This audit is read-only: it never promotes a
+proposal-only crash to success or rewrites legacy history. The authentic
+archived BASE Provider fixture/generator intentionally retain their proofless
+success; startup rejects it, with no migration or grandfathering policy.
+
+The acceptance foundation is implemented; final whole-slice review and push
+remain controller gates. Worker model/tool execution, task-input retention and
+restart resupply, a Worker candidate-byte publisher, Gateway / Approval /
+Secret Broker integration, functional Worker crash recovery, CLI/MCP, full
+end-to-end security acceptance, and cost/token/rework benchmarks remain open.
+`NodeProposal.task_text` is consumed but not persisted; no production
+`WorkerTask` is constructed. The production Worker remains blocked-only and
+V1 is not complete.
 
 The new `SystemdOverlayCandidateLauncher` is a separate internal command
 backend, not a change to the blocked-only Worker. It can produce private,
@@ -152,3 +227,18 @@ zero skipped, and 90.12% total coverage; journal-module coverage was 87.73%.
 Focused runtime/live Verifier integration (211 passed, zero skipped),
 `compileall`, `pip check`, wheel build, and branch whitespace checks passed.
 These measurements cover this proposal-only slice; P5 and V1 remain incomplete.
+
+The 2026-10-09 acceptance-foundation gate, including the recovered Attempt
+policy-commitment fix, recorded 391 focused acceptance tests and 1,786 full
+suite tests passed, with zero skips and 90.29% total coverage (16,946 statements,
+1,645 missing). The full suite ran the required live systemd integration cases;
+coordinator coverage was 98.55%, Scheduler core 90.43%, and application 97.16%.
+Compilation, dependency consistency, wheel build and complete branch-range
+whitespace checks passed. Coverage was measured with `coverage run -m pytest`
+and `coverage report` using the existing 90% threshold; pytest-cov is absent.
+Tests cover grant reuse, frozen-context/proof mismatch, unavailable usage,
+cancellation/expiry races, atomic rollback, real isolated re-verification,
+proposal-only restart non-promotion, historical/legacy corruption rejection,
+and committed-success response loss. Final whole-slice review and documentation
+push remain controller gates; these results do not complete functional Worker,
+P5, or V1.
