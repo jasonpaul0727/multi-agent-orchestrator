@@ -124,6 +124,7 @@ class ControlPlaneApplication:
 
         def recover_under_lock(_events, _version):
             nonlocal report
+            self._scheduler.validate_success_proofs()
             before = self._recover_all_runs()
             self._validate_provider_calls(before)
             applied = self._reconciliation.apply_pending_settlements()

@@ -485,6 +485,57 @@ def test_verified_completion_is_atomic_and_idempotent(tmp_path):
     assert _resolver_durable_state(store) == before
 
 
+def test_success_proof_audit_is_read_only_and_accepts_later_graph_expansion(tmp_path):
+    store = SQLiteEventStore(tmp_path / "expanded-proof.db")
+    reg, config, lifecycle, manifest = run_setup(store, nodes=(
+        NodeSpec(node_id="node-1", role="coder", planning_contract_hash=HASH),
+        NodeSpec(node_id="waiting-node", role="coder", planning_contract_hash=HASH),
+    ), freeze_contracts=True)
+    request, decision = proof_routed_pair(reg, config, manifest)
+    control = scheduler(store)
+    accepted = accept(control, request, decision)
+    finish_with_proof(control, run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+                      fencing_generation=1, completed_at=NOW + timedelta(seconds=3),
+                      usage=UsageRecord(run_id="run-1", reservation_id=accepted.reservation.reservation_id,
+                                        settlement_key="expanded-proof", currency="USD", cost_minor=2))
+    lifecycle.append_nodes("run-1", (NodeSpec(node_id="later-node", role="coder",
+                           planning_contract_hash=HASH),), expected_graph_version=1,
+                           idempotency_key="after-success")
+    before = _resolver_durable_state(store)
+    # SQLite rejects any validator write, including snapshots and idempotency records.
+    store._connection.execute("PRAGMA query_only = ON")
+    control.validate_success_proofs()
+    assert _resolver_durable_state(store) == before
+    store._connection.execute("PRAGMA query_only = OFF")
+    from orchestrator.application import ControlPlaneApplication
+    with ControlPlaneApplication(tmp_path / "expanded-proof.db", limits=control.limits) as app:
+        assert app.recover_run("run-1").lifecycle.graph_version == 2
+
+
+def test_success_proof_audit_checks_every_historical_success(tmp_path):
+    store = SQLiteEventStore(tmp_path / "multiple-proofs.db")
+    reg, config, _, manifest = run_setup(store, nodes=(
+        NodeSpec(node_id="node-1", role="coder", planning_contract_hash=HASH),
+        NodeSpec(node_id="node-2", role="coder", planning_contract_hash=HASH),
+    ), freeze_contracts=True)
+    control = scheduler(store)
+    for node_id in ("node-1", "node-2"):
+        request, decision = proof_routed_pair(reg, config, manifest, node_id=node_id)
+        accepted = accept(control, request, decision)
+        finish_with_proof(control, run_id="run-1", node_id=node_id, attempt_id=request.attempt_id,
+                          fencing_generation=1, completed_at=NOW + timedelta(seconds=3),
+                          usage=UsageRecord(run_id="run-1", reservation_id=accepted.reservation.reservation_id,
+                                            settlement_key=node_id, currency="USD", cost_minor=2))
+    from tests.integration.test_recovery import _replace_proof_payload
+    release = next(event for event in store.read_stream("scheduler", "global")
+                   if event.event_type == "AttemptSlotReleased" and event.node_id == "node-1")
+    _replace_proof_payload(store, release, {**release.payload, "evidence_sha256": HASH})
+    before = _resolver_durable_state(store)
+    with pytest.raises(SchedulerError):
+        control.validate_success_proofs()
+    assert _resolver_durable_state(store) == before
+
+
 @pytest.mark.parametrize("generation", [True, 1.0, "1"])
 def test_verified_completion_duplicate_rejects_non_integer_generation(tmp_path, generation):
     store, control, _, request, _, kwargs = _proof_attempt(tmp_path, **ADMISSION)

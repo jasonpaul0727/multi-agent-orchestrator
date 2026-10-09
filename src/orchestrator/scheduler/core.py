@@ -37,8 +37,9 @@ from orchestrator.lifecycle.controller import (
     LifecycleConflict,
     LifecycleController,
     LifecycleError,
+    apply_lifecycle_event,
 )
-from orchestrator.lifecycle.models import AttemptState
+from orchestrator.lifecycle.models import AttemptState, RunLifecycleState
 
 
 _SCHEDULER_STREAM = "scheduler"
@@ -816,6 +817,142 @@ class Scheduler:
             raise SchedulerError("verification binding failed a durable-state invariant") from exc
         assert result is not None
         return result
+
+    def validate_success_proofs(self) -> None:
+        """Audit every historical success without promoting proposals or writing state.
+
+        Bootstrap calls this inside its SQLite transaction. Historical authority
+        comes from the original acceptance and lifecycle prefix at completion;
+        a later graph append must not invalidate a previously accepted proof.
+        """
+        try:
+            self._validate_success_proofs()
+        except SchedulerError:
+            raise
+        except Exception as exc:
+            raise SchedulerError("success proof audit failed a durable-state invariant") from exc
+
+    def _validate_success_proofs(self) -> None:
+        events, version = self.event_store.read_stream_with_version(_SCHEDULER_STREAM, _SCHEDULER_ID)
+        if version != len(events) or any(event.stream_version != index
+                                        for index, event in enumerate(events, 1)):
+            raise SchedulerError("success proof audit found an invalid Scheduler stream")
+        acceptances = {}
+        releases = {}
+        for event in events:
+            if event.event_type == "RoutingDecisionAccepted":
+                key = (event.run_id, event.node_id, event.attempt_id, event.fencing_generation)
+                if key in acceptances:
+                    raise SchedulerError("success proof audit found duplicate acceptance")
+                acceptances[key] = event
+            elif event.event_type == "AttemptSlotReleased" and event.payload.get("outcome") == "succeeded":
+                key = (event.run_id, event.node_id, event.attempt_id, event.fencing_generation)
+                if key in releases:
+                    raise SchedulerError("success proof audit found duplicate success")
+                releases[key] = event
+
+        terminals: dict[tuple, tuple[StoredEvent, RunLifecycleState]] = {}
+        acceptance_graphs = {}
+        for run_id in self.event_store.stream_ids("run_lifecycle"):
+            lifecycle_events, lifecycle_version = self.event_store.read_stream_with_version("run_lifecycle", run_id)
+            if lifecycle_version != len(lifecycle_events):
+                raise SchedulerError("success proof audit found an invalid lifecycle stream")
+            state = None
+            for event in lifecycle_events:
+                key = (run_id, event.node_id, event.attempt_id, event.fencing_generation)
+                if event.event_type == "AttemptAccepted" and state is not None:
+                    acceptance_graphs[key] = state.graph_version
+                if event.event_type in {"AttemptCompleted", "AttemptReconciled"} and event.payload.get("outcome") == "succeeded":
+                    if state is None or key in terminals or event.event_type != "AttemptCompleted":
+                        raise SchedulerError("success proof audit found unsupported or duplicate lifecycle success")
+                    terminals[key] = (event, state)
+                state = apply_lifecycle_event(run_id, state, event)
+        if set(releases) != set(terminals):
+            raise SchedulerError("success proof audit found unmatched terminal events")
+
+        journal = VerifierProposalJournal(self.event_store)
+        for key, release in releases.items():
+            accepted = acceptances.get(key)
+            terminal, state = terminals[key]
+            if accepted is None or accepted.stream_version >= release.stream_version:
+                raise SchedulerError("success proof has no original route acceptance")
+            run_id, node_id, attempt_id, generation = key
+            attempt_ref = _attempt_ref(run_id, node_id, attempt_id)
+            payload = accepted.payload
+            admission = payload.get("verification_admission")
+            if not isinstance(admission, dict) or _verification_admission(**admission) != admission:
+                raise SchedulerError("success proof has no canonical frozen admission")
+            snapshot = self.lifecycle.config_snapshot(run_id)
+            node = state.node(node_id)
+            attempt = next(item for item in node.attempts if item.attempt_id == attempt_id)
+            contract = node.spec.planning_contract
+            if (contract is None or state.status in {"cancelling", "cancelled"}
+                or attempt.status != "accepted" or attempt.fencing_generation != generation
+                or contract.run_id != run_id or contract.node_id != node_id
+                or contract.contract_hash != node.spec.planning_contract_hash
+                or contract.config_hash != snapshot.effective_config_hash
+                or contract.registry_hash != snapshot.registry_manifest_hash
+                or contract.policy_manifest_hash != state.policy_manifest_hash
+                or type(payload.get("graph_version")) is not int
+                or payload["graph_version"] != acceptance_graphs.get(key)
+                or payload["graph_version"] != state.graph_version):
+                raise SchedulerError("success proof does not bind the original frozen graph")
+            expected_context = AttemptContext(
+                run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                agent_instance_id=attempt.agent_instance_id, fencing_generation=generation,
+                graph_version=payload["graph_version"], input_manifest_hash=admission["input_manifest_hash"],
+                effective_config_hash=snapshot.effective_config_hash,
+                registry_hash=snapshot.registry_manifest_hash,
+                policy_manifest_hash=contract.policy_manifest_hash,
+                routing_decision_hash=attempt.decision_hash, planning_contract_hash=contract.contract_hash)
+            context = AttemptContext.model_validate(payload.get("verification_context"))
+            route = AcceptedModelRoute.model_validate(payload.get("accepted_route"))
+            if (context != expected_context
+                or payload.get("verification_contract") != admission["verification_contract"]
+                or payload.get("required_check_ids") != admission["required_check_ids"]
+                or payload.get("attempt_ref") != attempt_ref
+                or payload.get("run_id") != run_id or payload.get("node_id") != node_id
+                or payload.get("attempt_id") != attempt_id
+                or payload.get("agent_instance_id") != context.agent_instance_id
+                or payload.get("decision_hash") != context.routing_decision_hash
+                or accepted.causation_id != context.routing_decision_hash or accepted.correlation_id != run_id
+                or route.run_id != run_id or route.node_id != node_id or route.attempt_id != attempt_id
+                or route.fencing_generation != generation
+                or route.decision_id != "decision-" + context.routing_decision_hash.removeprefix("sha256:")
+                or route.budget_reservation_id != attempt.reservation_id
+                or payload.get("reservation_id") != attempt.reservation_id
+                or route.model_id != attempt.model_id or route.provider_id != attempt.provider_id
+                or payload.get("provider_id") != attempt.provider_id
+                or route.reasoning_effort != attempt.reasoning_effort
+                or route.registry_manifest_hash != context.registry_hash):
+                raise SchedulerError("success proof frozen route bindings disagree")
+            completed_at = _aware(datetime.fromisoformat(release.payload["completed_at"]), "completed_at")
+            accepted_at = _aware(datetime.fromisoformat(payload["accepted_at"]), "accepted_at")
+            expires_at = _aware(datetime.fromisoformat(payload["lease_expires_at"]), "lease_expires_at")
+            if not accepted_at <= completed_at < expires_at or attempt.lease_expires_at != expires_at.isoformat():
+                raise SchedulerError("success proof completion is outside its original lease")
+            proposal = journal.read_proposal(run_id, release.payload.get("task_sha256"))
+            if (proposal is None or proposal.evidence.outcome != "accepted"
+                or proposal.task.context != context
+                or proposal.task.acceptance_contract != admission["verification_contract"]
+                or tuple(sorted(proposal.task.required_check_ids)) != tuple(admission["required_check_ids"])):
+                raise SchedulerError("success proof does not match the exact durable proposal")
+            for event in (release, terminal):
+                if (event.payload.get("task_sha256") != proposal.task_sha256
+                    or event.payload.get("evidence_sha256") != proposal.evidence_sha256
+                    or event.payload.get("node_id") != node_id or event.payload.get("attempt_id") != attempt_id
+                    or event.correlation_id != run_id):
+                    raise SchedulerError("success proof terminal references disagree")
+            if (release.payload.get("run_id") != run_id
+                or type(release.payload.get("fencing_generation")) is not int
+                or release.payload["fencing_generation"] != generation
+                or release.payload.get("attempt_ref") != attempt_ref
+                or release.payload.get("known_no_effect") is not False
+                or release.causation_id != context.routing_decision_hash
+                or terminal.causation_id != proposal.task_sha256
+                or release.idempotency_key != f"finish:{attempt_ref}"
+                or terminal.idempotency_key != f"attemptcompleted:{attempt_id}"):
+                raise SchedulerError("success proof terminal execution bindings disagree")
 
     def finish_verified_attempt(
         self, *, run_id: str, node_id: str, attempt_id: str,

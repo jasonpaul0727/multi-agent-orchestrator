@@ -1,4 +1,9 @@
 import sqlite3
+import hashlib
+import json
+import multiprocessing
+import os
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +19,190 @@ from orchestrator.recovery import (
     recover,
     recover_aggregate,
 )
+from orchestrator.application import ControlPlaneApplication, StartupRecoveryFailed
+from tests.support.attempt_acceptance import ADMISSION, proposal_for_attempt
+from tests.unit.lifecycle.test_scheduler import _proof_attempt, scheduler
+
+
+def _success_proof_writer(directory, commit):
+    store, control, _, request, _, kwargs = _proof_attempt(Path(directory), **ADMISSION)
+    proposal = proposal_for_attempt(control, run_id="run-1", node_id="node-1",
+                                    attempt_id=request.attempt_id)
+    if commit:
+        control.finish_verified_attempt(**kwargs, task_sha256=proposal.task_sha256)
+    # Lose the response after the durable proposal or atomic acceptance commit.
+    os._exit(73)
+
+
+def _success_proof_startup(database, output):
+    from tests.unit.lifecycle.test_scheduler import scheduler
+    with SQLiteEventStore(database) as store:
+        limits = scheduler(store).limits
+    try:
+        with ControlPlaneApplication(database, limits=limits) as app:
+            output.put(("ready", app.recover_run("run-1").lifecycle.status))
+    except StartupRecoveryFailed:
+        output.put(("rejected", None))
+
+
+def _fresh_startup(database):
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    child = context.Process(target=_success_proof_startup, args=(str(database), output))
+    child.start()
+    child.join(20)
+    if child.is_alive():
+        child.kill()
+        child.join()
+        pytest.fail("startup child timed out")
+    assert child.exitcode == 0
+    result = output.get(timeout=5)
+    output.close()
+    return result
+
+
+def _durable_rows(database):
+    with sqlite3.connect(database) as connection:
+        tables = [row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+        return {table: connection.execute('SELECT * FROM "' + table + '" ORDER BY rowid').fetchall()
+                for table in tables}
+
+
+def _replace_proof_payload(store, event, payload):
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    store._connection.execute("DROP TRIGGER IF EXISTS events_immutable_update")
+    store._connection.execute(
+        "UPDATE events SET payload_json = ?, payload_hash = ? WHERE event_id = ?",
+        (encoded, hashlib.sha256(encoded.encode()).hexdigest(), event.event_id),
+    )
+
+
+@pytest.mark.parametrize("commit", [False, True], ids=["proposal_only", "committed_success_proof"])
+def test_fresh_process_replays_proposal_only_or_committed_success_proof(tmp_path, commit):
+    child = multiprocessing.get_context("spawn").Process(
+        target=_success_proof_writer, args=(str(tmp_path), commit))
+    child.start()
+    child.join(20)
+    if child.is_alive():
+        child.kill()
+        child.join()
+        pytest.fail("proof writer child timed out")
+    assert child.exitcode == 73
+    database = tmp_path / "proof.db"
+    before = _durable_rows(database)
+    assert _fresh_startup(database) == ("ready", "succeeded" if commit else "running")
+    assert _durable_rows(database) == before
+    with SQLiteEventStore(database) as store:
+        control = scheduler(store)
+        proposals = store.read_stream("verification_proposals", "run-1")
+        assert len(proposals) == 1
+        terminals = [event for event in store.read_stream("scheduler", "global")
+                     if event.event_type == "AttemptSlotReleased"]
+        if commit:
+            from datetime import timedelta
+            from orchestrator.budget import UsageRecord
+            from tests.unit.lifecycle.test_scheduler import NOW
+            acceptance = store.read_stream("scheduler", "global")[0]
+            control.finish_verified_attempt(
+                run_id="run-1", node_id="node-1", attempt_id=acceptance.attempt_id,
+                fencing_generation=1, completed_at=NOW + timedelta(seconds=3),
+                task_sha256=proposals[0].payload["task_sha256"],
+                usage=UsageRecord(run_id="run-1", reservation_id=acceptance.payload["reservation_id"],
+                                  settlement_key="verified", currency="USD", cost_minor=2))
+            assert len(terminals) == 1
+            assert terminals[0].payload["task_sha256"] == proposals[0].payload["task_sha256"]
+            assert terminals[0].payload["evidence_sha256"] == proposals[0].payload["evidence_sha256"]
+        else:
+            assert terminals == []
+            recovered = control.recovery.recover("run-1")
+            assert len(recovered.active_attempts) == 1
+            assert recovered.budget.reserved_minor == 20
+    assert _durable_rows(database) == before
+
+
+@pytest.mark.parametrize("fault", [
+    "missing-proposal", "corrupt-proposal", "corrupt-tail", "duplicate-proposal",
+    "task-hash", "evidence-hash", "lifecycle-task-hash", "lifecycle-evidence-hash",
+    "generation", "legacy_success", "context", "route", "admission", "expired",
+    "other-proof", "rejected-proof", "duplicate-success", "orphan-success",
+])
+def test_startup_rejects_invalid_success_proof_without_writes(tmp_path, fault):
+    store, control, _, request, _, kwargs = _proof_attempt(tmp_path, **ADMISSION)
+    proposal = proposal_for_attempt(control, run_id="run-1", node_id="node-1",
+                                    attempt_id=request.attempt_id)
+    control.finish_verified_attempt(**kwargs, task_sha256=proposal.task_sha256)
+    release = store.read_stream("scheduler", "global")[-1]
+    acceptance = store.read_stream("scheduler", "global")[0]
+    terminal = next(event for event in store.read_stream("run_lifecycle", "run-1")
+                    if event.event_type == "AttemptCompleted")
+    if fault == "missing-proposal":
+        store._connection.execute("DROP TRIGGER events_immutable_delete")
+        store._connection.execute("DELETE FROM events WHERE stream_type = 'verification_proposals'")
+    elif fault == "corrupt-proposal":
+        event = store.read_stream("verification_proposals", "run-1")[0]
+        _replace_proof_payload(store, event, {**event.payload, "evidence_sha256": "sha256:" + "f" * 64})
+    elif fault in {"corrupt-tail", "duplicate-proposal"}:
+        event = store.read_stream("verification_proposals", "run-1")[0]
+        from orchestrator.persistence import EventDraft
+        draft = EventDraft("MalformedProposal", {}, run_id="run-1", node_id="node-1",
+                           attempt_id=request.attempt_id, fencing_generation=1,
+                           causation_id=proposal.task_sha256)
+        appended = store.append("verification_proposals", "run-1", 1, [draft], "corrupt-tail")[0]
+        if fault == "duplicate-proposal":
+            store._connection.execute("DROP TRIGGER events_immutable_update")
+            store._connection.execute(
+                "UPDATE events SET event_type = ?, payload_json = ?, payload_hash = ?, "
+                "idempotency_key = ?, correlation_id = ? WHERE event_id = ?",
+                (event.event_type, json.dumps(event.payload, sort_keys=True, separators=(",", ":")),
+                 event.payload_hash, event.idempotency_key, event.correlation_id, appended.event_id))
+    elif fault in {"task-hash", "evidence-hash", "lifecycle-task-hash", "lifecycle-evidence-hash"}:
+        event = terminal if fault.startswith("lifecycle-") else release
+        field = "task_sha256" if "task" in fault else "evidence_sha256"
+        _replace_proof_payload(store, event, {**event.payload, field: "sha256:" + "f" * 64})
+    elif fault == "legacy_success":
+        for event in (release, terminal):
+            _replace_proof_payload(store, event, {key: value for key, value in event.payload.items()
+                                                if key not in {"task_sha256", "evidence_sha256"}})
+    elif fault == "generation":
+        _replace_proof_payload(store, release, {**release.payload, "fencing_generation": 2})
+    elif fault in {"context", "route", "admission"}:
+        payload = dict(acceptance.payload)
+        field = {"context": "verification_context", "route": "accepted_route",
+                 "admission": "verification_admission"}[fault]
+        payload[field] = {**payload[field],
+                          {"context": "input_manifest_hash", "route": "model_id",
+                           "admission": "input_manifest_hash"}[fault]: "sha256:" + "f" * 64}
+        _replace_proof_payload(store, acceptance, payload)
+    elif fault == "expired":
+        _replace_proof_payload(store, release, {**release.payload,
+                                               "completed_at": acceptance.payload["lease_expires_at"]})
+    elif fault in {"other-proof", "rejected-proof"}:
+        other = proposal_for_attempt(control, run_id="run-1", node_id="node-1",
+                                     attempt_id=request.attempt_id,
+                                     context_changes={"graph_version": 2},
+                                     outcome="rejected" if fault == "rejected-proof" else "accepted")
+        for event in (release, terminal):
+            _replace_proof_payload(store, event, {**event.payload, "task_sha256": other.task_sha256,
+                                                 "evidence_sha256": other.evidence_sha256})
+    elif fault == "duplicate-success":
+        from orchestrator.persistence import EventDraft
+        duplicate = store.append("scheduler", "global", 2, [EventDraft(
+            "MalformedSuccess", {}, run_id=release.run_id, node_id=release.node_id,
+            attempt_id=release.attempt_id, fencing_generation=release.fencing_generation,
+            causation_id=release.causation_id)], "duplicate-success")[0]
+        _replace_proof_payload(store, duplicate, release.payload)
+        store._connection.execute("UPDATE events SET event_type = ? WHERE event_id = ?",
+                                  (release.event_type, duplicate.event_id))
+    elif fault == "orphan-success":
+        payload = {**release.payload, "run_id": "missing-run"}
+        _replace_proof_payload(store, release, payload)
+        store._connection.execute("UPDATE events SET run_id = 'missing-run' WHERE event_id = ?",
+                                  (release.event_id,))
+    store.close()
+    before = _durable_rows(tmp_path / "proof.db")
+    assert _fresh_startup(tmp_path / "proof.db") == ("rejected", None)
+    assert _durable_rows(tmp_path / "proof.db") == before
 
 
 def test_recovery_loads_snapshot_and_replays_only_input_tail_to_planning(tmp_path):

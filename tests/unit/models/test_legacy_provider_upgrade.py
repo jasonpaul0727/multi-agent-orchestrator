@@ -6,12 +6,12 @@ from datetime import datetime, timezone
 
 import pytest
 
-from orchestrator.application import ControlPlaneApplication
+from orchestrator.application import ControlPlaneApplication, StartupRecoveryFailed
 from orchestrator.models import ModelGatewayError, ModelRequest, ProviderModelGateway, SQLiteProviderCallJournal
 from orchestrator.persistence import EventContractError, EventDraft, SQLiteEventStore
 from orchestrator.persistence.events import validate_event_contract
-from orchestrator.provider_reconciliation import ProviderEvidenceUnsupported
-from orchestrator.scheduler import ConcurrencyLimits
+from orchestrator.provider_reconciliation import ProviderEvidenceUnsupported, ProviderReconciliationService
+from orchestrator.scheduler import ConcurrencyLimits, Scheduler
 
 
 FIXTURE = Path(__file__).parents[2] / "fixtures/provider_calls/base_v1_events.json"
@@ -48,7 +48,21 @@ def test_base_v1_terminal_and_unresolved_calls_replay_without_invented_metadata(
         assert [dict(row) for row in store._connection.execute("SELECT * FROM events")] == fixture["tables"]["events"]
 
 
-def test_base_upgrade_bootstrap_retains_holds_replay_block_and_evidence_rejection(base_database):
+def test_legacy_success_from_archived_base_rejects_startup_without_rewriting(base_database):
+    path, _requests, fixture = base_database
+    limits = ConcurrencyLimits(system_active_attempts=8, run_active_attempts=8,
+                               provider_active_attempts=8, tool_active_attempts=8)
+    from tests.integration.test_recovery import _durable_rows
+    before = _durable_rows(path)
+    with pytest.raises(StartupRecoveryFailed):
+        ControlPlaneApplication(path, limits=limits)
+    assert _durable_rows(path) == before
+    with SQLiteEventStore(path) as store:
+        assert [dict(row) for row in store._connection.execute("SELECT * FROM events")] == fixture["tables"]["events"]
+        assert store.read_stream("verification_proposals", "run-1") == []
+
+
+def test_base_upgrade_journal_retains_holds_replay_block_and_evidence_rejection(base_database):
     path, requests, fixture = base_database
     limits = ConcurrencyLimits(system_active_attempts=8, run_active_attempts=8, provider_active_attempts=8, tool_active_attempts=8)
     class NoVerifierCalls:
@@ -56,19 +70,21 @@ def test_base_upgrade_bootstrap_retains_holds_replay_block_and_evidence_rejectio
             pytest.fail("legacy evidence was sent to an unsupported verifier")
         def verify_stopped(self, *_args):
             pytest.fail("legacy call reached termination verification")
-    with ControlPlaneApplication(path, limits=limits, evidence_verifier=NoVerifierCalls(), termination_verifier=NoVerifierCalls()) as app:
-        assert app.startup_report.held_attempts == 2
-        assert app.startup_report.unknown_attempts == 2
-        assert len(app.startup_report.unresolved_provider_calls) == 2
-        recovered = app.recover_run("run-1")
+    with SQLiteEventStore(path) as store:
+        control = Scheduler(store, limits=limits)
+        journal = SQLiteProviderCallJournal(store)
+        service = ProviderReconciliationService(journal=journal, scheduler=control,
+            evidence_verifier=NoVerifierCalls(), termination_verifier=NoVerifierCalls())
+        recovered = control.recovery.recover("run-1")
         assert len(recovered.active_attempts) == 2
+        assert all(attempt.status == "outcome_unknown" for attempt in recovered.active_attempts)
         assert recovered.budget.unknown_minor == 40
-        journal = SQLiteProviderCallJournal(app._event_store)
+        assert len(journal.unresolved()) == 2
         for state in ("dispatching", "unknown"):
             request = requests[state]
             call = journal.read(request)
             with pytest.raises(ProviderEvidenceUnsupported):
-                app.reconcile_provider_call(call.stream_id, raw_evidence=b"no historical correlation",
+                service.reconcile(call.stream_id, raw_evidence=b"no historical correlation",
                     termination_receipt=object(), reconciled_at=datetime(2026, 10, 4, tzinfo=timezone.utc))
             class Accepted:
                 async def is_accepted(self, _request):
@@ -76,12 +92,12 @@ def test_base_upgrade_bootstrap_retains_holds_replay_block_and_evidence_rejectio
             class NoBrokerAccess:
                 async def acquire_provider_credential(self, **_kwargs):
                     pytest.fail("legacy replay reached credential acquisition")
-            gateway = ProviderModelGateway(registry=app._scheduler.lifecycle.config_snapshot("run-1").registry_manifest,
+            gateway = ProviderModelGateway(registry=control.lifecycle.config_snapshot("run-1").registry_manifest,
                 accepted_route_verifier=Accepted(), secret_broker=NoBrokerAccess(), provider_call_journal=journal)
             with pytest.raises(ModelGatewayError) as failure:
                 asyncio.run(gateway.invoke(request))
             assert failure.value.failure.code == "idempotency_conflict"
-        assert [dict(row) for row in app._event_store._connection.execute("SELECT * FROM events")] == fixture["tables"]["events"]
+        assert [dict(row) for row in store._connection.execute("SELECT * FROM events")] == fixture["tables"]["events"]
 
 
 def test_new_outcome_can_append_to_authentic_legacy_intent_without_rewriting_it(base_database):
