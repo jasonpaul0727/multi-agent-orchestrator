@@ -893,6 +893,7 @@ class Scheduler:
                 or contract.config_hash != snapshot.effective_config_hash
                 or contract.registry_hash != snapshot.registry_manifest_hash
                 or contract.policy_manifest_hash != state.policy_manifest_hash
+                or attempt.policy_manifest_hash != contract.policy_manifest_hash
                 or type(payload.get("graph_version")) is not int
                 or payload["graph_version"] != acceptance_graphs.get(key)
                 or payload["graph_version"] != state.graph_version):

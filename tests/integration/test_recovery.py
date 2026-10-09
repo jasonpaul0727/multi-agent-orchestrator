@@ -126,6 +126,7 @@ def test_fresh_process_replays_proposal_only_or_committed_success_proof(tmp_path
     "task-hash", "evidence-hash", "lifecycle-task-hash", "lifecycle-evidence-hash",
     "generation", "legacy_success", "context", "route", "admission", "expired",
     "other-proof", "rejected-proof", "duplicate-success", "orphan-success",
+    "lifecycle-policy",
 ])
 def test_startup_rejects_invalid_success_proof_without_writes(tmp_path, fault):
     store, control, _, request, _, kwargs = _proof_attempt(tmp_path, **ADMISSION)
@@ -166,6 +167,11 @@ def test_startup_rejects_invalid_success_proof_without_writes(tmp_path, fault):
                                                 if key not in {"task_sha256", "evidence_sha256"}})
     elif fault == "generation":
         _replace_proof_payload(store, release, {**release.payload, "fencing_generation": 2})
+    elif fault == "lifecycle-policy":
+        event = next(event for event in store.read_stream("run_lifecycle", "run-1")
+                     if event.event_type == "AttemptAccepted")
+        _replace_proof_payload(store, event, {**event.payload, "attempt": {
+            **event.payload["attempt"], "policy_manifest_hash": "sha256:" + "f" * 64}})
     elif fault in {"context", "route", "admission"}:
         payload = dict(acceptance.payload)
         field = {"context": "verification_context", "route": "accepted_route",
