@@ -427,9 +427,11 @@ class LifecycleController:
         node_id: str,
         attempt_id: str,
         fencing_generation: int,
-        outcome: Literal["succeeded", "failed", "outcome_unknown"],
+        outcome: Literal["failed", "outcome_unknown"],
         causation_id: str,
     ) -> RunLifecycleState:
+        if outcome == "succeeded":
+            raise LifecycleError("attempt success requires durable verifier proof")
         return self._record_attempt_end(
             run_id,
             event_type="AttemptCompleted",
@@ -447,9 +449,11 @@ class LifecycleController:
         node_id: str,
         attempt_id: str,
         fencing_generation: int,
-        outcome: Literal["succeeded", "failed"],
+        outcome: Literal["failed"],
         causation_id: str,
     ) -> RunLifecycleState:
+        if outcome == "succeeded":
+            raise LifecycleError("attempt success requires durable verifier proof")
         return self._record_attempt_end(
             run_id,
             event_type="AttemptReconciled",
@@ -458,6 +462,20 @@ class LifecycleController:
             fencing_generation=fencing_generation,
             outcome=outcome,
             causation_id=causation_id,
+        )
+
+    def _record_verified_attempt_completed(
+        self, run_id: str, *, node_id: str, attempt_id: str, fencing_generation: int,
+        task_sha256: str, evidence_sha256: str,
+    ) -> RunLifecycleState:
+        """Scheduler-owned writer, called only after transactional proof validation."""
+        for digest in (task_sha256, evidence_sha256):
+            if not re.fullmatch(_HASH, digest):
+                raise LifecycleError("invalid verifier proof hash")
+        return self._record_attempt_end(
+            run_id, event_type="AttemptCompleted", node_id=node_id, attempt_id=attempt_id,
+            fencing_generation=fencing_generation, outcome="succeeded", causation_id=task_sha256,
+            proof={"task_sha256": task_sha256, "evidence_sha256": evidence_sha256},
         )
 
     def record_attempt_cancelled(
@@ -517,8 +535,11 @@ class LifecycleController:
         fencing_generation: int,
         outcome: str,
         causation_id: str,
+        proof: dict[str, str] | None = None,
     ) -> RunLifecycleState:
         payload = {"node_id": node_id, "attempt_id": attempt_id, "outcome": outcome}
+        if proof is not None:
+            payload.update(proof)
         key = f"{event_type.lower()}:{attempt_id}"
 
         def decide(events: list[StoredEvent], version: int):

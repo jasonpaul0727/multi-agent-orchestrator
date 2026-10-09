@@ -141,6 +141,20 @@ git push origin codex/p3-systemd-termination-receipts
 
 ## Task 3: Make success require a durable accepted Verifier proposal
 
+Execution clarification: frozen input/graph/check binding is absent from the
+current Scheduler record. Extend trusted host `Scheduler.accept_routing` with
+optional keyword-only `input_manifest_hash`, `verification_contract`, and
+`required_check_ids`, accepted only all together or all absent. Validate the
+fixed supported contract/checks including `artifact-integrity` before writes,
+capture graph version and construct complete Attempt context internally, and
+persist it with the accepted check contract. Missing binding cannot succeed or
+be retrofitted. Canonical binding must match on admission retries. Require full
+PlanningNodeContract for success. Add tests for absent/partial/invalid binding,
+input/check mismatch, graph drift, and changed/omitted retry bindings. The input
+hash is a host commitment, not proof of undisclosed input content. No task-text
+retention or Worker dispatch is added. Task 4 forwards this optional host
+admission binding and consumes the shared canonical binding resolver.
+
 **Files:**
 - Modify: `src/orchestrator/scheduler/core.py`
 - Modify: `src/orchestrator/lifecycle/controller.py`

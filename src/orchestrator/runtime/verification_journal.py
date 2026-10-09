@@ -172,6 +172,14 @@ class VerifierProposalJournal:
         except Exception as exc:
             raise VerifierProposalJournalError("proposal journal replay failed") from exc
 
+    def read_proposal(self, run_id: str, task_sha256: str) -> VerifierProposalRecord | None:
+        """Resolve a proposal only after validating the complete Run stream."""
+        records = self.read_run(run_id)
+        matches = [record for record in records if record.task_sha256 == task_sha256]
+        if len(matches) > 1:
+            raise VerifierProposalJournalError("proposal task identity is duplicated")
+        return matches[0] if matches else None
+
 
 def _revalidate_proposal(
     task: VerificationTask,

@@ -2,6 +2,11 @@
 
 Usage: PYTHONPATH=<base>/src python3 <this-file> <base> <output-json>
 BASE: 5bb9e58699b8f86ddb54a497fde273a19af35bac.
+
+This intentionally emits historical, pre-verifier-proof success using BASE's
+API. It is not a current completion path and must not fabricate or retrofit
+proof. Current application startup compatibility must reject proofless success;
+current successful test Attempts use tests.support.attempt_acceptance instead.
 """
 from datetime import timedelta
 import importlib.util

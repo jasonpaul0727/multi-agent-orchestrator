@@ -162,6 +162,19 @@ def test_record_round_trips_from_fresh_store_with_canonical_hashes_and_exact_bin
     reopened_store.close()
 
 
+def test_read_proposal_validates_entire_stream_before_resolving_hash(tmp_path):
+    store, journal, task, evidence = _seed_journal(tmp_path / "lookup.db")
+    record = journal.record(task, evidence)
+    assert journal.read_proposal("run-1", record.task_sha256) == record
+    assert journal.read_proposal("run-1", _OTHER_HASH) is None
+    store.append("verification_proposals", "run-1", 1,
+        [EventDraft("UnexpectedProposal", {}, run_id="run-1", node_id="node-1",
+                    attempt_id="attempt-2", fencing_generation=3, causation_id=_HASH)], "corrupt-tail")
+    for digest in (record.task_sha256, _OTHER_HASH):
+        with pytest.raises(VerifierProposalJournalError, match="integrity"):
+            journal.read_proposal("run-1", digest)
+
+
 def test_identical_retry_is_idempotent_and_distinct_task_hash_is_a_distinct_proposal(tmp_path):
     store, journal, task, evidence = _seed_journal(tmp_path / "events.db")
 

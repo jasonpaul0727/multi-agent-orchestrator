@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import hashlib
 import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
@@ -26,6 +27,11 @@ from orchestrator.routing import (
 from orchestrator.routing.planning import PlanningNodeContract
 from orchestrator.recovery.run import RunRecoveryCoordinator, RunRecoveryError
 from orchestrator.validation import revalidate_model
+from orchestrator.runtime.contracts import AttemptContext
+from orchestrator.runtime.verifier_process import (
+    BUILTIN_VERIFICATION_CONTRACT_ID, SUPPORTED_VERIFICATION_CHECK_IDS,
+)
+from orchestrator.runtime.verification_journal import VerifierProposalJournal
 
 from orchestrator.lifecycle.controller import (
     LifecycleConflict,
@@ -92,6 +98,16 @@ class ActiveAttemptSnapshot(BaseModel):
     agent_instance_id: str
     accepted_at: datetime
     lease_expires_at: datetime
+
+
+class VerificationBinding(BaseModel):
+    """Trusted admission commitment resolved under the active Attempt lease."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+    active_attempt: ActiveAttemptSnapshot
+    context: AttemptContext
+    verification_contract: str
+    required_check_ids: tuple[str, ...]
 
 
 class Scheduler:
@@ -243,7 +259,13 @@ class Scheduler:
         *,
         accepted_at: datetime,
         lease_expires_at: datetime,
+        input_manifest_hash: str | None = None,
+        verification_contract: str | None = None,
+        required_check_ids: tuple[str, ...] | None = None,
     ) -> AcceptedAttempt:
+        # The input digest is an explicit trusted-host commitment. It does not
+        # establish the contents of an undisclosed manifest or dispatch a Worker.
+        binding = _verification_admission(input_manifest_hash, verification_contract, required_check_ids)
         request = revalidate_model(RoutingRequest, request)
         decision = revalidate_model(RoutingDecision, decision)
         accepted_at = _aware(accepted_at, "accepted_at")
@@ -273,6 +295,7 @@ class Scheduler:
                     or prior.payload.get("decision_hash") != decision.decision_hash
                     or prior.payload.get("accepted_at") != accepted_at.isoformat()
                     or prior.payload.get("lease_expires_at") != lease_expires_at.isoformat()
+                    or prior.payload.get("verification_admission") != binding
                 ):
                     raise SchedulerError("route acceptance idempotency key was reused")
                 return None
@@ -284,6 +307,7 @@ class Scheduler:
                 or request.attempt_id != decision.attempt_id
                 or request.fencing_generation != decision.fencing_generation
                 or request.request_hash != decision.request_hash
+                or request.planning_contract_hash != decision.planning_contract_hash
                 or request.config_hash != snapshot.effective_config_hash
                 or request.registry_hash != snapshot.registry_manifest_hash
                 or decision.config_hash != snapshot.effective_config_hash
@@ -442,6 +466,21 @@ class Scheduler:
                 "node_id": request.node_id,
                 "attempt_id": request.attempt_id,
                 "agent_instance_id": attempt.agent_instance_id,
+                "graph_version": state.graph_version,
+                "verification_admission": binding,
+                "verification_context": None if binding is None else AttemptContext(
+                    run_id=request.run_id, node_id=request.node_id, attempt_id=request.attempt_id,
+                    agent_instance_id=attempt.agent_instance_id,
+                    fencing_generation=request.fencing_generation, graph_version=state.graph_version,
+                    input_manifest_hash=input_manifest_hash,
+                    effective_config_hash=snapshot.effective_config_hash,
+                    registry_hash=snapshot.registry_manifest_hash,
+                    policy_manifest_hash=request.policy_manifest_hash,
+                    routing_decision_hash=decision.decision_hash,
+                    planning_contract_hash=node.spec.planning_contract_hash,
+                ).model_dump(mode="json"),
+                "verification_contract": None if binding is None else binding["verification_contract"],
+                "required_check_ids": None if binding is None else binding["required_check_ids"],
                 "provider_id": route.provider_id,
                 "tool_ids": list(node.spec.tool_ids),
                 "request_hash": request.request_hash,
@@ -710,6 +749,131 @@ class Scheduler:
         )
         return RecoveryPlan.model_validate(result["plan"])
 
+    def resolve_verification_binding(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, as_of: datetime,
+    ) -> VerificationBinding:
+        """Reload independent admission authority; missing/changed bindings fail closed."""
+        result = None
+        attempt_ref = _attempt_ref(run_id, node_id, attempt_id)
+
+        def resolve(events, _version):
+            nonlocal result
+            active = self.resolve_active_attempt(
+                run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                fencing_generation=fencing_generation, as_of=as_of,
+            )
+            accepted = _active_acceptance(events, attempt_ref)
+            if accepted is None:
+                raise SchedulerError("verification requires active acceptance")
+            payload = accepted.payload
+            admission = payload.get("verification_admission")
+            if not isinstance(admission, dict):
+                raise SchedulerError("Attempt has no frozen verification admission")
+            canonical = _verification_admission(**admission)
+            if canonical != admission:
+                raise SchedulerError("verification admission is not canonical")
+            state = self.lifecycle.replay(run_id)
+            node = state.node(node_id)
+            contract = node.spec.planning_contract
+            snapshot = self.lifecycle.config_snapshot(run_id)
+            if contract is None or (
+                contract.run_id != run_id or contract.node_id != node_id
+                or contract.contract_hash != node.spec.planning_contract_hash
+                or contract.config_hash != snapshot.effective_config_hash
+                or contract.registry_hash != snapshot.registry_manifest_hash
+                or contract.policy_manifest_hash != state.policy_manifest_hash
+                or payload.get("graph_version") != state.graph_version
+                or type(payload.get("graph_version")) is not int
+            ):
+                raise SchedulerError("verification requires the exact frozen graph and planning contract")
+            expected = AttemptContext(
+                run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                agent_instance_id=active.agent_instance_id, fencing_generation=fencing_generation,
+                graph_version=state.graph_version, input_manifest_hash=admission["input_manifest_hash"],
+                effective_config_hash=snapshot.effective_config_hash,
+                registry_hash=snapshot.registry_manifest_hash,
+                policy_manifest_hash=contract.policy_manifest_hash,
+                routing_decision_hash=payload["decision_hash"],
+                planning_contract_hash=contract.contract_hash,
+            )
+            persisted_context = AttemptContext.model_validate(payload.get("verification_context"))
+            if (persisted_context != expected
+                or payload.get("verification_contract") != admission["verification_contract"]
+                or payload.get("required_check_ids") != admission["required_check_ids"]):
+                raise SchedulerError("accepted verification bindings disagree")
+            result = VerificationBinding(active_attempt=active, context=expected,
+                verification_contract=admission["verification_contract"],
+                required_check_ids=tuple(admission["required_check_ids"]))
+            return None
+
+        try:
+            self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID,
+                                            f"verification-binding:{attempt_ref}", resolve)
+        except SchedulerError:
+            raise
+        except Exception as exc:
+            raise SchedulerError("verification binding failed a durable-state invariant") from exc
+        assert result is not None
+        return result
+
+    def finish_verified_attempt(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, task_sha256: str, completed_at: datetime, usage: UsageRecord,
+    ) -> None:
+        """Atomically accept durable verifier proof and settle the exact Attempt."""
+        if type(fencing_generation) is not int or fencing_generation <= 0:
+            raise SchedulerError("verified completion has invalid fencing generation")
+        completed_at = _aware(completed_at, "completed_at")
+        usage = revalidate_model(UsageRecord, usage)
+        attempt_ref = _attempt_ref(run_id, node_id, attempt_id)
+        key = f"finish:{attempt_ref}"
+
+        def decide(events, _version):
+            proposal = VerifierProposalJournal(self.event_store).read_proposal(run_id, task_sha256)
+            if proposal is None or proposal.evidence.outcome != "accepted":
+                raise SchedulerError("completion requires an accepted durable verifier proof")
+            payload = dict(attempt_ref=attempt_ref, run_id=run_id, node_id=node_id,
+                attempt_id=attempt_id, fencing_generation=fencing_generation,
+                completed_at=completed_at.isoformat(), outcome="succeeded",
+                usage_hash=_hash(usage.model_dump(mode="json")), known_no_effect=False,
+                task_sha256=proposal.task_sha256, evidence_sha256=proposal.evidence_sha256)
+            prior = next((event for event in events if event.idempotency_key == key), None)
+            if prior is not None:
+                if prior.event_type != "AttemptSlotReleased" or prior.payload != payload:
+                    raise SchedulerError("attempt completion idempotency key was reused")
+                return None
+            binding = self.resolve_verification_binding(
+                run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                fencing_generation=fencing_generation, as_of=completed_at,
+            )
+            if (proposal.task.context != binding.context
+                or proposal.task.acceptance_contract != binding.verification_contract
+                or tuple(sorted(proposal.task.required_check_ids)) != binding.required_check_ids):
+                raise SchedulerError("verifier proof does not match frozen Attempt acceptance")
+            reservation_id = binding.active_attempt.reservation.reservation_id
+            _validate_usage(usage, run_id=run_id, reservation_id=reservation_id)
+            self._ledger_for_run(run_id).commit_usage(
+                reservation_id, usage, settlement_key=usage.settlement_key, run_id=run_id)
+            self.lifecycle._record_verified_attempt_completed(
+                run_id, node_id=node_id, attempt_id=attempt_id, fencing_generation=fencing_generation,
+                task_sha256=proposal.task_sha256, evidence_sha256=proposal.evidence_sha256)
+            self.agents.complete_attempt(
+                run_id, node_id=node_id, attempt_id=attempt_id,
+                agent_instance_id=binding.context.agent_instance_id,
+                fencing_generation=fencing_generation,
+                causation_id=binding.context.routing_decision_hash, outcome="succeeded")
+            return [EventDraft("AttemptSlotReleased", payload, run_id=run_id,
+                node_id=node_id, attempt_id=attempt_id, fencing_generation=fencing_generation,
+                correlation_id=run_id, causation_id=binding.context.routing_decision_hash)]
+
+        try:
+            self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
+        except SchedulerError:
+            raise
+        except Exception as exc:
+            raise SchedulerError("verified completion failed a durable-state invariant") from exc
+
     def finish_attempt(
         self,
         *,
@@ -718,10 +882,12 @@ class Scheduler:
         attempt_id: str,
         fencing_generation: int,
         completed_at: datetime,
-        outcome: Literal["succeeded", "failed", "outcome_unknown"],
+        outcome: Literal["failed", "outcome_unknown"],
         usage: UsageRecord | None = None,
         known_no_effect: bool = False,
     ) -> None:
+        if outcome == "succeeded":
+            raise SchedulerError("attempt success requires durable verifier proof")
         completed_at = _aware(completed_at, "completed_at")
         if usage is not None:
             usage = revalidate_model(UsageRecord, usage)
@@ -998,10 +1164,12 @@ class Scheduler:
         attempt_id: str,
         fencing_generation: int,
         reconciled_at: datetime,
-        outcome: Literal["succeeded", "failed"],
+        outcome: Literal["failed"],
         usage: UsageRecord | None = None,
         known_no_effect: bool = False,
     ) -> None:
+        if outcome == "succeeded":
+            raise SchedulerError("attempt success requires durable verifier proof")
         reconciled_at = _aware(reconciled_at, "reconciled_at")
         if usage is not None:
             usage = revalidate_model(UsageRecord, usage)
@@ -1120,6 +1288,22 @@ def _run_limit(snapshot: RunConfigSnapshot) -> RunLimit:
         max_tokens=min(token_caps) if token_caps else None,
         currency=envelope.currency,
     )
+
+
+def _verification_admission(input_manifest_hash, verification_contract, required_check_ids):
+    if input_manifest_hash is verification_contract is required_check_ids is None:
+        return None
+    if (not isinstance(input_manifest_hash, str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", input_manifest_hash)
+        or verification_contract != BUILTIN_VERIFICATION_CONTRACT_ID
+        or not isinstance(required_check_ids, (tuple, list))
+        or not all(isinstance(check, str) for check in required_check_ids)
+        or len(required_check_ids) != len(set(required_check_ids))
+        or "artifact-integrity" not in required_check_ids
+        or not set(required_check_ids).issubset(SUPPORTED_VERIFICATION_CHECK_IDS)):
+        raise SchedulerError("invalid or incomplete verification admission binding")
+    return dict(input_manifest_hash=input_manifest_hash, verification_contract=verification_contract,
+                required_check_ids=sorted(required_check_ids))
 
 
 def _run_concurrency_limit(snapshot: RunConfigSnapshot, limits: ConcurrencyLimits) -> int:

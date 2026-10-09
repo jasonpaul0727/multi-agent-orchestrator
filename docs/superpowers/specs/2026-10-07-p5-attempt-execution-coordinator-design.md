@@ -54,6 +54,23 @@ The acceptance event and existing terminal bookkeeping—lifecycle transition, b
 
 ### 5. Every success-authorizing write path is proof-gated
 
+Implementation clarification (2026-10-07): existing durable state has no input
+manifest or accepted graph version, and the planning contract has no verifier
+check contract. The acceptance foundation must not fill that gap from a later
+proposal. Trusted host routing admission may explicitly provide an input
+manifest hash, the fixed built-in verification contract, and its required
+supported checks (including `artifact-integrity`), as an all-or-none binding.
+Scheduler captures the graph version and constructs the full Attempt context
+from its own frozen Run/node/route/Agent state in the admission transaction,
+then persists that context and check contract in `RoutingDecisionAccepted`.
+The input hash is a trusted-host commitment, not proof of undisclosed manifest
+contents or permission to retain task text. Worker dispatch and actual input
+retention remain out of scope. Admission retries must match the original
+binding exactly; missing bindings cannot be retrofitted onto old Attempts.
+Ordinary admission without this optional binding remains available for existing
+failure/unknown paths, but cannot authorize verified success. Success also
+requires the full frozen planning contract; test fixtures must not weaken this.
+
 Add a distinct Scheduler operation for verified success (or an equivalent mandatory typed proof parameter) and make ordinary `finish_attempt(outcome="succeeded")` and `reconcile_attempt(outcome="succeeded")` fail closed without that proof. Lifecycle success-writing methods must likewise be internal to the Scheduler transaction or require the exact proof reference; callers must not be able to write `AttemptCompleted`/`AttemptReconciled` with `succeeded` directly. This protects against future application callers bypassing `AttemptExecutionCoordinator`.
 
 The proof must bind at least: Run, Node, Attempt, fencing generation, graph version, input manifest, effective-config hash, Registry hash, policy/routing/planning hashes, exact candidate artifact digests, verifier/contract/check-set identity, evidence digest, and the accepted route/reservation identity. The Scheduler must resolve those values against authoritative durable records and reject stale leases, expired results, cancellation races, and duplicate/conflicting idempotency keys.

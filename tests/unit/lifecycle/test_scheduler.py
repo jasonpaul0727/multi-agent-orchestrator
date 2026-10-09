@@ -71,6 +71,7 @@ from orchestrator.scheduler import (
 from orchestrator.scheduler.core import _verify_persisted_recovery_authorization
 from orchestrator.security import PolicyAuthority, PolicyEngine, PolicyManifest, PolicyRequest
 from tests.support.process_crash import block_at_crash_point, kill_at_crash_point
+from tests.support.attempt_acceptance import ADMISSION, finish_with_proof, proposal_for_attempt
 
 
 NOW = datetime(2026, 9, 23, 12, tzinfo=timezone.utc)
@@ -165,7 +166,8 @@ def effective_config(reg, *, max_agents=8, max_depth=4, max_concurrency=4):
 
 
 def run_setup(
-    store, *, run_id="run-1", nodes=None, max_agents=8, max_depth=4, max_concurrency=4
+    store, *, run_id="run-1", nodes=None, max_agents=8, max_depth=4, max_concurrency=4,
+    freeze_contracts=False,
 ):
     reg = registry()
     resolved = effective_config(
@@ -176,14 +178,6 @@ def run_setup(
     controller.initialize_run(run_id)
     if nodes is None:
         nodes = (NodeSpec(node_id="node-1", role="coder", planning_contract_hash=HASH, max_attempts=2),)
-    if nodes:
-        controller.append_nodes(
-            run_id,
-            tuple(nodes),
-            expected_graph_version=0,
-            idempotency_key="initial-graph",
-        )
-        controller.start_run(run_id)
     manifest = PolicyManifest(
         authorities=(
             PolicyAuthority(
@@ -194,7 +188,34 @@ def run_setup(
             ),
         )
     )
+    if freeze_contracts:
+        nodes = tuple(node.model_copy(update={
+            "planning_contract": contract, "planning_contract_hash": contract.contract_hash,
+        }) for node in nodes for contract in (
+            _fixture_contract(reg, resolved.config, manifest, run_id=run_id,
+                              node_id=node.node_id, role=node.role),))
+    if nodes:
+        controller.append_nodes(
+            run_id, tuple(nodes), expected_graph_version=0, idempotency_key="initial-graph",
+            policy_manifest=manifest if freeze_contracts else None,
+        )
+        controller.start_run(run_id)
     return reg, resolved.config, controller, manifest
+
+
+def _fixture_contract(reg, config, manifest, *, run_id="run-1", node_id="node-1", role="coder"):
+    return compile_node_contract(
+        run_id=run_id, node_id=node_id, role=role, task_text="implement a small change",
+        config=config, registry=reg, policy_manifest=manifest, context_tokens=1000,
+        max_output_tokens=500, required_capabilities=("text",),
+    )
+
+
+def proof_routed_pair(reg, config, manifest, **kwargs):
+    contract = _fixture_contract(reg, config, manifest, **{
+        key: value for key, value in kwargs.items() if key in {"run_id", "node_id", "role"}
+    })
+    return routed_pair(reg, config, manifest, contract_hash=contract.contract_hash, **kwargs)
 
 
 def run_setup_with_frozen_contract(store, *, max_attempts=3):
@@ -378,6 +399,7 @@ def accept(scheduler_, request, decision):
         decision,
         accepted_at=NOW + timedelta(seconds=1),
         lease_expires_at=NOW + timedelta(minutes=1),
+        **ADMISSION,
     )
 
 
@@ -390,6 +412,317 @@ def _resolver_durable_state(store):
         store._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0],
         store._connection.execute("SELECT COUNT(*) FROM idempotency_records").fetchone()[0],
     )
+
+
+@pytest.mark.parametrize("path", ["finish", "reconcile", "lifecycle-complete", "lifecycle-reconcile"])
+def test_unproved_success_paths_are_rejected_atomically(tmp_path, path):
+    store = SQLiteEventStore(tmp_path / "unproved-success.db")
+    reg, config, lifecycle, manifest = run_setup(store)
+    request, decision = routed_pair(reg, config, manifest)
+    control = scheduler(store)
+    accepted = accept(control, request, decision)
+    if "reconcile" in path:
+        control.finish_attempt(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=1, completed_at=NOW + timedelta(seconds=2),
+            outcome="outcome_unknown",
+        )
+    before = _resolver_durable_state(store)
+    balance = BudgetLedger(store).available("run-1")
+    context = dict(node_id="node-1", attempt_id=request.attempt_id,
+                   fencing_generation=1, outcome="succeeded")
+    usage = UsageRecord(
+        run_id="run-1", reservation_id=accepted.reservation.reservation_id,
+        settlement_key="unproved", currency="USD", cost_minor=1,
+    )
+    with pytest.raises((SchedulerError, LifecycleError), match="verifier proof"):
+        if path == "finish":
+            control.finish_attempt(run_id="run-1", **context,
+                                   completed_at=NOW + timedelta(seconds=3), usage=usage)
+        elif path == "reconcile":
+            control.reconcile_attempt(run_id="run-1", **context,
+                                      reconciled_at=NOW + timedelta(seconds=3), usage=usage)
+        elif path == "lifecycle-complete":
+            lifecycle.record_attempt_completed("run-1", **context, causation_id=HASH)
+        else:
+            lifecycle.record_attempt_reconciled("run-1", **context, causation_id=HASH)
+    assert _resolver_durable_state(store) == before
+    assert BudgetLedger(store).available("run-1") == balance
+
+
+def _proof_attempt(tmp_path, **admission):
+    store = SQLiteEventStore(tmp_path / "proof.db")
+    reg, config, lifecycle, manifest, contract = run_setup_with_frozen_contract(store)
+    request, decision = routed_pair(reg, config, manifest, contract_hash=contract.contract_hash)
+    control = scheduler(store)
+    accepted = control.accept_routing(
+        request, decision, accepted_at=NOW + timedelta(seconds=1),
+        lease_expires_at=NOW + timedelta(minutes=1), **admission,
+    )
+    usage = UsageRecord(run_id="run-1", reservation_id=accepted.reservation.reservation_id,
+                        settlement_key="verified", currency="USD", cost_minor=2)
+    kwargs = dict(run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+                  fencing_generation=1, completed_at=NOW + timedelta(seconds=3), usage=usage)
+    return store, control, lifecycle, request, decision, kwargs
+
+
+def test_verified_completion_is_atomic_and_idempotent(tmp_path):
+    store, control, lifecycle, request, _, kwargs = _proof_attempt(tmp_path, **ADMISSION)
+    proposal = proposal_for_attempt(control, run_id="run-1", node_id="node-1", attempt_id=request.attempt_id)
+    control.finish_verified_attempt(**kwargs, task_sha256=proposal.task_sha256)
+    before = _resolver_durable_state(store)
+    control.finish_verified_attempt(**kwargs, task_sha256=proposal.task_sha256)
+    assert _resolver_durable_state(store) == before
+    assert lifecycle.replay("run-1").status == "succeeded"
+    assert control.agents.replay("run-1").active_count == 0
+    assert BudgetLedger(store).available("run-1").used_minor == 2
+    event = store.read_stream("scheduler", "global")[-1]
+    assert event.payload["task_sha256"] == proposal.task_sha256
+    assert event.payload["evidence_sha256"] == proposal.evidence_sha256
+    with pytest.raises(SchedulerError, match="idempotency"):
+        control.finish_verified_attempt(**{**kwargs, "completed_at": NOW + timedelta(seconds=4)},
+                                        task_sha256=proposal.task_sha256)
+    assert _resolver_durable_state(store) == before
+
+
+@pytest.mark.parametrize("generation", [True, 1.0, "1"])
+def test_verified_completion_duplicate_rejects_non_integer_generation(tmp_path, generation):
+    store, control, _, request, _, kwargs = _proof_attempt(tmp_path, **ADMISSION)
+    proposal = proposal_for_attempt(control, run_id="run-1", node_id="node-1",
+                                    attempt_id=request.attempt_id)
+    control.finish_verified_attempt(**kwargs, task_sha256=proposal.task_sha256)
+    before = _resolver_durable_state(store)
+    balance = BudgetLedger(store).available("run-1")
+    with pytest.raises(SchedulerError):
+        control.finish_verified_attempt(**{**kwargs, "fencing_generation": generation},
+                                        task_sha256=proposal.task_sha256)
+    assert _resolver_durable_state(store) == before
+    assert BudgetLedger(store).available("run-1") == balance
+
+
+@pytest.mark.parametrize("field", ["fencing_generation", "graph_version"])
+@pytest.mark.parametrize("operation", ["resolve", "finish"])
+def test_verification_binding_rejects_boolean_persisted_context(tmp_path, field, operation):
+    store, control, _, request, _, kwargs = _proof_attempt(tmp_path, **ADMISSION)
+    proposal = proposal_for_attempt(control, run_id="run-1", node_id="node-1",
+                                    attempt_id=request.attempt_id)
+    event = store.read_stream("scheduler", "global")[0]
+    payload = dict(event.payload)
+    payload["verification_context"] = {**payload["verification_context"], field: True}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    store._connection.execute("DROP TRIGGER events_immutable_update")
+    store._connection.execute(
+        "UPDATE events SET payload_json = ?, payload_hash = ? WHERE event_id = ?",
+        (encoded, hashlib.sha256(encoded.encode()).hexdigest(), event.event_id),
+    )
+    before = _resolver_durable_state(store)
+    balance = BudgetLedger(store).available("run-1")
+    with pytest.raises(SchedulerError):
+        if operation == "finish":
+            control.finish_verified_attempt(**kwargs, task_sha256=proposal.task_sha256)
+        else:
+            control.resolve_verification_binding(
+                run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+                fencing_generation=1, as_of=kwargs["completed_at"],
+            )
+    assert _resolver_durable_state(store) == before
+    assert BudgetLedger(store).available("run-1") == balance
+
+
+@pytest.mark.parametrize("change", [
+    {"run_id": "other-run"}, {"node_id": "other-node"}, {"attempt_id": "other-attempt"},
+    {"agent_instance_id": "other-agent"}, {"fencing_generation": 2}, {"graph_version": 2},
+    *({field: HASH} for field in ("input_manifest_hash", "effective_config_hash", "registry_hash",
+                                 "policy_manifest_hash", "routing_decision_hash", "planning_contract_hash")),
+])
+def test_verified_completion_rejects_each_context_mismatch(tmp_path, change):
+    store, control, _, request, _, kwargs = _proof_attempt(tmp_path, **ADMISSION)
+    proposal = proposal_for_attempt(control, run_id="run-1", node_id="node-1",
+                                    attempt_id=request.attempt_id, context_changes=change)
+    before = _resolver_durable_state(store)
+    with pytest.raises(SchedulerError):
+        control.finish_verified_attempt(**kwargs, task_sha256=proposal.task_sha256)
+    assert _resolver_durable_state(store) == before
+    assert BudgetLedger(store).available("run-1").reserved_minor == 20
+
+
+@pytest.mark.parametrize("admission", [
+    {"input_manifest_hash": HASH}, {**ADMISSION, "input_manifest_hash": "bad"},
+    {**ADMISSION, "verification_contract": "unsupported"},
+    {**ADMISSION, "required_check_ids": ()},
+    {**ADMISSION, "required_check_ids": ("artifact-integrity", "unsupported")},
+])
+def test_invalid_verification_admission_writes_nothing(tmp_path, admission):
+    store = SQLiteEventStore(tmp_path / "invalid-admission.db")
+    reg, config, _, manifest, contract = run_setup_with_frozen_contract(store)
+    request, decision = routed_pair(reg, config, manifest, contract_hash=contract.contract_hash)
+    before = _resolver_durable_state(store)
+    with pytest.raises(SchedulerError):
+        scheduler(store).accept_routing(request, decision, accepted_at=NOW + timedelta(seconds=1),
+                                        lease_expires_at=NOW + timedelta(minutes=1), **admission)
+    assert _resolver_durable_state(store) == before
+
+
+@pytest.mark.parametrize("change", [
+    {}, {**ADMISSION, "input_manifest_hash": HASH},
+    {**ADMISSION, "required_check_ids": ("artifact-integrity", "utf8-text")},
+])
+def test_verification_admission_retry_cannot_change_or_omit_binding(tmp_path, change):
+    store, control, _, request, decision, _ = _proof_attempt(tmp_path, **ADMISSION)
+    before = _resolver_durable_state(store)
+    with pytest.raises(SchedulerError, match="idempotency"):
+        control.accept_routing(request, decision, accepted_at=NOW + timedelta(seconds=1),
+                               lease_expires_at=NOW + timedelta(minutes=1), **change)
+    assert _resolver_durable_state(store) == before
+
+
+def test_verification_admission_cannot_retrofit_existing_attempt(tmp_path):
+    from orchestrator.runtime.verification_journal import VerifierProposalJournal
+    from tests.unit.runtime.test_verification_journal import _task, _evidence
+    store, control, _, request, decision, kwargs = _proof_attempt(tmp_path)
+    task = _task()
+    proposal = VerifierProposalJournal(store).record(task, _evidence(task))
+    before = _resolver_durable_state(store)
+    with pytest.raises(SchedulerError, match="no frozen verification admission"):
+        control.finish_verified_attempt(**kwargs, task_sha256=proposal.task_sha256)
+    with pytest.raises(SchedulerError, match="idempotency"):
+        control.accept_routing(request, decision, accepted_at=NOW + timedelta(seconds=1),
+                               lease_expires_at=NOW + timedelta(minutes=1), **ADMISSION)
+    assert _resolver_durable_state(store) == before
+
+
+@pytest.mark.parametrize("fault", ["missing-task", "rejected", "inconclusive", "checks",
+                                   "expired", "stale", "cancelled", "graph", "usage",
+                                   "reservation", "route", "corrupt-proposal"])
+def test_verified_completion_fails_closed_without_resource_changes(tmp_path, fault):
+    store, control, lifecycle, request, _, kwargs = _proof_attempt(tmp_path, **ADMISSION)
+    proposal = proposal_for_attempt(
+        control, run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        outcome=fault if fault in {"rejected", "inconclusive"} else "accepted",
+        required_check_ids=("artifact-integrity", "utf8-text") if fault == "checks" else None,
+    )
+    digest = proposal.task_sha256
+    if fault == "missing-task":
+        digest = HASH
+    elif fault == "expired":
+        kwargs["completed_at"] = NOW + timedelta(minutes=1)
+    elif fault == "stale":
+        kwargs["fencing_generation"] = 2
+    elif fault == "cancelled":
+        lifecycle.request_cancel("run-1", reason_code="user_cancelled")
+    elif fault == "graph":
+        lifecycle.append_nodes("run-1", (NodeSpec(node_id="new-node", role="coder",
+                               planning_contract_hash=HASH),), expected_graph_version=1,
+                               idempotency_key="graph-drift")
+    elif fault == "usage":
+        kwargs["usage"] = kwargs["usage"].model_copy(update={"reservation_id": "other-reservation"})
+    elif fault in {"reservation", "route"}:
+        event = store.read_stream("scheduler", "global")[0]
+        payload = dict(event.payload)
+        route = dict(payload["accepted_route"])
+        route["budget_reservation_id" if fault == "reservation" else "model_id"] = "other"
+        payload["accepted_route"] = route
+        store._connection.execute("DROP TRIGGER events_immutable_update")
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        store._connection.execute(
+            "UPDATE events SET payload_json = ?, payload_hash = ? WHERE event_id = ?",
+            (encoded, hashlib.sha256(encoded.encode()).hexdigest(), event.event_id),
+        )
+    elif fault == "corrupt-proposal":
+        store.append("verification_proposals", "run-1", 1,
+                     [EventDraft("MalformedProposal", {}, run_id="run-1", node_id="node-1",
+                                 attempt_id=request.attempt_id, fencing_generation=1,
+                                 causation_id=HASH)], "corrupt-tail")
+    before = _resolver_durable_state(store)
+    balance = BudgetLedger(store).available("run-1")
+    with pytest.raises(SchedulerError):
+        control.finish_verified_attempt(**kwargs, task_sha256=digest)
+    assert _resolver_durable_state(store) == before
+    assert BudgetLedger(store).available("run-1") == balance
+
+
+def test_verified_completion_rolls_back_nested_lifecycle_budget_and_agent_writes(tmp_path, monkeypatch):
+    store, control, lifecycle, request, _, kwargs = _proof_attempt(tmp_path, **ADMISSION)
+    proposal = proposal_for_attempt(control, run_id="run-1", node_id="node-1", attempt_id=request.attempt_id)
+    before = _resolver_durable_state(store)
+    balance = BudgetLedger(store).available("run-1")
+    original = control.agents.complete_attempt
+
+    def fail_after_nested_writes(*args, **values):
+        original(*args, **values)
+        assert lifecycle.replay("run-1").status == "succeeded"
+        assert BudgetLedger(store).available("run-1").used_minor == 2
+        raise OSError("injected after nested writes")
+
+    monkeypatch.setattr(control.agents, "complete_attempt", fail_after_nested_writes)
+    with pytest.raises(SchedulerError, match="durable-state invariant"):
+        control.finish_verified_attempt(**kwargs, task_sha256=proposal.task_sha256)
+    assert _resolver_durable_state(store) == before
+    assert BudgetLedger(store).available("run-1") == balance
+    assert lifecycle.replay("run-1").node("node-1").status == "running"
+    assert control.agents.replay("run-1").active_count == 1
+
+
+def test_verified_admission_rejects_decision_with_another_planning_contract(tmp_path):
+    store = SQLiteEventStore(tmp_path / "wrong-decision-contract.db")
+    reg, config, _, manifest, contract = run_setup_with_frozen_contract(store)
+    request, decision = routed_pair(reg, config, manifest, contract_hash=contract.contract_hash)
+    decision = decision.model_copy(update={"planning_contract_hash": HASH})
+    before = _resolver_durable_state(store)
+    with pytest.raises(StaleRoutingDecision):
+        accept(scheduler(store), request, decision)
+    assert _resolver_durable_state(store) == before
+
+
+def test_verified_completion_requires_full_frozen_contract(tmp_path):
+    store = SQLiteEventStore(tmp_path / "no-contract.db")
+    reg, config, _, manifest = run_setup(store)
+    request, decision = routed_pair(reg, config, manifest)
+    control = scheduler(store)
+    accepted = accept(control, request, decision)
+    proposal = proposal_for_attempt(control, run_id="run-1", node_id="node-1", attempt_id=request.attempt_id)
+    before = _resolver_durable_state(store)
+    with pytest.raises(SchedulerError, match="planning contract"):
+        control.finish_verified_attempt(run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=1, completed_at=NOW + timedelta(seconds=3), task_sha256=proposal.task_sha256,
+            usage=UsageRecord(run_id="run-1", reservation_id=accepted.reservation.reservation_id,
+                              settlement_key="missing-contract", currency="USD", cost_minor=0))
+    assert _resolver_durable_state(store) == before
+
+
+def test_verified_completion_serializes_with_cancellation(tmp_path):
+    store, control, lifecycle, request, _, kwargs = _proof_attempt(tmp_path, **ADMISSION)
+    proposal = proposal_for_attempt(control, run_id="run-1", node_id="node-1", attempt_id=request.attempt_id)
+    barrier = Barrier(2)
+
+    def finish():
+        with SQLiteEventStore(tmp_path / "proof.db") as competing:
+            barrier.wait(timeout=5)
+            try:
+                scheduler(competing).finish_verified_attempt(**kwargs, task_sha256=proposal.task_sha256)
+                return "succeeded"
+            except SchedulerError:
+                return "rejected"
+
+    def cancel():
+        with SQLiteEventStore(tmp_path / "proof.db") as competing:
+            barrier.wait(timeout=5)
+            try:
+                LifecycleController(competing).request_cancel("run-1", reason_code="user_cancelled")
+                return "cancelling"
+            except LifecycleError:
+                return "rejected"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finished, cancelled = pool.submit(finish), pool.submit(cancel)
+        results = (finished.result(timeout=10), cancelled.result(timeout=10))
+    assert results in {("succeeded", "rejected"), ("rejected", "cancelling")}
+    state = lifecycle.replay("run-1")
+    balance = BudgetLedger(store).available("run-1")
+    assert state.status == ("succeeded" if results[0] == "succeeded" else "cancelling")
+    assert balance.used_minor == (2 if state.status == "succeeded" else 0)
+    assert balance.reserved_minor == (0 if state.status == "succeeded" else 20)
+    assert control.agents.replay("run-1").active_count == (0 if state.status == "succeeded" else 1)
 
 
 def test_resolve_active_attempt_reloads_exact_durable_snapshot_without_writes(tmp_path):
@@ -1641,8 +1974,8 @@ def test_route_acceptance_atomically_reserves_budget_slots_and_fences_attempt(tm
             node_id="node-2", role="tester", planning_contract_hash=HASH, depends_on=("node-1",)
         ),
     )
-    reg, config, lifecycle, manifest = run_setup(store, nodes=nodes)
-    request, decision = routed_pair(reg, config, manifest)
+    reg, config, lifecycle, manifest = run_setup(store, nodes=nodes, freeze_contracts=True)
+    request, decision = proof_routed_pair(reg, config, manifest)
     control = scheduler(store, system=1, provider=1, tool=1)
     accepted = accept(control, request, decision)
 
@@ -1668,30 +2001,28 @@ def test_route_acceptance_atomically_reserves_budget_slots_and_fences_attempt(tm
         output_tokens=6,
         cost_minor=12,
     )
-    control.finish_attempt(
+    finish_with_proof(control,
         run_id="run-1",
         node_id="node-1",
         attempt_id="attempt-node-1-1",
         fencing_generation=1,
         completed_at=NOW + timedelta(seconds=10),
-        outcome="succeeded",
         usage=usage,
     )
     state = lifecycle.replay("run-1")
     assert state.status == "running"
     assert state.node("node-2").status == "ready"
 
-    next_request, next_decision = routed_pair(
+    next_request, next_decision = proof_routed_pair(
         reg, config, manifest, node_id="node-2", role="tester"
     )
     next_accepted = accept(control, next_request, next_decision)
-    control.finish_attempt(
+    finish_with_proof(control,
         run_id="run-1",
         node_id="node-2",
         attempt_id=next_request.attempt_id,
         fencing_generation=1,
         completed_at=NOW + timedelta(seconds=20),
-        outcome="succeeded",
         usage=UsageRecord(
             reservation_id=next_accepted.reservation.reservation_id,
             run_id="run-1",
@@ -1714,9 +2045,9 @@ def test_route_acceptance_atomically_reserves_budget_slots_and_fences_attempt(tm
 
 def test_run_recovery_reconstructs_active_and_settled_control_plane_state(tmp_path):
     store = SQLiteEventStore(tmp_path / "run-recovery.db")
-    reg, config, lifecycle, manifest = run_setup(store)
+    reg, config, lifecycle, manifest = run_setup(store, freeze_contracts=True)
     control = scheduler(store)
-    request, decision = routed_pair(reg, config, manifest)
+    request, decision = proof_routed_pair(reg, config, manifest)
     accepted = accept(control, request, decision)
 
     recovered = RunRecoveryCoordinator(store).recover("run-1")
@@ -1727,10 +2058,9 @@ def test_run_recovery_reconstructs_active_and_settled_control_plane_state(tmp_pa
     assert recovered.active_attempts[0].attempt_id == request.attempt_id
     assert recovered.active_attempts[0].status == "active"
 
-    control.finish_attempt(
+    finish_with_proof(control,
         run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
         fencing_generation=1, completed_at=NOW + timedelta(seconds=5),
-        outcome="succeeded",
         usage=UsageRecord(
             reservation_id=accepted.reservation.reservation_id,
             run_id="run-1", settlement_key="run-recovery-success", currency="USD",
@@ -2534,13 +2864,12 @@ def test_scheduler_recovery_rejects_known_failure_after_success(tmp_path):
     control = scheduler(store)
     request, decision = routed_pair(reg, config, manifest, contract_hash=contract.contract_hash)
     accepted = accept(control, request, decision)
-    control.finish_attempt(
+    finish_with_proof(control,
         run_id="run-1",
         node_id="node-1",
         attempt_id=request.attempt_id,
         fencing_generation=1,
         completed_at=NOW + timedelta(seconds=5),
-        outcome="succeeded",
         usage=UsageRecord(
             reservation_id=accepted.reservation.reservation_id,
             run_id="run-1",
@@ -2828,9 +3157,9 @@ def test_run_recovery_treats_legacy_receipt_id_as_applied(tmp_path):
 
 def test_run_recovery_refuses_terminal_attempt_with_unresolved_effect(tmp_path):
     store = SQLiteEventStore(tmp_path / "run-recovery-effect-terminal.db")
-    reg, config, _lifecycle, manifest = run_setup(store)
+    reg, config, _lifecycle, manifest = run_setup(store, freeze_contracts=True)
     control = scheduler(store)
-    request, decision = routed_pair(reg, config, manifest)
+    request, decision = proof_routed_pair(reg, config, manifest)
     accepted = accept(control, request, decision)
     store.append(
         "budget",
@@ -2849,13 +3178,12 @@ def test_run_recovery_refuses_terminal_attempt_with_unresolved_effect(tmp_path):
         ],
         "effect-intent-pending",
     )
-    control.finish_attempt(
+    finish_with_proof(control,
         run_id=request.run_id,
         node_id=request.node_id,
         attempt_id=request.attempt_id,
         fencing_generation=request.fencing_generation,
         completed_at=NOW + timedelta(seconds=5),
-        outcome="succeeded",
         usage=UsageRecord(
             reservation_id=accepted.reservation.reservation_id,
             run_id=request.run_id,
@@ -3624,7 +3952,7 @@ def test_unknown_result_keeps_resources_until_explicit_reconciliation(tmp_path):
             attempt_id=request.attempt_id,
             fencing_generation=1,
             completed_at=NOW + timedelta(minutes=2),
-            outcome="succeeded",
+            outcome="failed",
             usage=UsageRecord(
                 reservation_id=accepted.reservation.reservation_id,
                 run_id="run-1",
@@ -3912,7 +4240,7 @@ def test_scheduler_completion_and_reconciliation_require_durable_evidence(tmp_pa
     control = scheduler(store)
     accepted = accept(control, request, decision)
 
-    with pytest.raises(SchedulerError, match="needs usage or an explicit no-effect"):
+    with pytest.raises(SchedulerError, match="verifier proof"):
         control.finish_attempt(
             run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
             fencing_generation=1, completed_at=NOW + timedelta(seconds=5),
@@ -3929,7 +4257,7 @@ def test_scheduler_completion_and_reconciliation_require_durable_evidence(tmp_pa
             fencing_generation=1, completed_at=NOW + timedelta(seconds=5),
             outcome="failed", usage=evidence, known_no_effect=True,
         )
-    with pytest.raises(SchedulerError, match="only for a failed attempt"):
+    with pytest.raises(SchedulerError, match="verifier proof"):
         control.finish_attempt(
             run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
             fencing_generation=1, completed_at=NOW + timedelta(seconds=5),
@@ -3973,7 +4301,7 @@ def test_scheduler_completion_and_reconciliation_require_durable_evidence(tmp_pa
             fencing_generation=1, reconciled_at=NOW + timedelta(minutes=3),
             outcome="failed", usage=evidence, known_no_effect=True,
         )
-    with pytest.raises(SchedulerError, match="only for a failed attempt"):
+    with pytest.raises(SchedulerError, match="verifier proof"):
         control.reconcile_attempt(
             run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
             fencing_generation=1, reconciled_at=NOW + timedelta(minutes=3),
@@ -4038,21 +4366,20 @@ def test_agent_depth_is_derived_from_frozen_parent_instance(tmp_path):
             parent_agent_instance_id=parent_agent_id,
         ),
     )
-    reg, config, _, manifest = run_setup(store, nodes=nodes, max_depth=0)
+    reg, config, _, manifest = run_setup(store, nodes=nodes, max_depth=0, freeze_contracts=True)
     control = scheduler(store)
-    request, decision = routed_pair(reg, config, manifest, node_id="node-1")
+    request, decision = proof_routed_pair(reg, config, manifest, node_id="node-1")
     accepted = accept(control, request, decision)
-    control.finish_attempt(
+    finish_with_proof(control,
         run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
         fencing_generation=1, completed_at=NOW + timedelta(seconds=10),
-        outcome="succeeded",
         usage=UsageRecord(
             reservation_id=accepted.reservation.reservation_id,
             run_id="run-1", settlement_key="parent-success", currency="USD",
             input_tokens=1, output_tokens=1, cost_minor=1,
         ),
     )
-    child_request, child_decision = routed_pair(
+    child_request, child_decision = proof_routed_pair(
         reg, config, manifest, node_id="node-2", role="tester"
     )
     with pytest.raises(AgentDepthLimitExceeded, match="depth exceeds"):
@@ -4072,21 +4399,20 @@ def test_child_agent_records_parent_attempt_as_creator(tmp_path):
             parent_agent_instance_id=parent_agent_id,
         ),
     )
-    reg, config, _, manifest = run_setup(store, nodes=nodes, max_depth=1)
+    reg, config, _, manifest = run_setup(store, nodes=nodes, max_depth=1, freeze_contracts=True)
     control = scheduler(store)
-    parent_request, parent_decision = routed_pair(reg, config, manifest, node_id="node-1")
+    parent_request, parent_decision = proof_routed_pair(reg, config, manifest, node_id="node-1")
     parent = accept(control, parent_request, parent_decision)
-    control.finish_attempt(
+    finish_with_proof(control,
         run_id="run-1", node_id="node-1", attempt_id=parent_request.attempt_id,
         fencing_generation=1, completed_at=NOW + timedelta(seconds=10),
-        outcome="succeeded",
         usage=UsageRecord(
             reservation_id=parent.reservation.reservation_id,
             run_id="run-1", settlement_key="parent-creator-success", currency="USD",
             input_tokens=1, output_tokens=1, cost_minor=1,
         ),
     )
-    child_request, child_decision = routed_pair(
+    child_request, child_decision = proof_routed_pair(
         reg, config, manifest, node_id="node-2", role="tester"
     )
 
@@ -4099,9 +4425,9 @@ def test_child_agent_records_parent_attempt_as_creator(tmp_path):
 
 def test_agent_registry_replay_and_transition_idempotency_are_fenced(tmp_path):
     store = SQLiteEventStore(tmp_path / "agent-replay.db")
-    reg, config, lifecycle, manifest = run_setup(store)
+    reg, config, lifecycle, manifest = run_setup(store, freeze_contracts=True)
     control = scheduler(store)
-    request, decision = routed_pair(reg, config, manifest)
+    request, decision = proof_routed_pair(reg, config, manifest)
     accepted = accept(control, request, decision)
     node_spec = lifecycle.replay("run-1").node("node-1").spec
     attempt = lifecycle.replay("run-1").node("node-1").attempts[0]
@@ -4122,10 +4448,9 @@ def test_agent_registry_replay_and_transition_idempotency_are_fenced(tmp_path):
             causation_id=decision.decision_hash, outcome="succeeded",
         )
 
-    control.finish_attempt(
+    finish_with_proof(control,
         run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
         fencing_generation=1, completed_at=NOW + timedelta(seconds=10),
-        outcome="succeeded",
         usage=UsageRecord(
             reservation_id=accepted.reservation.reservation_id,
             run_id="run-1", settlement_key="agent-replay-success", currency="USD",
