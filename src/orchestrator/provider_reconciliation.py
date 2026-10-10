@@ -292,9 +292,9 @@ class ProviderReconciliationService:
             provider_result = self.evidence_verifier.verify(call, raw_evidence)
             provider_result = revalidate_model(ProviderEvidenceResult, provider_result)
         except ProviderEvidenceUnsupported:
-            raise
-        except ReconciliationRejected:
-            raise
+            raise ProviderEvidenceUnsupported(
+                "no authoritative Provider evidence source is available"
+            ) from None
         except Exception:
             raise ReconciliationRejected(
                 "Provider evidence verifier rejected the receipt"
@@ -333,8 +333,6 @@ class ProviderReconciliationService:
             termination_digest = self.termination_verifier.verify_stopped(
                 call, termination_receipt
             )
-        except ReconciliationRejected:
-            raise
         except Exception:
             raise ReconciliationRejected(
                 "Attempt termination witness was rejected"
@@ -458,7 +456,7 @@ class ProviderReconciliationService:
 
 
 def _provider_call_binding(call: ProviderCallSnapshot) -> dict[str, object]:
-    return {
+    binding = {
         "provider_call_stream_id": call.stream_id,
         "provider_adapter": call.provider_adapter,
         "provider_correlation_id": call.provider_correlation_id,
@@ -473,6 +471,9 @@ def _provider_call_binding(call: ProviderCallSnapshot) -> dict[str, object]:
         "registry_manifest_hash": call.registry_manifest_hash,
         "request_hash": call.request_hash,
     }
+    if call.provider_request_id is not None:
+        binding["provider_request_id"] = call.provider_request_id
+    return binding
 
 
 def _revalidate_call_snapshot(
@@ -529,10 +530,12 @@ def _revalidate_call_snapshot(
         isinstance(call.fencing_generation, bool)
         or not isinstance(call.fencing_generation, int)
         or call.fencing_generation < 1
-        or not isinstance(call.provider_adapter, str)
-        or call.provider_adapter not in (
+        or (call.provider_adapter is not None and (
+            not isinstance(call.provider_adapter, str)
+            or call.provider_adapter not in (
             "openai_responses", "anthropic_messages", "openai_compatible"
-        )
+            )
+        ))
         or not isinstance(call.status, str)
         or call.status not in (
             "dispatching", "not_sent", "known_failure", "known_success", "unknown",
@@ -676,6 +679,7 @@ def _require_scheduler_evidence(
             or route["provider_id"] != call.provider_id
             or route["model_id"] != call.model_id
             or route["decision_id"] != call.accepted_route_id
+            or route["registry_manifest_hash"] != call.registry_manifest_hash
             or unknown_at.tzinfo is None
             or unknown_at.utcoffset() is None
         ):

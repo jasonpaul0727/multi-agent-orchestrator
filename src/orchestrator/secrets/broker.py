@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 import re
-from typing import Protocol
+from typing import Literal, Protocol
 
 from orchestrator.config.models import ProviderSpec
 from orchestrator.models.gateway import SecretAccessContext
@@ -104,6 +104,14 @@ class SecretBrokerUnavailable(RuntimeError):
     """Audit or backing-store failure prevented a safe secret decision."""
 
 
+@dataclass(frozen=True, slots=True)
+class AuditedSecretDecision:
+    """One durable authorization/value decision, without a history reread."""
+
+    status: Literal["credential", "denied", "unavailable"]
+    credential: ProviderCredential | None = None
+
+
 class AuditedSecretBroker:
     """Return a scoped credential only after allowlist and durable audit checks."""
 
@@ -132,6 +140,21 @@ class AuditedSecretBroker:
         purpose: str,
         context: SecretAccessContext,
     ) -> ProviderCredential | None:
+        decision = await self.acquire_provider_credential_decision(
+            secret_ref=secret_ref, provider=provider, endpoint=endpoint,
+            purpose=purpose, context=context,
+        )
+        return decision.credential
+
+    async def acquire_provider_credential_decision(
+        self,
+        *,
+        secret_ref: str,
+        provider: ProviderSpec,
+        endpoint: str,
+        purpose: str,
+        context: SecretAccessContext,
+    ) -> AuditedSecretDecision:
         if not isinstance(context, SecretAccessContext):
             raise SecretAccessDenied("a validated Model Gateway access context is required")
         valid_request = (
@@ -166,7 +189,7 @@ class AuditedSecretBroker:
             reason="authorized" if rule is not None else "scope_denied",
         )
         if rule is None:
-            return None
+            return AuditedSecretDecision("denied")
         assert isinstance(provider, ProviderSpec)
         try:
             secret = self._values.read(secret_ref)
@@ -189,14 +212,14 @@ class AuditedSecretBroker:
                 purpose=purpose,
                 reason="credential_unavailable",
             )
-            return None
-        return ProviderCredential(
+            return AuditedSecretDecision("unavailable")
+        return AuditedSecretDecision("credential", ProviderCredential(
             header_name=_HEADER_BY_ADAPTER[provider.adapter],
             value=secret,
             provider_id=provider.id,
             endpoint=endpoint,
             purpose=purpose,
-        )
+        ))
 
     def _audit(
         self,
@@ -304,6 +327,7 @@ def _has_header_controls(value: str) -> bool:
 
 __all__ = [
     "AuditedSecretBroker",
+    "AuditedSecretDecision",
     "EnvironmentSecretStore",
     "SecretAccessDenied",
     "SecretAccessRule",

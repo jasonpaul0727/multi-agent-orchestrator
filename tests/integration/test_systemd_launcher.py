@@ -233,6 +233,63 @@ def test_launcher_runtime_limit_terminates_command(tmp_path: Path) -> None:
     _assert_empty_cgroup_receipt(result)
 
 
+def test_delayed_real_unit_submission_cannot_follow_a_confirmed_stop(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    release = tmp_path / "release-launch"
+    entered = tmp_path / "launcher-entered"
+    wrapper = tmp_path / "delayed-systemd-run"
+    wrapper.write_text(
+        "#!/usr/bin/python3\nimport os, sys, time\nfrom pathlib import Path\n"
+        f"Path({str(entered)!r}).touch()\n"
+        "deadline = time.monotonic() + 20\n"
+        f"while not Path({str(release)!r}).exists():\n"
+        "    if time.monotonic() >= deadline: raise SystemExit(124)\n"
+        "    time.sleep(0.02)\n"
+        "os.execv('/usr/bin/systemd-run', ['systemd-run', *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+    session = SystemdReadOnlyLauncher(systemd_run=str(wrapper)).launch(
+        workspace, ["/usr/bin/python3", "-c", "import time; time.sleep(30)"],
+        limits=SandboxLimits(timeout_seconds=30, output_bytes=1024),
+    )
+    staging = session._staging.path
+    try:
+        deadline = time.monotonic() + 5
+        while not entered.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert entered.exists(), "delayed launcher never reached submission barrier"
+        session.cancel()
+        result = session.wait()
+        assert session._process.poll() is None
+        assert result.elapsed_seconds < 8
+        release.touch()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = subprocess.run(
+                ["systemctl", "--user", "show", session.unit_name, "--property=ActiveState", "--value"],
+                capture_output=True, check=False, timeout=1,
+            )
+            if state.returncode == 0 and state.stdout.strip() == b"active":
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("released launcher never submitted its actual systemd unit")
+        # The real unit becomes active after wait(): absence before submission
+        # cannot authorize a stop receipt or automatic staging cleanup.
+        assert not result.termination_confirmed
+        assert staging.is_dir()
+    finally:
+        if session._process.poll() is None:
+            session._process.kill()
+        session._process.wait(timeout=5)
+        stopped = subprocess.run(["systemctl", "--user", "stop", session.unit_name],
+            capture_output=True, check=False, timeout=5)
+        if stopped.returncode == 0 or b"not loaded" in stopped.stderr:
+            session._staging.discard()
+
+
 def test_launcher_cancellation_kills_entire_service_process_tree(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

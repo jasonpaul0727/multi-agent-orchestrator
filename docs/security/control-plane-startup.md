@@ -41,6 +41,10 @@ The entire bootstrap runs under one SQLite `BEGIN IMMEDIATE` transaction:
    reservation, model, Provider adapter, and frozen Registry. Unresolved calls
    on terminal Attempts are rejected. Existing settlement markers must match
    the exact Scheduler reconciliation operation.
+   Authentic BASE v1 intents without adapter/correlation metadata retain their
+   exact route/Registry binding and recover without inventing those fields.
+   Their unknown holds and replay block remain; new evidence reconciliation is
+   unsupported without a real historical correlation.
 3. Apply only proofs already recorded as `settlement_pending`, using the
    existing Scheduler API and canonical idempotency keys. Revalidate all Run
    and Provider-call state after settlement.
@@ -71,8 +75,17 @@ text, raw evidence, secrets, and protected paths.
 
 This composition root is a Python host API. Functional Worker execution,
 automatic recovery-plan dispatch, CLI/MCP, and complete end-to-end security
-acceptance remain to integrate. The real urllib Provider sender currently uses
-a host background thread that can outlive a cancelled coroutine: a Worker
-systemd stop receipt does not prove that sender stopped. Provider sender
-supervision and authoritative Provider evidence remain separate production
-reconciliation requirements.
+acceptance remain to integrate. The default Provider transport is the fixed
+systemd sender, with bounded host stop waits and exact unit/cgroup receipts.
+An unconfirmed stop returns an unknown failure, retains staging, and cannot
+release effect/budget holds. The urllib thread transport is an explicit legacy
+option and supplies no supervised sender proof. A Worker stop receipt does not
+prove that either sender stopped; Provider charge evidence remains independent.
+
+`SecretBrokerProcessManager` exposes the separate Linux Broker process API:
+readiness-gated Unix client, bounded IPC, audit-before-value access and pidfd
+shutdown. Its runtime root must be canonical and private under `/run/user/<uid>`
+and absent from runtime/source binds. Its production backend remains
+`UnavailableSecretValueStore`; the application does not automatically start or
+wire a production credential store. Production authoritative Provider evidence,
+secret-backend integration and full Gateway/Worker composition remain open.

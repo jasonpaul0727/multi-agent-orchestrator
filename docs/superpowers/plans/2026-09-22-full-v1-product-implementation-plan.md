@@ -162,6 +162,44 @@ cross-stream interruption matrix, or validate the résumé cost/token/rework
 targets. README and [Provider journal security notes](../../security/provider-call-journal.md)
 record the boundary and remaining gates.
 
+2026-10-05 P3 offline cross-process crash matrix (scoped evidence): on Ubuntu
+24.04.4 LTS / WSL2, kernel `6.6.87.2-microsoft-standard-WSL2`, systemd
+`255.4-1ubuntu8.17`, Python 3.12.3, the focused acceptance command completed
+**266 passed with no skips**:
+
+```bash
+python3 -m pytest -o addopts= tests/integration/test_crash_matrix.py tests/integration/test_approval_tool_gateway.py tests/unit/approvals tests/unit/budget tests/unit/lifecycle/test_scheduler.py tests/unit/isolation/test_workspace_publish.py tests/integration/test_systemd_launcher.py tests/integration/test_isolated_worker_process.py -q
+```
+
+The full coverage gate was:
+
+```bash
+python3 -m pytest --cov=orchestrator --cov-report=term-missing --cov-fail-under=90
+```
+
+It completed **1,536 passed, 90.15% total coverage**. Parent-
+issued SIGKILL and fresh-store assertions cover budget reserve/settlement
+before and after COMMIT; ApprovalGrant binding before consumption and atomic
+consume before/after COMMIT; an external test receiver action before a missing
+EffectReceipt; and ArtifactPublicationIntent-only / installed-blob-before-
+Published windows. Recovery retains unknown effect budget/slot holds, refuses
+to repeat the external action, and reports pending artifacts as `missing` or
+`orphaned_blob` with exact Run/Node/Attempt/fencing-generation provenance.
+The bound-but-unconsumed grant stays bound and unusable, so proceeding needs a
+fresh approval. The existing fake Provider dispatch replay rejection remains
+in the focused target; no real or paid Provider call or production Provider
+authority was involved.
+
+The system Python initially lacked pytest-cov, so the specified coverage gate
+was rerun after activating a temporary `/tmp` validation environment with
+pytest-cov 7.1.0 and coverage 7.16.2; project dependency metadata was not
+changed. `compileall`, `pip check`, wheel build, and `git diff --check` passed.
+The wheel result establishes packaging only, not deployment compatibility.
+This matrix does **not** implement or verify a functional Worker, whole Worker
+stop/recovery lifecycle, Provider-authoritative reconciliation, CLI/MCP,
+end-to-end security acceptance, or the cost/token/rework benchmarks. The P3
+and V1 delivery checklists remain open.
+
 建议新增包：`orchestrator/lifecycle`、`orchestrator/graph`、`orchestrator/scheduler`、`orchestrator/agents`。
 
 - [x] 建立 Run/Node/Attempt/Graph 生命周期投影；实现基础状态机与非法转换拒绝。
@@ -181,7 +219,7 @@ record the boundary and remaining gates.
 - [x] 将 effect intent/receipt 与 ArtifactPublished stream 纳入统一 Run Recovery Coordinator；恢复时将缺回执的外部 effect 保持为 outcome_unknown、拒绝终态 Attempt 上的未决 effect，并验证有发布事件的 ArtifactStore 对象 digest/size 与可用 attempt provenance。只读恢复结果不重放副作用或暴露 artifact bytes。
 - [x] 增加全局只读 orphan blob inventory：按内容寻址文件名、常规文件类型和 SHA-256 校验；对每个候选使用正常 publication digest lock 并重读事件元数据，避免把正常并发发布误报为 orphan。此操作不自动删除，也不宣称 Run 级归属。
 - [x] 在 Artifact bytes 落盘前写入 `ArtifactPublicationIntent`，随后原子发布内容寻址对象和 `ArtifactPublished` 元数据；恢复时按 Run 查询带有对应 source provenance 的未完成意图并验证已存在对象的 digest/size/provenance。子进程死亡测试覆盖 intent 后、blob 后两个窗口。Worker publisher 必须提供 Run/node/Attempt-generation source。候选只列入 pending inventory，不被自动采纳或删除。
-- [ ] 扩展多进程中断矩阵覆盖全部跨流事务/副作用窗口；将 systemd 停止证明接入并实测整个 Worker 生命周期协调，并配置 Provider 权威查询/签名回执验证源及其线上测试。Gateway 的 Provider request sender 已有独立 systemd 停止证明，但不能替代 Worker 停止/完整恢复。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
+- [ ] 扩展多进程中断矩阵覆盖全部跨流事务/副作用窗口；2026-10-05 已对本计划列出的离线 durable boundary 完成真实 SIGKILL/reopen 验收，但这不包含 functional Worker 的完整运行/取消/恢复矩阵。仍需将 systemd 停止证明接入并实测整个 Worker 生命周期协调，并配置 Provider 权威查询/签名回执验证源及其线上测试。Gateway 的 Provider request sender 已有独立 systemd 停止证明，但不能替代 Worker 停止/完整恢复。没有持久化 intent 的旧/裸 orphan 仍无法归属 Run。当前恢复器是重建/完整性门，不是完整自动恢复执行器。
 - [x] 实现脱敏、确定性的 Gateway 失败分类/指纹并交由 Recovery Controller 生成有界计划；Scheduler 持久化分类/计划，并在接纳恢复 Attempt 时重验 authorization、失败类别、retry level 和 exhausted model，再原子消费单次授权。未知结果保持 reconciliation 阻断。
 - [x] 将已持久化 Provider pending-proof 结算接入 host application 启动；完整 Run/调用前后校验、原子批次回滚、初始化中断报告、双连接启动及进程死亡验收通过。
 - [ ] 将持久化恢复计划接入 functional Worker 与 application service 的运行时协调/自动派发；不得自动重放 `outcome_unknown` Provider 调用。CLI/MCP 尚未接入 host 入口。
@@ -295,11 +333,73 @@ Evidence is still only a proposal: no durable verifier event, node acceptance,
 semantic review, test-suite execution, Final Review, or Worker-produced
 candidate path exists. P5 remains open.
 
+2026-10-05 durable proposal replay slice: `VerifierProposalJournal` now stores
+bounded task/evidence proposals in the existing SQLiteEventStore and replays
+them after restart, revalidating canonical hashes, strict payload types,
+Attempt/artifact bindings, event headers and idempotency. Identical retries
+are a no-op; per-record and atomic per-Run count/byte caps bound persistence.
+This supersedes the earlier absence of durable verifier proposal events only.
+The trusted host caller must obtain evidence through the isolated Verifier;
+the journal does not attest to verifier process origin, re-read ArtifactStore
+bytes, accept a Node, write lifecycle state, or affect the Scheduler. The
+reviewed implementation gate recorded 1,567 passed, zero skipped, 90.12%
+total coverage and 87.73% journal-module coverage; focused runtime/live
+Verifier integration (211 passed, zero skipped), compileall, pip check, wheel
+build and branch whitespace checks passed. Those measurements apply to the
+proposal-only milestone. The later acceptance foundation below supersedes
+the earlier absence of control-plane evidence acceptance and startup proof
+validation; broader P5/V1 completion remains open.
+
+2026-10-09 verified Attempt acceptance foundation: the ready-gated application
+method `accept_verifier_proposal(*, run_id, node_id, attempt_id,
+fencing_generation, task_sha256)` accepts only identity and task hash. The
+private coordinator resolves the original trusted admission's frozen graph,
+input manifest, complete AttemptContext and deterministic check contract,
+then loads a fully validated durable proposal. It re-runs the built-in
+isolated Verifier over exact host-published bytes/provenance using one-use
+Run/digest/issuer/expiry-bound grants and requires matching canonical evidence.
+Caller evidence, usage, completion times, Worker output and paths cannot
+authorize acceptance. A composition-time trusted `AttemptUsageSource` supplies
+reservation-bound usage; the default is unavailable and fails closed. No
+production Provider usage backend exists.
+
+Scheduler rechecks durable proof, original admission, cancellation, fencing,
+lease and usage inside one existing SQLite `append_checked` transaction that
+commits lifecycle success, Agent completion, budget settlement and slot
+release with task/evidence hash references. Ordinary finish, Provider
+reconciliation and public Lifecycle success writers reject unproved success.
+Before readiness, a read-only historical audit reloads every exact proposal
+and checks all Scheduler/lifecycle successes against original context and
+completion history, including the independent Attempt policy commitment.
+Proposal-only crashes remain unaccepted; missing/corrupt/duplicated or
+proofless legacy success fails startup. The archived BASE fixture/generator
+intentionally preserve authentic legacy proofless success; there is no
+migration or silent rewrite.
+
+This narrow foundation is implemented; final whole-slice review/push gates
+remain in the acceptance subplan. Production `IsolatedWorkerProcess` stays
+blocked-only. `NodeProposal.task_text` remains consumed but unpersisted, so
+functional Worker dispatch still needs a separate task-input retention and
+restart-resupply design. Worker byte publication, Gateway/Approval/Secret
+Broker wiring, functional Worker recovery, CLI/MCP, full end-to-end security,
+semantic review/project tests/Final Review, and real cost/token/rework
+benchmarks remain incomplete. This does not complete P5 or V1.
+
+Final implementation test/build gate on 2026-10-09: 391 focused acceptance
+tests and 1,786 full suite tests passed, zero skips, 90.29% total coverage;
+compileall, pip check, wheel build and complete branch whitespace checks
+passed. These results include the startup Attempt-policy commitment fix and
+real systemd integration. Final whole-slice review and documentation push
+remain pending controller gates; the broader product checklist stays open.
+
+- [x] 完成受限的 verified Attempt acceptance foundation：独立冻结上下文、产物重验、持久化 proof、原子资源结算与 startup 历史证明审计；production Worker 仍 blocked-only，默认 usage 不可用。
+- [ ] 为 functional Worker 设计 task-input 保留/重启重供，并接入候选字节 publisher、Gateway/Approval/Secret Broker；覆盖完整 Worker 运行/取消/恢复。
+
 - [ ] Worker 仅获得当前 attempt 的最小输入、CapabilityGrant 引用和工具请求接口；不得拿到 EventStore/控制目录句柄或写最终状态。
 - [ ] 实现 Model Gateway：按 accepted RoutingDecision 调用 adapter，通过 Secret Broker 请求凭据，做超时/取消/有限重试、usage 采集、预算结算和响应脱敏。
 - [ ] 实现 Planner 生成初始 DAG、Worker 候选结果、Reviewer、Director 和文档分析 Agent 契约；模型输出只能成为提案/候选，由控制层验证后追加事件。
 - [ ] 实现 Agent 动态拆分：Graph Manager 校验依赖/契约/权限/预算/深度/累计数量后追加子图；新增能力必须形成具有新安全契约的节点。
-- [ ] 扩展独立 Verifier：现有只读进程仅覆盖 Artifact hash/size、UTF-8、JSON 和 Python 语法，不运行项目测试或语义审查；仍需按节点验收契约生成、持久化证据并由控制层决定是否接受。
+- [ ] 扩展独立 Verifier：已实现 Artifact hash/size、UTF-8、JSON 和 Python 语法的持久化提案与 proof-gated 控制层接受；仍需节点语义验收、项目测试及真实 Worker 端到端接线。
 - [ ] 实现 Final Review：冻结 review graph version 与 input manifest，核验原始目标、必需产物、证据、风险、账本；repair 必须有界返工并重新审查最新 generation。
 
 验收：离线 fake-model + fake-tool 模式跑通成功、失败、重试、升级、拆分、审批等待和恢复流程；Worker 无法伪造状态/访问控制面/绕过 Gateway；Verifier 与 Final Review 的每个判定可追溯到事件和产物哈希。

@@ -4,9 +4,13 @@ import base64
 import importlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 
 import pytest
 
@@ -96,6 +100,8 @@ def test_provider_sender_launcher_uses_separate_network_enabled_profile(monkeypa
     assert "PrivateNetwork=no" in properties
     assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in properties
     assert "NoNewPrivileges=yes" in properties
+    assert "InaccessiblePaths=-/run/user" in properties
+    assert "InaccessiblePaths=-/mnt/wslg/run/user" in properties
     binds = [value for value in properties if value.startswith("BindReadOnlyPaths=")]
     assert len(binds) == (2 if configured_ca else 1)
     source, target = binds[0].removeprefix("BindReadOnlyPaths=").split(":", 1)
@@ -128,6 +134,102 @@ def test_provider_sender_launcher_uses_separate_network_enabled_profile(monkeypa
         limits=SandboxLimits(),
     )
     session._sandbox_session._staging.discard()
+
+
+@pytest.mark.parametrize("reason", ["timeout", "cancel"])
+@pytest.mark.parametrize("profile", ["sender", "readonly"])
+def test_launcher_wait_is_bounded_when_stop_fails_and_transport_holds_pipes(monkeypatch, tmp_path, reason, profile):
+    sender_module = _sender_module()
+    runtime_module = importlib.import_module("orchestrator.runtime.provider_sender_process")
+
+    class HeldTransport:
+        returncode = None
+        def __init__(self):
+            self.stdin = None
+            self.writers = []
+            for name in ("stdout", "stderr"):
+                reader, writer = os.pipe()
+                setattr(self, name, os.fdopen(reader, "rb", buffering=0))
+                self.writers.append(writer)
+        def poll(self):
+            return self.returncode
+        def wait(self, timeout=None):
+            assert self.returncode is not None or timeout is not None, "unbounded host transport wait"
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("held-transport", timeout)
+            return self.returncode
+
+    transport = HeldTransport()
+    for module in (sender_module, launcher_module):
+        monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(module, "_systemd_client_environment", lambda: {})
+        monkeypatch.setattr(module, "_systemd_cgroup_parent", lambda *_args: Path("/sys/fs/cgroup/user.slice/app.slice"))
+    monkeypatch.setattr(subprocess, "run", lambda args, **_kw: subprocess.CompletedProcess(args, 1 if "kill" in args else 0))
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kw: transport)
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", lambda **_kw: None)
+    if profile == "sender":
+        session = sender_module.SystemdProviderSenderLauncher(systemd_run="run", systemctl="ctl").launch(
+            _request_frame(runtime_module), timeout_seconds=1, output_bytes=4096,
+        )
+        sandbox = session._sandbox_session
+    else:
+        session = launcher_module.SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl").launch(
+            tmp_path, ["/bin/true"], limits=SandboxLimits(timeout_seconds=1),
+        )
+        sandbox = session
+    finished = threading.Event()
+    results = []
+    def wait():
+        try:
+            results.append(session.wait())
+        except Exception as error:
+            results.append(error)
+        finally:
+            finished.set()
+    if reason == "cancel":
+        assert session.cancel() is False
+    worker = threading.Thread(target=wait, daemon=True)
+    worker.start()
+    try:
+        assert finished.wait(4), "launcher-created session hung after unconfirmed stop"
+        if profile == "sender":
+            assert isinstance(results[0], IsolationUnavailable)
+        else:
+            assert results[0].termination_receipt is None
+        assert sandbox._result.termination_receipt is None
+        assert sandbox._staging.path.is_dir()
+    finally:
+        transport.returncode = 125
+        for writer in transport.writers:
+            os.close(writer)
+        worker.join(2)
+        sandbox._staging.discard()
+
+
+def test_sender_retains_staging_before_uncertain_popen_start(monkeypatch, tmp_path):
+    sender_module = _sender_module()
+    runtime_module = importlib.import_module("orchestrator.runtime.provider_sender_process")
+    staging = tempfile.TemporaryDirectory(dir=tmp_path)
+    stage_path = Path(staging.name)
+    monkeypatch.setattr(sender_module, "_create_provider_staging", lambda: staging)
+    monkeypatch.setattr(sender_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(sender_module, "_systemd_client_environment", lambda: {})
+    monkeypatch.setattr(sender_module, "_systemd_cgroup_parent", lambda *_a: Path("/sys/fs/cgroup/user.slice/app.slice"))
+    monkeypatch.setattr(subprocess, "run", lambda args, **_kw: subprocess.CompletedProcess(args, 0))
+    detached_at_launch = []
+    def uncertain_start(*_args, **_kwargs):
+        detached_at_launch.append(staging._finalizer.peek() is None)
+        raise KeyboardInterrupt
+    monkeypatch.setattr(subprocess, "Popen", uncertain_start)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            sender_module.SystemdProviderSenderLauncher(systemd_run="run", systemctl="ctl").launch(
+                _request_frame(runtime_module), timeout_seconds=1, output_bytes=4096,
+            )
+        assert detached_at_launch == [True]
+        assert stage_path.is_dir()
+    finally:
+        staging.cleanup()
 
 
 @pytest.mark.parametrize("kind", ["missing", "directory", "symlink", "unsupported", "unreadable", "fifo", "empty", "oversized", "parent-symlink"])

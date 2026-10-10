@@ -18,6 +18,7 @@ import sqlite3
 import ssl
 import threading
 import time
+import tempfile
 
 import pytest
 
@@ -444,17 +445,87 @@ async def test_invalid_socket_response_binding_never_reaches_sender(tmp_path, mi
         assert len(replies) == 2
 
 
+@pytest.fixture(autouse=True)
+def private_manager_runtime_area(monkeypatch):
+    with tempfile.TemporaryDirectory(prefix="maestro-broker-test-", dir=f"/run/user/{os.getuid()}") as directory:
+        monkeypatch.setattr(sys.modules[__name__], "_MANAGER_RUNTIME_AREA", Path(directory), raising=False)
+        yield
+
+
 def _setup(tmp_path):
     from orchestrator.secrets import SecretBrokerProcessManager
     events = tmp_path / "events.db"
     with SQLiteEventStore(events):
         pass
-    runtime = tmp_path / "runtime"
-    runtime.mkdir(mode=0o700)
+    runtime = Path(tempfile.mkdtemp(prefix="runtime-", dir=_MANAGER_RUNTIME_AREA))
     provider = ProviderSpec(id="primary", adapter="openai_responses", secret_ref="env:MODEL_KEY", enabled=True)
     rule = SecretAccessRule(provider.id, provider.secret_ref, provider.effective_endpoint,
                             "model_inference", frozenset({"run-1"}))
     return SecretBrokerProcessManager(runtime_root=runtime, event_store_path=events), provider, rule, events
+
+
+@pytest.mark.parametrize("profile", ["overlay", "readonly"])
+@pytest.mark.skipif(not _live_systemd_available(), reason="requires live Linux systemd user manager")
+def test_actual_manager_broker_socket_is_hidden_and_unreachable_from_sandbox(tmp_path, profile):
+    from orchestrator.isolation import SystemdOverlayCandidateLauncher, SystemdReadOnlyLauncher
+    manager, provider, rule, events = _setup(tmp_path)
+    session = manager.start(rules=(rule,), providers={provider.id: provider})
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    code = r'''
+import json, socket, sys
+from pathlib import Path
+results = []
+for path in sys.argv[1:]:
+    p = Path(path)
+    try:
+        p.stat()
+        hidden = False
+    except OSError:
+        hidden = True
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as s:
+            s.connect(str(p))
+        denied = False
+    except OSError:
+        denied = True
+    results.append({"hidden": hidden, "denied": denied})
+print(json.dumps(results))
+'''
+    try:
+        assert session.socket_path.is_relative_to(f"/run/user/{os.getuid()}")
+        paths = [session.socket_path]
+        wsl_alias = Path("/mnt/wslg/run/user") / session.socket_path.relative_to("/run/user")
+        if wsl_alias.exists():
+            assert wsl_alias.samefile(session.socket_path)
+            paths.append(wsl_alias)
+        for path in paths:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as host:
+                host.connect(str(path))
+        command = ["/usr/bin/python3", "-c", code, *map(str, paths)]
+        if profile == "overlay":
+            with SystemdOverlayCandidateLauncher().launch(workspace, command) as candidate:
+                result = candidate.wait().execution
+        else:
+            result = SystemdReadOnlyLauncher().launch(workspace, command).wait()
+        assert result.returncode == 0, result.stderr.decode(errors="replace")
+        assert result.termination_confirmed
+        assert json.loads(result.stdout) == [{"hidden": True, "denied": True}] * len(paths)
+        with SQLiteEventStore(events) as store:
+            assert store.read_stream("security", "run-1") == []
+        assert session.is_alive
+    finally:
+        session.close()
+
+
+def test_manager_rejects_actual_source_visible_runtime_root_before_spawn(tmp_path, monkeypatch):
+    import orchestrator.secrets.process as process_module
+    manager, provider, rule, _events = _setup(tmp_path)
+    with tempfile.TemporaryDirectory(prefix=".broker-runtime-test-", dir=Path(process_module.__file__).resolve().parents[2]) as directory:
+        manager._runtime_root = Path(directory)
+        monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_kw: pytest.fail("source-visible Broker root launched a child"))
+        with pytest.raises(ValueError, match="runtime root"):
+            manager.start(rules=(rule,), providers={provider.id: provider})
 
 
 def test_restart_replay_is_denied_after_child_restart(tmp_path):

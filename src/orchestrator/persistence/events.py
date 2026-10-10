@@ -170,6 +170,8 @@ def validate_event_contract(events: list[Any]) -> None:
             "ProviderCallSchedulerSettlementApplied",
         }:
             raise EventContractError("provider call stream contains an unsupported event")
+        if event.stream_type == "provider_call" and event.schema_version not in {1, 2}:
+            raise EventContractError("provider call event schema version is unsupported")
         execution_key = (
             event.run_id,
             event.node_id,
@@ -183,10 +185,15 @@ def validate_event_contract(events: list[Any]) -> None:
                 "provider_adapter", "provider_correlation_id", "registry_manifest_hash",
                 "budget_reservation_id", "request_hash",
             }
+            # BASE v1 lacked adapter/correlation. Expanded v1 was also shipped
+            # before explicit payload versioning. Only exact historical shapes
+            # replay; all new appends are v2 and require the expanded binding.
+            legacy_fields = required_fields - {"provider_adapter", "provider_correlation_id"}
+            legacy_intent = event.schema_version == 1 and set(payload) == legacy_fields
             if (
                 provider_call_intent is not None
                 or event.stream_version != 1
-                or set(payload) != required_fields
+                or (set(payload) != required_fields and not legacy_intent)
                 or not all(execution_key)
                 or payload.get("run_id") != event.run_id
                 or payload.get("node_id") != event.node_id
@@ -205,9 +212,9 @@ def validate_event_contract(events: list[Any]) -> None:
                 except ValueError as exc:
                     raise EventContractError("ProviderCallIntentRecorded has invalid identifiers") from exc
             provider_adapter = payload.get("provider_adapter")
-            if not isinstance(provider_adapter, str) or provider_adapter not in (
+            if not legacy_intent and (not isinstance(provider_adapter, str) or provider_adapter not in (
                 "openai_responses", "anthropic_messages", "openai_compatible"
-            ):
+            )):
                 raise EventContractError("ProviderCallIntentRecorded has invalid adapter")
             provider_correlation_id = payload.get("provider_correlation_id")
             if provider_adapter == "openai_responses":
@@ -291,6 +298,7 @@ def validate_event_contract(events: list[Any]) -> None:
             expected_version = 2 if provider_call_outcome is None else 3
             if (
                 provider_call_intent is None
+                or "provider_adapter" not in provider_call_intent.payload
                 or provider_call_reconciliation is not None
                 or provider_call_settlement is not None
                 or event.stream_version != expected_version
@@ -307,6 +315,12 @@ def validate_event_contract(events: list[Any]) -> None:
                 intent=provider_call_intent,
                 stream_id=event.stream_id,
             )
+            provider_request_id = (
+                None if provider_call_outcome is None
+                else provider_call_outcome.payload.get("provider_request_id")
+            )
+            if provider_request_id is not None and payload.get("provider_request_id") != provider_request_id:
+                raise EventContractError("ProviderCallReconciliationRecorded has conflicting provider request id")
             provider_call_reconciliation = event
         elif event_type == "ProviderCallSchedulerSettlementApplied":
             if (

@@ -25,8 +25,11 @@ if TYPE_CHECKING:
 _MAX_FRAME_BYTES = 1_048_576
 _DEFAULT_ARTIFACT_BYTES = 8 * 1024 * 1024
 _CHILD_PATH = "@maestro-runtime@/orchestrator/runtime/verifier_process.py"
-_ACCEPTANCE_CONTRACT = "maestro.artifact-verification/v1"
-_CHECKS = frozenset({"artifact-integrity", "utf8-text", "json", "python-syntax"})
+BUILTIN_VERIFIER_ID = "builtin.readonly-v1"
+BUILTIN_VERIFICATION_CONTRACT_ID = "maestro.artifact-verification/v1"
+SUPPORTED_VERIFICATION_CHECK_IDS = frozenset(
+    {"artifact-integrity", "utf8-text", "json", "python-syntax"}
+)
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
 _STAGED_NAME = re.compile(r"^candidate-[0-9]{3}\.bin$", re.ASCII)
 
@@ -81,16 +84,16 @@ class IsolatedVerifierProcess:
             VerificationTask,
             decode_verification_evidence,
             validate_verification_evidence,
+            validate_verification_task,
         )
 
         if not isinstance(task, VerificationTask):
             raise TypeError("task must be a validated VerificationTask")
-        if task.acceptance_contract != _ACCEPTANCE_CONTRACT:
-            raise VerifierProcessError("unsupported built-in verification acceptance contract")
-        if any(check_id not in _CHECKS for check_id in task.required_check_ids):
-            raise VerifierProcessError("verification task requests an unsupported deterministic check")
-        if "artifact-integrity" not in task.required_check_ids:
-            raise VerifierProcessError("artifact-integrity is a required verifier check")
+        try:
+            task = VerificationTask.model_validate(task.model_dump(mode="json"))
+            validate_verification_task(task)
+        except (RuntimeContractError, ValueError, TypeError) as exc:
+            raise VerifierProcessError("verification task is invalid") from exc
         if not callable(grant_for_digest):
             raise TypeError("grant_for_digest must be a trusted ArtifactAccessGrant provider")
 
@@ -192,6 +195,8 @@ class IsolatedVerifierProcess:
             raise VerifierProcessError("isolated Verifier transport did not complete cleanly")
         try:
             evidence = decode_verification_evidence(result.stdout)
+            if evidence.verifier_id != BUILTIN_VERIFIER_ID:
+                raise RuntimeContractError("unsupported verifier")
             validate_verification_evidence(task, evidence)
         except RuntimeContractError as exc:
             raise VerifierProcessError("isolated Verifier returned invalid evidence") from exc
@@ -219,14 +224,14 @@ def _verification_child_result(workspace: Path, raw: bytes) -> bytes:
         context = task["context"]
         if not isinstance(context, dict) or not isinstance(task["candidate_artifacts"], list):
             raise ValueError
-        if task["acceptance_contract"] != _ACCEPTANCE_CONTRACT:
+        if task["acceptance_contract"] != BUILTIN_VERIFICATION_CONTRACT_ID:
             raise ValueError
         required = task["required_check_ids"]
         if (
             not isinstance(required, list)
             or len(required) != len(set(required))
             or "artifact-integrity" not in required
-            or any(check not in _CHECKS for check in required)
+            or any(check not in SUPPORTED_VERIFICATION_CHECK_IDS for check in required)
         ):
             raise ValueError
         references = task["candidate_artifacts"]
@@ -295,7 +300,7 @@ def _verification_child_result(workspace: Path, raw: bytes) -> bytes:
             })
         evidence = {
             "context": context,
-            "verifier_id": "builtin.readonly-v1",
+            "verifier_id": BUILTIN_VERIFIER_ID,
             "outcome": "accepted" if all(item["passed"] for item in checks) else "rejected",
             "checks": checks,
             "inspected_digests": all_digests,
@@ -333,4 +338,10 @@ if __name__ == "__main__":
     raise SystemExit(_child_main() if sys.argv[1:] == ["--child"] else 64)
 
 
-__all__ = ["IsolatedVerifierProcess", "VerifierProcessError"]
+__all__ = [
+    "BUILTIN_VERIFICATION_CONTRACT_ID",
+    "BUILTIN_VERIFIER_ID",
+    "SUPPORTED_VERIFICATION_CHECK_IDS",
+    "IsolatedVerifierProcess",
+    "VerifierProcessError",
+]

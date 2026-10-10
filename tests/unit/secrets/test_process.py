@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import struct
+import tempfile
 
 import pytest
 
@@ -38,13 +39,19 @@ def _context_for(run_id, request_id="request-1"):
                                accepted_route_id="route-1", budget_reservation_id="reservation-1")
 
 
+@pytest.fixture(autouse=True)
+def private_runtime_area(monkeypatch):
+    with tempfile.TemporaryDirectory(prefix="maestro-broker-test-", dir=f"/run/user/{os.getuid()}") as directory:
+        monkeypatch.setattr(sys.modules[__name__], "_RUNTIME_AREA", Path(directory), raising=False)
+        yield
+
+
 def _manager(tmp_path):
     _, manager = _apis()
     events = tmp_path / "events.db"
     with SQLiteEventStore(events):
         pass
-    runtime = tmp_path / "runtime"
-    runtime.mkdir(mode=0o700)
+    runtime = Path(tempfile.mkdtemp(prefix="runtime-", dir=_RUNTIME_AREA))
     return manager(runtime_root=runtime, event_store_path=events), runtime
 
 
@@ -73,6 +80,93 @@ def test_manager_exposes_client_only_after_ready_and_closes_exact_child(tmp_path
     assert list(runtime.iterdir()) == []
     with pytest.raises(RuntimeError):
         _ = session.client
+
+
+@pytest.fixture
+def visible_area():
+    with tempfile.TemporaryDirectory(prefix="broker-visible-") as directory:
+        yield Path(directory)
+
+
+@pytest.mark.parametrize("kind", ["outside", "source", "ancestor-alias", "source-alias"])
+def test_manager_rejects_runtime_roots_visible_outside_canonical_private_area(tmp_path, monkeypatch, kind, visible_area):
+    manager, runtime = _manager(tmp_path)
+    if kind == "outside":
+        runtime = visible_area / "runtime"
+        runtime.mkdir(mode=0o700)
+    elif kind == "source":
+        import orchestrator.secrets.process as process
+        source = visible_area / "source"
+        runtime = source / "broker"
+        runtime.mkdir(parents=True, mode=0o700)
+        monkeypatch.setattr(process, "__file__", str(source / "orchestrator/secrets/process.py"))
+    elif kind == "ancestor-alias":
+        alias = visible_area / "private-alias"
+        alias.symlink_to(runtime.parent, target_is_directory=True)
+        runtime = alias / runtime.name
+    else:
+        import orchestrator.secrets.process as process
+        alias = visible_area / "source-alias"
+        alias.symlink_to(runtime.parent, target_is_directory=True)
+        monkeypatch.setattr(process, "__file__", str(alias / "orchestrator/secrets/process.py"))
+    manager._runtime_root = runtime
+    provider, rule = _provider_and_rule("run-1")
+    monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_kw: pytest.fail("unsafe root reached child launch"))
+    with pytest.raises(ValueError, match="runtime root"):
+        manager.start(rules=(rule,), providers={provider.id: provider})
+
+
+def test_manager_rejects_runtime_bind_alias_by_inode(tmp_path, monkeypatch):
+    import orchestrator.secrets.process as process
+    manager, runtime = _manager(tmp_path)
+    source = Path(process.__file__).resolve().parents[2]
+    identity = process._identity
+    # A bind mount can alias directories without any symlink in either path.
+    source_identity = identity(source)
+    monkeypatch.setattr(process, "_identity", lambda path: source_identity if path == runtime.parent else identity(path))
+    with pytest.raises(ValueError, match="runtime root"):
+        manager._validate_host()
+
+
+def test_manager_rejects_nonprivate_runtime_ancestor(tmp_path):
+    manager, runtime = _manager(tmp_path)
+    runtime.parent.chmod(0o755)
+    try:
+        with pytest.raises(ValueError, match="runtime root"):
+            manager._validate_host()
+    finally:
+        runtime.parent.chmod(0o700)
+
+
+@pytest.mark.parametrize("kind", ["source-subtree", "private-subtree", "runtime-subtree", "escaped-subtree", "invalid", "no-root", "unavailable"])
+def test_manager_rejects_mount_aliases_of_private_runtime_subdirectories(tmp_path, monkeypatch, kind):
+    import orchestrator.secrets.process as process
+    manager, runtime = _manager(tmp_path)
+    source = Path(process.__file__).resolve().parents[2]
+    # Mountinfo records filesystem roots, unlike path resolution or the
+    # identities of source ancestors. Model both directions of a subtree bind.
+    mountinfo = "1 0 0:1 / / rw - ext4 root rw\n"
+    if kind == "source-subtree":
+        mountinfo += f"2 1 0:1 {source}/private-subtree {runtime} rw - ext4 root rw\n"
+    elif kind in {"private-subtree", "runtime-subtree"}:
+        alias = source / "private-subtree" if kind == "private-subtree" else Path("/usr/lib/private-subtree")
+        mountinfo += f"2 1 0:1 {runtime} {alias} rw - ext4 root rw\n"
+    elif kind == "escaped-subtree":
+        mountinfo += f"2 1 0:1 {runtime} /usr/lib/private\\040subtree rw - ext4 root rw\n"
+    elif kind == "invalid":
+        mountinfo = "malformed mount table\n"
+    elif kind == "no-root":
+        mountinfo = "1 0 0:1 / /unrelated rw - ext4 root rw\n"
+    original_read = Path.read_text
+    def read_mountinfo(path, *args, **kwargs):
+        if path == Path("/proc/self/mountinfo"):
+            if kind == "unavailable":
+                raise OSError("mount table unavailable")
+            return mountinfo
+        return original_read(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", read_mountinfo)
+    with pytest.raises(ValueError, match="runtime root"):
+        manager._validate_host()
 
 
 @pytest.mark.parametrize("change", [
@@ -478,4 +572,3 @@ os._exit(0)
                 pass
             finally:
                 os.close(child_handle)
-

@@ -574,7 +574,7 @@ class SQLiteEventStore:
                     stream_id=stream_id,
                     stream_version=first_version + offset,
                     event_type=draft.event_type,
-                    schema_version=1,
+                    schema_version=2 if stream_type == "provider_call" else 1,
                     occurred_at=occurred_at,
                     payload=draft.payload,
                     payload_hash=_sha256_json(draft.payload),
