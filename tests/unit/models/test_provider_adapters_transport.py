@@ -396,7 +396,10 @@ class _ControlledSenderSession:
     def __init__(self, result_factory):
         self.result_factory = result_factory
         self.wait_started = threading.Event()
+        self.wait_completed = threading.Event()
         self.release_wait = threading.Event()
+        self.cancel_started = threading.Event()
+        self.cancel_completed = threading.Event()
         self.cancel_count = 0
         self.wait_started_before_cancel = None
 
@@ -405,10 +408,14 @@ class _ControlledSenderSession:
         self.wait_started.set()
         if not self.release_wait.wait(5):
             raise TimeoutError("controlled sender wait was not released")
-        return self.result_factory()
+        result = self.result_factory()
+        self.wait_completed.set()
+        return result
 
     def cancel(self):
+        self.cancel_started.set()
         self.cancel_count += 1
+        self.cancel_completed.set()
         return True
 
 
@@ -639,23 +646,69 @@ def test_systemd_gateway_persists_success_and_call_bound_sender_receipt(tmp_path
     assert header_names.count("content-type") == 1
 
 
-def test_cancelled_gateway_waits_for_sender_stop_before_recording_unknown(tmp_path):
+@pytest.mark.parametrize(
+    "delay_cancel_dispatch", [False, True], ids=["direct", "blocked-cancel-dispatch"]
+)
+def test_cancelled_gateway_waits_for_sender_stop_before_recording_unknown(
+    tmp_path, monkeypatch, delay_cancel_dispatch
+):
     session = _ControlledSenderSession(lambda: _sender_result(None, returncode=1))
     gateway, request, journal, _launcher = _systemd_gateway(tmp_path, session)
 
     async def cancel_gateway_after_sender_starts():
+        cancel_dispatched = asyncio.Event()
+        release_cancel = asyncio.Event()
+        to_thread = asyncio.to_thread
+
+        async def controlled_to_thread(function, *args, **kwargs):
+            if function == session.cancel:
+                cancel_dispatched.set()
+                if delay_cancel_dispatch:
+                    await asyncio.wait_for(release_cancel.wait(), timeout=2)
+            return await to_thread(function, *args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", controlled_to_thread)
         invocation = asyncio.create_task(gateway.invoke(request))
-        assert await asyncio.to_thread(session.wait_started.wait, 2)
-        invocation.cancel()
-        await asyncio.sleep(0.05)
-        assert not invocation.done()
-        assert session.cancel_count >= 1
-        invocation.cancel()
-        await asyncio.sleep(0.05)
-        assert not invocation.done()
-        session.release_wait.set()
-        with pytest.raises(ModelGatewayError, match="cancelled"):
-            await invocation
+
+        def assert_sender_stop_is_pending():
+            assert not invocation.done()
+            assert not session.wait_completed.is_set()
+            call = journal.read(request)
+            assert call is not None and call.status == "dispatching"
+            assert call.termination_receipt is None
+
+        try:
+            assert await asyncio.to_thread(session.wait_started.wait, 2)
+            invocation.cancel()
+            await asyncio.wait_for(cancel_dispatched.wait(), timeout=2)
+            assert_sender_stop_is_pending()
+            if delay_cancel_dispatch:
+                # Submission to to_thread does not prove its function has run.
+                assert not session.cancel_started.is_set()
+                assert session.cancel_count == 0
+            release_cancel.set()
+            assert await asyncio.to_thread(session.cancel_started.wait, 2)
+            assert await asyncio.to_thread(session.cancel_completed.wait, 2)
+            assert session.cancel_count >= 1
+            assert_sender_stop_is_pending()
+
+            invocation.cancel()
+            # Task.cancel queues the cancellation wakeup before this FIFO loop
+            # checkpoint. Await its delivery, not an elapsed scheduler delay.
+            checkpoint = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(checkpoint.set_result, None)
+            await asyncio.wait_for(checkpoint, timeout=2)
+            assert_sender_stop_is_pending()
+            session.release_wait.set()
+            with pytest.raises(ModelGatewayError, match="cancelled"):
+                await asyncio.wait_for(asyncio.shield(invocation), timeout=2)
+            assert session.wait_completed.is_set()
+        finally:
+            release_cancel.set()
+            session.release_wait.set()
+            await asyncio.wait_for(
+                asyncio.gather(invocation, return_exceptions=True), timeout=2
+            )
 
     asyncio.run(cancel_gateway_after_sender_starts())
 
@@ -663,6 +716,7 @@ def test_cancelled_gateway_waits_for_sender_stop_before_recording_unknown(tmp_pa
     assert call is not None and call.status == "unknown"
     assert call.termination_receipt is not None
     assert call.termination_receipt.attempt_id == request.attempt_id
+    assert call.termination_receipt.provider_call_stream_id == call.stream_id
     assert call.termination_receipt.cgroup_empty is True
 
 
