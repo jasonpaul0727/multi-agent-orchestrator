@@ -49,11 +49,14 @@ class DecodedWorkerOutput:
 def _revalidate_task(task: WorkerTask) -> WorkerTask:
     if not isinstance(task, WorkerTask):
         raise TypeError("expected WorkerTask")
-    _preflight_model(task, WorkerTask)
-    return revalidate_model(WorkerTask, task)
+    fields = _preflight_model(task, WorkerTask)
+    # Rebuild from expected-schema mappings before the shared helper can
+    # delegate nested validation to an untrusted instance's subclass type.
+    canonical_task = WorkerTask.model_validate(fields)
+    return revalidate_model(WorkerTask, canonical_task)
 
 
-def _preflight_model(value: object, schema: type) -> None:
+def _preflight_model(value: object, schema: type) -> dict[str, object]:
     # The allowlist always comes from the expected contract, never a subclass.
     if isinstance(value, schema):
         fields = value.__dict__
@@ -66,18 +69,20 @@ def _preflight_model(value: object, schema: type) -> None:
         raise TypeError("unexpected nested model")
     if not set(fields) <= set(schema.model_fields):
         raise ValueError("unexpected model fields")
+    rebuilt = {}
     for name in schema.model_fields:
         child = fields[name]
         if schema is WorkerTask and name == "context":
-            _preflight_model(child, AttemptContext)
+            child = _preflight_model(child, AttemptContext)
         elif schema is WorkerTask and name in ("input_artifacts", "tool_capabilities"):
             if not isinstance(child, (list, tuple)):
                 raise TypeError("expected array")
             item_schema = ArtifactRef if name == "input_artifacts" else ToolCapabilityRef
-            for item in child:
-                _preflight_model(item, item_schema)
+            child = [_preflight_model(item, item_schema) for item in child]
         else:
             _check_tree(child)
+        rebuilt[name] = child
+    return rebuilt
 
 
 def _decode_base64(encoded: str) -> bytes:

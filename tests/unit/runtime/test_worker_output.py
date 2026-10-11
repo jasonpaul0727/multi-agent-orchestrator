@@ -689,3 +689,81 @@ def test_legitimate_nested_plain_mappings_are_rebuilt():
                                  "input_artifacts": [input_ref().model_dump()],
                                  "tool_capabilities": [capability().model_dump()]})
     assert decode_worker_output(wire(envelope(t)), copied).blobs[0].content == b"abc"
+
+
+@pytest.mark.parametrize("kind", ["context_float", "artifact_negative", "artifact_digest",
+                                  "artifact_metadata", "capability_scope", "capability_id"])
+def test_field_overriding_nested_subclasses_cannot_weaken_task_contracts(kind):
+    class RelaxedContext(AttemptContext):
+        graph_version: float
+    class RelaxedArtifact(ArtifactRef):
+        digest: str
+        size_bytes: int
+        artifact_type: str
+    class RelaxedCapability(ToolCapabilityRef):
+        scope_hash: str
+        tool_id: str
+    t = task()
+    value = envelope(t)
+    value["result"].update(outcome="blocked", artifacts=[])
+    value["blobs"] = []
+    if kind == "context_float":
+        context = RelaxedContext(**t.context.model_dump())
+        assert type(context.graph_version) is float
+        # Equality alone would accept 3.0 as equal to the required integer 3.
+        assert context.graph_version == value["result"]["context"]["graph_version"]
+        update = {"context": context}
+    elif kind.startswith("artifact"):
+        fields = input_ref().model_dump()
+        fields.update({"artifact_negative": {"size_bytes": -1},
+                       "artifact_digest": {"digest": "not-a-digest"},
+                       "artifact_metadata": {"artifact_type": "bad path"}}[kind])
+        update = {"input_artifacts": (RelaxedArtifact(**fields),)}
+    else:
+        fields = capability().model_dump()
+        fields.update({"capability_scope": {"scope_hash": "not-a-digest"},
+                       "capability_id": {"tool_id": "bad path"}}[kind])
+        update = {"tool_capabilities": (RelaxedCapability(**fields),)}
+    rejected(wire(value), t.model_copy(update=update))
+
+
+@pytest.mark.parametrize("container", [tuple, list])
+def test_harmless_nested_subclasses_keep_normalization(container):
+    class ContextSubclass(AttemptContext):
+        pass
+    class ArtifactSubclass(ArtifactRef):
+        pass
+    class CapabilitySubclass(ToolCapabilityRef):
+        pass
+    t = task()
+    copied = t.model_copy(update={
+        "context": ContextSubclass(**t.context.model_dump()),
+        "input_artifacts": container([ArtifactSubclass(**input_ref().model_dump())]),
+        "tool_capabilities": container([
+            CapabilitySubclass(**capability(2).model_dump()),
+            CapabilitySubclass(**capability(1).model_dump()),
+        ]),
+    })
+    rebuilt = output_module._revalidate_task(copied)
+    assert rebuilt.context == t.context
+    assert rebuilt.input_artifacts[0] == input_ref()
+    assert tuple(item.grant_id for item in rebuilt.tool_capabilities) == ("grant-1", "grant-2")
+    assert type(rebuilt.context) is AttemptContext
+    assert type(rebuilt.input_artifacts[0]) is ArtifactRef
+    assert all(type(item) is ToolCapabilityRef for item in rebuilt.tool_capabilities)
+    assert decode_worker_output(wire(envelope(t)), copied).blobs[0].content == b"abc"
+
+
+@pytest.mark.parametrize("field,invalid", [("graph_version", 3.0),
+    ("fencing_generation", -1), ("registry_hash", "not-a-digest")])
+def test_context_subclass_fields_are_revalidated_before_binding(field, invalid):
+    class RelaxedContext(AttemptContext):
+        graph_version: float
+        fencing_generation: int
+        registry_hash: str
+    t = task()
+    fields = t.context.model_dump()
+    fields[field] = invalid
+    copied = t.model_copy(update={"context": RelaxedContext(**fields)})
+    with pytest.raises(ValueError):
+        output_module._revalidate_task(copied)

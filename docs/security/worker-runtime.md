@@ -202,7 +202,10 @@ input-digest alias prohibition.
 Tasks are recursively revalidated, including unsafe construction/copy and
 nested context, ArtifactRef and ToolCapabilityRef values. Surviving unknown
 fields and model extras reject before field-only rebuilding can discard
-them; already discarded input cannot be recovered. Existing list normalization,
+them; nested values then rebuild against the expected contract schemas,
+so field-overriding subclasses cannot weaken validation. Harmless subclasses
+and existing list/mapping normalization remain supported. Already discarded
+input cannot be recovered. Existing list normalization,
 Task text/metadata bounds, 128 input references, 64 capabilities, unique
 digests/grants, and the strict 1..1,073,741,824 Task output limit are retained.
 
