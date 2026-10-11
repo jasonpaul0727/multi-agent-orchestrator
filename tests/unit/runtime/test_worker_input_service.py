@@ -211,3 +211,40 @@ def test_task_text_absent_from_durable_data_logs_and_errors(case, caplog):
     assert sentinel not in repr(durable_state(case.app))
     assert sentinel not in caplog.text
     assert sentinel not in "".join(traceback.format_exception(caught.value))
+
+
+@pytest.mark.parametrize("invalidity", ["surrogate", "validation"])
+def test_public_admission_detaches_raw_input_exception_objects(case, invalidity):
+    from tests.unit.runtime.test_worker_input import _SENTINEL, _assert_safe_error_object
+
+    case.text = _SENTINEL + "\ud800"
+    if invalidity == "validation":
+        case.text += "x" * 100_001
+    before = durable_state(case.app)
+    with pytest.raises(WorkerInputError) as caught:
+        admit_worker_input_case(case)
+    _assert_safe_error_object(caught.value, "worker_input_invalid")
+    assert durable_state(case.app) == before
+
+
+@pytest.mark.parametrize("fault", ["opaque-code", "code-object", "raw-args", "known-code-cause"])
+def test_public_admission_detaches_nested_errors_and_rejects_opaque_codes(case, monkeypatch, fault):
+    from tests.unit.runtime.test_worker_input import _SENTINEL, _assert_safe_error_object
+
+    before = durable_state(case.app)
+    real = case.app._scheduler.accept_routing
+
+    def fail_after_real(*args, **kwargs):
+        real(*args, **kwargs)
+        if fault == "known-code-cause":
+            raise WorkerInputError("worker_input_too_large") from RuntimeError(_SENTINEL)
+        if fault == "raw-args":
+            raise RuntimeError(_SENTINEL)
+        raise WorkerInputError(_SENTINEL if fault == "opaque-code" else {_SENTINEL: "private"})
+
+    monkeypatch.setattr(case.app._scheduler, "accept_routing", fail_after_real)
+    with pytest.raises(WorkerInputError) as caught:
+        admit_worker_input_case(case)
+    _assert_safe_error_object(caught.value, (
+        "worker_input_too_large" if fault == "known-code-cause" else "worker_input_admission_failed"))
+    assert durable_state(case.app) == before

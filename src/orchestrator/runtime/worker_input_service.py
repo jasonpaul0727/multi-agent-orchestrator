@@ -27,6 +27,7 @@ class WorkerInputService:
         self, request: RoutingRequest, decision: RoutingDecision, *, task_text: str,
         accepted_at: datetime, lease_expires_at: datetime,
     ) -> AcceptedAttempt:
+        error_code = "worker_input_admission_failed"
         try:
             request = revalidate_model(RoutingRequest, request)
             decision = revalidate_model(RoutingDecision, decision)
@@ -65,9 +66,14 @@ class WorkerInputService:
                 raise WorkerInputError("worker_input_admission_failed")
             return result
         except WorkerInputError as exc:
-            raise WorkerInputError(exc.code) from None
+            if type(exc) is WorkerInputError and type(vars(exc).get("code")) is str:
+                for safe_code in ("worker_input_invalid", "worker_input_too_large"):
+                    if vars(exc).get("code") == safe_code:
+                        error_code = safe_code
         except Exception:
-            raise WorkerInputError("worker_input_admission_failed") from None
+            pass
+        # Keep only a trusted code; no caught exception is linked to the result.
+        raise WorkerInputError(error_code) from None
 
 
 __all__ = ["WorkerInputService"]

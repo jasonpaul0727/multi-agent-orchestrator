@@ -64,7 +64,10 @@ the 1,048,576-byte manifest envelope. An unknown key already discarded by
 Pydantic's unsafe `model_construct` cannot be recovered; raw mappings forbid
 unknown keys. Public builder/property errors expose only stable
 `WorkerInputError.code` values (`worker_input_invalid` or
-`worker_input_too_large`) with underlying exception context suppressed.
+`worker_input_too_large`). Guarded builder/property exits retain only trusted
+literal codes and raise a fresh error after leaving their handlers, detaching
+raw underlying exception args, context and cause rather than merely hiding
+their formatted output. Opaque internal codes map to `worker_input_invalid`.
 Task text is omitted from model repr.
 
 Text is compared exactly: it is never trimmed, case-folded, newline-normalized,
@@ -113,8 +116,12 @@ lock, and later graph changes do not alter an accepted Node's role/hash.
 Verification resolution still requires the exact accepted graph version.
 Service errors expose only `WorkerInputError.code`: input validation retains
 `worker_input_invalid`/`worker_input_too_large`; routing, time or durable-state
-failures use `worker_input_admission_failed`, suppressing underlying exception
-context. Task text remains only in request-lifetime host memory.
+failures and opaque internal codes use `worker_input_admission_failed`.
+Admission likewise raises after leaving its handlers, with no owned raw
+exception args, context or cause linked to the public error. These boundaries
+do not clear Python traceback frame locals or host memory, or sanitize arbitrary
+exceptions a caller was already handling. Task text remains in request-lifetime
+host memory.
 
 This commitment proves equality with text supplied at admission, not with
 the original planner input. Canonical admission is implemented; task

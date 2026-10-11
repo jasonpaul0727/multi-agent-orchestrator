@@ -254,3 +254,82 @@ def test_runtime_exports_the_pure_manifest_api() -> None:
     assert exported_error is WorkerInputError
     assert exported_manifest is WorkerInputManifest
     assert exported_builder(**_values()).canonical_bytes == _CANONICAL
+
+
+def _assert_safe_error_object(error: WorkerInputError, code: str) -> None:
+    """Inspect error data itself; formatted suppression does not detach context."""
+    assert error.code == code
+    assert error.args == (code,)
+    seen = set()
+    pending = [error]
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        assert _SENTINEL not in repr(item.args)
+        assert _SENTINEL not in repr(vars(item))
+        if isinstance(item, ValidationError):
+            assert _SENTINEL not in repr(item.errors())
+        pending.extend(link for link in (item.__context__, item.__cause__) if link is not None)
+    assert error.__context__ is None
+    assert error.__cause__ is None
+    assert str(error) == code
+    assert _SENTINEL not in "".join(traceback.format_exception(error))
+
+
+@pytest.mark.parametrize("operation", ["builder", "canonical_bytes", "content_hash"])
+@pytest.mark.parametrize("construction", ["copy", "construct"])
+@pytest.mark.parametrize("invalidity", ["surrogate", "validation"])
+def test_guarded_errors_detach_raw_validation_and_encoding_context(
+    operation, construction, invalidity,
+):
+    text = _SENTINEL + "\ud800"
+    if invalidity == "validation":
+        text += "x" * 100_001
+    with pytest.raises(WorkerInputError) as caught:
+        if operation == "builder":
+            build_worker_input_manifest(**_values(task_text=text))
+        else:
+            value = (WorkerInputManifest(**_values()).model_copy(update={"task_text": text})
+                     if construction == "copy" else
+                     WorkerInputManifest.model_construct(**_values(task_text=text)))
+            getattr(value, operation)
+    _assert_safe_error_object(caught.value, "worker_input_invalid")
+
+
+@pytest.mark.parametrize("operation", ["builder", "canonical_bytes", "content_hash"])
+@pytest.mark.parametrize("fault", ["opaque-code", "code-object", "raw-args", "known-code-cause"])
+def test_guarded_errors_allowlist_internal_codes_and_detach_injected_faults(
+    monkeypatch, operation, fault,
+):
+    value = WorkerInputManifest(**_values())
+
+    def fail(_value):
+        if fault == "known-code-cause":
+            raise WorkerInputError("worker_input_too_large") from RuntimeError(_SENTINEL)
+        if fault == "raw-args":
+            raise RuntimeError(_SENTINEL)
+        raise WorkerInputError(_SENTINEL if fault == "opaque-code" else {_SENTINEL: "private"})
+
+    if operation == "builder":
+        monkeypatch.setattr(WorkerInputManifest, "canonical_bytes", property(fail))
+    elif operation == "canonical_bytes":
+        def fail_revalidation(_model, _value):
+            return fail(_value)
+        monkeypatch.setattr(worker_input, "revalidate_model", fail_revalidation)
+    else:
+        monkeypatch.setattr(worker_input.hashlib, "sha256", fail)
+    with pytest.raises(WorkerInputError) as caught:
+        build_worker_input_manifest(**_values()) if operation == "builder" else getattr(value, operation)
+    _assert_safe_error_object(caught.value, (
+        "worker_input_too_large" if fault == "known-code-cause" else "worker_input_invalid"))
+
+
+@pytest.mark.parametrize("operation", ["builder", "canonical_bytes", "content_hash"])
+def test_too_large_guard_errors_remain_safe_detached_and_stable(monkeypatch, operation):
+    value = WorkerInputManifest(**_values())
+    monkeypatch.setattr(worker_input, "MAX_WORKER_INPUT_FRAME_BYTES", 1)
+    with pytest.raises(WorkerInputError) as caught:
+        build_worker_input_manifest(**_values()) if operation == "builder" else getattr(value, operation)
+    _assert_safe_error_object(caught.value, "worker_input_too_large")

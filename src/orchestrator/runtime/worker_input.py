@@ -58,6 +58,7 @@ class WorkerInputManifest(BaseModel):
 
     @property
     def canonical_bytes(self) -> bytes:
+        error_code = "worker_input_invalid"
         try:
             # The shared helper rebuilds declared fields only. Check surviving
             # unsafe-copy extras first so that rebuilding cannot discard them.
@@ -76,20 +77,30 @@ class WorkerInputManifest(BaseModel):
                 raise WorkerInputError("worker_input_too_large")
             return encoded
         except WorkerInputError as exc:
-            raise WorkerInputError(exc.code) from None
+            if (type(exc) is WorkerInputError
+                and type(vars(exc).get("code")) is str
+                and vars(exc).get("code") == "worker_input_too_large"):
+                error_code = "worker_input_too_large"
         except Exception:
-            raise WorkerInputError("worker_input_invalid") from None
+            pass
+        # Raising within a handler would retain the raw exception in context.
+        raise WorkerInputError(error_code) from None
 
     @property
     def content_hash(self) -> str:
+        error_code = "worker_input_invalid"
         try:
             return "sha256:" + hashlib.sha256(
                 b"maestro.worker-input.v1\x00" + self.canonical_bytes
             ).hexdigest()
         except WorkerInputError as exc:
-            raise WorkerInputError(exc.code) from None
+            if (type(exc) is WorkerInputError
+                and type(vars(exc).get("code")) is str
+                and vars(exc).get("code") == "worker_input_too_large"):
+                error_code = "worker_input_too_large"
         except Exception:
-            raise WorkerInputError("worker_input_invalid") from None
+            pass
+        raise WorkerInputError(error_code) from None
 
 
 def build_worker_input_manifest(
@@ -97,6 +108,7 @@ def build_worker_input_manifest(
 ) -> WorkerInputManifest:
     """Validate and commit supplied input without persisting or executing it."""
 
+    error_code = "worker_input_invalid"
     try:
         value = WorkerInputManifest(
             run_id=run_id, node_id=node_id, role=role, task_text=task_text,
@@ -104,9 +116,13 @@ def build_worker_input_manifest(
         value.canonical_bytes
         return value
     except WorkerInputError as exc:
-        raise WorkerInputError(exc.code) from None
+        if (type(exc) is WorkerInputError
+            and type(vars(exc).get("code")) is str
+            and vars(exc).get("code") == "worker_input_too_large"):
+            error_code = "worker_input_too_large"
     except Exception:
-        raise WorkerInputError("worker_input_invalid") from None
+        pass
+    raise WorkerInputError(error_code) from None
 
 
 __all__ = [
