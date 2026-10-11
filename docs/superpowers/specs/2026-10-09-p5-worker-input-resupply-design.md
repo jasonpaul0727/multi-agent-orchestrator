@@ -1,6 +1,6 @@
 # P5 Worker Input Re-supply and Task Construction Design
 
-**Status:** Written specification approved by the user on 2026-10-10; implementation-plan review/approval still required before product code changes.
+**Status:** Specification and reviewed implementation plan explicitly approved for execution by the user on 2026-10-10. Source implementation independently reviewed and pushed. Final documentation closure is conditional on independent review and controller push/remote verification recorded in the durable delivery ledger.
 **Date:** 2026-10-09 (America/Los_Angeles)
 **Base:** `e521885ba37997f97dc9609ecc960ea961e33bc0`
 **Delivery:** A prerequisite for functional Worker execution, not functional Worker or V1 delivery.
@@ -14,9 +14,9 @@ This specification covers a versioned input commitment, host-owned routing admis
 ## Current evidence and limitation
 
 - `GraphPlanningService` consumes `NodeProposal.task_text` but does not persist it. The frozen planning contract does not contain a digest of that original text.
-- `ControlPlaneApplication.accept_routing()` currently accepts a caller-provided `input_manifest_hash`; Scheduler freezes it together with full Attempt context and the supported verification contract/check set.
+- The compatible low-level `ControlPlaneApplication.accept_routing()` accepts a caller-provided `input_manifest_hash`; the implemented `accept_routing_with_input()` derives the canonical commitment from durable Node authority and exact caller text. Scheduler freezes it together with full Attempt context and the supported verification contract/check set.
 - `Scheduler.resolve_verification_binding()` re-resolves active, current-generation, unexpired Attempt authority from durable state. It is the authority source for this slice.
-- `WorkerTask` already has strict bounded context, text, artifact-reference, capability-reference, and output-limit fields. No production application entry point constructs it.
+- `WorkerTask` has strict bounded context, text, artifact-reference, capability-reference, and output-limit fields. The implemented `ControlPlaneApplication.prepare_worker_task()` constructs task data from one serialized frozen Attempt snapshot; it does not execute a Worker.
 - The production `IsolatedWorkerProcess` remains blocked-only. `AttemptExecutionCoordinator` currently re-verifies an existing proposal and uses trusted usage before proof-gated completion; it does not execute tasks.
 
 Matching a new commitment proves equality with text accepted at routing admission, not equality with text previously consumed by the planner. This slice must not claim to recover original planner text, authenticate caller identity, or prove semantic equivalence. Adding original-planning-input commitments is separate work; raw-text re-supply cannot silently repair missing historical evidence.
@@ -98,10 +98,16 @@ Required new tests, with RED/GREEN where behavior is added:
 7. Sentinel task text does not occur in SQLite event/projection payloads, audit records, captured logs/errors, artifacts, argv, or environment; explicit in-memory task data is the documented exception. No live secrets or paid Provider are needed.
 8. Full repository tests pass with total coverage at least 90%; required existing real systemd isolation tests are not skipped. A task-construction-only test must not be labeled functional Worker execution.
 
-Each approved implementation task uses the retained subagent-driven workflow and independent scoped review. A completed stage is committed and pushed to `codex/p3-systemd-termination-receipts`; the main checkout's unrelated changes remain untouched. This written-spec stage requires self-review, independent documentation review, diff checks, and verified push; it does not reassert old test results as a fresh run.
+Each approved implementation task uses the retained subagent-driven workflow and independent scoped review. Source stages were committed, reviewed and pushed to `codex/p3-systemd-termination-receipts`; the main checkout's unrelated changes remain untouched. Final documentation bookkeeping requires independent documentation review, diff checks, and verified push; its candidate does not reassert source test results as a fresh run.
+
+### Recorded source acceptance and delivery — 2026-10-10
+
+Tested source is `d5436c25aab182170da6634ca068bf06c0f55a17`. Its scoped Task 3 review was Approved; the complete six-commit/fifteen-file range `fd5a9351d2b75f71b72e28442f6143f8f946c9fa..d5436c25aab182170da6634ca068bf06c0f55a17` passed independent whole-branch review with no Critical, Important or new Minor findings. The technical approval did not authorize a merge. The controller pushed that source and verified HEAD, tracking ref and actual remote SHA all equal to the tested source, with a clean checkout. This records the source push only; the later documentation candidate's review and remote equality remain pending.
+
+Source gates in the isolated WSL worktree used `/home/paul2/workspace/multi-agent-orchestrator/.venv/bin/python`, with explicit `PYTHONPATH=src:.`: prescribed focused **552 passed in 98.58s**, affected final-test recheck **10 passed in 21.17s**, and `python -m coverage run -m pytest` **2,074 passed in 401.16s**, zero test skips/warnings. `coverage report` measured **90.41%** total (17,134 statements/1,643 missing); report elision of 28 completely covered files is not a test skip. Required existing real systemd isolation tests ran. Compileall, pip check and whitespace gates exited 0. A normal isolated PEP517 wheel built successfully; its application, contracts and input-service files matched source byte-for-byte. Actual runtime was Python **3.12.3** / Pydantic **2.13.5**; no minimum-version matrix or child-process coverage certification is implied. Detailed command/RED/GREEN provenance remains in the task recovery reports and the [implementation plan](../plans/2026-10-10-p5-worker-input-resupply.md). No source tests or build are rerun for documentation-only bookkeeping.
 
 ## Boundaries and next work
 
 This slice deliberately prepares data before enabling execution. Functional Worker logic, bounded candidate-byte IPC and trusted publication, Model/Tool Gateway integration, production usage/effect receipts, complete interruption recovery, seven-role delegation, semantic/project-test verification, CLI/MCP, and product-wide V1 acceptance remain separate follow-up gates. No offline test substantiates the advertised paid-Provider cost/token/rework improvement numbers.
 
-The next authorized step after written-spec approval is a reviewed implementation plan. Product code must not be added based only on this proposed document, and lack of a user response does not approve new data retention or external effects.
+The human's explicit "继续开发" response after the linked reviewed plan authorized this source implementation; silence was not approval. The source slice is complete. Final documentation delivery becomes complete only when the controller's durable delivery ledger records independent approval of this exact candidate, its push, actual remote equality and clean checkout; those gates are pending at candidate creation, and their later ledger confirmation does not require another tracked-document patch solely to close status. Functional execution and the other follow-up gates above require their own implementation and evidence; this delivery grants no new data-retention or external-effect authority.
