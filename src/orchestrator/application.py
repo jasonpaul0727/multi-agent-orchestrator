@@ -29,6 +29,7 @@ from orchestrator.runtime.verification_journal import (
     VERIFICATION_PROPOSAL_STREAM_TYPE, VerifierProposalJournal, VerifierProposalRecord,
 )
 from orchestrator.runtime.verifier_process import IsolatedVerifierProcess
+from orchestrator.runtime.worker_input_service import WorkerInputService
 from orchestrator.scheduler import AcceptedAttempt, ConcurrencyLimits, Scheduler
 from orchestrator.validation import revalidate_model
 
@@ -93,6 +94,7 @@ class ControlPlaneApplication:
                 if artifact_root is not None else None
             )
             self._scheduler = Scheduler(store, limits=limits, artifact_store=self._artifact_store)
+            self._worker_inputs = WorkerInputService(self._scheduler)
             self._acceptance_coordinator = (
                 AttemptExecutionCoordinator(
                     scheduler=self._scheduler, artifact_store=self._artifact_store,
@@ -246,6 +248,16 @@ class ControlPlaneApplication:
             request, decision, accepted_at=accepted_at, lease_expires_at=lease_expires_at,
             input_manifest_hash=input_manifest_hash, verification_contract=verification_contract,
             required_check_ids=required_check_ids,
+        )
+
+    def accept_routing_with_input(
+        self, request: RoutingRequest, decision: RoutingDecision, *, task_text: str,
+        accepted_at: datetime, lease_expires_at: datetime,
+    ) -> AcceptedAttempt:
+        self._require_ready()
+        return self._worker_inputs.accept_routing_with_input(
+            request, decision, task_text=task_text,
+            accepted_at=accepted_at, lease_expires_at=lease_expires_at,
         )
 
     def accept_verifier_proposal(

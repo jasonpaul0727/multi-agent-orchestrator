@@ -73,15 +73,56 @@ decomposed Unicode change the commitment. Unencodable surrogates fail closed.
 Run, Node and role are also committed, so identical text alone cannot bind
 another identity. This hash is an equality check, with no confidentiality,
 caller-authentication or original-planner-authenticity claim: low-entropy text
-may be guessable, and matching a future admission commitment would prove only
+may be guessable, and matching an admission commitment proves only
 equality with text accepted at that routing admission.
 
-This stage supplies in-memory data only. It adds no persistence, logging,
-input cache, reference resolution, routing admission, task preparation or
-production dispatch. `WORKER_INPUT_OUTPUT_BYTES` fixes the later task output
+The pure manifest supplies in-memory data only. It adds no persistence,
+logging, input cache, reference resolution or production dispatch.
+`WORKER_INPUT_OUTPUT_BYTES` fixes the later task output
 bound at 16,384 bytes; it is not a caller option or an execution capability.
 The production Worker remains blocked-only, and no new production path
 constructs a `WorkerTask`.
+
+## Atomic input-bound routing admission
+
+`ControlPlaneApplication.accept_routing_with_input(request, decision, *,
+task_text, accepted_at, lease_expires_at)` is available after startup recovery
+and rejects calls on a closed application. The application privately owns
+`WorkerInputService`; callers cannot supply a role, input hash, verifier
+contract/check set, context, workspace/path, usage, result or clock through
+this API. The service revalidates routing models, requires the Node's full
+frozen planning contract to agree with its Run, identity, role and routing
+contract hashes, and derives `manifest.content_hash` from durable Node role
+and exact caller text.
+
+One outer `SQLiteEventStore.append_checked` callback serializes that Node
+lookup, commitment calculation and existing `Scheduler.accept_routing` call
+on the same connection. Scheduler retains its readiness, frozen config,
+Registry/policy, budget, Agent, fencing, lease and slot authority. The trusted
+verification binding is fixed to `maestro.artifact-verification/v1` with
+`artifact-integrity` as its only required check. Nested Scheduler savepoints
+commit or roll back together with the outer transaction. No input manifest,
+task text, cache, extra snapshot event or readiness event is persisted.
+Exact retries produce one durable acceptance/resource effect; changed text
+or changed admission authority cannot retrofit an existing commitment.
+The older hash-based admission API remains available with its existing rules.
+
+Concurrent cancellation can reject admission. Graph append retains existing
+Scheduler semantics: admission commits against the graph it reads under the
+lock, and later graph changes do not alter an accepted Node's role/hash.
+Verification resolution still requires the exact accepted graph version.
+Service errors expose only `WorkerInputError.code`: input validation retains
+`worker_input_invalid`/`worker_input_too_large`; routing, time or durable-state
+failures use `worker_input_admission_failed`, suppressing underlying exception
+context. Task text remains only in request-lifetime host memory.
+
+This commitment proves equality with text supplied at admission, not with
+the original planner input. Canonical admission is implemented; task
+preparation, restart re-supply into a `WorkerTask`, automatic execution and a
+functional Worker are still unavailable. The real SQLite tests exercise
+separate owner-thread connections and fresh spawned-process SIGKILL before
+outer commit and after commit; retries do not create partial or duplicate
+reservations, Agents, slots or acceptances.
 
 ## Host-verified termination and staging
 
@@ -236,9 +277,10 @@ This check shares the startup transaction with pending Provider settlement;
 failure rolls back settlement writes and prevents readiness. Historical
 proposals do not require a currently active lease and are never promoted.
 
-The acceptance foundation is implemented; final whole-slice review and push
-remain controller gates. Worker model/tool execution, task-input retention and
-restart resupply, a Worker candidate-byte publisher, Gateway / Approval /
+The acceptance foundation and canonical input-bound admission are implemented;
+final whole-slice review and push remain controller gates. Worker model/tool
+execution, task preparation and restart re-supply, task-input retention,
+a Worker candidate-byte publisher, Gateway / Approval /
 Secret Broker integration, functional Worker crash recovery, CLI/MCP, full
 end-to-end security acceptance, and cost/token/rework benchmarks remain open.
 `NodeProposal.task_text` is consumed but not persisted; no production
