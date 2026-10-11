@@ -1,6 +1,6 @@
 # P5 Worker Input Re-supply and Task Construction Design
 
-**Status:** Proposed written specification; input re-supply direction confirmed in chat, written-spec review and implementation-plan approval still required.
+**Status:** Written specification approved by the user on 2026-10-10; implementation-plan review/approval still required before product code changes.
 **Date:** 2026-10-09 (America/Los_Angeles)
 **Base:** `e521885ba37997f97dc9609ecc960ea961e33bc0`
 **Delivery:** A prerequisite for functional Worker execution, not functional Worker or V1 delivery.
