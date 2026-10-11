@@ -10,9 +10,17 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-10-p5-worker-output-envelope-design.md` (independently reviewed design delivered at `720f1507c2056424703008674e1c070bd48a5773`).
 
-**Authorization and status:** Prepared under the human's explicit self-plan/review-next-task/proceed mandate, with Subagent-driven already selected; this is not a new written-spec human approval. Plan review is required before execution. Source implementation and fresh acceptance measurements are not yet present. Push each completed reviewed stage to the existing `codex/p3-systemd-termination-receipts` branch; no main merge, PR, deployment or publication authority.
+**Authorization and status:** Prepared under the human's explicit self-plan/review-next-task/proceed mandate, with Subagent-driven already selected; this is not a new written-spec human approval. Independent design and amended-plan reviews completed before implementation. Source implementation, exact-source acceptance and final source review are complete; documentation review and controller delivery verification remain pending. Push each completed reviewed stage to the existing `codex/p3-systemd-termination-receipts` branch; no main merge, PR, deployment or publication authority.
 
 **Whole-slice BASE:** `720f1507c2056424703008674e1c070bd48a5773` (before this plan and all new implementation/fix commits). Separately capture the actual task pre-dispatch BASE after reviewed plan delivery for the task review; neither review uses HEAD~1.
+
+## Recorded execution status (2026-10-11)
+
+The actual task pre-dispatch BASE was `d34f61c7a0d7f074bce1212852f4a1de7b3ba939`. The exact tested and reviewed source HEAD is `2f51e3fa31b5952da1c504b805756c6d64072790`; final full acceptance measured its frozen bytes on 2026-10-11 before the source commit. This subsequent closure changes only plan/spec status, not source or tests. Its separate docs-only commit identity belongs in the documentation closure report and controller delivery record, not the historical source-test identity.
+
+`task-1-report.md` in the plan-owned ignored workspace records the real RED/GREEN rounds and repaired-source acceptance: 218 decoder tests passed, 543 focused/runtime/live tests passed in 20.12s, and 2,292 full-suite tests passed in 453.63s. Total statement coverage was 90.49%; decoder coverage was 100.00%. There were zero test skips or warnings, and required existing live systemd tests executed. Compile, dependency, whitespace, isolated wheel build, packaged-source equality and isolated-checkout module-path checks passed on the same source bytes. Earlier source measurements are historical; unchanged-source evidence is retained without rerunning or redating tests for documentation.
+
+Independent task review completed. Whole-slice source review identified one Important nested-subclass revalidation issue; the source fix above and scoped final fix re-review addressed it with no new Critical/Important breakage. Steps 1–6 are satisfied. Step 7 remains open only for independent documentation review and controller push/actual remote equality/clean-state delivery verification; its exact-source acceptance and final source-review portions are complete. Neither Task 1 delivery nor whole-slice delivery is declared complete before those remaining gates. This records only the pure decoder prerequisite, not publisher/transport/functional Worker, paid-Provider or full V1 acceptance.
 
 ## Global Constraints
 
@@ -71,7 +79,7 @@ Ledger: `.superpowers/sdd/2026-10-10-p5-worker-output-envelope/progress.md`. Res
 - Produces `WorkerOutputError(ValueError)` with safe `code` and args; no raw validation detail. Any unsupported constructor code maps to `worker_output_invalid`; check exact string type before comparing allowed literal values, without invoking arbitrary input equality/stringification.
 - Private helper names for fault-injection tests: `_revalidate_task(task: WorkerTask) -> WorkerTask`, `_decode_base64(encoded: str) -> bytes`, `_digest_bytes(content: bytes) -> str`. They grant no authority and are not public adapters.
 
-- [ ] **Step 1: Write fixed-vector and immutable-data RED tests, then establish the new API.**
+- [x] **Step 1: Write fixed-vector and immutable-data RED tests, then establish the new API.**
 
 Use these complete fixture helpers in the new test file; do not import another test module's private fixtures:
 
@@ -151,7 +159,7 @@ def test_binary_zero_order_and_immutable_repr():
 
 Run `env PYTHONPATH=src:. /home/paul2/workspace/multi-agent-orchestrator/.venv/bin/python -m pytest tests/unit/runtime/test_worker_output.py -x`. Initially expect missing-module collection failure, not a failure in fixture construction. Record exact command, failure reason and source state. Introduce the dataclasses/API and minimal decoding for the pinned vectors, then run these tests GREEN; this intermediate implementation is not committed or approved for delivery. Every later round first adds its rejecting/boundary tests and records their genuine behavior failures before implementing them.
 
-- [ ] **Step 2: RED/GREEN strict frame/JSON/model validation.**
+- [x] **Step 2: RED/GREEN strict frame/JSON/model validation.**
 
 Add tests using these vectors and mutation examples:
 
@@ -203,7 +211,7 @@ Repeat shape vectors for missing required root/blob fields, root `result` not an
 
 Implementation order: check `type(payload) is bytes`, nonempty and frame length before parsing; decode strict UTF-8 and reject BOM; `json.loads` uses duplicate-rejecting `object_pairs_hook` and rejecting `parse_constant`. Traverse the parsed JSON tree to reject non-finite floats (including exponent overflow) and unencodable strings before schema rebuilding. Require exact root keys and schema, exact blob dict keys and strict strings; validate fresh `WorkerResult.model_validate(result_mapping)` rather than legacy decoder exception behavior. Do not turn dictionary insertion order or JSON whitespace into a wire canonicality requirement.
 
-- [ ] **Step 3: RED/GREEN canonical content, outcome shapes, matching sets and exact caps.**
+- [x] **Step 3: RED/GREEN canonical content, outcome shapes, matching sets and exact caps.**
 
 ```python
 @pytest.mark.parametrize("encoded", ["YR==", "YQ", "YQ===", "YQ==junk", " YQ==",
@@ -271,7 +279,7 @@ Add explicit cases: empty candidate, blocked/failed with references but no blobs
 
 Implementation phases are global across the matched blob set, never per-blob early integrity/cap exits: (1) check candidate/noncandidate shape and 1..128 unique blob/ref sets, derive `cap = min(valid_task.output_byte_limit, 16_384)` and encoded cap `4*((cap+2)//3)`, and check every encoded-string length before decoding any blob; (2) validate canonical encoding for every blob; (3) classify actual individual/aggregate byte overflow; (4) compare declared sizes and host digests; (5) run shared result binding. `_decode_base64` encodes ASCII strictly, uses `base64.b64decode(..., validate=True)` and requires `base64.b64encode(content).decode("ascii") == encoded`. During phase2 an implementation may count actual bytes and discard content after detecting overflow to avoid retaining oversized aggregate data, but it must still finish remaining encoding validation before raising actual overflow. Malformed encoding within all preliminary bounds takes invalid priority even if another blob has actual overflow. If all encodings are canonical, actual overflow takes too-large priority over any declared-size/digest mismatch. Preliminary frame or encoded-length overflow may reject as too-large before encoding validation. Only after byte integrity and caps, call `validate_worker_result(valid_task,result)` for context, input-alias and declared aggregate. Return a tuple sorted by digest, with references linked to the freshly validated result; result artifact ordering is not rewritten. Do not trust any metadata as host provenance.
 
-- [ ] **Step 4: RED/GREEN unsafe Task and exact binding checks.**
+- [x] **Step 4: RED/GREEN unsafe Task and exact binding checks.**
 
 ```python
 @pytest.mark.parametrize("field,value", [("output_byte_limit",True), ("output_byte_limit",0),
@@ -301,7 +309,7 @@ Add unsafe `model_construct` with missing required fields and type-substituted c
 
 Implement `_revalidate_task` as recursive preflight over model fields and container members: reject surviving `__dict__` names outside the corresponding expected contract class's `model_fields` and nonempty `__pydantic_extra__` before `revalidate_model(WorkerTask,task)`. Expected schemas are the existing WorkerTask, AttemptContext, ArtifactRef and ToolCapabilityRef; never use an untrusted subclass's expanded field set as the allowlist. Add a subclass with an extra declared field to the rejecting tests as well as unsafe model_copy extras. Reject unencodable nested strings and field-only rebuild invalid types; catch cycles/recursion as invalid. Avoid serialization methods on the untrusted model, and do not amend the shared helper. Fresh result models are validated from plain parsed JSON, not accepted model instances.
 
-- [ ] **Step 5: RED/GREEN detached errors, purity and legacy compatibility.**
+- [x] **Step 5: RED/GREEN detached errors, purity and legacy compatibility.**
 
 ```python
 import traceback
@@ -354,7 +362,7 @@ For purity, construct inputs/import module before the guarded call. Inside `monk
 
 Run the growing focused file after each RED/GREEN change. Run existing `tests/unit/runtime/test_contracts.py`, `test_worker_process.py`, `test_artifact_admission.py`, `test_worker_input.py`, `test_worker_input_service.py` and `tests/integration/test_isolated_worker_process.py` from the real WSL user systemd environment. Required live tests must execute with zero skips; unavailable environment is a failed delivery gate, not permission to loosen marks/limits or substitute a pure test.
 
-- [ ] **Step 6: Document, self-review, commit and independently review the task.**
+- [x] **Step 6: Document, self-review, commit and independently review the task.**
 
 Add a pure-output section to `docs/security/worker-runtime.md` showing the exact direct-module import/signature, schema keys, sorted immutable blob mapping, two safe error codes, exact frame/raw/Task caps, canonical Base64 and strict new outcome shape. State explicitly: no publication, origin attestation, active authority, Node success, settlement or Worker execution; current transport remains blocked-only. Describe surviving-extra Task revalidation and detached owned errors without promising memory erasure. Document that 16,384 bytes encode to 21,848 characters before metadata and cannot fit the current default 16,384-byte stdout budget; future integration needs a separately reviewed encoded-frame limit. Preserve publisher digest-lock-before-SQLite/intent/recovery gates in the existing spec; do not claim those solved here. Link focused tests and retain historical test numbers as historical, not new evidence.
 

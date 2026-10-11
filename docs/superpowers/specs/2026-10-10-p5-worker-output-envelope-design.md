@@ -1,9 +1,17 @@
 # P5 Bounded Worker Candidate Byte Envelope
 
 **Date:** 2026-10-10 (America/Los_Angeles)
-**Status:** Architectural specification prepared under the user's explicit instruction to self-plan/review the next task and proceed when sound; independent specification review required before an implementation plan. This is not a claim of written-spec human approval.
+**Status:** Architectural specification and implementation plan independently reviewed; the pure decoder source is implemented, acceptance-recorded and independently reviewed as of 2026-10-11. Preparation remained under the user's explicit self-plan/review-next-task/proceed mandate, not written-spec human approval. Documentation review and controller delivery verification remain pending.
 **Source BASE:** `d274eae71bec4895b744594b3dad4a0c0853b721`
 **Delivery:** A pure output-data prerequisite for trusted publication and functional Worker execution, not either feature or V1 delivery.
+
+## Recorded implementation status (2026-10-11)
+
+The exact tested and reviewed source commit is `2f51e3fa31b5952da1c504b805756c6d64072790`. The final full acceptance on 2026-10-11 was measured on its frozen source bytes before that source commit, not on this subsequent documentation-only closure commit. `task-1-report.md` in the plan-owned ignored workspace records raw commands, source hashes, RED/GREEN rounds and source/wheel equality; earlier source acceptance remains historical.
+
+Recorded repaired-source results: 218 decoder tests passed; 543 focused/runtime/live tests passed in 20.12s; 2,292 full-suite tests passed in 453.63s. Total statement coverage was 90.49% and decoder coverage 100.00%, with zero test skips or warnings, including execution of required existing live systemd tests. Compile, dependency, whitespace, isolated wheel build, packaged-source equality and isolated-checkout module-path checks passed on those source bytes. These measurements are not rerun or redated for documentation-only changes.
+
+Independent architectural and amended-plan reviews completed, followed by task review and whole-slice source review. The whole-slice review's nested-subclass revalidation finding was fixed in the source commit above; its scoped final fix re-review reports all findings addressed and no new Critical/Important breakage. Independent review of this documentation closure, controller push and actual remote/clean verification are still pending; this is not a remote-delivery claim. Publication, transport integration, functional Worker execution, paid-Provider evidence and full V1 remain outside this completed source prerequisite.
 
 ## Intent, authorized scope and assumptions
 
