@@ -173,6 +173,71 @@ are task-construction checks, not functional Worker or semantic acceptance.
 See the [approved design](../superpowers/specs/2026-10-09-p5-worker-input-resupply-design.md)
 and [implementation plan](../superpowers/plans/2026-10-10-p5-worker-input-resupply.md).
 
+## Pure Worker candidate-byte output
+
+The direct module API is
+`from orchestrator.runtime.worker_output import decode_worker_output`, with
+`decode_worker_output(payload: bytes, task: WorkerTask) -> DecodedWorkerOutput`.
+It accepts nonempty exact `bytes` of at most 1,048,576 bytes before parsing.
+The JSON object has exactly `schema`, `result`, and `blobs`, with schema
+`maestro.worker-output.v1`. `result` is a fresh strict `WorkerResult`; each
+blob has exactly the strict strings `digest` and `content_base64`. Invalid
+UTF-8, BOM, duplicate keys, unknown fields at every model level, malformed
+JSON, non-finite numbers (including exponent overflow), unencodable strings,
+and scalar type substitution reject. JSON whitespace and key order are free.
+
+A candidate requires one to 128 unique ArtifactRefs and matching unique
+blobs, with equal digest sets. Blocked/failed results require empty artifacts
+and blobs; the existing failure-code rules still apply. Base64 must be ASCII
+standard RFC 4648, padded where required, with no whitespace, suffixes,
+URL-safe alphabet, or alternate pad bits. Canonical re-encoding must match.
+Each encoded string is bounded before any decoding by
+`4 * ceil(min(task.output_byte_limit, 16_384) / 3)`. All encodings are checked
+before actual byte caps, then declared sizes and host SHA-256 digests. Actual
+individual and aggregate content must fit
+`min(task.output_byte_limit, 16_384)`; declared sizes cannot raise that cap.
+The shared result validator finally checks the full Attempt binding and
+input-digest alias prohibition.
+
+Tasks are recursively revalidated, including unsafe construction/copy and
+nested context, ArtifactRef and ToolCapabilityRef values. Surviving unknown
+fields and model extras reject before field-only rebuilding can discard
+them; already discarded input cannot be recovered. Existing list normalization,
+Task text/metadata bounds, 128 input references, 64 capabilities, unique
+digests/grants, and the strict 1..1,073,741,824 Task output limit are retained.
+
+Frozen, slotted `DecodedWorkerOutput` holds the freshly validated result and
+a tuple of frozen, slotted `DecodedCandidateBlob` objects sorted by digest.
+Each blob links its matching result reference and exact immutable bytes;
+result reference order is preserved. Blob repr/str omits content, and no Task
+text is returned. `WorkerOutputError` exposes only `worker_output_invalid`
+or `worker_output_too_large` in code/args. Preliminary frame/encoded overflow
+or canonical actual-byte overflow is too-large; malformed encoding within
+preliminary bounds is invalid, before actual overflow or integrity checks.
+Owned exceptions are detached by raising after their handlers, without raw
+validation detail or linked cause/context. Explicit byte access, traceback
+frame locals, prior caller exceptions and host memory are outside these
+privacy guarantees; no memory erasure is promised.
+
+The decoder performs no I/O, publication, origin attestation, active-authority
+resolution, Node success, settlement, event write, Verifier call or Worker
+execution. Acceptance is data validation only. Production transport remains
+blocked-only. A 16,384-byte artifact requires 21,848 Base64 characters before
+metadata and cannot fit the current default 16,384-byte stdout budget. Future
+integration needs a separately reviewed encoded-frame budget. Trusted
+publication must still address fresh durable Attempt authority, host-derived
+metadata, digest-lock-before-SQLite ordering, publication intent and uncertain
+crash recovery as specified in the
+[output design](../superpowers/specs/2026-10-10-p5-worker-output-envelope-design.md).
+
+The focused [decoder tests](../../tests/unit/runtime/test_worker_output.py)
+cover fixed/binary/zero-byte vectors, natural limits, canonicality and global
+error precedence in both blob orders, strict model/frame inputs, unsafe Tasks,
+immutable mapping, detached injected errors and guarded no-I/O behavior.
+Those pure checks are not process-isolation or functional-execution evidence.
+Historical measurements elsewhere in this document describe their dated
+slices, not this decoder's current acceptance gate.
+
 ## Host-verified termination and staging
 
 For the systemd launcher, child/transport exit and an accepted `systemctl kill`
