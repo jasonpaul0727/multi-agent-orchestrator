@@ -41,6 +41,48 @@ input writes, malformed output, child errors, unconfirmed termination, and
 any unauthorized candidate. This is a process-boundary smoke test, not a
 functional Agent; the Worker cannot yet publish output.
 
+## Pure Worker input commitment
+
+`orchestrator.runtime.worker_input` defines the frozen, strict
+`WorkerInputManifest` and `build_worker_input_manifest` data API. Its fields
+are schema `maestro.worker-input.v1`, Run and Node identifiers with the same
+1–128-character ASCII shape as `AttemptContext`, the existing authoritative
+`RoleName`, nonblank task text of at most 100,000 characters, and an empty
+input-artifact tuple. Unknown fields, unsupported schema/roles, and nonempty
+artifact arrays are rejected. The builder receives the host-selected Run,
+Node and role; this pure module does not resolve their durable authority.
+
+Only `canonical_bytes` defines this commitment's wire protocol: JSON uses the
+`schema` alias, sorted keys, compact separators, `ensure_ascii=False` and
+`allow_nan=False`, encoded as strict UTF-8. Native Pydantic dump methods are
+model inspection/explicit serialization interfaces; their default output
+must not replace these canonical bytes. `content_hash` is `sha256:` followed
+by the lowercase digest of `b"maestro.worker-input.v1\x00" + canonical_bytes`.
+Both properties rebuild and validate unsafe copied/constructed models,
+reject surviving unknown object fields/extras before rebuilding, and enforce
+the 1,048,576-byte manifest envelope. An unknown key already discarded by
+Pydantic's unsafe `model_construct` cannot be recovered; raw mappings forbid
+unknown keys. Public builder/property errors expose only stable
+`WorkerInputError.code` values (`worker_input_invalid` or
+`worker_input_too_large`) with underlying exception context suppressed.
+Task text is omitted from model repr.
+
+Text is compared exactly: it is never trimmed, case-folded, newline-normalized,
+or Unicode-normalized. Leading/trailing whitespace, CRLF/LF, and composed/
+decomposed Unicode change the commitment. Unencodable surrogates fail closed.
+Run, Node and role are also committed, so identical text alone cannot bind
+another identity. This hash is an equality check, with no confidentiality,
+caller-authentication or original-planner-authenticity claim: low-entropy text
+may be guessable, and matching a future admission commitment would prove only
+equality with text accepted at that routing admission.
+
+This stage supplies in-memory data only. It adds no persistence, logging,
+input cache, reference resolution, routing admission, task preparation or
+production dispatch. `WORKER_INPUT_OUTPUT_BYTES` fixes the later task output
+bound at 16,384 bytes; it is not a caller option or an execution capability.
+The production Worker remains blocked-only, and no new production path
+constructs a `WorkerTask`.
+
 ## Host-verified termination and staging
 
 For the systemd launcher, child/transport exit and an accepted `systemctl kill`

@@ -20,6 +20,13 @@ from .contracts import (
     validate_worker_result,
 )
 from .verifier_process import IsolatedVerifierProcess, VerifierProcessError
+from .worker_input import (
+    MAX_WORKER_INPUT_FRAME_BYTES,
+    WORKER_INPUT_OUTPUT_BYTES,
+    WorkerInputError,
+    WorkerInputManifest,
+    build_worker_input_manifest,
+)
 from .verification_journal import (
     VerifierProposalJournal,
     VerifierProposalJournalError,
@@ -32,6 +39,7 @@ __all__ = [
     "BUILTIN_VERIFICATION_CONTRACT_ID",
     "BUILTIN_VERIFIER_ID",
     "IsolatedVerifierProcess",
+    "MAX_WORKER_INPUT_FRAME_BYTES",
     "RuntimeContractError",
     "SUPPORTED_VERIFICATION_CHECK_IDS",
     "ToolCapabilityRef",
@@ -44,6 +52,10 @@ __all__ = [
     "VerifierProposalRecord",
     "WorkerResult",
     "WorkerTask",
+    "WORKER_INPUT_OUTPUT_BYTES",
+    "WorkerInputError",
+    "WorkerInputManifest",
+    "build_worker_input_manifest",
     "decode_verification_evidence",
     "decode_worker_result",
     "validate_verification_evidence",
