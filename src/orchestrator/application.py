@@ -29,6 +29,7 @@ from orchestrator.runtime.verification_journal import (
     VERIFICATION_PROPOSAL_STREAM_TYPE, VerifierProposalJournal, VerifierProposalRecord,
 )
 from orchestrator.runtime.verifier_process import IsolatedVerifierProcess
+from orchestrator.runtime.contracts import WorkerTask
 from orchestrator.runtime.worker_input_service import WorkerInputService
 from orchestrator.scheduler import AcceptedAttempt, ConcurrencyLimits, Scheduler
 from orchestrator.validation import revalidate_model
@@ -258,6 +259,16 @@ class ControlPlaneApplication:
         return self._worker_inputs.accept_routing_with_input(
             request, decision, task_text=task_text,
             accepted_at=accepted_at, lease_expires_at=lease_expires_at,
+        )
+
+    def prepare_worker_task(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, task_text: str,
+    ) -> WorkerTask:
+        self._require_ready()
+        return self._worker_inputs.prepare_worker_task(
+            run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+            fencing_generation=fencing_generation, task_text=task_text,
         )
 
     def accept_verifier_proposal(

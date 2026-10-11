@@ -106,7 +106,9 @@ Run lifecycle 在初始化、图变更、Run 状态和 Attempt 变化后写入�
 
 已实现确定性 Verifier proposal 的持久化、完整 journal 重放与宿主 proof-gated acceptance：宿主重验冻结上下文、精确产物来源和内置 Verifier 证据，在同一 SQLite 事务里提交生命周期成功、Agent 完成、预算结算与 slot 释放；proposal 本身不授权成功，启动会校验所有 proposal 流且不会自动提升 proposal-only 结果。当前内置 Verifier 只在 systemd 只读沙箱检查 ArtifactStore 精确 Attempt 产物的哈希/大小、UTF-8、JSON 或 Python 语法；它不运行项目测试、不作语义审查。
 
-仍未实现：workspace-write 与 Scheduler/Worker 的安全服务接线、Secret Broker 与真实 Worker 的端到端接线、能生成候选产物的功能 Worker、候选发布与 task-input 保留/恢复设计、节点语义验收与项目测试验证、Gateway/effect 的完整 Worker 集成、CLI、MCP Server、完整安全验收、真实 Provider 基准及跨流完整崩溃恢复。Provider 对账已有可信服务边界，但生产权威查询/费用后端仍不可用；未决发布意图会 fail-closed，但没有自动跨流 reconciliation service。V1 仍未完成，当前交付仍不是可完整运行的多 Agent 产品。
+输入补供已接入 `accept_routing_with_input` 和 `prepare_worker_task`：调用方每次显式提供原样文本，宿主在 SQLite 序列化锁内采样 UTC 时间，核对活动 Attempt 的冻结输入承诺、角色、图和配置后，返回有界 `WorkerTask` 数据。新进程可为仍有效的 Attempt 补供相同文本；缺失、变化、过期、取消、终态或陈旧绑定均拒绝。文本不落盘、不缓存，任务 repr 隐藏文本而显式 JSON 保留原文。准备本身不执行 Worker，也不产生事件或资源效果；后续 dispatch 必须重新核对权限。这证明文本与 admission 输入相同，不能证明它与原始 planner 输入相同。见[批准设计](docs/superpowers/specs/2026-10-09-p5-worker-input-resupply-design.md)、[实施计划](docs/superpowers/plans/2026-10-10-p5-worker-input-resupply.md)和[运行时边界](docs/security/worker-runtime.md)。
+
+仍未实现：workspace-write 与 Scheduler/Worker 的安全服务接线、Secret Broker 与真实 Worker 的端到端接线、能生成候选产物的功能 Worker、候选发布与受保护的 task-input 持久保留、节点语义验收与项目测试验证、Gateway/effect 的完整 Worker 集成、CLI、MCP Server、完整安全验收、真实 Provider 基准及跨流完整崩溃恢复。Provider 对账已有可信服务边界，但生产权威查询/费用后端仍不可用；未决发布意图会 fail-closed，但没有自动跨流 reconciliation service。V1 仍未完成，当前交付仍不是可完整运行的多 Agent 产品。
 
 ### 预算生命周期
 

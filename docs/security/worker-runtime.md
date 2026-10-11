@@ -83,8 +83,8 @@ The pure manifest supplies in-memory data only. It adds no persistence,
 logging, input cache, reference resolution or production dispatch.
 `WORKER_INPUT_OUTPUT_BYTES` fixes the later task output
 bound at 16,384 bytes; it is not a caller option or an execution capability.
-The production Worker remains blocked-only, and no new production path
-constructs a `WorkerTask`.
+The production Worker remains blocked-only. The host preparation API below
+constructs bounded `WorkerTask` data from frozen Attempt authority.
 
 ## Atomic input-bound routing admission
 
@@ -124,12 +124,54 @@ exceptions a caller was already handling. Task text remains in request-lifetime
 host memory.
 
 This commitment proves equality with text supplied at admission, not with
-the original planner input. Canonical admission is implemented; task
-preparation, restart re-supply into a `WorkerTask`, automatic execution and a
-functional Worker are still unavailable. The real SQLite tests exercise
+the original planner input. Canonical admission and explicit task preparation
+are implemented. Automatic execution and a functional Worker remain unavailable.
+The real SQLite tests exercise
 separate owner-thread connections and fresh spawned-process SIGKILL before
 outer commit and after commit; retries do not create partial or duplicate
 reservations, Agents, slots or acceptances.
+
+## Frozen task preparation and explicit re-supply
+
+`ControlPlaneApplication.prepare_worker_task(*, run_id, node_id, attempt_id,
+fencing_generation, task_text)` requires a ready application and exact caller
+text on every call. Identities use `AttemptContext`'s strict ASCII bounds and
+a positive integer fencing generation; bool is rejected. A single outer
+checked-append transaction samples the private host clock after acquiring the
+SQLite lock, validates aware UTC, and resolves the current active, unexpired
+verification binding on the same connection. The frozen Node role, planning
+contract, graph version, config, Registry and policy identities must agree.
+Preparation compares the canonical manifest `content_hash` with the frozen
+input commitment, using constant-time digest comparison.
+
+The returned task carries that immutable context, authoritative role, exact
+text, empty artifact/capability tuples and a fixed 16,384-byte output limit.
+Its strict UTF-8 JSON frame must fit 1,048,576 bytes. Task repr omits plaintext;
+explicit JSON serialization deliberately retains it. Preparation creates no
+event, idempotency record, reservation, Agent, slot, artifact or execution
+effect. Errors expose only trusted literal codes: `worker_input_invalid`,
+`worker_input_too_large`, `worker_input_mismatch`, or the generic
+`worker_input_preparation_failed`. Owned underlying args/context/cause are
+detached after leaving exception handlers, subject to the same frame-local,
+host-memory and existing-caller-exception limits described above.
+
+Fresh-process restart permits exact re-supply only while the original authority
+is active and unexpired. Missing/changed input, absent/arbitrary legacy hashes,
+cancelled/terminal/stale authority and graph changes fail closed; no commitment
+is retrofitted. Independent config reload cannot replace the Run's frozen
+hashes. Inputs remain in host/returned-task memory for the request lifetime,
+with no cache or durable text store. Startup never prepares or executes tasks.
+The validity point is the clock sample under the serialization lock. A returned
+task is data, not continuing permission to execute: future dispatch and result
+acceptance must independently recheck authority.
+
+The real SQLite tests cover lock waiting across the exact lease deadline,
+both cancellation/graph serialization orders, fresh spawned-process re-supply,
+frozen config reload, injected errors after the binding read, detached error
+objects and sentinel absence from durable payloads/logs/database bytes. These
+are task-construction checks, not functional Worker or semantic acceptance.
+See the [approved design](../superpowers/specs/2026-10-09-p5-worker-input-resupply-design.md)
+and [implementation plan](../superpowers/plans/2026-10-10-p5-worker-input-resupply.md).
 
 ## Host-verified termination and staging
 
@@ -284,14 +326,14 @@ This check shares the startup transaction with pending Provider settlement;
 failure rolls back settlement writes and prevents readiness. Historical
 proposals do not require a currently active lease and are never promoted.
 
-The acceptance foundation and canonical input-bound admission are implemented;
+The acceptance foundation, canonical input-bound admission and frozen task preparation are implemented;
 final whole-slice review and push remain controller gates. Worker model/tool
-execution, task preparation and restart re-supply, task-input retention,
+execution, task-input retention,
 a Worker candidate-byte publisher, Gateway / Approval /
 Secret Broker integration, functional Worker crash recovery, CLI/MCP, full
 end-to-end security acceptance, and cost/token/rework benchmarks remain open.
-`NodeProposal.task_text` is consumed but not persisted; no production
-`WorkerTask` is constructed. The production Worker remains blocked-only and
+`NodeProposal.task_text` is consumed but not persisted; explicit caller re-supply
+can construct bounded `WorkerTask` data. The production Worker remains blocked-only and
 V1 is not complete.
 
 The new `SystemdOverlayCandidateLauncher` is a separate internal command
