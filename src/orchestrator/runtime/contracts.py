@@ -89,7 +89,7 @@ class WorkerTask(_ContractModel):
 
     context: AttemptContext
     role: StrictStr = Field(min_length=1, max_length=64, pattern=_IDENTIFIER.pattern)
-    task_text: StrictStr = Field(min_length=1, max_length=100_000)
+    task_text: StrictStr = Field(min_length=1, max_length=100_000, repr=False)
     input_artifacts: tuple[ArtifactRef, ...] = Field(max_length=_MAX_ARTIFACTS)
     tool_capabilities: tuple[ToolCapabilityRef, ...] = Field(max_length=64)
     output_byte_limit: StrictInt = Field(ge=1, le=1_073_741_824)

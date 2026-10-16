@@ -84,6 +84,16 @@ def test_worker_task_contains_only_bounded_scoped_inputs() -> None:
     assert "credential" not in task.model_dump()
 
 
+def test_worker_task_repr_omits_text_without_changing_explicit_wire() -> None:
+    sentinel = "private-worker-task-repr-sentinel-145f"
+    text = sentinel + "\r\né"
+    task = _task(task_text=text)
+    assert sentinel not in repr(task)
+    assert sentinel not in str(task)
+    assert task.model_dump(mode="json")["task_text"] == text
+    assert WorkerTask.model_validate_json(task.model_dump_json()) == task
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

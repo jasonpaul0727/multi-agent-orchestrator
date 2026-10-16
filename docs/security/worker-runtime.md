@@ -41,6 +41,206 @@ input writes, malformed output, child errors, unconfirmed termination, and
 any unauthorized candidate. This is a process-boundary smoke test, not a
 functional Agent; the Worker cannot yet publish output.
 
+## Pure Worker input commitment
+
+`orchestrator.runtime.worker_input` defines the frozen, strict
+`WorkerInputManifest` and `build_worker_input_manifest` data API. Its fields
+are schema `maestro.worker-input.v1`, Run and Node identifiers with the same
+1–128-character ASCII shape as `AttemptContext`, the existing authoritative
+`RoleName`, nonblank task text of at most 100,000 characters, and an empty
+input-artifact tuple. Unknown fields, unsupported schema/roles, and nonempty
+artifact arrays are rejected. The builder receives the host-selected Run,
+Node and role; this pure module does not resolve their durable authority.
+
+Only `canonical_bytes` defines this commitment's wire protocol: JSON uses the
+`schema` alias, sorted keys, compact separators, `ensure_ascii=False` and
+`allow_nan=False`, encoded as strict UTF-8. Native Pydantic dump methods are
+model inspection/explicit serialization interfaces; their default output
+must not replace these canonical bytes. `content_hash` is `sha256:` followed
+by the lowercase digest of `b"maestro.worker-input.v1\x00" + canonical_bytes`.
+Both properties rebuild and validate unsafe copied/constructed models,
+reject surviving unknown object fields/extras before rebuilding, and enforce
+the 1,048,576-byte manifest envelope. An unknown key already discarded by
+Pydantic's unsafe `model_construct` cannot be recovered; raw mappings forbid
+unknown keys. Public builder/property errors expose only stable
+`WorkerInputError.code` values (`worker_input_invalid` or
+`worker_input_too_large`). Guarded builder/property exits retain only trusted
+literal codes and raise a fresh error after leaving their handlers, detaching
+raw underlying exception args, context and cause rather than merely hiding
+their formatted output. Opaque internal codes map to `worker_input_invalid`.
+Task text is omitted from model repr.
+
+Text is compared exactly: it is never trimmed, case-folded, newline-normalized,
+or Unicode-normalized. Leading/trailing whitespace, CRLF/LF, and composed/
+decomposed Unicode change the commitment. Unencodable surrogates fail closed.
+Run, Node and role are also committed, so identical text alone cannot bind
+another identity. This hash is an equality check, with no confidentiality,
+caller-authentication or original-planner-authenticity claim: low-entropy text
+may be guessable, and matching an admission commitment proves only
+equality with text accepted at that routing admission.
+
+The pure manifest supplies in-memory data only. It adds no persistence,
+logging, input cache, reference resolution or production dispatch.
+`WORKER_INPUT_OUTPUT_BYTES` fixes the later task output
+bound at 16,384 bytes; it is not a caller option or an execution capability.
+The production Worker remains blocked-only. The host preparation API below
+constructs bounded `WorkerTask` data from frozen Attempt authority.
+
+## Atomic input-bound routing admission
+
+`ControlPlaneApplication.accept_routing_with_input(request, decision, *,
+task_text, accepted_at, lease_expires_at)` is available after startup recovery
+and rejects calls on a closed application. The application privately owns
+`WorkerInputService`; callers cannot supply a role, input hash, verifier
+contract/check set, context, workspace/path, usage, result or clock through
+this API. The service revalidates routing models, requires the Node's full
+frozen planning contract to agree with its Run, identity, role and routing
+contract hashes, and derives `manifest.content_hash` from durable Node role
+and exact caller text.
+
+One outer `SQLiteEventStore.append_checked` callback serializes that Node
+lookup, commitment calculation and existing `Scheduler.accept_routing` call
+on the same connection. Scheduler retains its readiness, frozen config,
+Registry/policy, budget, Agent, fencing, lease and slot authority. The trusted
+verification binding is fixed to `maestro.artifact-verification/v1` with
+`artifact-integrity` as its only required check. Nested Scheduler savepoints
+commit or roll back together with the outer transaction. No input manifest,
+task text, cache, extra snapshot event or readiness event is persisted.
+Exact retries produce one durable acceptance/resource effect; changed text
+or changed admission authority cannot retrofit an existing commitment.
+The older hash-based admission API remains available with its existing rules.
+
+Concurrent cancellation can reject admission. Graph append retains existing
+Scheduler semantics: admission commits against the graph it reads under the
+lock, and later graph changes do not alter an accepted Node's role/hash.
+Verification resolution still requires the exact accepted graph version.
+Service errors expose only `WorkerInputError.code`: input validation retains
+`worker_input_invalid`/`worker_input_too_large`; routing, time or durable-state
+failures and opaque internal codes use `worker_input_admission_failed`.
+Admission likewise raises after leaving its handlers, with no owned raw
+exception args, context or cause linked to the public error. These boundaries
+do not clear Python traceback frame locals or host memory, or sanitize arbitrary
+exceptions a caller was already handling. Task text remains in request-lifetime
+host memory.
+
+This commitment proves equality with text supplied at admission, not with
+the original planner input. Canonical admission and explicit task preparation
+are implemented. Automatic execution and a functional Worker remain unavailable.
+The real SQLite tests exercise
+separate owner-thread connections and fresh spawned-process SIGKILL before
+outer commit and after commit; retries do not create partial or duplicate
+reservations, Agents, slots or acceptances.
+
+## Frozen task preparation and explicit re-supply
+
+`ControlPlaneApplication.prepare_worker_task(*, run_id, node_id, attempt_id,
+fencing_generation, task_text)` requires a ready application and exact caller
+text on every call. Identities use `AttemptContext`'s strict ASCII bounds and
+a positive integer fencing generation; bool is rejected. A single outer
+checked-append transaction samples the private host clock after acquiring the
+SQLite lock, validates aware UTC, and resolves the current active, unexpired
+verification binding on the same connection. The frozen Node role, planning
+contract, graph version, config, Registry and policy identities must agree.
+Preparation compares the canonical manifest `content_hash` with the frozen
+input commitment, using constant-time digest comparison.
+
+The returned task carries that immutable context, authoritative role, exact
+text, empty artifact/capability tuples and a fixed 16,384-byte output limit.
+Its strict UTF-8 JSON frame must fit 1,048,576 bytes. Task repr omits plaintext;
+explicit JSON serialization deliberately retains it. Preparation creates no
+event, idempotency record, reservation, Agent, slot, artifact or execution
+effect. Errors expose only trusted literal codes: `worker_input_invalid`,
+`worker_input_too_large`, `worker_input_mismatch`, or the generic
+`worker_input_preparation_failed`. Owned underlying args/context/cause are
+detached after leaving exception handlers, subject to the same frame-local,
+host-memory and existing-caller-exception limits described above.
+
+Fresh-process restart permits exact re-supply only while the original authority
+is active and unexpired. Missing/changed input, absent/arbitrary legacy hashes,
+cancelled/terminal/stale authority and graph changes fail closed; no commitment
+is retrofitted. Independent config reload cannot replace the Run's frozen
+hashes. Inputs remain in host/returned-task memory for the request lifetime,
+with no cache or durable text store. Startup never prepares or executes tasks.
+The validity point is the clock sample under the serialization lock. A returned
+task is data, not continuing permission to execute: future dispatch and result
+acceptance must independently recheck authority.
+
+The real SQLite tests cover lock waiting across the exact lease deadline,
+both cancellation/graph serialization orders, fresh spawned-process re-supply,
+frozen config reload, injected errors after the binding read, detached error
+objects and sentinel absence from durable payloads/logs/database bytes. These
+are task-construction checks, not functional Worker or semantic acceptance.
+See the [approved design](../superpowers/specs/2026-10-09-p5-worker-input-resupply-design.md)
+and [implementation plan](../superpowers/plans/2026-10-10-p5-worker-input-resupply.md).
+
+## Pure Worker candidate-byte output
+
+The direct module API is
+`from orchestrator.runtime.worker_output import decode_worker_output`, with
+`decode_worker_output(payload: bytes, task: WorkerTask) -> DecodedWorkerOutput`.
+It accepts nonempty exact `bytes` of at most 1,048,576 bytes before parsing.
+The JSON object has exactly `schema`, `result`, and `blobs`, with schema
+`maestro.worker-output.v1`. `result` is a fresh strict `WorkerResult`; each
+blob has exactly the strict strings `digest` and `content_base64`. Invalid
+UTF-8, BOM, duplicate keys, unknown fields at every model level, malformed
+JSON, non-finite numbers (including exponent overflow), unencodable strings,
+and scalar type substitution reject. JSON whitespace and key order are free.
+
+A candidate requires one to 128 unique ArtifactRefs and matching unique
+blobs, with equal digest sets. Blocked/failed results require empty artifacts
+and blobs; the existing failure-code rules still apply. Base64 must be ASCII
+standard RFC 4648, padded where required, with no whitespace, suffixes,
+URL-safe alphabet, or alternate pad bits. Canonical re-encoding must match.
+Each encoded string is bounded before any decoding by
+`4 * ceil(min(task.output_byte_limit, 16_384) / 3)`. All encodings are checked
+before actual byte caps, then declared sizes and host SHA-256 digests. Actual
+individual and aggregate content must fit
+`min(task.output_byte_limit, 16_384)`; declared sizes cannot raise that cap.
+The shared result validator finally checks the full Attempt binding and
+input-digest alias prohibition.
+
+Tasks are recursively revalidated, including unsafe construction/copy and
+nested context, ArtifactRef and ToolCapabilityRef values. Surviving unknown
+fields and model extras reject before field-only rebuilding can discard
+them; nested values then rebuild against the expected contract schemas,
+so field-overriding subclasses cannot weaken validation. Harmless subclasses
+and existing list/mapping normalization remain supported. Already discarded
+input cannot be recovered. Existing list normalization,
+Task text/metadata bounds, 128 input references, 64 capabilities, unique
+digests/grants, and the strict 1..1,073,741,824 Task output limit are retained.
+
+Frozen, slotted `DecodedWorkerOutput` holds the freshly validated result and
+a tuple of frozen, slotted `DecodedCandidateBlob` objects sorted by digest.
+Each blob links its matching result reference and exact immutable bytes;
+result reference order is preserved. Blob repr/str omits content, and no Task
+text is returned. `WorkerOutputError` exposes only `worker_output_invalid`
+or `worker_output_too_large` in code/args. Preliminary frame/encoded overflow
+or canonical actual-byte overflow is too-large; malformed encoding within
+preliminary bounds is invalid, before actual overflow or integrity checks.
+Owned exceptions are detached by raising after their handlers, without raw
+validation detail or linked cause/context. Explicit byte access, traceback
+frame locals, prior caller exceptions and host memory are outside these
+privacy guarantees; no memory erasure is promised.
+
+The decoder performs no I/O, publication, origin attestation, active-authority
+resolution, Node success, settlement, event write, Verifier call or Worker
+execution. Acceptance is data validation only. Production transport remains
+blocked-only. A 16,384-byte artifact requires 21,848 Base64 characters before
+metadata and cannot fit the current default 16,384-byte stdout budget. Future
+integration needs a separately reviewed encoded-frame budget. Trusted
+publication must still address fresh durable Attempt authority, host-derived
+metadata, digest-lock-before-SQLite ordering, publication intent and uncertain
+crash recovery as specified in the
+[output design](../superpowers/specs/2026-10-10-p5-worker-output-envelope-design.md).
+
+The focused [decoder tests](../../tests/unit/runtime/test_worker_output.py)
+cover fixed/binary/zero-byte vectors, natural limits, canonicality and global
+error precedence in both blob orders, strict model/frame inputs, unsafe Tasks,
+immutable mapping, detached injected errors and guarded no-I/O behavior.
+Those pure checks are not process-isolation or functional-execution evidence.
+Historical measurements elsewhere in this document describe their dated
+slices, not this decoder's current acceptance gate.
+
 ## Host-verified termination and staging
 
 For the systemd launcher, child/transport exit and an accepted `systemctl kill`
@@ -194,13 +394,14 @@ This check shares the startup transaction with pending Provider settlement;
 failure rolls back settlement writes and prevents readiness. Historical
 proposals do not require a currently active lease and are never promoted.
 
-The acceptance foundation is implemented; final whole-slice review and push
-remain controller gates. Worker model/tool execution, task-input retention and
-restart resupply, a Worker candidate-byte publisher, Gateway / Approval /
+The acceptance foundation, canonical input-bound admission and frozen task preparation are implemented;
+final whole-slice review and push remain controller gates. Worker model/tool
+execution, task-input retention,
+a Worker candidate-byte publisher, Gateway / Approval /
 Secret Broker integration, functional Worker crash recovery, CLI/MCP, full
 end-to-end security acceptance, and cost/token/rework benchmarks remain open.
-`NodeProposal.task_text` is consumed but not persisted; no production
-`WorkerTask` is constructed. The production Worker remains blocked-only and
+`NodeProposal.task_text` is consumed but not persisted; explicit caller re-supply
+can construct bounded `WorkerTask` data. The production Worker remains blocked-only and
 V1 is not complete.
 
 The new `SystemdOverlayCandidateLauncher` is a separate internal command
