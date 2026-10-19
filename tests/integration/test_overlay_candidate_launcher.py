@@ -289,6 +289,50 @@ def test_stopped_final_view_exports_removals_without_publishing(tmp_path, operat
     assert not (workspace / "renamed").exists() and not (workspace / "renamed.txt").exists()
 
 
+def test_nested_candidate_edit_keeps_unchanged_ancestor_scaffolds_private(tmp_path):
+    workspace = tmp_path / "workspace"
+    (workspace / "a/b").mkdir(parents=True)
+    (workspace / "a/b/file").write_text("original")
+    with isolation.SystemdOverlayCandidateLauncher().launch(
+        workspace, ["/usr/bin/python3", "-c", "from pathlib import Path; Path('a/b/file').write_text('candidate')"],
+    ) as session:
+        result = session.wait()
+        assert result.execution.returncode == 0, result.execution.stderr.decode(errors="replace")
+        assert result.execution.termination_confirmed and result.diff is not None
+        assert [(e.path, e.operation) for e in result.diff.entries] == [("a/b/file", "modify")]
+        assert (result.diff.candidate_root / "a").stat().st_mode & 0o777 == 0o700
+        assert (result.diff.candidate_root / "a/b").stat().st_mode & 0o777 == 0o700
+        assert (result.diff.candidate_root / "a/b/file").read_text() == "candidate"
+        isolation.validate_overlay_candidate(result.lower_root, result.diff)
+    assert (workspace / "a/b/file").read_text() == "original"
+
+
+@pytest.mark.parametrize("unchanged", [False, True])
+def test_live_candidate_rejects_composed_symlink_escape(tmp_path, unchanged):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "original").write_bytes(b"original")
+    (tmp_path / "outside").write_bytes(b"outside sentinel")
+    if unchanged:
+        (workspace / "a").mkdir()
+        (workspace / "a/b").symlink_to("..")
+        (workspace / "a/c").symlink_to("b/../outside")
+        command = "pass"
+    else:
+        command = "from pathlib import Path; Path('a').mkdir(); Path('a/b').symlink_to('..'); Path('a/c').symlink_to('b/../outside')"
+    with isolation.SystemdOverlayCandidateLauncher().launch(
+        workspace, ["/usr/bin/python3", "-c", command],
+    ) as session:
+        result = session.wait()
+        assert result.execution.termination_confirmed
+        assert result.execution.returncode != 0 and result.diff is None
+        assert b"symlink chain escapes" in result.execution.stderr
+    assert (workspace / "original").read_bytes() == b"original"
+    assert (tmp_path / "outside").read_bytes() == b"outside sentinel"
+    if not unchanged:
+        assert not (workspace / "a").exists()
+
+
 @pytest.mark.parametrize(("kind", "code"), [
     ("timeout", "import time; time.sleep(20)"),
     ("output", "import os;\nwhile True: os.write(1, b'x'*4096)"),

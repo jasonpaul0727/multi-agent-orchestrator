@@ -5,6 +5,7 @@ whiteout. Candidate storage contains only changed payloads and parent scaffolds.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import hashlib
 import json
@@ -69,6 +70,47 @@ def _names(fd: int, limit: int) -> list[str]:
     return sorted(names)
 
 
+def _validate_symlink_chains(items: dict[str, _Item], max_depth: int) -> None:
+    """Resolve only descriptor-inventoried entries, never host-follow a link.
+
+    Expansion precedes ``..`` processing, matching filesystem resolution. The
+    same resolver can inspect a complete view or a baseline/payload composition
+    without materializing that composition or opening any external destination.
+    Missing paths may remain dangling, but cannot hide a lexical root escape.
+    """
+    for path, item in items.items():
+        if item.kind != "symlink":
+            continue
+        pending = deque(path.split("/"))
+        resolved: list[str] = []
+        links = 0
+        steps = 0
+        while pending:
+            steps += 1
+            if steps > 41 * (max_depth + 1):
+                raise WorkspaceBoundaryError("symlink resolution exceeds its path bound")
+            component = pending.popleft()
+            if component in ("", "."):
+                continue
+            if component == "..":
+                if not resolved:
+                    raise WorkspaceBoundaryError("symlink chain escapes its workspace root")
+                resolved.pop()
+                continue
+            current = "/".join((*resolved, component))
+            _path(current, max_depth)
+            target = items.get(current)
+            if target is not None and target.kind == "symlink":
+                links += 1
+                if links > 40:
+                    raise WorkspaceBoundaryError("symlink chain exceeds the resolution limit")
+                pending.extendleft(reversed(os.fsdecode(target.payload).split("/")))
+            else:
+                if target is not None and target.kind != "directory" and pending:
+                    raise WorkspaceBoundaryError("symlink chain traverses a non-directory")
+                resolved.append(component)
+
+
 def _inventory(root: Path, *, max_entries: int, max_bytes: int, max_depth: int,
                payloads: bool = False, private: bool = False, live: bool = False) -> dict[str, _Item]:
     """Read through held directory handles, checking identity before/after reads."""
@@ -131,7 +173,9 @@ def _inventory(root: Path, *, max_entries: int, max_bytes: int, max_depth: int,
                             raise WorkspaceBoundaryError("symlink contains extended attributes")
                         data = os.fsencode(link)
                         total += len(data)
-                        item = _Item("symlink", 0o777, len(data), _digest(data), data if payloads else b"")
+                        # Targets are needed even for unchanged baseline links:
+                        # another changed link can alter their composed meaning.
+                        item = _Item("symlink", 0o777, len(data), _digest(data), data)
                     elif stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode):
                         directory = stat.S_ISDIR(before.st_mode)
                         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
@@ -203,6 +247,7 @@ def _inventory(root: Path, *, max_entries: int, max_bytes: int, max_depth: int,
                         os.close(child)
 
             walk(fd, ())
+            _validate_symlink_chains(items, max_depth)
             verify(fd, ())
             if _signature(root.lstat()) != _signature(initial):
                 raise WorkspaceBoundaryError("inventory root changed during inspection")
@@ -298,7 +343,10 @@ def export_workspace_view_diff(lower_root: str | Path, view_root: str | Path, ca
         for entry in entries:
             if entry.operation == "delete": continue
             target = candidate / entry.path
-            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            parent = candidate
+            for component in entry.path.split("/")[:-1]:
+                parent /= component
+                parent.mkdir(mode=0o700, exist_ok=True)
             if entry.kind == "directory": target.mkdir(mode=0o700, exist_ok=True)
             elif entry.kind == "symlink": target.symlink_to(os.fsdecode(final[entry.path].payload))
             else:
@@ -374,6 +422,13 @@ def validate_workspace_view_candidate(lower_root, diff, *, max_entries=100_000, 
             raise WorkspaceBoundaryError("candidate contains undeclared payload")
     if total != diff.total_bytes or diff.manifest_hash != _workspace_diff_hash(diff.entries, schema_version=2):
         raise WorkspaceBoundaryError("candidate manifest hash or byte count differs")
+    composed = dict(baseline)
+    for path, entry in declared.items():
+        if entry.operation == "delete":
+            composed.pop(path)
+        else:
+            composed[path] = payload[path]
+    _validate_symlink_chains(composed, max_depth)
     if _root_identities(lower, candidate) != roots_before:
         raise WorkspaceBoundaryError("workspace roots changed during validation")
 

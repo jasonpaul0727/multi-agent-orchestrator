@@ -279,3 +279,113 @@ def test_directory_preimage_uses_snapshot_normalization_not_live_mode_authority(
     assert (live / "private").stat().st_mode & 0o777 == 0o700
     assert (live / "private/data").stat().st_mode & 0o777 == 0o600
     assert (live / "private/executable").stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("unchanged", [False, True])
+@pytest.mark.parametrize("target", ["b/../outside", "b/.git/config", "b/.maestro/control"])
+def test_chained_symlink_escape_or_protected_target_rejected(tmp_path, unchanged, target):
+    lower = tmp_path / "lower"
+    view = tmp_path / "view"
+    lower.mkdir()
+    view.mkdir()
+    (tmp_path / "outside").write_bytes(b"outside sentinel")
+    for root in ([lower, view] if unchanged else [view]):
+        (root / "a").mkdir()
+        (root / "a/b").symlink_to("..")
+        (root / "a/c").symlink_to(target)
+    if target == "b/../outside":
+        assert (view / "a/c").resolve() == tmp_path / "outside"
+    with pytest.raises(isolation.WorkspaceBoundaryError):
+        export(lower, view, tmp_path / "candidate")
+    assert not (tmp_path / "candidate").exists()
+
+
+def test_independent_validation_checks_changed_link_against_unchanged_baseline_links(tmp_path):
+    lower = tmp_path / "lower"
+    lower.mkdir()
+    (lower / "a").mkdir()
+    (lower / "a/b").symlink_to("..")
+    (lower / "a/c").symlink_to("safe")
+    candidate = tmp_path / "candidate"
+    candidate.mkdir(mode=0o700)
+    (candidate / "a").mkdir(mode=0o700)
+    (candidate / "a/c").symlink_to("b/../outside")
+    entry = isolation.WorkspaceDiffEntry("a/c", "modify", "symlink", 0o777, 12,
+        "sha256:" + hashlib.sha256(b"b/../outside").hexdigest(),
+        "sha256:" + hashlib.sha256(b"safe").hexdigest())
+    diff = isolation.WorkspaceDiff(candidate, (entry,), 12,
+        workspace_module._workspace_diff_hash([entry], schema_version=2), 2)
+    with pytest.raises(isolation.WorkspaceBoundaryError):
+        isolation.validate_overlay_candidate(lower, diff)
+
+
+def test_independent_validation_checks_unchanged_link_after_intermediate_link_change(tmp_path):
+    lower = tmp_path / "lower"
+    lower.mkdir()
+    (lower / "a").mkdir()
+    (lower / "a/safe").mkdir()
+    (lower / "a/b").symlink_to("safe")
+    (lower / "a/c").symlink_to("b/../outside")
+    candidate = tmp_path / "candidate"
+    candidate.mkdir(mode=0o700)
+    (candidate / "a").mkdir(mode=0o700)
+    (candidate / "a/b").symlink_to("..")
+    entry = isolation.WorkspaceDiffEntry("a/b", "modify", "symlink", 0o777, 2,
+        "sha256:" + hashlib.sha256(b"..").hexdigest(),
+        "sha256:" + hashlib.sha256(b"safe").hexdigest())
+    diff = isolation.WorkspaceDiff(candidate, (entry,), 2,
+        workspace_module._workspace_diff_hash([entry], schema_version=2), 2)
+    with pytest.raises(isolation.WorkspaceBoundaryError):
+        isolation.validate_overlay_candidate(lower, diff)
+
+
+@pytest.mark.parametrize("cyclic", [False, True])
+def test_safe_symlink_chains_pass_and_cycles_are_bounded(tmp_path, cyclic):
+    lower = tmp_path / "lower"
+    view = tmp_path / "view"
+    lower.mkdir()
+    view.mkdir()
+    (view / "target").write_bytes(b"safe")
+    (view / "first").symlink_to("second")
+    (view / "second").symlink_to("first" if cyclic else "target")
+    if cyclic:
+        with pytest.raises(isolation.WorkspaceBoundaryError):
+            export(lower, view, tmp_path / "candidate")
+    else:
+        diff = export(lower, view, tmp_path / "candidate")
+        isolation.validate_overlay_candidate(lower, diff)
+        assert (diff.candidate_root / "first").read_bytes() == b"safe"
+
+
+@pytest.mark.parametrize("mask", [0o022, 0o000, 0o077])
+@pytest.mark.parametrize("kind", ["file", "symlink"])
+def test_changed_payload_under_two_unchanged_ancestors_has_private_scaffolds(tmp_path, mask, kind):
+    lower = tmp_path / "lower"
+    (lower / "a/b").mkdir(parents=True)
+    if kind == "file":
+        (lower / "a/b/changed").write_bytes(b"old")
+    else:
+        (lower / "a/b/changed").symlink_to("old")
+    view = tmp_path / "view"
+    shutil.copytree(lower, view, symlinks=True)
+    if kind == "file":
+        (view / "a/b/changed").write_bytes(b"new")
+    else:
+        (view / "a/b/changed").unlink()
+        (view / "a/b/changed").symlink_to("new")
+    previous_mask = os.umask(mask)
+    try:
+        diff = export(lower, view, tmp_path / "candidate")
+    finally:
+        os.umask(previous_mask)
+    assert [(e.path, e.operation) for e in diff.entries] == [("a/b/changed", "modify")]
+    assert diff.total_bytes == 3
+    assert (diff.candidate_root / "a").stat().st_mode & 0o777 == 0o700
+    assert (diff.candidate_root / "a/b").stat().st_mode & 0o777 == 0o700
+    isolation.validate_overlay_candidate(lower, diff)
+    if kind == "file":
+        assert (lower / "a/b/changed").read_bytes() == b"old"
+        assert (diff.candidate_root / "a/b/changed").read_bytes() == b"new"
+    else:
+        assert os.readlink(lower / "a/b/changed") == "old"
+        assert os.readlink(diff.candidate_root / "a/b/changed") == "new"
