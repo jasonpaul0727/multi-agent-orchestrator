@@ -241,12 +241,11 @@ print(len(data))
 
 
 @pytest.mark.parametrize("operation", [
-    "Path('input.txt').unlink()",
     "os.link('input.txt', 'hardlink')",
     "Path('escape').symlink_to('../../host-secret')",
     "Path('.git').mkdir(); Path('.git/config').write_text('tamper')",
     "Path('a').write_text('one'); Path('b').write_text('two')",
-], ids=["whiteout", "hardlink", "escaping-symlink", "control-path", "entry-limit"])
+], ids=["hardlink", "escaping-symlink", "control-path", "entry-limit"])
 def test_candidate_export_rejects_unsupported_or_unsafe_changes(tmp_path: Path, operation: str) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -259,6 +258,35 @@ def test_candidate_export_rejects_unsupported_or_unsafe_changes(tmp_path: Path, 
         assert result.execution.returncode != 0
         assert result.diff is None
     assert (workspace / "input.txt").read_text() == "original"
+
+
+@pytest.mark.parametrize("operation, expected", [
+    ("Path('input.txt').unlink()", [("input.txt", "delete")]),
+    ("Path('input.txt').rename('renamed.txt')", [("input.txt", "delete"), ("renamed.txt", "add")]),
+    ("__import__('shutil').move('tree', 'renamed')", [("renamed", "add"), ("renamed/child", "add"), ("tree", "delete"), ("tree/child", "delete")]),
+])
+def test_stopped_final_view_exports_removals_without_publishing(tmp_path, operation, expected):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "input.txt").write_text("original")
+    (workspace / "tree").mkdir()
+    (workspace / "tree/child").write_text("child")
+    with isolation.SystemdOverlayCandidateLauncher().launch(
+        workspace, ["/usr/bin/python3", "-c", "from pathlib import Path; " + operation],
+    ) as session:
+        result = session.wait()
+        assert result.execution.returncode == 0, result.execution.stderr.decode(errors="replace")
+        assert result.execution.termination_confirmed
+        assert result.diff is not None and result.diff.schema_version == 2
+        assert [(e.path, e.operation) for e in result.diff.entries] == expected
+        isolation.validate_overlay_candidate(result.lower_root, result.diff)
+        for entry in result.diff.entries:
+            if entry.operation == "delete":
+                assert entry.baseline_digest is not None and entry.size == 0
+                assert not (result.diff.candidate_root / entry.path).exists()
+    assert (workspace / "input.txt").read_text() == "original"
+    assert (workspace / "tree/child").read_text() == "child"
+    assert not (workspace / "renamed").exists() and not (workspace / "renamed.txt").exists()
 
 
 @pytest.mark.parametrize(("kind", "code"), [

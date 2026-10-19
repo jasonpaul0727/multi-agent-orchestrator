@@ -138,6 +138,7 @@ def prepared(tmp_path, monkeypatch):
     (upper / "input.txt").write_text("candidate")
     view = root / "rootfs"
     (view / "workspace").mkdir(parents=True)
+    (view / "workspace" / "input.txt").write_text("candidate")
     (root / "config.json").write_text(json.dumps({"command": ["command", "arg"], "candidate_entries": 10, "candidate_bytes": 1024, "expected_cgroup": "/expected/scope"}))
     monkeypatch.setenv("MAESTRO_EXPECT_NOFILE", "256")
     monkeypatch.setenv("MAESTRO_EXPECT_FSIZE", "1024")
@@ -159,6 +160,9 @@ def prepared(tmp_path, monkeypatch):
     monkeypatch.setattr(module.subprocess, "Popen", start)
     monkeypatch.setattr(module, "_terminate_descendants", lambda: events.append("reaped"))
     def unmount(*_args, **_options):
+        assert (root / "candidate" / "input.txt").read_text() == "candidate"
+        assert not (root / "completion.json").exists()
+        (view / "workspace" / "input.txt").unlink()
         events.append("unmount")
         return subprocess.CompletedProcess([], 0)
     monkeypatch.setattr(module.subprocess, "run", unmount)
@@ -170,7 +174,7 @@ def test_export_and_completion_only_after_descendant_stop_and_unmount(prepared) 
     assert module.main([str(root)]) == 0
     assert events == ["start", "exit", "reaped", "unmount"]
     payload = json.loads((root / "completion.json").read_text())
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["entries"][0]["path"] == "input.txt"
     assert (root / "candidate" / "input.txt").read_text() == "candidate"
     assert (root / "lower" / "input.txt").read_text() == "original"
@@ -201,7 +205,7 @@ def test_incomplete_boundary_cannot_generate_completion(prepared, monkeypatch, c
     elif boundary == "unmount":
         monkeypatch.setattr(module.subprocess, "run", lambda *_a, **_k: subprocess.CompletedProcess([], 1))
     elif boundary == "export":
-        (root / "buffer" / "upper" / "escape").symlink_to("../../outside")
+        (root / "rootfs" / "workspace" / "escape").symlink_to("../../outside")
     else:
         monkeypatch.setattr(module, "_write_completion", failure)
     assert module.main([str(root)]) == 78

@@ -22,6 +22,7 @@ from .launcher import (
     SandboxSession,
     SystemdReadOnlyLauncher,
 )
+from .workspace_view import export_workspace_view_diff
 from .landlock import (
     FsAccess,
     LandlockResult,
@@ -99,6 +100,7 @@ __all__ = [
     "WorkspaceWriteLease",
     "acquire_workspace_write_lease",
     "export_overlay_diff",
+    "export_workspace_view_diff",
     "check_workspace_publish_conflicts",
     "inspect_workspace",
     "publish_workspace_diff",

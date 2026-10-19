@@ -332,14 +332,18 @@ def _read_candidate(root: Path, max_entries: int, max_bytes: int) -> WorkspaceDi
                              parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("non-finite")))
     if not isinstance(payload, dict) or set(payload) != {"schema_version", "entries", "total_bytes", "manifest_hash"}:
         raise ValueError("invalid completion fields")
-    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] not in (1, 2):
         raise ValueError("unsupported completion version")
     if not isinstance(payload["entries"], list) or len(payload["entries"]) > max_entries:
         raise ValueError("invalid completion entries")
+    fields = {"path", "operation", "kind", "mode", "size", "digest", "baseline_digest"}
+    if any(not isinstance(entry, dict) or set(entry) != fields for entry in payload["entries"]):
+        raise ValueError("invalid completion entry fields")
     diff = WorkspaceDiff(
         candidate_root=root / "candidate",
         entries=tuple(WorkspaceDiffEntry(**entry) for entry in payload["entries"]),
         total_bytes=payload["total_bytes"], manifest_hash=payload["manifest_hash"],
+        schema_version=payload["schema_version"],
     )
     validate_overlay_candidate(root / "lower", diff, max_entries=max_entries, max_bytes=max_bytes)
     return diff

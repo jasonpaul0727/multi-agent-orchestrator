@@ -186,6 +186,37 @@ def test_malformed_duplicate_and_nonfinite_completion_fail(tmp_path: Path, paylo
         module._read_candidate(root, 10, 1024)
 
 
+def test_schema_two_completion_round_trips_tombstone_and_rejects_legacy_hash(tmp_path):
+    from orchestrator.isolation import export_workspace_view_diff
+    root = tmp_path / "stage"
+    root.mkdir(mode=0o700)
+    (root / "lower").mkdir()
+    (root / "view").mkdir()
+    (root / "lower/deleted").write_bytes(b"preimage")
+    diff = export_workspace_view_diff(root / "lower", root / "view", root / "candidate")
+    _write_completion(root, diff)
+    assert module._read_candidate(root, 10, 1024) == diff
+    payload = json.loads((root / "completion.json").read_text())
+    payload["schema_version"] = 1
+    (root / "completion.json").write_text(json.dumps(payload))
+    with pytest.raises(module.WorkspaceBoundaryError): module._read_candidate(root, 10, 1024)
+
+
+def test_completion_entries_require_exact_fields(tmp_path):
+    root = tmp_path / "stage"
+    root.mkdir(mode=0o700)
+    (root / "lower").mkdir()
+    (root / "upper").mkdir()
+    (root / "upper/added").write_bytes(b"new")
+    diff = export_overlay_diff(root / "lower", root / "upper", root / "candidate")
+    _write_completion(root, diff)
+    payload = json.loads((root / "completion.json").read_text())
+    del payload["entries"][0]["baseline_digest"]
+    (root / "completion.json").write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="entry fields"):
+        module._read_candidate(root, 10, 1024)
+
+
 @pytest.mark.parametrize("kind", ["permissions", "symlink", "hardlink", "oversized", "entries"])
 def test_completion_file_must_be_private_regular_and_bounded(monkeypatch, tmp_path: Path, kind: str) -> None:
     root = tmp_path / "stage"

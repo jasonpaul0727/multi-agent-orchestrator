@@ -34,7 +34,7 @@ class WorkspaceDiffEntry:
     """One validated staged change exported from an OverlayFS upper layer."""
 
     path: str
-    operation: Literal["add", "modify"]
+    operation: Literal["add", "modify", "delete"]
     kind: Literal["file", "directory", "symlink"]
     mode: int
     size: int
@@ -50,6 +50,7 @@ class WorkspaceDiff:
     entries: tuple[WorkspaceDiffEntry, ...]
     total_bytes: int
     manifest_hash: str
+    schema_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -598,6 +599,15 @@ def validate_overlay_candidate(
     that the live host workspace still matches the lower snapshot.
     """
 
+    if not isinstance(diff, WorkspaceDiff):
+        raise WorkspaceBoundaryError("candidate manifest has an invalid type")
+    if type(diff.schema_version) is not int or diff.schema_version not in (1, 2):
+        raise WorkspaceBoundaryError("candidate manifest has an unsupported schema version")
+    if diff.schema_version == 2:
+        from .workspace_view import validate_workspace_view_candidate
+        return validate_workspace_view_candidate(
+            lower_root, diff, max_entries=max_entries, max_bytes=max_bytes, max_depth=max_depth,
+        )
     for name, value in (
         ("max_entries", max_entries),
         ("max_bytes", max_bytes),
@@ -922,6 +932,9 @@ def check_workspace_publish_conflicts(
     """
 
     validate_overlay_candidate(lower_root, diff, max_bytes=max_bytes)
+    if diff.schema_version == 2:
+        from .workspace_view import check_workspace_view_conflicts
+        return check_workspace_view_conflicts(lower_root, workspace_root, diff, max_bytes=max_bytes)
     workspace = Path(workspace_root)
     lower = Path(lower_root)
     candidate = Path(diff.candidate_root)
@@ -1020,7 +1033,9 @@ def _manifest_digest(kind: str, mode: int, size: int) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
-def _workspace_diff_hash(entries: tuple[WorkspaceDiffEntry, ...] | list[WorkspaceDiffEntry]) -> str:
+def _workspace_diff_hash(entries: tuple[WorkspaceDiffEntry, ...] | list[WorkspaceDiffEntry], *, schema_version: int = 1) -> str:
+    if type(schema_version) is not int or schema_version not in (1, 2):
+        raise WorkspaceBoundaryError("unsupported manifest schema version")
     canonical = json.dumps(
         [
             {
@@ -1037,7 +1052,8 @@ def _workspace_diff_hash(entries: tuple[WorkspaceDiffEntry, ...] | list[Workspac
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+    prefix = b"maestro.workspace-diff.v2\0" if schema_version == 2 else b""
+    return "sha256:" + hashlib.sha256(prefix + canonical).hexdigest()
 
 
 def _reject_xattrs(descriptor: int) -> None:
