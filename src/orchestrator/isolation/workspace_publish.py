@@ -1231,7 +1231,10 @@ def _restore_before(roots: _Roots, transaction_fd: int, record: dict[str, Any]) 
                 dir_fd=transaction_fd,
             )
             try:
-                _restore_backup_file(backup_fd, record["backup"], parent_fd, record["temporary"], leaf, before)
+                _restore_backup_file(
+                    backup_fd, record["backup"], parent_fd, record["temporary"], leaf, before,
+                    roots=roots, record=record,
+                )
             finally:
                 os.close(backup_fd)
         else:
@@ -1253,6 +1256,9 @@ def _restore_backup_file(
     temporary: str,
     leaf: str,
     expected: dict[str, Any],
+    *,
+    roots: _Roots,
+    record: dict[str, Any],
 ) -> None:
     if backup_name is None:
         raise WorkspacePublishError("publication journal is missing a rollback backup")
@@ -1289,6 +1295,10 @@ def _restore_backup_file(
         for descriptor in (destination_fd, source_fd):
             if descriptor >= 0:
                 os.close(descriptor)
+    # Copying and syncing may outlive the lease or the observed target state.
+    # Keep the journal and temporary intact if either has changed.
+    _check_mutation_authority(roots)
+    _assert_live_state(roots.workspace_fd, roots.workspace_mount_id, record, "after")
     os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
 
 

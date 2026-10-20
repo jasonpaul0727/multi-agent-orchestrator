@@ -13,7 +13,7 @@ import pytest
 from orchestrator.isolation import (
     acquire_workspace_write_lease, export_workspace_view_diff,
     publish_workspace_diff, recover_workspace_publications_with_outcomes,
-    snapshot_workspace, WorkspacePublishError, WorkspacePublishRecoveryConflict,
+    snapshot_workspace, WorkspaceLeaseError, WorkspacePublishError, WorkspacePublishRecoveryConflict,
 )
 from orchestrator.isolation import workspace_publish as publisher
 
@@ -75,6 +75,57 @@ def test_removal_and_rename_overwrite_publish_then_acknowledge(tmp_path):
         publisher.acknowledge_workspace_publication(workspace, lease, journal, receipt)
         publisher.acknowledge_workspace_publication(workspace, lease, journal, receipt)
         assert not list(journal.glob("publish-*"))
+
+
+@pytest.mark.parametrize("lose_lease", [False, True])
+def test_rollback_copy_preserves_intervening_writer(tmp_path, monkeypatch, lose_lease):
+    workspace, lower, journal, diff = removal_fixture(tmp_path)
+
+    def stop_after_removal(transaction, path):
+        if path == "source":
+            raise WorkspacePublishError("interrupted after removal")
+
+    monkeypatch.setattr(publisher, "_after_publish_entry", stop_after_removal)
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        with pytest.raises(WorkspacePublishError, match="interrupted after removal"):
+            publish_workspace_diff(lower, workspace, diff, lease, journal, retain_committed=True)
+        transaction, = journal.glob("publish-*")
+        state_path = transaction / "state.json"
+        original_state = state_path.read_bytes()
+        record, = (
+            value for value in json.loads(original_state)["records"]
+            if value["path"] == "standalone"
+        )
+        backup = transaction / "backups" / record["backup"]
+        original_backup = backup.read_bytes()
+        read = os.read
+        intervened = False
+
+        def write_during_backup_copy(descriptor, count):
+            nonlocal intervened
+            chunk = read(descriptor, count)
+            # Backup verification happens earlier, without a restoration
+            # temporary. Intervene only after the real copy has started.
+            if (not intervened and chunk
+                    and (workspace / record["temporary"]).exists()
+                    and Path(f"/proc/self/fd/{descriptor}").resolve() == backup):
+                intervened = True
+                if lose_lease:
+                    lease.close()
+                (workspace / "standalone").write_bytes(b"external-new-writer")
+            return chunk
+
+        monkeypatch.setattr(os, "read", write_during_backup_copy)
+        error = None
+        try:
+            recover_workspace_publications_with_outcomes(workspace, lease, journal)
+        except (WorkspaceLeaseError, WorkspacePublishRecoveryConflict) as exc:
+            error = exc
+        assert intervened
+        assert (workspace / "standalone").read_bytes() == b"external-new-writer"
+        assert isinstance(error, WorkspaceLeaseError if lose_lease else WorkspacePublishRecoveryConflict)
+        assert state_path.read_bytes() == original_state
+        assert backup.read_bytes() == original_backup
 
 
 @pytest.mark.parametrize("rollback", [False, True])
