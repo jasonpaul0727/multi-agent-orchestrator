@@ -125,6 +125,7 @@ def _fixture(
     allow: bool = True,
     authority: _Authority | None = None,
     approval: bool = False,
+    retain_publication: bool = False,
 ):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -194,8 +195,60 @@ def _fixture(
         approval_service=approval_service,
         approval_requester=(lambda request: "requester-1") if approval else None,
         approval_now=lambda: now,
+        retain_publication=retain_publication,
     )
     return workspace, events, launcher, session, lease_root, journal_root, gateway, approval_service
+
+
+def test_service_owned_publication_retains_committed_receipt(tmp_path):
+    workspace, events, launcher, session, leases, journal, gateway, _ = _fixture(tmp_path, retain_publication=True)
+    result = gateway.execute(_request(workspace))
+    assert result.outcome == "completed"
+    assert result.publication_receipt is not None
+    from orchestrator.isolation import recover_workspace_publications_with_outcomes, acknowledge_workspace_publication
+    with acquire_workspace_write_lease(workspace, leases) as lease:
+        recovery, = recover_workspace_publications_with_outcomes(workspace, lease, journal)
+        assert recovery.outcome == "committed"
+        assert recovery.transaction_id == result.publication_receipt.transaction_id
+        acknowledge_workspace_publication(workspace, lease, journal, result.publication_receipt)
+    assert not list(journal.iterdir())
+
+
+def test_response_loss_reconciles_committed_effect_once(tmp_path, monkeypatch):
+    workspace, events, launcher, _, _, journal, gateway, _ = _fixture(tmp_path)
+    from orchestrator.tools import workspace_write
+    publish = workspace_write.publish_workspace_diff
+    identity = None
+    def lose_response(*args, **kwargs):
+        nonlocal identity
+        publish(*args, **kwargs)
+        identity = (workspace / "new.txt").stat().st_ino
+        raise WorkspacePublishError("response lost after durable commit")
+    monkeypatch.setattr(workspace_write, "publish_workspace_diff", lose_response)
+    result = gateway.execute(_request(workspace))
+    assert result.outcome == "completed" and result.publication_receipt is not None
+    assert (workspace / "new.txt").stat().st_ino == identity
+    assert len(launcher.calls) == 1
+    assert sum(e.event_type == "WorkspacePublicationCompleted" for e in events.read_stream("security", "run-1")) == 1
+    assert not list(journal.iterdir())
+
+
+def test_direct_acknowledgement_follows_durable_terminal_audit(tmp_path, monkeypatch):
+    workspace, events, _, _, _, journal, gateway, _ = _fixture(tmp_path)
+    append = events.append_checked
+    def fail_terminal(stream_type, stream_id, key, decide):
+        def inspect(history, version):
+            drafts = decide(history, version)
+            if drafts and any(d.event_type == "ToolExecutionCompleted" for d in drafts):
+                raise OSError("terminal audit unavailable")
+            return drafts
+        return append(stream_type, stream_id, key, inspect)
+    monkeypatch.setattr(events, "append_checked", fail_terminal)
+    with pytest.raises(ToolAuditUnavailable):
+        gateway.execute(_request(workspace))
+    assert (workspace / "new.txt").read_text() == "private candidate data\n"
+    assert list(journal.glob("publish-*"))
+    assert gateway._has_unresolved_publication("run-1")
 
 
 def test_allowed_write_is_attempt_bound_audited_and_published(tmp_path: Path) -> None:

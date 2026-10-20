@@ -42,6 +42,8 @@ from orchestrator.isolation import (
     WorkspaceWriteLease,
     acquire_workspace_write_lease,
     publish_workspace_diff,
+    acknowledge_workspace_publication,
+    acknowledge_workspace_recovery,
     recover_workspace_publications,
     recover_workspace_publications_with_outcomes,
 )
@@ -138,9 +140,13 @@ class WorkspaceWriteGateway:
         approval_requester: Callable[[WorkspaceWriteRequest], str] | None = None,
         approval_now: Callable[[], datetime] | None = None,
         approval_ttl_seconds: int = 3_600,
+        retain_publication: bool = False,
     ) -> None:
         if not isinstance(run_id, str) or re.fullmatch(_SAFE_IDENTIFIER, run_id) is None:
             raise ValueError("run_id must be a stable identifier")
+        if type(retain_publication) is not bool:
+            raise ValueError("retain_publication must be a boolean")
+        self._retain_publication = retain_publication
         workspace_path = Path(workspace)
         if not workspace_path.is_absolute() or not workspace_path.is_dir():
             raise ValueError("workspace must be an existing absolute directory")
@@ -401,6 +407,7 @@ class WorkspaceWriteGateway:
                 self._journal_root,
                 transaction_id=tx_id,
                 authorize=lambda: self._authorized_now(request, state),
+                retain_committed=True,
             )
             self._record_publication_completed(request, intent, receipt, consumed, approval_attempt)
         except _WriteAuthorityLost as exc:
@@ -435,7 +442,18 @@ class WorkspaceWriteGateway:
             "ToolExecutionCompleted",
             _execution_payload(request, candidate, outcome="completed", receipt=receipt),
         )
+        self._resolve_publication_completed(request, intent, receipt)
+        self._acknowledge_publication(lease, receipt)
         return self._result(request, decision, "completed", candidate, receipt=receipt)
+
+    def _acknowledge_publication(self, lease, receipt):
+        if not self._retain_publication:
+            try:
+                acknowledge_workspace_publication(self._workspace, lease, self._journal_root, receipt)
+            except (OSError, WorkspacePublishError):
+                # The effect and its audit receipts are durable. A failed
+                # cleanup retains evidence for reconciliation, not rollback.
+                pass
 
     def _reconcile_publication_failure(
         self,
@@ -472,10 +490,14 @@ class WorkspaceWriteGateway:
                 self._terminal(request, "ToolExecutionCancelled", {
                     "outcome": "authority_lost", "reason": _reason_code(reason),
                 })
+                if recovery is not None and not self._retain_publication:
+                    acknowledge_workspace_recovery(self._workspace, lease, self._journal_root, recovery)
                 return ToolExecutionResult(request.request_id, "authority_lost", decision)
             self._terminal(request, "ToolExecutionFailed", {
                 "reason": _reason_code(reason), "publication_outcome": "not_applied",
             })
+            if recovery is not None and not self._retain_publication:
+                acknowledge_workspace_recovery(self._workspace, lease, self._journal_root, recovery)
             return self._result(request, decision, "failed", candidate)
 
         if recovery.outcome == "committed" and intent is not None:
@@ -493,6 +515,8 @@ class WorkspaceWriteGateway:
                 "ToolExecutionCompleted",
                 _execution_payload(request, candidate, outcome="completed", receipt=receipt),
             )
+            self._resolve_publication_completed(request, intent, receipt)
+            self._acknowledge_publication(lease, receipt)
             return self._result(request, decision, "completed", candidate, receipt=receipt)
 
         return self._publication_outcome_unknown(request, decision)
@@ -534,16 +558,23 @@ class WorkspaceWriteGateway:
             events, request, "WorkspacePublicationCompleted", receipt_payload,
             _publication_intent_event_id(events, request), require_start=False,
         )
-        workspace_decider = lambda events, _version: self._new_event_once(
-            events, request, "WorkspacePublicationCompleted", receipt_payload,
-            _publication_intent_event_id(events, request), require_start=False,
-        )
-        # The workspace-wide intent remains unresolved until the Run audit
-        # receipt is durable, so its failure keeps every later writer blocked.
         self._append_required(
             "security", request.run_id,
             f"workspace-publication-receipt:{request.request_id}", security_decider,
             "workspace publication receipt was not durably audited",
+        )
+
+    def _resolve_publication_completed(self, request, intent, receipt):
+        # Resolve occupancy only after both the Run publication receipt and
+        # its terminal audit are durable. An audit failure keeps later writers
+        # blocked, with the committed journal available for reconciliation.
+        receipt_payload = {
+            **intent, "lease_generation": receipt.lease_generation,
+            "entries_published": receipt.entries_published,
+        }
+        workspace_decider = lambda events, _version: self._new_event_once(
+            events, request, "WorkspacePublicationCompleted", receipt_payload,
+            _publication_intent_event_id(events, request), require_start=False,
         )
         self._append_required(
             "workspace_publications", self._publication_stream_id,
@@ -1058,6 +1089,7 @@ class WorkspaceWriteGateway:
             cancelled=execution.cancelled,
             timed_out=execution.timed_out,
             output_limited=execution.output_limited,
+            publication_receipt=receipt if outcome == "completed" else None,
         )
 
     def _unknown(self, request, decision, reason, candidate):

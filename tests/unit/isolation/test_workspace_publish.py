@@ -26,6 +26,138 @@ from orchestrator.isolation import workspace_publish
 from orchestrator.isolation import workspace as workspace_module
 
 
+@pytest.mark.parametrize("invalid", ["duplicate", "nan", "bool", "float", "version", "overlap"])
+def test_retained_journal_strict_decoding_blocks_cleanup(tmp_path, invalid):
+    lower, workspace, _, journal, _, diff = _fixture(tmp_path)
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        receipt = publish_workspace_diff(lower, workspace, diff, lease, journal, retain_committed=True)
+        state = journal / ("publish-" + receipt.transaction_id) / "state.json"
+        payload = json.loads(state.read_text())
+        if invalid == "duplicate":
+            encoded = state.read_text().replace('"schema":2', '"schema":1,"schema":2')
+        elif invalid == "nan":
+            encoded = state.read_text().replace('"schema":2', '"schema":NaN')
+        else:
+            if invalid in ("bool", "float", "version"):
+                payload["schema"] = {"bool": True, "float": 2.0, "version": 99}[invalid]
+            else:
+                payload["records"][1]["path"] = payload["records"][0]["path"]
+            encoded = json.dumps(payload) + "\n"
+        state.write_text(encoded)
+        with pytest.raises(WorkspacePublishError):
+            recover_workspace_publications_with_outcomes(workspace, lease, journal)
+        assert state.exists()
+
+
+def test_growth_during_backup_cannot_exceed_captured_byte_bound(tmp_path, monkeypatch):
+    lower, workspace, _, journal, _, diff = _fixture(tmp_path)
+    capture = workspace_publish._copy_live_backup
+    def grow(root_fd, mount_id, parts, backup_fd, backup_name, state):
+        (workspace / "changed.txt").write_bytes(b"unexpected growth" * 4096)
+        return capture(root_fd, mount_id, parts, backup_fd, backup_name, state)
+    monkeypatch.setattr(workspace_publish, "_copy_live_backup", grow)
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        with pytest.raises(WorkspacePublishError):
+            publish_workspace_diff(lower, workspace, diff, lease, journal, retain_committed=True)
+        assert sum(p.stat().st_size for p in journal.glob("publish-*/backups/*")) <= 4
+
+
+def test_candidate_growth_cannot_overflow_live_temporary(tmp_path, monkeypatch):
+    lower, workspace, candidate, journal, _, diff = _fixture(tmp_path)
+    apply = workspace_publish._apply_record
+    def grow(roots, record, transaction):
+        if record["path"] == "changed.txt":
+            (candidate / "changed.txt").write_bytes(b"grown" * 4096)
+        return apply(roots, record, transaction)
+    monkeypatch.setattr(workspace_publish, "_apply_record", grow)
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        with pytest.raises(WorkspacePublishError):
+            publish_workspace_diff(lower, workspace, diff, lease, journal, retain_committed=True)
+        assert (workspace / "changed.txt").read_bytes() == b"old\n"
+        assert sum(path.stat().st_size for path in workspace.glob(".mp*")) <= 4
+
+
+def test_all_exact_live_modes_rechecked_before_first_mutation(tmp_path, monkeypatch):
+    lower, workspace, _, journal, _, diff = _fixture(tmp_path)
+    capture = workspace_publish._capture_originals
+    def change_mode(*args, **kwargs):
+        result = capture(*args, **kwargs)
+        (workspace / "changed.txt").chmod(0o600)
+        return result
+    monkeypatch.setattr(workspace_publish, "_capture_originals", change_mode)
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        with pytest.raises(WorkspacePublishConflict):
+            publish_workspace_diff(lower, workspace, diff, lease, journal, retain_committed=True)
+        assert not (workspace / "added").exists()
+        assert (workspace / "changed.txt").read_bytes() == b"old\n"
+
+
+def test_duplicate_transaction_identity_blocks_recovery(tmp_path):
+    import shutil
+    lower, workspace, _, journal, _, diff = _fixture(tmp_path)
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        receipt = publish_workspace_diff(lower, workspace, diff, lease, journal, retain_committed=True)
+        committed = journal / ("publish-" + receipt.transaction_id)
+        staging = journal / ("staging-" + receipt.transaction_id)
+        shutil.copytree(committed, staging)
+        payload = json.loads((staging / "state.json").read_text())
+        payload.update(status="preparing", records=[], backup_bytes=0)
+        (staging / "state.json").write_text(json.dumps(payload) + "\n")
+        with pytest.raises(WorkspacePublishError):
+            recover_workspace_publications_with_outcomes(workspace, lease, journal)
+        assert committed.exists() and staging.exists()
+
+
+def test_schema2_missing_state_is_not_legacy_no_effect_evidence(tmp_path):
+    lower, workspace, _, journal, _, diff = _fixture(tmp_path)
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        receipt = publish_workspace_diff(lower, workspace, diff, lease, journal, retain_committed=True)
+        transaction = journal / ("publish-" + receipt.transaction_id)
+        (transaction / "state.json").unlink()
+        with pytest.raises(WorkspacePublishError):
+            recover_workspace_publications_with_outcomes(workspace, lease, journal)
+        assert transaction.exists()
+        assert (workspace / "changed.txt").read_bytes() == b"new\n"
+
+
+def test_authority_is_rechecked_after_candidate_copy_before_replacement(tmp_path, monkeypatch):
+    lower, workspace, candidate, journal, _, diff = _fixture(tmp_path)
+    authority = True
+    real_read = os.read
+    def revoke_on_candidate_read(fd, size):
+        nonlocal authority
+        data = real_read(fd, size)
+        # Validation reads happen before the prepared journal; revoke only on
+        # the publisher's final copy from the still-private candidate.
+        prepared = list(journal.glob("publish-*/state.json"))
+        if (prepared and json.loads(prepared[0].read_text())["status"] == "prepared"
+                and os.readlink(f"/proc/self/fd/{fd}") == str(candidate / "changed.txt")):
+            authority = False
+        return data
+    monkeypatch.setattr(os, "read", revoke_on_candidate_read)
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        with pytest.raises(workspace_publish.WorkspacePublishAuthorizationLost):
+            publish_workspace_diff(lower, workspace, diff, lease, journal, retain_committed=True, authorize=lambda: authority)
+        assert (workspace / "changed.txt").read_bytes() == b"old\n"
+
+
+@pytest.mark.parametrize("field", ["after_children", "case_collision"])
+def test_schema2_rejects_ambiguous_record_metadata(tmp_path, field):
+    lower, workspace, _, journal, _, diff = _fixture(tmp_path)
+    with acquire_workspace_write_lease(workspace, journal) as lease:
+        receipt = publish_workspace_diff(lower, workspace, diff, lease, journal, retain_committed=True)
+        state = journal / ("publish-" + receipt.transaction_id) / "state.json"
+        payload = json.loads(state.read_text())
+        if field == "after_children":
+            payload["records"][0]["after"]["children"] = []
+        else:
+            payload["records"][1]["path"] = "Added"
+        state.write_text(json.dumps(payload) + "\n")
+        with pytest.raises(WorkspacePublishError):
+            recover_workspace_publications_with_outcomes(workspace, lease, journal)
+        assert state.exists()
+
+
 def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, object]:
     workspace = tmp_path / "workspace"
     lower = tmp_path / "lower"
