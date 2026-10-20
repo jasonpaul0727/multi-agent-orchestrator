@@ -141,7 +141,7 @@ class ToolExecutionResult:
 
     request_id: str
     outcome: Literal[
-        "completed", "awaiting_approval", "denied", "failed", "authority_lost", "execution_unknown"
+        "completed", "awaiting_approval", "denied", "failed", "authority_lost", "execution_unknown", "blocked"
     ]
     decision: PolicyDecision
     stdout: bytes = b""
@@ -155,6 +155,7 @@ class ToolExecutionResult:
     output_limited: bool = False
     approval_request_id: str | None = None
     publication_receipt: WorkspacePublishReceipt | None = None
+    reason_code: Literal["isolation_unavailable"] | None = None
 
 
 class ToolAuditUnavailable(RuntimeError):

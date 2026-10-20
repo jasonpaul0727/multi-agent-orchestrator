@@ -22,6 +22,7 @@ import tempfile
 
 import pytest
 
+from tests.support.isolation_runtime import private_isolation_runtime, use_private_isolation_runtime
 
 from orchestrator.config.models import ModelRegistryManifest, ModelSpec, ProviderSpec
 from orchestrator.isolation import SystemdProviderSenderLauncher
@@ -466,7 +467,9 @@ def _setup(tmp_path):
 
 @pytest.mark.parametrize("profile", ["overlay", "readonly"])
 @pytest.mark.skipif(not _live_systemd_available(), reason="requires live Linux systemd user manager")
-def test_actual_manager_broker_socket_is_hidden_and_unreachable_from_sandbox(tmp_path, profile):
+def test_actual_manager_broker_socket_is_hidden_and_unreachable_from_sandbox(
+    tmp_path, profile, use_private_isolation_runtime,
+):
     from orchestrator.isolation import SystemdOverlayCandidateLauncher, SystemdReadOnlyLauncher
     manager, provider, rule, events = _setup(tmp_path)
     session = manager.start(rules=(rule,), providers={provider.id: provider})

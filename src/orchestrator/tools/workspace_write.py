@@ -8,6 +8,7 @@ leased, journaled host operation after a durable intent event.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -31,8 +32,11 @@ from orchestrator.approvals import (
 from orchestrator.budget import CostEstimate
 from orchestrator.isolation import (
     IsolationUnavailable,
+    IsolationNotStarted,
+    verify_workspace_isolation,
     OverlayCandidateResult,
     SandboxLimits,
+    SandboxTerminationReceipt,
     SystemdOverlayCandidateLauncher,
     WorkspacePublishAuthorizationLost,
     WorkspacePublishConflict,
@@ -111,6 +115,7 @@ class _CandidateLauncher(Protocol):
         *,
         limits: SandboxLimits | None = None,
         expected_workspace_identity_hash: str | None = None,
+        expected_profile_hash: str | None = None,
     ) -> _CandidateSession: ...
 
 
@@ -224,6 +229,19 @@ class WorkspaceWriteGateway:
             return ToolExecutionResult(request.request_id, "denied", decision)
         if decision.outcome == "deny":
             return ToolExecutionResult(request.request_id, "denied", decision)
+        try:
+            _private_external_directory(self._lease_root, self._workspace, "workspace lease root")
+            _private_external_directory(self._journal_root, self._workspace, "publication journal root")
+        except ValueError:
+            self._record_block(request, "isolation_unavailable")
+            return ToolExecutionResult(request.request_id, "blocked", decision,
+                                       reason_code="isolation_unavailable")
+        admission = verify_workspace_isolation(self._workspace, limits=self._limits)
+        if (admission.outcome != "eligible" or admission.profile_hash != self._profile_hash
+                or admission.workspace_identity_hash != self._workspace_identity_hash):
+            self._record_block(request, "isolation_unavailable")
+            return ToolExecutionResult(request.request_id, "blocked", decision,
+                                       reason_code="isolation_unavailable")
         if decision.outcome == "needs_approval":
             if self._approval_service is None:
                 if approval_grant_id is not None:
@@ -290,19 +308,24 @@ class WorkspaceWriteGateway:
         approval_attempt: ExecutionAttempt | None,
     ) -> ToolExecutionResult:
         session: _CandidateSession | None = None
+        execution_intended = False
         try:
             if not self._authorized_now(request, state):
                 raise _WriteAuthorityLost("authority_lost_before_launch")
+            self._record_execution_occupancy(request, stopped=False)
+            execution_intended = True
             session = self._launcher.launch(
                 self._workspace,
                 request.command,
                 limits=self._limits,
                 expected_workspace_identity_hash=self._workspace_identity_hash,
+                expected_profile_hash=self._profile_hash,
             )
             result, lost = self._wait_with_authority(session, request, state)
             accepted = not lost and self._authorized_now(request, state)
             if not result.execution.termination_confirmed:
                 return self._unknown(request, decision, "candidate_termination_unconfirmed", result)
+            self._record_execution_occupancy(request, stopped=True, receipt=result.execution.termination_receipt)
             if not accepted:
                 self._approval_receipt_if_consumed(
                     consumed, approval_attempt, "not_applied", _digest(b"authority-lost-before-publication")
@@ -320,6 +343,24 @@ class WorkspaceWriteGateway:
             return self._publish(
                 request, decision, state, request_hash, result, lease, consumed, approval_attempt
             )
+        except IsolationNotStarted:
+            if session is not None:
+                self._terminal_best_effort(request, "ToolExecutionOutcomeUnknown", {
+                    "outcome": "execution_unknown", "reason": "nonstart_claim_after_launch",
+                })
+                return ToolExecutionResult(request.request_id, "execution_unknown", decision,
+                                           termination_confirmed=False)
+            if execution_intended:
+                self._record_execution_occupancy(request, stopped=True, not_started=True)
+            self._approval_receipt_if_consumed(
+                consumed, approval_attempt, "not_applied", _digest(b"isolation_unavailable")
+            )
+            self._terminal(request, "ToolExecutionFailed", {
+                "outcome": "blocked", "reason": "isolation_unavailable", "not_started": True,
+            })
+            self._record_block(request, "isolation_unavailable")
+            return ToolExecutionResult(request.request_id, "blocked", decision,
+                                       reason_code="isolation_unavailable")
         except _WriteAuthorityLost as exc:
             self._approval_receipt_if_consumed(
                 consumed, approval_attempt, "not_applied", _digest(str(exc).encode())
@@ -1017,11 +1058,52 @@ class WorkspaceWriteGateway:
         try:
             workspace_events = self._events.read_stream("workspace_publications", self._publication_stream_id)
             run_events = self._events.read_stream("security", run_id)
+            executions = self._events.read_stream("workspace_executions", self._publication_stream_id)
         except Exception as exc:
             raise ToolAuditUnavailable("publication history is unavailable") from exc
         return bool(
             _unresolved_publications(workspace_events)
             or _unresolved_publications(run_events, run_id=run_id)
+            or _unresolved_executions(executions, self._workspace_identity_hash)
+        )
+
+    def _record_execution_occupancy(
+        self, request, *, stopped: bool, receipt: SandboxTerminationReceipt | None = None,
+        not_started: bool = False,
+    ) -> None:
+        if stopped and (not_started == (receipt is not None)):
+            raise ToolAuditUnavailable("execution release requires exactly one stop proof")
+        event_type = "WorkspaceExecutionStopped" if stopped else "WorkspaceExecutionIntended"
+        def decide(events, _version):
+            unresolved = _unresolved_executions(events, self._workspace_identity_hash)
+            if any(e.event_type == event_type and e.run_id == request.run_id
+                   and e.payload.get("request_id") == request.request_id for e in events):
+                return None
+            if not stopped and unresolved:
+                raise ToolAuditUnavailable("a prior workspace execution remains unresolved")
+            payload = {
+                "request_id": request.request_id,
+                "workspace_identity_hash": self._workspace_identity_hash,
+                "request_hash": self._request_hash(request),
+                "profile_hash": self._profile_hash,
+            }
+            causation = request.causation_id
+            if stopped:
+                intent = next((e for e in events if e.event_type == "WorkspaceExecutionIntended"
+                               and e.run_id == request.run_id and e.payload.get("request_id") == request.request_id), None)
+                if intent is None or (request.run_id, request.request_id) not in unresolved:
+                    raise ToolAuditUnavailable("execution stop has no matching intent")
+                causation = intent.event_id
+                payload.update({
+                    "execution_intent_event_id": intent.event_id,
+                    "proof": "not_started" if not_started else "terminated",
+                    "termination_receipt": None if not_started else asdict(receipt),
+                })
+            return [EventDraft(event_type, payload, **_event_context(request, causation))]
+        self._append_required(
+            "workspace_executions", self._publication_stream_id,
+            f"workspace-execution:{request.run_id}:{request.request_id}:{stopped}",
+            decide, "workspace execution occupancy could not be durably audited",
         )
 
     def _record_block(self, request, reason):
@@ -1205,6 +1287,55 @@ def _unresolved_publications(events, *, run_id: str | None = None) -> set[tuple[
         elif event.event_type in {"WorkspacePublicationCompleted", "WorkspacePublicationAborted"}:
             resolved.add(identity)
     return intents - resolved
+
+
+def _unresolved_executions(events, workspace_hash: str) -> set[tuple[str, str]]:
+    """Replay execution occupancy separately from publication, rejecting ambiguity."""
+    pending, seen = {}, set()
+    common = {"request_id", "workspace_identity_hash", "request_hash", "profile_hash"}
+    for version, event in enumerate(events, 1):
+        payload = event.payload
+        context = (event.run_id, event.node_id, event.attempt_id, event.fencing_generation)
+        if (event.schema_version != 1 or event.stream_version != version
+                or event.stream_type != "workspace_executions"
+                or event.stream_id != "workspace:" + workspace_hash.removeprefix("sha256:")
+                or not all(isinstance(v, str) and re.fullmatch(_SAFE_IDENTIFIER, v) for v in context[:3])
+                or type(context[3]) is not int or context[3] < 0
+                or not isinstance(payload.get("request_id"), str)
+                or re.fullmatch(_SAFE_IDENTIFIER, payload["request_id"]) is None
+                or payload.get("workspace_identity_hash") != workspace_hash
+                or any(not isinstance(payload.get(key), str) or not _HASH.fullmatch(payload[key])
+                       for key in ("request_hash", "profile_hash"))):
+            raise ToolAuditUnavailable("workspace execution history has invalid binding")
+        identity = (event.run_id, payload["request_id"])
+        if event.event_type == "WorkspaceExecutionIntended":
+            if set(payload) != common or identity in seen or pending:
+                raise ToolAuditUnavailable("workspace execution intent is duplicate or overlapping")
+            pending[identity] = event
+            seen.add(identity)
+        elif event.event_type == "WorkspaceExecutionStopped":
+            intent = pending.get(identity)
+            if (set(payload) != common | {"execution_intent_event_id", "proof", "termination_receipt"}
+                    or intent is None
+                    or context != (intent.run_id, intent.node_id, intent.attempt_id, intent.fencing_generation)
+                    or any(payload[key] != intent.payload[key] for key in common)
+                    or payload["execution_intent_event_id"] != intent.event_id
+                    or event.causation_id != intent.event_id):
+                raise ToolAuditUnavailable("workspace execution stop is orphaned or mismatched")
+            if payload["proof"] == "not_started":
+                if payload["termination_receipt"] is not None:
+                    raise ToolAuditUnavailable("non-start proof contains contradictory stop evidence")
+            elif payload["proof"] == "terminated":
+                try:
+                    SandboxTerminationReceipt(**payload["termination_receipt"])
+                except (TypeError, ValueError) as exc:
+                    raise ToolAuditUnavailable("workspace execution stop proof is invalid") from exc
+            else:
+                raise ToolAuditUnavailable("workspace execution stop proof is unavailable")
+            del pending[identity]
+        else:
+            raise ToolAuditUnavailable("workspace execution history contains an unsupported event")
+    return set(pending)
 
 
 def _publication_intent_event_id(events, request) -> str:

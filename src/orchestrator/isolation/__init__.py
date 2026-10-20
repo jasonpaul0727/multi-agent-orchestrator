@@ -16,6 +16,8 @@ from .workspace import (
 from .launcher import (
     InvalidSandboxRequest,
     IsolationUnavailable,
+    IsolationNotStarted,
+    IsolationStartUnknown,
     SandboxLimits,
     SandboxResult,
     SandboxTerminationReceipt,
@@ -63,10 +65,15 @@ from .provider_sender import (
     SystemdProviderSenderLauncher,
     SystemdProviderSenderSession,
 )
+from .admission import WorkspaceIsolationAdmission, verify_workspace_isolation
 
 __all__ = [
     "InvalidSandboxRequest",
     "IsolationUnavailable",
+    "IsolationNotStarted",
+    "IsolationStartUnknown",
+    "WorkspaceIsolationAdmission",
+    "verify_workspace_isolation",
     "SandboxLimits",
     "SandboxResult",
     "SandboxTerminationReceipt",

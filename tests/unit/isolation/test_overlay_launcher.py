@@ -276,11 +276,11 @@ def test_invalid_candidate_budgets_fail_before_launch(key: str, value) -> None:
 def test_unsupported_platform_or_missing_kernel_tools_fail(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(module.platform, "system", lambda: "Windows")
     with pytest.raises(IsolationUnavailable, match="Linux-only"):
-        module.SystemdOverlayCandidateLauncher().launch(tmp_path, ["true"])
+        module.SystemdOverlayCandidateLauncher()._launch(tmp_path, ["true"])
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
     monkeypatch.setattr(module.shutil, "which", lambda _name: None)
     with pytest.raises(IsolationUnavailable, match="requires"):
-        module.SystemdOverlayCandidateLauncher().launch(tmp_path, ["true"])
+        module.SystemdOverlayCandidateLauncher()._launch(tmp_path, ["true"])
 
 
 @pytest.mark.parametrize("options", [{"input_bytes": b"x"*1_048_577}, {"input_bytes": "text"}, {"limits": {}}])
@@ -297,12 +297,12 @@ def test_manager_probe_failure_prevents_execution(monkeypatch, tmp_path: Path, f
         return subprocess.CompletedProcess([], failure)
     monkeypatch.setattr(module.subprocess, "run", query)
     with pytest.raises(IsolationUnavailable):
-        module.SystemdOverlayCandidateLauncher().launch(tmp_path, ["/bin/true"])
+        module.SystemdOverlayCandidateLauncher()._launch(tmp_path, ["/bin/true"])
 
 
 def test_wrong_frozen_workspace_identity_rejects_before_scope(tmp_path: Path) -> None:
     with pytest.raises(InvalidSandboxRequest, match="snapshot"):
-        module.SystemdOverlayCandidateLauncher().launch(
+        module.SystemdOverlayCandidateLauncher()._launch(
             tmp_path, ["/bin/true"], expected_workspace_identity_hash="sha256:" + "a"*64,
         )
 
@@ -323,31 +323,60 @@ def test_untrackable_start_failure_retains_even_if_scope_not_yet_registered(monk
     monkeypatch.setattr(module.subprocess, "run", lambda *_a, **_k: subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(module.subprocess, "Popen", start)
     with pytest.raises(IsolationUnavailable, match="retained at"):
-        module.SystemdOverlayCandidateLauncher().launch(workspace, ["/bin/true"])
+        module.SystemdOverlayCandidateLauncher()._launch(workspace, ["/bin/true"])
     assert len(stages) == 1
     assert Path(stages[0].name).exists()
     stages[0].cleanup()  # The fake transport could not have launched a real scope.
 
 
 def test_uncertain_transport_start_does_not_remove_potentially_mounted_stage(monkeypatch, tmp_path: Path) -> None:
+    from orchestrator.isolation import IsolationStartUnknown
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     stages = []
+    children = []
+    real_popen = subprocess.Popen
     def stage(_workspace):
         temporary = tempfile.TemporaryDirectory(prefix="candidate-unit-", dir=tmp_path)
         stages.append(temporary)
         return temporary
     def start(*_a, **_k):
-        raise OSError("transport unavailable")
+        children.append(real_popen(["/bin/sleep", "30"]))
+        raise OSError("transport handle lost after child start")
     monkeypatch.setattr(module, "_create_staging", stage)
     monkeypatch.setattr(module, "_scope_stopped", lambda *_a: False)
     monkeypatch.setattr(module, "_candidate_cgroup_parent", lambda _env: Path("/sys/fs/cgroup/app.slice"))
     monkeypatch.setattr(module.subprocess, "run", lambda *_a, **_k: subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(module.subprocess, "Popen", start)
-    with pytest.raises(IsolationUnavailable, match="retained at"):
-        module.SystemdOverlayCandidateLauncher().launch(workspace, ["/bin/true"])
-    assert len(stages) == 1 and Path(stages[0].name).exists()
-    stages[0].cleanup()  # Test transport never spawned a real process.
+    try:
+        with pytest.raises(IsolationStartUnknown, match="retained at"):
+            module.SystemdOverlayCandidateLauncher()._launch(workspace, ["/bin/true"])
+        assert len(children) == 1 and children[0].poll() is None
+        assert len(stages) == 1 and Path(stages[0].name).exists()
+    finally:
+        for child in children:
+            child.kill()
+            child.wait(timeout=5)
+        for stage in stages:
+            stage.cleanup()  # The test owns the real child and has now reaped it.
+
+
+def test_proven_snapshot_setup_failure_is_nonstart_and_releases_private_stage(monkeypatch, tmp_path):
+    from orchestrator.isolation import IsolationNotStarted
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    stage = tempfile.TemporaryDirectory(dir=tmp_path)
+    stage_path = Path(stage.name)
+    monkeypatch.setattr(module, "_create_staging", lambda _: stage)
+    monkeypatch.setattr(module, "_candidate_cgroup_parent", lambda _: Path("/sys/fs/cgroup/app.slice"))
+    monkeypatch.setattr(module.subprocess, "run", lambda *_a, **_k: subprocess.CompletedProcess([], 0))
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *_a, **_k: pytest.fail("snapshot failure launched command"))
+    def failed_snapshot(*args, **kwargs):
+        raise OSError("private staging write failed")
+    monkeypatch.setattr(module, "snapshot_workspace", failed_snapshot)
+    with pytest.raises(IsolationNotStarted):
+        module.SystemdOverlayCandidateLauncher()._launch(workspace, ["/bin/true"])
+    assert not stage_path.exists()
 
 
 @pytest.mark.parametrize("content", [b"populated 0\nfrozen 0\n", b"populated 1\nfrozen 0\n", b"populated 0\npopulated 1\n", b"unknown\n", b"populated true\n"])

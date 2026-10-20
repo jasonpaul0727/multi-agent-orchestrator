@@ -16,7 +16,8 @@ import uuid
 from typing import Sequence
 
 from .launcher import (
-    InvalidSandboxRequest, IsolationUnavailable, SandboxLimits, SandboxResult, SandboxSession,
+    InvalidSandboxRequest, IsolationUnavailable, IsolationNotStarted, IsolationStartUnknown,
+    SandboxLimits, SandboxResult, SandboxSession,
     _create_staging, _expand_runtime_paths, _systemd_client_environment,
     _systemd_path_supported, _validate_command, _validated_workspace,
 )
@@ -83,12 +84,41 @@ class SystemdOverlayCandidateLauncher:
     def launch(
         self, workspace: str | Path, command: Sequence[str], *, limits: SandboxLimits | None = None,
         input_bytes: bytes | None = None, expected_workspace_identity_hash: str | None = None,
+        expected_profile_hash: str | None = None,
     ) -> "OverlayCandidateSession":
+        from .admission import _verify_workspace_isolation, revalidate_workspace_isolation
+        _validate_command(command)
+        if input_bytes is not None and (not isinstance(input_bytes, bytes) or len(input_bytes) > 1_048_576):
+            raise InvalidSandboxRequest("stdin payload must be at most 1 MiB of bytes")
+        limits = SandboxLimits() if limits is None else limits
+        if not isinstance(limits, SandboxLimits):
+            raise InvalidSandboxRequest("limits must be a validated SandboxLimits")
+        bounds = (self._candidate_bytes, self._candidate_entries, self._scratch_bytes)
+        admission = _verify_workspace_isolation(workspace, limits=limits, candidate_bounds=bounds)
+        if (admission.outcome != "eligible"
+                or expected_profile_hash is not None and admission.profile_hash != expected_profile_hash
+                or expected_workspace_identity_hash is not None
+                and admission.workspace_identity_hash != expected_workspace_identity_hash):
+            raise IsolationNotStarted("isolation_unavailable")
+        return self._launch(
+            workspace, command, limits=limits, input_bytes=input_bytes,
+            expected_workspace_identity_hash=admission.workspace_identity_hash,
+            before_start=lambda: revalidate_workspace_isolation(
+                workspace, limits=limits, admission=admission, candidate_bounds=bounds,
+            ),
+        )
+
+    def _launch(
+        self, workspace: str | Path, command: Sequence[str], *, limits: SandboxLimits | None = None,
+        input_bytes: bytes | None = None, expected_workspace_identity_hash: str | None = None,
+        before_start=None,
+    ) -> "OverlayCandidateSession":
+        """Trusted probe/verified launch implementation; not a request entry."""
         if platform.system().lower() != "linux":
-            raise IsolationUnavailable("candidate backend is Linux-only")
+            raise IsolationNotStarted("candidate backend is Linux-only")
         for binary in ("systemd-run", "systemctl", "unshare", "mount", "umount"):
             if shutil.which(binary) is None:
-                raise IsolationUnavailable("candidate backend requires systemd and namespace tools")
+                raise IsolationNotStarted("candidate backend requires systemd and namespace tools")
         _validate_command(command)
         if input_bytes is not None and (not isinstance(input_bytes, bytes) or len(input_bytes) > 1_048_576):
             raise InvalidSandboxRequest("stdin payload must be at most 1 MiB of bytes")
@@ -103,18 +133,20 @@ class SystemdOverlayCandidateLauncher:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise IsolationUnavailable("candidate systemd manager probe failed") from exc
+            raise IsolationNotStarted("candidate systemd manager probe failed") from exc
         if manager.returncode != 0:
-            raise IsolationUnavailable("candidate backend requires a usable systemd user manager")
+            raise IsolationNotStarted("candidate backend requires a usable systemd user manager")
         cgroup_parent = _candidate_cgroup_parent(environment)
         runtime = Path(__file__).resolve().parents[2]
         if not runtime.is_dir() or not _systemd_path_supported(runtime):
-            raise IsolationUnavailable("candidate runtime path is unavailable or unsupported")
+            raise IsolationNotStarted("candidate runtime path is unavailable or unsupported")
         expanded = _expand_runtime_paths(command, runtime, Path("/runtime"))
         temporary = _create_staging(root)
         stage = Path(temporary.name)
         retained = None
         try:
+            from .admission import _trusted_path
+            _trusted_path(stage, private=True)
             snapshot_workspace(
                 root, stage / "lower", max_entries=100_000, max_bytes=256 * 1024 * 1024,
                 max_depth=64, expected_identity_hash=expected_workspace_identity_hash,
@@ -132,6 +164,7 @@ class SystemdOverlayCandidateLauncher:
                 os.chmod(stage / "config.json", 0o600)
                 json.dump(config, stream, separators=(",", ":"))
             env_args = ["PATH=/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
+                        "PYTHONDONTWRITEBYTECODE=1",
                         f"PYTHONPATH={runtime}", f"MAESTRO_EXPECT_MEMORY={limits.memory_bytes}",
                         f"MAESTRO_EXPECT_TASKS={limits.tasks}", f"MAESTRO_EXPECT_CPU={limits.cpu_percent}",
                         f"MAESTRO_EXPECT_NOFILE={limits.nofile}", f"MAESTRO_EXPECT_FSIZE={limits.file_bytes}"]
@@ -143,6 +176,8 @@ class SystemdOverlayCandidateLauncher:
                 "--pid", "--fork", "--mount-proc=/proc", "/usr/bin/python3", "-P", "-S", "-m",
                 "orchestrator.isolation._overlay_bootstrap", str(stage),
             ]
+            if before_start is not None:
+                before_start()
             retained = _RetainedStaging(temporary)
             process = subprocess.Popen(
                 args, stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
@@ -154,8 +189,10 @@ class SystemdOverlayCandidateLauncher:
         except BaseException as exc:
             if retained is None:
                 temporary.cleanup()
+                if isinstance(exc, Exception):
+                    raise IsolationNotStarted("candidate preparation failed before launch") from exc
                 raise
-            raise IsolationUnavailable(
+            raise IsolationStartUnknown(
                 f"candidate start failed; stop unconfirmed; private staging retained at {stage}; unit {unit}"
             ) from exc
         transport = SandboxSession(
@@ -265,7 +302,7 @@ def _candidate_cgroup_parent(environment: dict[str, str]) -> Path:
             raise ValueError("candidate cgroup parent is absent")
         return parent
     except (OSError, subprocess.TimeoutExpired, UnicodeError, ValueError) as exc:
-        raise IsolationUnavailable("candidate cgroup parent cannot be proven") from exc
+        raise IsolationNotStarted("candidate cgroup parent cannot be proven") from exc
 
 
 def _cgroup_is_empty(group: Path) -> bool:

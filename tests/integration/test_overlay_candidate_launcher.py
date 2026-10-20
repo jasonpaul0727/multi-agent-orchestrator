@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 from pathlib import Path
-import shutil
 import socket
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -25,26 +22,14 @@ from orchestrator.tools import (
     WorkspaceWriteGateway,
     WorkspaceWriteRequest,
 )
+from tests.support.isolation_runtime import private_isolation_runtime, use_private_isolation_runtime
 
-
-def _systemd_available() -> bool:
-    if not sys.platform.startswith("linux") or not shutil.which("systemd-run"):
-        return False
-    return subprocess.run(
-        ["systemctl", "--user", "show-environment"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5,
-    ).returncode == 0
-
-
-pytestmark = pytest.mark.skipif(
-    not _systemd_available(), reason="live candidate backend requires Linux/systemd --user",
-)
+pytestmark = pytest.mark.usefixtures("use_private_isolation_runtime")
 
 
 def test_candidate_cannot_see_or_connect_host_broker_socket(tmp_path: Path) -> None:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime is None or not Path(runtime).is_relative_to("/run/user"):
-        pytest.skip("live Broker boundary requires a /run/user runtime path")
+    assert runtime is not None and Path(runtime).is_relative_to("/run/user")
     socket_path = Path(runtime) / f"maestro-test-{uuid.uuid4().hex}.sock"
     code = r'''
 import errno, json, socket, sys
@@ -178,7 +163,9 @@ def test_live_candidate_gateway_audits_then_publishes_exact_workspace_diff(tmp_p
         policy_state=lambda request: PolicyState(1, 0),
         lease_root=lease_root,
         journal_root=journal_root,
-        isolation_profile_hash="sha256:" + hashlib.sha256(b"live-overlay-workspace-write-profile").hexdigest(),
+        isolation_profile_hash=isolation.verify_workspace_isolation(
+            workspace, limits=isolation.SandboxLimits(),
+        ).profile_hash,
     )
     request = WorkspaceWriteRequest(
         request_id="live-write-1",
