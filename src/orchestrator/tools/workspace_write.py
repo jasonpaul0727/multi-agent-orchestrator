@@ -236,7 +236,12 @@ class WorkspaceWriteGateway:
             self._record_block(request, "isolation_unavailable")
             return ToolExecutionResult(request.request_id, "blocked", decision,
                                        reason_code="isolation_unavailable")
-        admission = verify_workspace_isolation(self._workspace, limits=self._limits)
+        try:
+            admission = verify_workspace_isolation(self._workspace, limits=self._limits)
+        except IsolationNotStarted:
+            self._record_block(request, "isolation_unavailable")
+            return ToolExecutionResult(request.request_id, "blocked", decision,
+                                       reason_code="isolation_unavailable")
         if (admission.outcome != "eligible" or admission.profile_hash != self._profile_hash
                 or admission.workspace_identity_hash != self._workspace_identity_hash):
             self._record_block(request, "isolation_unavailable")

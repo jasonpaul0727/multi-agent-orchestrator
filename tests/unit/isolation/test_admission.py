@@ -115,6 +115,29 @@ def test_invalid_command_is_proven_nonstart_without_admission_probe(monkeypatch,
         isolation.SystemdOverlayCandidateLauncher().launch(tmp_path, [])
 
 
+@pytest.mark.parametrize("loss", ["disappeared", "symlink"])
+@pytest.mark.parametrize("entrypoint", ["verify", "launch"])
+def test_workspace_identity_loss_is_proven_nonstart(monkeypatch, tmp_path, loss, entrypoint):
+    admission = _admission()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bound_identity = workspace_identity_hash(workspace)
+    moved = tmp_path / "moved"
+    workspace.rename(moved)
+    if loss == "symlink":
+        workspace.symlink_to(moved, target_is_directory=True)
+    monkeypatch.setattr(admission, "_run_probe", lambda *_a, **_k: pytest.fail("lost identity probed"))
+    monkeypatch.setattr(isolation.SystemdOverlayCandidateLauncher, "_launch",
+                        lambda *_a, **_k: pytest.fail("lost identity launched"))
+    with pytest.raises(isolation.IsolationNotStarted):
+        if entrypoint == "verify":
+            admission.verify_workspace_isolation(workspace, limits=isolation.SandboxLimits())
+        else:
+            isolation.SystemdOverlayCandidateLauncher().launch(
+                workspace, ("/usr/bin/true",), expected_workspace_identity_hash=bound_identity,
+            )
+
+
 def test_runtime_bytecode_changes_invalidate_verified_fingerprint(monkeypatch, tmp_path, use_private_isolation_runtime):
     admission = _admission()
     cache = use_private_isolation_runtime / "orchestrator/isolation/__pycache__"

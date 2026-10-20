@@ -203,7 +203,11 @@ def verify_workspace_isolation(workspace: str | Path, *, limits: SandboxLimits) 
 
 
 def _verify_workspace_isolation(workspace, *, limits, candidate_bounds=None):
-    identity = workspace_identity_hash(workspace)
+    try:
+        identity = workspace_identity_hash(workspace)
+    except ValueError as exc:
+        # No profile or probe can exist without an established workspace binding.
+        raise IsolationNotStarted("workspace identity cannot be established") from exc
     profile = None
     try:
         root = _validated_workspace(workspace)

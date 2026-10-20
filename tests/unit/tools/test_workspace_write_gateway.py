@@ -286,6 +286,66 @@ def test_consumed_approval_nonstart_receipt_requires_proof(tmp_path, monkeypatch
     assert len([e for e in events.read_stream("budget", "run-1") if e.event_type == "ApprovalGrantConsumed"]) == 1
 
 
+@pytest.mark.parametrize("loss", ["disappeared", "symlink"])
+@pytest.mark.parametrize("seam", ["preflight", "launch"])
+def test_workspace_identity_loss_is_audited_against_original_binding(tmp_path, monkeypatch, loss, seam):
+    from orchestrator.isolation import SystemdOverlayCandidateLauncher
+    from orchestrator.isolation import admission
+    from orchestrator.tools import workspace_write
+    workspace, events, launcher, _, _, journal, gateway, approvals = _fixture(tmp_path, approval=True)
+    waiting = gateway.execute(_request(workspace))
+    grant = approvals.approve(waiting.approval_request_id, "human-1", reason="exact scope")
+    request = _request(workspace, "fresh", attempt_id="attempt-2", generation=3)
+    original_identity = gateway._workspace_identity_hash
+    original_request_hash = gateway._request_hash(request)
+    moved = tmp_path / "moved-workspace"
+
+    def lose_workspace():
+        workspace.rename(moved)
+        if loss == "symlink":
+            workspace.symlink_to(moved, target_is_directory=True)
+
+    monkeypatch.setattr(admission, "_run_probe", lambda *_a, **_k: pytest.fail("lost identity probed"))
+    monkeypatch.setattr(SystemdOverlayCandidateLauncher, "_launch",
+                        lambda *_a, **_k: pytest.fail("lost identity launched"))
+    if seam == "preflight":
+        monkeypatch.setattr(workspace_write, "verify_workspace_isolation", admission.verify_workspace_isolation)
+        lose_workspace()
+    else:
+        def launch_after_identity_loss(*args, **kwargs):
+            lose_workspace()
+            return SystemdOverlayCandidateLauncher().launch(*args, **kwargs)
+        monkeypatch.setattr(launcher, "launch", launch_after_identity_loss)
+
+    result = gateway.execute(request, approval_grant_id=grant.approval_grant_id)
+
+    assert result.outcome == "blocked" and result.reason_code == "isolation_unavailable"
+    assert gateway._workspace_identity_hash == original_identity
+    security = [e for e in events.read_stream("security", "run-1")
+                if e.payload.get("request_id") == "fresh"]
+    blocks = [e for e in security if e.event_type == "ToolExecutionBlocked"]
+    assert len(blocks) == 1
+    assert blocks[0].payload["request_hash"] == original_request_hash
+    assert blocks[0].payload["reason"] == "isolation_unavailable"
+    assert not {"ToolExecutionOutcomeUnknown", "WorkspacePublicationIntent"} & {e.event_type for e in security}
+    occupancy = events.read_stream("workspace_executions", gateway._publication_stream_id)
+    assert [e.event_type for e in occupancy] == (
+        ["WorkspaceExecutionIntended", "WorkspaceExecutionStopped"] if seam == "launch" else [])
+    if occupancy:
+        assert all(e.payload["workspace_identity_hash"] == original_identity for e in occupancy)
+        assert occupancy[-1].payload["proof"] == "not_started"
+        assert occupancy[-1].payload["termination_receipt"] is None
+    budget = events.read_stream("budget", "run-1")
+    assert len([e for e in budget if e.event_type == "ApprovalGrantConsumed"]) == (1 if seam == "launch" else 0)
+    assert [e.payload["outcome"] for e in budget if e.event_type == "EffectReceiptRecorded"] == (
+        ["not_applied"] if seam == "launch" else [])
+    assert not (moved / "new.txt").exists() and not list(journal.iterdir())
+    if loss == "symlink":
+        workspace.unlink()
+    moved.rename(workspace)
+    assert not gateway._has_unresolved_publication("run-1")
+
+
 def test_nonstart_exception_after_launch_cannot_fabricate_safe_block(tmp_path, monkeypatch):
     from orchestrator.isolation import IsolationNotStarted
     workspace, events, _, session, _, _, gateway, _ = _fixture(tmp_path)
