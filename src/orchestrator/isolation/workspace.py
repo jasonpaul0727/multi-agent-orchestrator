@@ -160,6 +160,9 @@ def snapshot_workspace(
     directory_count = 1
     symlink_count = 0
     directory_paths: list[Path] = []
+    protected_entries: dict[str, tuple] = {}
+    protected_inodes: set[tuple[int, int]] = set()
+    root_names: tuple[str, ...] = ()
     try:
         root_mount_id = _descriptor_mount_id(source_fd)
     except BaseException:
@@ -172,6 +175,23 @@ def snapshot_workspace(
         entries += 1
         if entries > max_entries:
             raise WorkspaceBoundaryError("workspace exceeds the snapshot entry limit")
+
+    def metadata(info):
+        # Ignore access time: our own no-follow traversal can legitimately update it.
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    def validate_protected_entries():
+        try:
+            if tuple(sorted(os.listdir(source_fd))) != root_names:
+                raise WorkspaceBoundaryError("workspace root names changed during snapshot")
+            for name, expected in protected_entries.items():
+                if metadata(os.stat(name, dir_fd=source_fd, follow_symlinks=False)) != expected:
+                    raise WorkspaceBoundaryError("protected workspace entry changed during snapshot")
+            if metadata(os.fstat(source_fd)) != metadata(root_stat):
+                raise WorkspaceBoundaryError("workspace root changed during snapshot")
+        except OSError as exc:
+            raise WorkspaceBoundaryError("protected workspace entry changed during snapshot") from exc
 
     def validate_relative_symlink(relative_parent: tuple[str, ...], link: str) -> None:
         if not link or os.path.isabs(link):
@@ -188,13 +208,26 @@ def snapshot_workspace(
                 parts.append(component)
 
     def copy_directory(source_fd: int, output: Path, relative: tuple[str, ...], depth: int) -> None:
-        nonlocal bytes_copied, file_count, directory_count, symlink_count
+        nonlocal bytes_copied, file_count, directory_count, symlink_count, root_names
         if depth > max_depth:
             raise WorkspaceBoundaryError("workspace exceeds the snapshot depth limit")
         try:
             names = sorted(os.listdir(source_fd))
         except OSError as exc:
             raise WorkspaceBoundaryError("workspace directory cannot be read safely") from exc
+        if not relative:
+            root_names = tuple(names)
+            # Capture excluded inode identities before copying ANY sibling, even
+            # one sorting before the protected name. Never open secret contents.
+            try:
+                for name in names:
+                    if name.casefold() in (".git", ".maestro", ".env"):
+                        info = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+                        protected_entries[name] = metadata(info)
+                        protected_inodes.add((info.st_dev, info.st_ino))
+            except OSError as exc:
+                raise WorkspaceBoundaryError("protected workspace entry changed during snapshot") from exc
+            validate_protected_entries()
         for name in names:
             if name in (".", "..") or "/" in name or "\x00" in name:
                 raise WorkspaceBoundaryError("workspace contains an invalid directory entry")
@@ -204,6 +237,8 @@ def snapshot_workspace(
                 before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
             except OSError as exc:
                 raise WorkspaceBoundaryError("workspace changed during snapshot inspection") from exc
+            if (before.st_dev, before.st_ino) in protected_inodes:
+                raise WorkspaceBoundaryError("workspace hardlink aliases a protected entry")
             add_entry()
             output_path = output / name
             child_relative = (*relative, name)
@@ -285,6 +320,7 @@ def snapshot_workspace(
 
     try:
         copy_directory(source_fd, target, (), 0)
+        validate_protected_entries()
     except BaseException:
         shutil.rmtree(target, ignore_errors=True)
         raise

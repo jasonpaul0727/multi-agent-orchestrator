@@ -277,3 +277,25 @@ def test_real_readonly_runtime_rejects_hardlinked_secret_input(tmp_path, monkeyp
         session = SystemdReadOnlyLauncher().launch(workspace, ["/usr/bin/cat", "config-copy"])
         session.wait()
     assert (workspace / ".env").read_bytes() == b"hardlink-secret-sentinel"
+
+
+def test_real_readonly_runtime_rejects_secret_unlink_race(tmp_path, monkeypatch, use_private_isolation_runtime):
+    from orchestrator.isolation import launcher, InvalidSandboxRequest, SystemdReadOnlyLauncher
+    monkeypatch.setattr(launcher, "__file__", str(use_private_isolation_runtime / "orchestrator/isolation/launcher.py"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = workspace / ".env"
+    secret.write_bytes(b"unlink-secret-sentinel")
+    os.link(secret, workspace / "config-copy")
+    real_stat = os.stat
+    unlinked = False
+    def racing_stat(path, *args, **kwargs):
+        nonlocal unlinked
+        if not unlinked and path == "config-copy" and kwargs.get("dir_fd") is not None:
+            secret.unlink()
+            unlinked = True
+        return real_stat(path, *args, **kwargs)
+    monkeypatch.setattr(os, "stat", racing_stat)
+    with pytest.raises(InvalidSandboxRequest, match="snapshot failed closed"):
+        session = SystemdReadOnlyLauncher().launch(workspace, ["/usr/bin/cat", "config-copy"])
+        session.wait()
