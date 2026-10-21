@@ -264,3 +264,16 @@ def test_published_replay_rejects_gateway_proof_from_another_attempt(tmp_path, m
     case.app.close()
     with pytest.raises(StartupRecoveryFailed):
         ControlPlaneApplication(tmp_path / "events.db", limits=_application_limits())
+
+
+def test_real_readonly_runtime_rejects_hardlinked_secret_input(tmp_path, monkeypatch, use_private_isolation_runtime):
+    from orchestrator.isolation import launcher, InvalidSandboxRequest, SystemdReadOnlyLauncher
+    monkeypatch.setattr(launcher, "__file__", str(use_private_isolation_runtime / "orchestrator/isolation/launcher.py"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".env").write_bytes(b"hardlink-secret-sentinel")
+    os.link(workspace / ".env", workspace / "config-copy")
+    with pytest.raises(InvalidSandboxRequest, match="snapshot failed closed"):
+        session = SystemdReadOnlyLauncher().launch(workspace, ["/usr/bin/cat", "config-copy"])
+        session.wait()
+    assert (workspace / ".env").read_bytes() == b"hardlink-secret-sentinel"

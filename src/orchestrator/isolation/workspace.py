@@ -245,6 +245,8 @@ def snapshot_workspace(
                 continue
             if not stat.S_ISREG(before.st_mode) or before.st_dev != root_stat.st_dev:
                 raise WorkspaceBoundaryError("workspace contains a special file or nested mount")
+            if before.st_nlink != 1:
+                raise WorkspaceBoundaryError("workspace snapshot rejects hardlinked files")
             if before.st_size > max_bytes - bytes_copied:
                 raise WorkspaceBoundaryError("workspace exceeds the snapshot byte limit")
             try:
@@ -259,6 +261,8 @@ def snapshot_workspace(
                 opened = os.fstat(file_fd)
                 if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
                     raise WorkspaceBoundaryError("workspace file changed during snapshot")
+                if opened.st_nlink != 1:
+                    raise WorkspaceBoundaryError("workspace snapshot rejects hardlinked files")
                 if _descriptor_mount_id(file_fd) != root_mount_id:
                     raise WorkspaceBoundaryError("workspace contains a nested mount point")
                 with output_path.open("xb") as output_file:
@@ -270,6 +274,8 @@ def snapshot_workspace(
                         if bytes_copied > max_bytes:
                             raise WorkspaceBoundaryError("workspace exceeds the snapshot byte limit")
                         output_file.write(chunk)
+                if os.fstat(file_fd).st_nlink != 1:
+                    raise WorkspaceBoundaryError("workspace snapshot rejects hardlinked files")
                 output_path.chmod(0o555 if opened.st_mode & 0o111 else 0o444)
                 file_count += 1
             except OSError as exc:
