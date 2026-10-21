@@ -36,6 +36,16 @@ from orchestrator.tools import (
 from orchestrator.workspace_identity import workspace_identity_hash
 
 
+@pytest.fixture(autouse=True)
+def measured_host(monkeypatch):
+    """Gateway unit tests isolate measured host I/O; live tests use the probe."""
+    from orchestrator.isolation import WorkspaceIsolationAdmission
+    from orchestrator.tools import workspace_write
+    monkeypatch.setattr(workspace_write, "verify_workspace_isolation", lambda workspace, **kwargs:
+        WorkspaceIsolationAdmission("eligible", None, "sha256:" + "a"*64,
+                                    workspace_identity_hash(workspace), datetime.now(timezone.utc)), raising=False)
+
+
 class _Authority:
     def __init__(self, valid: bool = True) -> None:
         self.valid = valid
@@ -82,7 +92,8 @@ class _CandidateLauncher:
         self.session = session
         self.calls = []
 
-    def launch(self, workspace, command, *, limits, expected_workspace_identity_hash):
+    def launch(self, workspace, command, *, limits, expected_workspace_identity_hash, expected_profile_hash):
+        assert expected_profile_hash == "sha256:" + "a"*64
         self.calls.append((workspace, command, limits, expected_workspace_identity_hash))
         return self.session
 
@@ -125,6 +136,7 @@ def _fixture(
     allow: bool = True,
     authority: _Authority | None = None,
     approval: bool = False,
+    retain_publication: bool = False,
 ):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -194,8 +206,315 @@ def _fixture(
         approval_service=approval_service,
         approval_requester=(lambda request: "requester-1") if approval else None,
         approval_now=lambda: now,
+        retain_publication=retain_publication,
     )
     return workspace, events, launcher, session, lease_root, journal_root, gateway, approval_service
+
+
+def test_unmeasured_profile_blocks_before_consuming_or_launching(tmp_path, monkeypatch):
+    from orchestrator.isolation import WorkspaceIsolationAdmission
+    from orchestrator.tools import workspace_write
+    workspace, events, launcher, session, _, journal, gateway, _ = _fixture(tmp_path)
+    monkeypatch.setattr(workspace_write, "verify_workspace_isolation", lambda *a, **k:
+        WorkspaceIsolationAdmission("blocked", "isolation_unavailable", None,
+                                    workspace_identity_hash(workspace), datetime.now(timezone.utc)), raising=False)
+    result = gateway.execute(_request(workspace))
+    assert result.outcome == "blocked"
+    assert result.reason_code == "isolation_unavailable"
+    assert launcher.calls == [] and not session.closed
+    assert not (workspace / "new.txt").exists() and not list(journal.iterdir())
+    recorded = [e.event_type for e in events.read_stream("security", "run-1")]
+    assert "ToolExecutionBlocked" in recorded
+    assert not {"ToolExecutionStarted", "ToolCapabilityConsumed", "WorkspacePublicationIntent"} & set(recorded)
+    assert events.read_stream("workspace_executions", gateway._publication_stream_id) == []
+
+
+@pytest.mark.parametrize("private_root", ["lease", "journal"])
+def test_private_control_root_drift_blocks_before_command(tmp_path, private_root):
+    workspace, _, launcher, _, leases, journal, gateway, _ = _fixture(tmp_path)
+    root = leases if private_root == "lease" else journal
+    root.chmod(0o755)
+    result = gateway.execute(_request(workspace))
+    assert result.outcome == "blocked" and result.reason_code == "isolation_unavailable"
+    assert launcher.calls == [] and not (workspace / "new.txt").exists()
+
+
+@pytest.mark.parametrize("wrong", ["profile", "workspace"])
+def test_measured_evidence_must_match_gateway_binding(tmp_path, monkeypatch, wrong):
+    from orchestrator.isolation import WorkspaceIsolationAdmission
+    from orchestrator.tools import workspace_write
+    workspace, events, launcher, _, _, _, gateway, _ = _fixture(tmp_path)
+    monkeypatch.setattr(workspace_write, "verify_workspace_isolation", lambda *a, **k:
+        WorkspaceIsolationAdmission("eligible", None, "sha256:" + ("b" if wrong == "profile" else "a")*64,
+            "sha256:" + "b"*64 if wrong == "workspace" else workspace_identity_hash(workspace),
+            datetime.now(timezone.utc)), raising=False)
+    result = gateway.execute(_request(workspace))
+    assert result.outcome == "blocked" and launcher.calls == []
+    assert not any(e.event_type == "ToolExecutionStarted" for e in events.read_stream("security", "run-1"))
+
+
+def test_definite_nonstart_after_consumption_is_blocked_and_not_reusable(tmp_path, monkeypatch):
+    from orchestrator.isolation import IsolationNotStarted
+    workspace, events, launcher, _, _, _, gateway, _ = _fixture(tmp_path)
+    def reject(*args, **kwargs):
+        raise IsolationNotStarted("controls drifted")
+    monkeypatch.setattr(launcher, "launch", reject)
+    request = _request(workspace)
+    result = gateway.execute(request)
+    assert result.outcome == "blocked" and result.reason_code == "isolation_unavailable"
+    types = [e.event_type for e in events.read_stream("security", "run-1")]
+    assert "ToolExecutionStarted" in types and "ToolExecutionFailed" in types
+    assert "WorkspacePublicationIntent" not in types and "ToolExecutionOutcomeUnknown" not in types
+    with pytest.raises(ToolRequestAlreadyUsed):
+        gateway.execute(request)
+
+
+@pytest.mark.parametrize("definite", [True, False])
+def test_consumed_approval_nonstart_receipt_requires_proof(tmp_path, monkeypatch, definite):
+    from orchestrator.isolation import IsolationNotStarted
+    workspace, events, launcher, _, _, _, gateway, approvals = _fixture(tmp_path, approval=True)
+    waiting = gateway.execute(_request(workspace))
+    grant = approvals.approve(waiting.approval_request_id, "human-1", reason="exact scope")
+    def reject(*args, **kwargs):
+        raise IsolationNotStarted("rejected before start") if definite else OSError("start uncertain")
+    monkeypatch.setattr(launcher, "launch", reject)
+    result = gateway.execute(_request(workspace, "fresh", attempt_id="attempt-2", generation=3),
+                             approval_grant_id=grant.approval_grant_id)
+    assert result.outcome == ("blocked" if definite else "execution_unknown")
+    receipts = [e for e in events.read_stream("budget", "run-1") if e.event_type == "EffectReceiptRecorded"]
+    assert [e.payload["outcome"] for e in receipts] == (["not_applied"] if definite else [])
+    assert len([e for e in events.read_stream("budget", "run-1") if e.event_type == "ApprovalGrantConsumed"]) == 1
+
+
+@pytest.mark.parametrize("loss", ["disappeared", "symlink"])
+@pytest.mark.parametrize("seam", ["preflight", "launch"])
+def test_workspace_identity_loss_is_audited_against_original_binding(tmp_path, monkeypatch, loss, seam):
+    from orchestrator.isolation import SystemdOverlayCandidateLauncher
+    from orchestrator.isolation import admission
+    from orchestrator.tools import workspace_write
+    workspace, events, launcher, _, _, journal, gateway, approvals = _fixture(tmp_path, approval=True)
+    waiting = gateway.execute(_request(workspace))
+    grant = approvals.approve(waiting.approval_request_id, "human-1", reason="exact scope")
+    request = _request(workspace, "fresh", attempt_id="attempt-2", generation=3)
+    original_identity = gateway._workspace_identity_hash
+    original_request_hash = gateway._request_hash(request)
+    moved = tmp_path / "moved-workspace"
+
+    def lose_workspace():
+        workspace.rename(moved)
+        if loss == "symlink":
+            workspace.symlink_to(moved, target_is_directory=True)
+
+    monkeypatch.setattr(admission, "_run_probe", lambda *_a, **_k: pytest.fail("lost identity probed"))
+    monkeypatch.setattr(SystemdOverlayCandidateLauncher, "_launch",
+                        lambda *_a, **_k: pytest.fail("lost identity launched"))
+    if seam == "preflight":
+        monkeypatch.setattr(workspace_write, "verify_workspace_isolation", admission.verify_workspace_isolation)
+        lose_workspace()
+    else:
+        def launch_after_identity_loss(*args, **kwargs):
+            lose_workspace()
+            return SystemdOverlayCandidateLauncher().launch(*args, **kwargs)
+        monkeypatch.setattr(launcher, "launch", launch_after_identity_loss)
+
+    result = gateway.execute(request, approval_grant_id=grant.approval_grant_id)
+
+    assert result.outcome == "blocked" and result.reason_code == "isolation_unavailable"
+    assert gateway._workspace_identity_hash == original_identity
+    security = [e for e in events.read_stream("security", "run-1")
+                if e.payload.get("request_id") == "fresh"]
+    blocks = [e for e in security if e.event_type == "ToolExecutionBlocked"]
+    assert len(blocks) == 1
+    assert blocks[0].payload["request_hash"] == original_request_hash
+    assert blocks[0].payload["reason"] == "isolation_unavailable"
+    assert not {"ToolExecutionOutcomeUnknown", "WorkspacePublicationIntent"} & {e.event_type for e in security}
+    occupancy = events.read_stream("workspace_executions", gateway._publication_stream_id)
+    assert [e.event_type for e in occupancy] == (
+        ["WorkspaceExecutionIntended", "WorkspaceExecutionStopped"] if seam == "launch" else [])
+    if occupancy:
+        assert all(e.payload["workspace_identity_hash"] == original_identity for e in occupancy)
+        assert occupancy[-1].payload["proof"] == "not_started"
+        assert occupancy[-1].payload["termination_receipt"] is None
+    budget = events.read_stream("budget", "run-1")
+    assert len([e for e in budget if e.event_type == "ApprovalGrantConsumed"]) == (1 if seam == "launch" else 0)
+    assert [e.payload["outcome"] for e in budget if e.event_type == "EffectReceiptRecorded"] == (
+        ["not_applied"] if seam == "launch" else [])
+    assert not (moved / "new.txt").exists() and not list(journal.iterdir())
+    if loss == "symlink":
+        workspace.unlink()
+    moved.rename(workspace)
+    assert not gateway._has_unresolved_publication("run-1")
+
+
+def test_nonstart_exception_after_launch_cannot_fabricate_safe_block(tmp_path, monkeypatch):
+    from orchestrator.isolation import IsolationNotStarted
+    workspace, events, _, session, _, _, gateway, _ = _fixture(tmp_path)
+    def fail_after_launch():
+        raise IsolationNotStarted("late failure is not evidence of non-start")
+    monkeypatch.setattr(session, "wait", fail_after_launch)
+    result = gateway.execute(_request(workspace))
+    assert result.outcome == "execution_unknown" and not result.termination_confirmed
+    occupancy = events.read_stream("workspace_executions", gateway._publication_stream_id)
+    assert [e.event_type for e in occupancy] == ["WorkspaceExecutionIntended"]
+    assert gateway.execute(_request(workspace, "later")).outcome == "denied"
+
+
+def test_started_process_then_exception_retains_durable_workspace_occupancy(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    workspace, events, launcher, session, leases, journal, gateway, _ = _fixture(tmp_path)
+    children = []
+    def uncertain(*args, **kwargs):
+        child = subprocess.Popen([sys.executable, "-c", "import time; print('started', flush=True); time.sleep(30)"],
+                                 stdout=subprocess.PIPE)
+        children.append(child)
+        assert child.stdout.readline() == b"started\n"
+        raise OSError("lost launch handle after child start")
+    monkeypatch.setattr(launcher, "launch", uncertain)
+    try:
+        result = gateway.execute(_request(workspace))
+        assert result.outcome == "execution_unknown" and not result.termination_confirmed
+        assert children[0].poll() is None and not session.closed
+        # A fresh host object must still see the persisted occupancy.
+        reopened = WorkspaceWriteGateway(
+            run_id="other-run", workspace=workspace, event_store=SQLiteEventStore(tmp_path / "events.db"),
+            policy_manifest=_manifest(), attempt_authority=_Authority(), policy_state=lambda _: PolicyState(1, 4),
+            lease_root=leases, journal_root=journal, launcher=launcher, isolation_profile_hash="sha256:" + "a"*64,
+        )
+        following = reopened.execute(_request(workspace, "second").model_copy(update={"run_id": "other-run"}))
+        assert following.outcome == "denied"
+        assert len(children) == 1 and not (workspace / "new.txt").exists()
+        assert not any(e.event_type == "WorkspacePublicationIntent" for e in events.read_stream("security", "run-1"))
+    finally:
+        for child in children:
+            child.kill()
+            child.wait(timeout=5)
+            child.stdout.close()
+
+
+@pytest.mark.parametrize("corruption", ["duplicate", "orphan", "workspace", "proof", "attempt"])
+def test_malformed_execution_occupancy_cannot_release_a_workspace(tmp_path, corruption):
+    from orchestrator.persistence.events import EventDraft
+    workspace, events, launcher, _, _, _, gateway, _ = _fixture(tmp_path)
+    assert gateway.execute(_request(workspace)).outcome == "completed"
+    stored = events.read_stream("workspace_executions", gateway._publication_stream_id)
+    replay = SQLiteEventStore(tmp_path / "replay.db")
+    intent = stored[0]
+    replay.append_checked("workspace_executions", gateway._publication_stream_id, "intent",
+        lambda *_: [EventDraft("WorkspaceExecutionIntended", dict(intent.payload),
+            run_id=intent.run_id, node_id=intent.node_id, attempt_id=intent.attempt_id,
+            fencing_generation=intent.fencing_generation, causation_id=intent.causation_id)])
+    intent_id = replay.read_stream("workspace_executions", gateway._publication_stream_id)[0].event_id
+    stop = stored[-1]
+    payload = dict(stop.payload)
+    payload["execution_intent_event_id"] = intent_id
+    context = dict(run_id=stop.run_id, node_id=stop.node_id, attempt_id=stop.attempt_id,
+                   fencing_generation=stop.fencing_generation, causation_id=intent_id)
+    if corruption == "orphan":
+        payload["request_id"] = "orphan"
+    elif corruption == "workspace":
+        payload["workspace_identity_hash"] = "sha256:" + "b"*64
+    elif corruption == "proof":
+        payload["termination_receipt"] = {"cgroup_empty": False}
+    elif corruption == "attempt":
+        context["attempt_id"] = "other-attempt"
+    replay.append_checked("workspace_executions", gateway._publication_stream_id, "corrupt-stop",
+                          lambda *_: [EventDraft("WorkspaceExecutionStopped", payload, **context)])
+    if corruption == "duplicate":
+        replay.append_checked("workspace_executions", gateway._publication_stream_id, "duplicate-stop",
+                              lambda *_: [EventDraft("WorkspaceExecutionStopped", payload, **context)])
+    gateway._events = SQLiteEventStore(tmp_path / "replay.db")
+    with pytest.raises(ToolAuditUnavailable):
+        gateway.execute(_request(workspace, "next"))
+    assert len(launcher.calls) == 1
+
+
+def test_concurrent_request_observes_execution_occupancy_before_publication(tmp_path):
+    import threading
+    workspace, _, launcher, session, leases, journal, gateway, _ = _fixture(tmp_path)
+    waiting, release = threading.Event(), threading.Event()
+    original = session.wait
+    results = []
+    def wait():
+        waiting.set()
+        assert release.wait(5)
+        return original()
+    session.wait = wait
+    errors = []
+    def execute_first():
+        try:
+            independent = WorkspaceWriteGateway(
+                run_id="run-1", workspace=workspace, event_store=SQLiteEventStore(tmp_path / "events.db"),
+                policy_manifest=_manifest(), attempt_authority=_Authority(),
+                policy_state=lambda _: PolicyState(1, 4), lease_root=leases, journal_root=journal,
+                launcher=launcher, isolation_profile_hash="sha256:" + "a"*64,
+            )
+            results.append(independent.execute(_request(workspace)))
+        except BaseException as exc:
+            errors.append(exc)
+            waiting.set()
+    first = threading.Thread(target=execute_first)
+    first.start()
+    try:
+        assert waiting.wait(5)
+        assert errors == []
+        assert gateway.execute(_request(workspace, "concurrent")).outcome == "denied"
+        assert len(launcher.calls) == 1
+    finally:
+        release.set()
+        first.join(5)
+    assert not first.is_alive() and errors == [] and results[0].outcome == "completed"
+
+
+def test_service_owned_publication_retains_committed_receipt(tmp_path):
+    workspace, events, launcher, session, leases, journal, gateway, _ = _fixture(tmp_path, retain_publication=True)
+    result = gateway.execute(_request(workspace))
+    assert result.outcome == "completed"
+    assert result.publication_receipt is not None
+    from orchestrator.isolation import recover_workspace_publications_with_outcomes, acknowledge_workspace_publication
+    with acquire_workspace_write_lease(workspace, leases) as lease:
+        recovery, = recover_workspace_publications_with_outcomes(workspace, lease, journal)
+        assert recovery.outcome == "committed"
+        assert recovery.transaction_id == result.publication_receipt.transaction_id
+        acknowledge_workspace_publication(workspace, lease, journal, result.publication_receipt)
+    assert not list(journal.iterdir())
+
+
+def test_response_loss_reconciles_committed_effect_once(tmp_path, monkeypatch):
+    workspace, events, launcher, _, _, journal, gateway, _ = _fixture(tmp_path)
+    from orchestrator.tools import workspace_write
+    publish = workspace_write.publish_workspace_diff
+    identity = None
+    def lose_response(*args, **kwargs):
+        nonlocal identity
+        publish(*args, **kwargs)
+        identity = (workspace / "new.txt").stat().st_ino
+        raise WorkspacePublishError("response lost after durable commit")
+    monkeypatch.setattr(workspace_write, "publish_workspace_diff", lose_response)
+    result = gateway.execute(_request(workspace))
+    assert result.outcome == "completed" and result.publication_receipt is not None
+    assert (workspace / "new.txt").stat().st_ino == identity
+    assert len(launcher.calls) == 1
+    assert sum(e.event_type == "WorkspacePublicationCompleted" for e in events.read_stream("security", "run-1")) == 1
+    assert not list(journal.iterdir())
+
+
+def test_direct_acknowledgement_follows_durable_terminal_audit(tmp_path, monkeypatch):
+    workspace, events, _, _, _, journal, gateway, _ = _fixture(tmp_path)
+    append = events.append_checked
+    def fail_terminal(stream_type, stream_id, key, decide):
+        def inspect(history, version):
+            drafts = decide(history, version)
+            if drafts and any(d.event_type == "ToolExecutionCompleted" for d in drafts):
+                raise OSError("terminal audit unavailable")
+            return drafts
+        return append(stream_type, stream_id, key, inspect)
+    monkeypatch.setattr(events, "append_checked", fail_terminal)
+    with pytest.raises(ToolAuditUnavailable):
+        gateway.execute(_request(workspace))
+    assert (workspace / "new.txt").read_text() == "private candidate data\n"
+    assert list(journal.glob("publish-*"))
+    assert gateway._has_unresolved_publication("run-1")
 
 
 def test_allowed_write_is_attempt_bound_audited_and_published(tmp_path: Path) -> None:

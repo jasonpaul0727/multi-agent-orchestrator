@@ -33,7 +33,15 @@ class IsolationUnavailable(RuntimeError):
     """The host cannot prove all required isolation controls for a launch."""
 
 
-class InvalidSandboxRequest(ValueError):
+class IsolationNotStarted(IsolationUnavailable):
+    """Isolation was rejected before the untrusted launch boundary."""
+
+
+class IsolationStartUnknown(IsolationUnavailable):
+    """Launch may have started; retain staging and unresolved occupancy."""
+
+
+class InvalidSandboxRequest(ValueError, IsolationNotStarted):
     """A sandbox request is malformed or outside the supported profile."""
 
 
@@ -166,9 +174,9 @@ class SystemdReadOnlyLauncher:
         """Start a command with optional bounded stdin and return a cancellable handle."""
 
         if not platform.system().lower() == "linux":
-            raise IsolationUnavailable("the systemd isolation backend is Linux-only")
+            raise IsolationNotStarted("the systemd isolation backend is Linux-only")
         if not self._systemd_run or not self._systemctl:
-            raise IsolationUnavailable("systemd-run and systemctl are required")
+            raise IsolationNotStarted("systemd-run and systemctl are required")
         _validate_command(command)
         if input_bytes is not None and (
             not isinstance(input_bytes, bytes) or len(input_bytes) > _MAX_INPUT_BYTES
@@ -188,9 +196,9 @@ class SystemdReadOnlyLauncher:
                 timeout=5,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise IsolationUnavailable("systemd user manager probe failed") from exc
+            raise IsolationNotStarted("systemd user manager probe failed") from exc
         if probe.returncode != 0:
-            raise IsolationUnavailable("a usable systemd user manager is required")
+            raise IsolationNotStarted("a usable systemd user manager is required")
         cgroup_parent = _systemd_cgroup_parent(self._systemctl, client_env)
 
         staging = _create_staging(root)
@@ -203,7 +211,7 @@ class SystemdReadOnlyLauncher:
             runtime_target.mkdir()
         except OSError as exc:
             staging.cleanup()
-            raise IsolationUnavailable("sandbox mount targets cannot be staged") from exc
+            raise IsolationNotStarted("sandbox mount targets cannot be staged") from exc
         try:
             snapshot_workspace(
                 root,
@@ -216,7 +224,7 @@ class SystemdReadOnlyLauncher:
         runtime_source = Path(__file__).resolve().parents[2]
         if not runtime_source.is_dir():
             staging.cleanup()
-            raise IsolationUnavailable("the trusted isolation runtime is unavailable")
+            raise IsolationNotStarted("the trusted isolation runtime is unavailable")
         if not _systemd_path_supported(root) or not _systemd_path_supported(runtime_source):
             staging.cleanup()
             raise InvalidSandboxRequest("workspace paths with spaces or systemd separators are unsupported")
@@ -285,8 +293,7 @@ class SystemdReadOnlyLauncher:
                 close_fds=True,
             )
         except OSError as exc:
-            retained_staging.discard()
-            raise IsolationUnavailable("systemd transient unit could not be started") from exc
+            raise IsolationStartUnknown("systemd transient unit could not be started; staging retained") from exc
         return SandboxSession(
             process=process,
             unit_name=unit_name,
@@ -601,7 +608,7 @@ def _systemd_cgroup_parent(systemctl: str, client_env: dict[str, str]) -> Path:
         os.close(descriptor)
         return parent
     except (OSError, subprocess.TimeoutExpired, UnicodeError, ValueError) as exc:
-        raise IsolationUnavailable("the app.slice cgroup cannot be verified") from exc
+        raise IsolationNotStarted("the app.slice cgroup cannot be verified") from exc
 
 
 def _parse_systemd_properties(
@@ -792,7 +799,7 @@ def _create_staging(workspace: Path) -> tempfile.TemporaryDirectory[str]:
         except ValueError:
             return staging
         staging.cleanup()
-    raise IsolationUnavailable("no safe staging directory exists outside the workspace")
+    raise IsolationNotStarted("no safe staging directory exists outside the workspace")
 
 
 def _systemd_client_environment() -> dict[str, str]:
@@ -802,7 +809,7 @@ def _systemd_client_environment() -> dict[str, str]:
         if value:
             env[name] = value
     if "XDG_RUNTIME_DIR" not in env:
-        raise IsolationUnavailable("XDG_RUNTIME_DIR is required for the systemd user manager")
+        raise IsolationNotStarted("XDG_RUNTIME_DIR is required for the systemd user manager")
     return env
 
 
@@ -816,7 +823,7 @@ def _service_properties(
 ) -> tuple[str, ...]:
     controls = tuple(
         f"InaccessiblePaths=-{workspace_target / name}"
-        for name in (".git", ".maestro")
+        for name in (".git", ".maestro", ".env")
     )
     return (
         "PrivateNetwork=yes",
@@ -874,6 +881,8 @@ def _service_properties(
 __all__ = [
     "InvalidSandboxRequest",
     "IsolationUnavailable",
+    "IsolationNotStarted",
+    "IsolationStartUnknown",
     "SandboxLimits",
     "SandboxResult",
     "SandboxSession",

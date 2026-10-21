@@ -328,7 +328,7 @@ def test_launcher_retains_staging_when_systemd_client_start_is_interrupted(
     assert (staging_path / "marker").read_text(encoding="utf-8") == "retained"
 
 
-def test_launcher_cleans_staging_when_systemd_client_cannot_start(monkeypatch, tmp_path: Path) -> None:
+def test_launcher_retains_staging_when_systemd_client_start_is_uncertain(monkeypatch, tmp_path: Path) -> None:
     import orchestrator.isolation.launcher as module
 
     workspace = tmp_path / "workspace"
@@ -347,7 +347,8 @@ def test_launcher_cleans_staging_when_systemd_client_cannot_start(monkeypatch, t
             workspace, ["/bin/true"]
         )
 
-    assert not staging_path.exists()
+    assert staging_path.exists()
+    staging.cleanup()  # This test double never starts a child.
 
 
 def test_launcher_cleans_staging_when_bind_targets_cannot_be_created(monkeypatch, tmp_path: Path) -> None:

@@ -34,7 +34,7 @@ class WorkspaceDiffEntry:
     """One validated staged change exported from an OverlayFS upper layer."""
 
     path: str
-    operation: Literal["add", "modify"]
+    operation: Literal["add", "modify", "delete"]
     kind: Literal["file", "directory", "symlink"]
     mode: int
     size: int
@@ -50,6 +50,7 @@ class WorkspaceDiff:
     entries: tuple[WorkspaceDiffEntry, ...]
     total_bytes: int
     manifest_hash: str
+    schema_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -91,7 +92,8 @@ def snapshot_workspace(
     The source root is opened once and every descendant is opened relative to
     an already-open directory with ``O_NOFOLLOW``. Only regular files,
     directories, and lexically in-root relative symlinks are copied. The
-    control directories ``.git`` and ``.maestro`` are omitted. The resulting
+    control roots ``.git``, ``.maestro`` and secret config ``.env`` are omitted
+    case-insensitively without opening or following them. The resulting
     tree has no writable mode bits and is suitable for a read-only bind mount.
     """
 
@@ -158,6 +160,9 @@ def snapshot_workspace(
     directory_count = 1
     symlink_count = 0
     directory_paths: list[Path] = []
+    protected_entries: dict[str, tuple] = {}
+    protected_inodes: set[tuple[int, int]] = set()
+    root_names: tuple[str, ...] = ()
     try:
         root_mount_id = _descriptor_mount_id(source_fd)
     except BaseException:
@@ -170,6 +175,23 @@ def snapshot_workspace(
         entries += 1
         if entries > max_entries:
             raise WorkspaceBoundaryError("workspace exceeds the snapshot entry limit")
+
+    def metadata(info):
+        # Ignore access time: our own no-follow traversal can legitimately update it.
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    def validate_protected_entries():
+        try:
+            if tuple(sorted(os.listdir(source_fd))) != root_names:
+                raise WorkspaceBoundaryError("workspace root names changed during snapshot")
+            for name, expected in protected_entries.items():
+                if metadata(os.stat(name, dir_fd=source_fd, follow_symlinks=False)) != expected:
+                    raise WorkspaceBoundaryError("protected workspace entry changed during snapshot")
+            if metadata(os.fstat(source_fd)) != metadata(root_stat):
+                raise WorkspaceBoundaryError("workspace root changed during snapshot")
+        except OSError as exc:
+            raise WorkspaceBoundaryError("protected workspace entry changed during snapshot") from exc
 
     def validate_relative_symlink(relative_parent: tuple[str, ...], link: str) -> None:
         if not link or os.path.isabs(link):
@@ -186,22 +208,37 @@ def snapshot_workspace(
                 parts.append(component)
 
     def copy_directory(source_fd: int, output: Path, relative: tuple[str, ...], depth: int) -> None:
-        nonlocal bytes_copied, file_count, directory_count, symlink_count
+        nonlocal bytes_copied, file_count, directory_count, symlink_count, root_names
         if depth > max_depth:
             raise WorkspaceBoundaryError("workspace exceeds the snapshot depth limit")
         try:
             names = sorted(os.listdir(source_fd))
         except OSError as exc:
             raise WorkspaceBoundaryError("workspace directory cannot be read safely") from exc
+        if not relative:
+            root_names = tuple(names)
+            # Capture excluded inode identities before copying ANY sibling, even
+            # one sorting before the protected name. Never open secret contents.
+            try:
+                for name in names:
+                    if name.casefold() in (".git", ".maestro", ".env"):
+                        info = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+                        protected_entries[name] = metadata(info)
+                        protected_inodes.add((info.st_dev, info.st_ino))
+            except OSError as exc:
+                raise WorkspaceBoundaryError("protected workspace entry changed during snapshot") from exc
+            validate_protected_entries()
         for name in names:
             if name in (".", "..") or "/" in name or "\x00" in name:
                 raise WorkspaceBoundaryError("workspace contains an invalid directory entry")
-            if not relative and name in (".git", ".maestro"):
+            if not relative and name.casefold() in (".git", ".maestro", ".env"):
                 continue
             try:
                 before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
             except OSError as exc:
                 raise WorkspaceBoundaryError("workspace changed during snapshot inspection") from exc
+            if (before.st_dev, before.st_ino) in protected_inodes:
+                raise WorkspaceBoundaryError("workspace hardlink aliases a protected entry")
             add_entry()
             output_path = output / name
             child_relative = (*relative, name)
@@ -243,6 +280,8 @@ def snapshot_workspace(
                 continue
             if not stat.S_ISREG(before.st_mode) or before.st_dev != root_stat.st_dev:
                 raise WorkspaceBoundaryError("workspace contains a special file or nested mount")
+            if before.st_nlink != 1:
+                raise WorkspaceBoundaryError("workspace snapshot rejects hardlinked files")
             if before.st_size > max_bytes - bytes_copied:
                 raise WorkspaceBoundaryError("workspace exceeds the snapshot byte limit")
             try:
@@ -257,6 +296,8 @@ def snapshot_workspace(
                 opened = os.fstat(file_fd)
                 if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
                     raise WorkspaceBoundaryError("workspace file changed during snapshot")
+                if opened.st_nlink != 1:
+                    raise WorkspaceBoundaryError("workspace snapshot rejects hardlinked files")
                 if _descriptor_mount_id(file_fd) != root_mount_id:
                     raise WorkspaceBoundaryError("workspace contains a nested mount point")
                 with output_path.open("xb") as output_file:
@@ -268,6 +309,8 @@ def snapshot_workspace(
                         if bytes_copied > max_bytes:
                             raise WorkspaceBoundaryError("workspace exceeds the snapshot byte limit")
                         output_file.write(chunk)
+                if os.fstat(file_fd).st_nlink != 1:
+                    raise WorkspaceBoundaryError("workspace snapshot rejects hardlinked files")
                 output_path.chmod(0o555 if opened.st_mode & 0o111 else 0o444)
                 file_count += 1
             except OSError as exc:
@@ -277,6 +320,7 @@ def snapshot_workspace(
 
     try:
         copy_directory(source_fd, target, (), 0)
+        validate_protected_entries()
     except BaseException:
         shutil.rmtree(target, ignore_errors=True)
         raise
@@ -407,7 +451,7 @@ def export_overlay_diff(
         for name in names:
             if name in (".", "..") or "/" in name or "\x00" in name:
                 raise WorkspaceBoundaryError("OverlayFS upper contains an invalid path component")
-            if not relative and name in (".git", ".maestro"):
+            if not relative and name.casefold() in (".git", ".maestro", ".env"):
                 raise WorkspaceBoundaryError("OverlayFS diff targets a protected control directory")
             try:
                 before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
@@ -598,6 +642,15 @@ def validate_overlay_candidate(
     that the live host workspace still matches the lower snapshot.
     """
 
+    if not isinstance(diff, WorkspaceDiff):
+        raise WorkspaceBoundaryError("candidate manifest has an invalid type")
+    if type(diff.schema_version) is not int or diff.schema_version not in (1, 2):
+        raise WorkspaceBoundaryError("candidate manifest has an unsupported schema version")
+    if diff.schema_version == 2:
+        from .workspace_view import validate_workspace_view_candidate
+        return validate_workspace_view_candidate(
+            lower_root, diff, max_entries=max_entries, max_bytes=max_bytes, max_depth=max_depth,
+        )
     for name, value in (
         ("max_entries", max_entries),
         ("max_bytes", max_bytes),
@@ -683,7 +736,7 @@ def validate_overlay_candidate(
         if (
             not parts
             or any(part in ("", ".", "..") or "\\" in part for part in parts)
-            or (parts and parts[0] in (".git", ".maestro"))
+            or (parts and parts[0].casefold() in (".git", ".maestro", ".env"))
             or entry.path in entries_by_path
             or isinstance(entry.size, bool)
             or not isinstance(entry.size, int)
@@ -782,7 +835,7 @@ def validate_overlay_candidate(
             entry = entries_by_path.get(path)
             if entry is None or path in seen:
                 raise WorkspaceBoundaryError("candidate tree has an undeclared or duplicate entry")
-            if (path_parts and path_parts[0] in (".git", ".maestro")):
+            if (path_parts and path_parts[0].casefold() in (".git", ".maestro", ".env")):
                 raise WorkspaceBoundaryError("candidate tree includes a protected control path")
             try:
                 before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -922,6 +975,9 @@ def check_workspace_publish_conflicts(
     """
 
     validate_overlay_candidate(lower_root, diff, max_bytes=max_bytes)
+    if diff.schema_version == 2:
+        from .workspace_view import check_workspace_view_conflicts
+        return check_workspace_view_conflicts(lower_root, workspace_root, diff, max_bytes=max_bytes)
     workspace = Path(workspace_root)
     lower = Path(lower_root)
     candidate = Path(diff.candidate_root)
@@ -1020,7 +1076,9 @@ def _manifest_digest(kind: str, mode: int, size: int) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
-def _workspace_diff_hash(entries: tuple[WorkspaceDiffEntry, ...] | list[WorkspaceDiffEntry]) -> str:
+def _workspace_diff_hash(entries: tuple[WorkspaceDiffEntry, ...] | list[WorkspaceDiffEntry], *, schema_version: int = 1) -> str:
+    if type(schema_version) is not int or schema_version not in (1, 2):
+        raise WorkspaceBoundaryError("unsupported manifest schema version")
     canonical = json.dumps(
         [
             {
@@ -1037,7 +1095,8 @@ def _workspace_diff_hash(entries: tuple[WorkspaceDiffEntry, ...] | list[Workspac
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+    prefix = b"maestro.workspace-diff.v2\0" if schema_version == 2 else b""
+    return "sha256:" + hashlib.sha256(prefix + canonical).hexdigest()
 
 
 def _reject_xattrs(descriptor: int) -> None:

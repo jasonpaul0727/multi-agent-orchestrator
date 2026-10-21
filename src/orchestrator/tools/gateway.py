@@ -21,7 +21,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
-from orchestrator.isolation import SandboxLimits, SandboxResult, SandboxSession, SystemdReadOnlyLauncher
+from orchestrator.isolation import SandboxLimits, SandboxResult, SandboxSession, SystemdReadOnlyLauncher, WorkspacePublishReceipt
 from orchestrator.approvals import (
     ApprovalError,
     ApprovalInvalid,
@@ -141,7 +141,7 @@ class ToolExecutionResult:
 
     request_id: str
     outcome: Literal[
-        "completed", "awaiting_approval", "denied", "failed", "authority_lost", "execution_unknown"
+        "completed", "awaiting_approval", "denied", "failed", "authority_lost", "execution_unknown", "blocked"
     ]
     decision: PolicyDecision
     stdout: bytes = b""
@@ -154,6 +154,8 @@ class ToolExecutionResult:
     timed_out: bool = False
     output_limited: bool = False
     approval_request_id: str | None = None
+    publication_receipt: WorkspacePublishReceipt | None = None
+    reason_code: Literal["isolation_unavailable"] | None = None
 
 
 class ToolAuditUnavailable(RuntimeError):

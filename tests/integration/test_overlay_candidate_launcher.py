@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 from pathlib import Path
-import shutil
 import socket
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -25,26 +22,14 @@ from orchestrator.tools import (
     WorkspaceWriteGateway,
     WorkspaceWriteRequest,
 )
+from tests.support.isolation_runtime import private_isolation_runtime, use_private_isolation_runtime
 
-
-def _systemd_available() -> bool:
-    if not sys.platform.startswith("linux") or not shutil.which("systemd-run"):
-        return False
-    return subprocess.run(
-        ["systemctl", "--user", "show-environment"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5,
-    ).returncode == 0
-
-
-pytestmark = pytest.mark.skipif(
-    not _systemd_available(), reason="live candidate backend requires Linux/systemd --user",
-)
+pytestmark = pytest.mark.usefixtures("use_private_isolation_runtime")
 
 
 def test_candidate_cannot_see_or_connect_host_broker_socket(tmp_path: Path) -> None:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime is None or not Path(runtime).is_relative_to("/run/user"):
-        pytest.skip("live Broker boundary requires a /run/user runtime path")
+    assert runtime is not None and Path(runtime).is_relative_to("/run/user")
     socket_path = Path(runtime) / f"maestro-test-{uuid.uuid4().hex}.sock"
     code = r'''
 import errno, json, socket, sys
@@ -178,7 +163,9 @@ def test_live_candidate_gateway_audits_then_publishes_exact_workspace_diff(tmp_p
         policy_state=lambda request: PolicyState(1, 0),
         lease_root=lease_root,
         journal_root=journal_root,
-        isolation_profile_hash="sha256:" + hashlib.sha256(b"live-overlay-workspace-write-profile").hexdigest(),
+        isolation_profile_hash=isolation.verify_workspace_isolation(
+            workspace, limits=isolation.SandboxLimits(),
+        ).profile_hash,
     )
     request = WorkspaceWriteRequest(
         request_id="live-write-1",
@@ -241,12 +228,11 @@ print(len(data))
 
 
 @pytest.mark.parametrize("operation", [
-    "Path('input.txt').unlink()",
     "os.link('input.txt', 'hardlink')",
     "Path('escape').symlink_to('../../host-secret')",
     "Path('.git').mkdir(); Path('.git/config').write_text('tamper')",
     "Path('a').write_text('one'); Path('b').write_text('two')",
-], ids=["whiteout", "hardlink", "escaping-symlink", "control-path", "entry-limit"])
+], ids=["hardlink", "escaping-symlink", "control-path", "entry-limit"])
 def test_candidate_export_rejects_unsupported_or_unsafe_changes(tmp_path: Path, operation: str) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -259,6 +245,79 @@ def test_candidate_export_rejects_unsupported_or_unsafe_changes(tmp_path: Path, 
         assert result.execution.returncode != 0
         assert result.diff is None
     assert (workspace / "input.txt").read_text() == "original"
+
+
+@pytest.mark.parametrize("operation, expected", [
+    ("Path('input.txt').unlink()", [("input.txt", "delete")]),
+    ("Path('input.txt').rename('renamed.txt')", [("input.txt", "delete"), ("renamed.txt", "add")]),
+    ("__import__('shutil').move('tree', 'renamed')", [("renamed", "add"), ("renamed/child", "add"), ("tree", "delete"), ("tree/child", "delete")]),
+])
+def test_stopped_final_view_exports_removals_without_publishing(tmp_path, operation, expected):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "input.txt").write_text("original")
+    (workspace / "tree").mkdir()
+    (workspace / "tree/child").write_text("child")
+    with isolation.SystemdOverlayCandidateLauncher().launch(
+        workspace, ["/usr/bin/python3", "-c", "from pathlib import Path; " + operation],
+    ) as session:
+        result = session.wait()
+        assert result.execution.returncode == 0, result.execution.stderr.decode(errors="replace")
+        assert result.execution.termination_confirmed
+        assert result.diff is not None and result.diff.schema_version == 2
+        assert [(e.path, e.operation) for e in result.diff.entries] == expected
+        isolation.validate_overlay_candidate(result.lower_root, result.diff)
+        for entry in result.diff.entries:
+            if entry.operation == "delete":
+                assert entry.baseline_digest is not None and entry.size == 0
+                assert not (result.diff.candidate_root / entry.path).exists()
+    assert (workspace / "input.txt").read_text() == "original"
+    assert (workspace / "tree/child").read_text() == "child"
+    assert not (workspace / "renamed").exists() and not (workspace / "renamed.txt").exists()
+
+
+def test_nested_candidate_edit_keeps_unchanged_ancestor_scaffolds_private(tmp_path):
+    workspace = tmp_path / "workspace"
+    (workspace / "a/b").mkdir(parents=True)
+    (workspace / "a/b/file").write_text("original")
+    with isolation.SystemdOverlayCandidateLauncher().launch(
+        workspace, ["/usr/bin/python3", "-c", "from pathlib import Path; Path('a/b/file').write_text('candidate')"],
+    ) as session:
+        result = session.wait()
+        assert result.execution.returncode == 0, result.execution.stderr.decode(errors="replace")
+        assert result.execution.termination_confirmed and result.diff is not None
+        assert [(e.path, e.operation) for e in result.diff.entries] == [("a/b/file", "modify")]
+        assert (result.diff.candidate_root / "a").stat().st_mode & 0o777 == 0o700
+        assert (result.diff.candidate_root / "a/b").stat().st_mode & 0o777 == 0o700
+        assert (result.diff.candidate_root / "a/b/file").read_text() == "candidate"
+        isolation.validate_overlay_candidate(result.lower_root, result.diff)
+    assert (workspace / "a/b/file").read_text() == "original"
+
+
+@pytest.mark.parametrize("unchanged", [False, True])
+def test_live_candidate_rejects_composed_symlink_escape(tmp_path, unchanged):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "original").write_bytes(b"original")
+    (tmp_path / "outside").write_bytes(b"outside sentinel")
+    if unchanged:
+        (workspace / "a").mkdir()
+        (workspace / "a/b").symlink_to("..")
+        (workspace / "a/c").symlink_to("b/../outside")
+        command = "pass"
+    else:
+        command = "from pathlib import Path; Path('a').mkdir(); Path('a/b').symlink_to('..'); Path('a/c').symlink_to('b/../outside')"
+    with isolation.SystemdOverlayCandidateLauncher().launch(
+        workspace, ["/usr/bin/python3", "-c", command],
+    ) as session:
+        result = session.wait()
+        assert result.execution.termination_confirmed
+        assert result.execution.returncode != 0 and result.diff is None
+        assert b"symlink chain escapes" in result.execution.stderr
+    assert (workspace / "original").read_bytes() == b"original"
+    assert (tmp_path / "outside").read_bytes() == b"outside sentinel"
+    if not unchanged:
+        assert not (workspace / "a").exists()
 
 
 @pytest.mark.parametrize(("kind", "code"), [

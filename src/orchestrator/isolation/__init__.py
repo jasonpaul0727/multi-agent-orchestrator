@@ -16,12 +16,15 @@ from .workspace import (
 from .launcher import (
     InvalidSandboxRequest,
     IsolationUnavailable,
+    IsolationNotStarted,
+    IsolationStartUnknown,
     SandboxLimits,
     SandboxResult,
     SandboxTerminationReceipt,
     SandboxSession,
     SystemdReadOnlyLauncher,
 )
+from .workspace_view import export_workspace_view_diff
 from .landlock import (
     FsAccess,
     LandlockResult,
@@ -46,6 +49,10 @@ from .workspace_publish import (
     WorkspacePublishReceipt,
     WorkspacePublishRecoveryConflict,
     WorkspacePublicationRecovery,
+    WorkspacePublicationJournalSnapshot,
+    acknowledge_workspace_publication,
+    acknowledge_workspace_recovery,
+    inspect_workspace_publication_journal,
     publish_workspace_diff,
     recover_workspace_publications,
     recover_workspace_publications_with_outcomes,
@@ -60,10 +67,15 @@ from .provider_sender import (
     SystemdProviderSenderLauncher,
     SystemdProviderSenderSession,
 )
+from .admission import WorkspaceIsolationAdmission, verify_workspace_isolation
 
 __all__ = [
     "InvalidSandboxRequest",
     "IsolationUnavailable",
+    "IsolationNotStarted",
+    "IsolationStartUnknown",
+    "WorkspaceIsolationAdmission",
+    "verify_workspace_isolation",
     "SandboxLimits",
     "SandboxResult",
     "SandboxTerminationReceipt",
@@ -93,12 +105,17 @@ __all__ = [
     "WorkspacePublishReceipt",
     "WorkspacePublishRecoveryConflict",
     "WorkspacePublicationRecovery",
+    "WorkspacePublicationJournalSnapshot",
     "WorkspaceDiff",
     "WorkspaceDiffEntry",
     "WorkspaceInspection",
     "WorkspaceWriteLease",
     "acquire_workspace_write_lease",
+    "acknowledge_workspace_publication",
+    "acknowledge_workspace_recovery",
+    "inspect_workspace_publication_journal",
     "export_overlay_diff",
+    "export_workspace_view_diff",
     "check_workspace_publish_conflicts",
     "inspect_workspace",
     "publish_workspace_diff",

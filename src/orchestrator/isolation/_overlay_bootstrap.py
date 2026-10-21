@@ -18,7 +18,8 @@ import sys
 
 from ._exec import _verify_limits
 from .candidate_security import drop_candidate_privileges
-from .workspace import WorkspaceBoundaryError, export_overlay_diff, validate_overlay_candidate
+from .workspace import WorkspaceBoundaryError, validate_overlay_candidate
+from .workspace_view import export_workspace_view_diff
 
 
 class _MountSetupError(RuntimeError):
@@ -174,7 +175,7 @@ def _strip_kernel_metadata(upper: Path) -> None:
 
 def _write_completion(root: Path, diff) -> None:
     payload = {
-        "schema_version": 1,
+        "schema_version": diff.schema_version,
         "entries": [entry.__dict__ for entry in diff.entries],
         "total_bytes": diff.total_bytes,
         "manifest_hash": diff.manifest_hash,
@@ -225,15 +226,8 @@ def main(arguments: list[str]) -> int:
         if returncode != 0:
             return returncode if 0 < returncode < 126 else 1
         phase = "export"
-        unmount = subprocess.run(
-            ["/usr/bin/umount", str(view / "workspace")], stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False, timeout=5,
-        )
-        if unmount.returncode != 0:
-            raise RuntimeError("candidate OverlayFS could not be unmounted")
-        _strip_kernel_metadata(root / "buffer" / "upper")
-        diff = export_overlay_diff(
-            root / "lower", root / "buffer" / "upper", root / "candidate",
+        diff = export_workspace_view_diff(
+            root / "lower", view / "workspace", root / "candidate",
             max_entries=config["candidate_entries"], max_bytes=config["candidate_bytes"],
             max_depth=64,
         )
@@ -241,6 +235,12 @@ def main(arguments: list[str]) -> int:
             root / "lower", diff, max_entries=config["candidate_entries"],
             max_bytes=config["candidate_bytes"],
         )
+        unmount = subprocess.run(
+            ["/usr/bin/umount", str(view / "workspace")], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False, timeout=5,
+        )
+        if unmount.returncode != 0:
+            raise RuntimeError("candidate OverlayFS could not be unmounted")
         phase = "completion"
         _write_completion(root, diff)
         return 0
