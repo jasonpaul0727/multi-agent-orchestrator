@@ -302,6 +302,15 @@ class ControlPlaneApplication:
             approval_grant_id=approval_grant_id,
         )
 
+    def reconcile_workspace_publication(
+        self, *, run_id: str, operation_id: str,
+    ) -> WorkspaceExecutionResult:
+        """Explicitly reconcile one exact interrupted workspace publication."""
+        self._require_ready()
+        return self._workspace_execution.reconcile_publication(
+            run_id=run_id, operation_id=operation_id,
+        )
+
     def recover_run(self, run_id: str) -> RecoveredRun:
         self._require_ready()
         return self._scheduler.recovery.recover(run_id)

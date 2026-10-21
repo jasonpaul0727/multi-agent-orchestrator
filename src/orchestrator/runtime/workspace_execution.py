@@ -5,16 +5,22 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
+import os
+import re
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
 
 from orchestrator.approvals import ApprovalService
 from orchestrator.isolation import (
-    IsolationNotStarted, SandboxLimits, WorkspacePublishReceipt,
-    acquire_workspace_write_lease, acknowledge_workspace_publication, verify_workspace_isolation,
+    IsolationNotStarted, SandboxLimits, SandboxTerminationReceipt,
+    WorkspacePublishReceipt,
+    acquire_workspace_write_lease, acknowledge_workspace_publication,
+    acknowledge_workspace_recovery, inspect_workspace_publication_journal,
+    recover_workspace_publications_with_outcomes, verify_workspace_isolation,
 )
 from orchestrator.persistence import EventDraft, SQLiteEventStore
 from orchestrator.runtime.contracts import AttemptContext
@@ -22,12 +28,15 @@ from orchestrator.runtime.worker_input import build_worker_input_manifest
 from orchestrator.runtime.worker_input_service import WorkerInputService
 from orchestrator.runtime.workspace_worker import (
     IsolatedWorkspaceWorker, WorkspaceWorkerError, WorkspaceWorkerTask, canonical,
-    decode_workspace_program, operation_id, proposal_bytes, validate_workspace_proposal,
+    decode_workspace_program, operation_id as _operation_id, proposal_bytes, validate_workspace_proposal,
 )
 from orchestrator.security import PolicyManifest
 from orchestrator.tools.authority import DurableAttemptAuthority
 from orchestrator.tools.gateway import PolicyState, ToolAuditUnavailable, ToolRequest
-from orchestrator.tools.workspace_write import WorkspaceWriteGateway, WorkspaceWriteRequest
+from orchestrator.tools.workspace_write import (
+    WorkspaceWriteGateway, WorkspaceWriteRequest, _unresolved_executions,
+    _unresolved_publications, _hash_json,
+)
 from orchestrator.workspace_identity import workspace_identity_hash
 
 OPERATION_STREAM = "workspace_worker_operation"
@@ -191,7 +200,7 @@ class WorkspaceExecutionService:
                 workspace_identity_hash=workspace_hash, causation_id=acceptances[0].event_id,
                 approval_grant_hash=None if approval_grant_id is None else _hash(approval_grant_id.encode()))
             prepared.update(envelope=envelope, binding=binding, manifest=policies[0],
-                            operation=operation_id(task.context.model_dump()))
+                            operation=_operation_id(task.context.model_dump()))
             return None
 
         corrupt = False
@@ -310,6 +319,421 @@ class WorkspaceExecutionService:
                 pass
         return result
 
+    def reconcile_publication(self, *, run_id: str, operation_id: str) -> WorkspaceExecutionResult:
+        """Explicitly reconcile one exact, durably admitted workspace operation.
+
+        Startup and ordinary execution only validate/replay historical state. This
+        method is the sole path that may recover a retained publication journal.
+        It never launches a Worker or candidate process and fails closed unless
+        the durable operation, Gateway receipts, process-stop proofs, workspace
+        identity, and one exact journal transaction agree.
+        """
+
+        if (type(run_id) is not str or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]*", run_id) is None
+                or type(operation_id) is not str or re.fullmatch(_HASH, operation_id) is None):
+            return WorkspaceExecutionResult(outcome="blocked", reason_code="workspace_input_invalid")
+        if self._host is None:
+            return WorkspaceExecutionResult(outcome="blocked", reason_code="isolation_unavailable")
+
+        unknown = self._result(operation_id, "outcome_unknown", "execution_unknown")
+        host = self._host
+        try:
+            events = self._events.read_stream(OPERATION_STREAM, operation_id)
+            if not events:
+                return unknown
+            binding = _Binding.model_validate(events[0].payload)
+            if (binding.context.run_id != run_id
+                    or operation_id != _operation_id(binding.context.model_dump())):
+                return unknown
+            replay = self._replay(events, binding, operation_id)
+            if replay is not None:
+                return self._reconcile_terminal_publication(binding, operation_id, replay)
+
+            # Only a durable Worker stop plus all exact Gateway evidence can
+            # authorize touching a publication journal. A Requested-only or
+            # Worker-only stream remains unknown and retains scheduler occupancy.
+            if len(events) != 2 or events[1].event_type != "WorkspaceWorkerStopped":
+                return unknown
+            worker_stop_payload = events[1].payload
+            worker_stop = SandboxTerminationReceipt(**worker_stop_payload["termination_receipt"])
+            if worker_stop_payload.get("proposal_hash") != binding.proposal_hash:
+                return unknown
+
+            current_identity = workspace_identity_hash(host.workspace)
+            if current_identity != binding.workspace_identity_hash:
+                return unknown
+            admission = verify_workspace_isolation(host.workspace, limits=host.limits)
+            if admission.outcome != "eligible" or admission.workspace_identity_hash != binding.workspace_identity_hash:
+                return unknown
+
+            evidence = self._publication_reconciliation_evidence(binding, operation_id, admission.profile_hash)
+            if evidence is None:
+                return unknown
+            intent, run_intent, workspace_intent, worker_stop, profile_hash = evidence
+
+            with acquire_workspace_write_lease(host.workspace, host.lease_root) as lease:
+                lease.assert_current()
+                admission = verify_workspace_isolation(host.workspace, limits=host.limits)
+                if (admission.outcome != "eligible"
+                        or admission.workspace_identity_hash != binding.workspace_identity_hash
+                        or admission.profile_hash != profile_hash):
+                    return unknown
+                journal_names = sorted(os.listdir(host.journal_root))
+                expected_names = {
+                    "publish-" + intent["transaction_id"],
+                    "staging-" + intent["transaction_id"],
+                }
+                if len(journal_names) != 1 or journal_names[0] not in expected_names:
+                    return unknown
+                snapshot = inspect_workspace_publication_journal(
+                    host.workspace, lease, host.journal_root, intent["transaction_id"]
+                )
+                if (snapshot is None or snapshot.status == "unbound"
+                        or snapshot.manifest_hash != intent["manifest_hash"]
+                        or snapshot.lease_generation != intent["lease_generation"]):
+                    return unknown
+                if snapshot.status not in {"preparing", "prepared", "committed", "rolled_back", "not_started"}:
+                    return unknown
+
+                completed, aborted = self._publication_resolution_events(
+                    binding, operation_id, intent, run_intent, workspace_intent
+                )
+                if snapshot.status in {"preparing", "prepared", "rolled_back", "not_started"} and completed:
+                    return unknown
+                if snapshot.status == "committed" and aborted:
+                    return unknown
+                # A schema-2 preparing record can prove no mutation started; a
+                # prepared/rolled-back record must agree with the intended diff.
+                if (snapshot.status in {"prepared", "rolled_back", "committed"}
+                        and snapshot.entries_published != intent["entries"]):
+                    return unknown
+
+                recoveries = recover_workspace_publications_with_outcomes(
+                    host.workspace, lease, host.journal_root
+                )
+                if (len(recoveries) != 1 or recoveries[0].transaction_id != intent["transaction_id"]):
+                    return unknown
+                recovery = recoveries[0]
+                if (recovery.manifest_hash != intent["manifest_hash"]
+                        or recovery.lease_generation != intent["lease_generation"]):
+                    return unknown
+                if recovery.outcome == "committed":
+                    if recovery.entries_published != intent["entries"]:
+                        return unknown
+                    receipt = WorkspacePublishReceipt(
+                        transaction_id=recovery.transaction_id,
+                        manifest_hash=recovery.manifest_hash,
+                        entries_published=recovery.entries_published,
+                        lease_generation=recovery.lease_generation,
+                    )
+                    self._record_reconciled_publication(
+                        binding, operation_id, intent, receipt, run_intent, workspace_intent
+                    )
+                    result = WorkspaceExecutionResult(
+                        outcome="published", reason_code="workspace_published",
+                        operation_id=operation_id, publication_receipt=PublicationReceipt(
+                            **asdict(receipt)
+                        ),
+                    )
+                    worker = SimpleNamespace(termination_receipt=worker_stop)
+                    self._finish(binding, operation_id, result, worker)
+                    acknowledge_workspace_publication(host.workspace, lease, host.journal_root, receipt)
+                    return result
+                if recovery.outcome in {"not_started", "rolled_back"}:
+                    if recovery.entries_published not in {0, intent["entries"]}:
+                        return unknown
+                    self._record_reconciled_abort(
+                        binding, operation_id, intent, recovery, run_intent, workspace_intent
+                    )
+                    result = self._result(operation_id, "failed", "execution_failed")
+                    worker = SimpleNamespace(termination_receipt=worker_stop)
+                    self._finish(binding, operation_id, result, worker)
+                    acknowledge_workspace_recovery(host.workspace, lease, host.journal_root, recovery)
+                    return result
+                return unknown
+        except Exception:
+            # Validation, filesystem, and audit uncertainty all preserve the
+            # durable journal and unknown-stop evidence for later investigation.
+            return unknown
+
+    def _publication_reconciliation_evidence(self, binding, operation, profile_hash):
+        context = binding.context
+        run_id = context.run_id
+        workspace_stream = "workspace:" + binding.workspace_identity_hash[7:]
+        run_events = self._events.read_stream("security", run_id)
+        workspace_events = self._events.read_stream("workspace_publications", workspace_stream)
+        execution_events = self._events.read_stream("workspace_executions", workspace_stream)
+        try:
+            unresolved_run = _unresolved_publications(run_events, run_id=run_id)
+            unresolved_workspace = _unresolved_publications(workspace_events)
+            unresolved_execution = _unresolved_executions(execution_events, binding.workspace_identity_hash)
+        except Exception:
+            return None
+        identity = (run_id, operation)
+        if (unresolved_run - {identity} or unresolved_workspace - {identity}
+                or unresolved_execution):
+            return None
+
+        def exact_context(event, causation_id=None):
+            return (
+                (event.run_id, event.node_id, event.attempt_id, event.fencing_generation,
+                 event.correlation_id)
+                == (run_id, context.node_id, context.attempt_id,
+                    context.fencing_generation, None)
+                and (causation_id is None or event.causation_id == causation_id)
+            )
+
+        def matching(events, event_type):
+            return [event for event in events if event.event_type == event_type
+                    and event.run_id == run_id and event.payload.get("request_id") == operation]
+
+        run_intents = matching(run_events, "WorkspacePublicationIntent")
+        workspace_intents = matching(workspace_events, "WorkspacePublicationIntent")
+        if len(run_intents) != 1 or len(workspace_intents) != 1:
+            return None
+        run_intent, workspace_intent = run_intents[0], workspace_intents[0]
+        intent = run_intent.payload
+        required = {"request_id", "transaction_id", "request_hash", "manifest_hash", "entries",
+                    "bytes", "workspace_identity_hash", "policy_manifest_hash", "lease_generation"}
+        if (set(intent) != required or workspace_intent.payload != intent
+                or not exact_context(run_intent, binding.causation_id)
+                or not exact_context(workspace_intent, binding.causation_id)
+                or re.fullmatch(r"[0-9a-f]{32}", intent.get("transaction_id", "")) is None
+                or re.fullmatch(_HASH, intent.get("request_hash", "")) is None
+                or re.fullmatch(_HASH, intent.get("manifest_hash", "")) is None
+                or re.fullmatch(_HASH, intent.get("workspace_identity_hash", "")) is None
+                or re.fullmatch(_HASH, intent.get("policy_manifest_hash", "")) is None
+                or intent["request_id"] != operation
+                or intent["workspace_identity_hash"] != binding.workspace_identity_hash
+                or intent["policy_manifest_hash"] != context.policy_manifest_hash
+                or type(intent["entries"]) is not int or intent["entries"] < 0
+                or type(intent["bytes"]) is not int or intent["bytes"] < 0
+                or type(intent["lease_generation"]) is not int or intent["lease_generation"] < 1):
+            return None
+
+        starts = matching(run_events, "ToolExecutionStarted")
+        if (len(starts) != 1 or starts[0].payload.get("request_hash") != intent["request_hash"]
+                or not exact_context(starts[0])):
+            return None
+        terminal_types = ("ToolExecutionCompleted", "ToolExecutionCancelled", "ToolExecutionFailed",
+                          "ToolExecutionOutcomeUnknown")
+        terminals = [event for event in run_events if event.event_type in terminal_types
+                     and event.run_id == run_id and event.payload.get("request_id") == operation]
+        if len(terminals) > 1 or (terminals and not exact_context(terminals[0], starts[0].event_id)):
+            return None
+        if terminals and terminals[0].event_type in {"ToolExecutionCancelled", "ToolExecutionOutcomeUnknown"}:
+            return None
+        if terminals and terminals[0].event_type == "ToolExecutionCompleted":
+            payload = terminals[0].payload
+            if (payload.get("outcome") != "completed" or payload.get("termination_confirmed") is not True
+                    or payload.get("cancelled") is not False or payload.get("timed_out") is not False
+                    or payload.get("output_limited") is not False
+                    or payload.get("publication_transaction_id") != intent["transaction_id"]
+                    or payload.get("publication_manifest_hash") != intent["manifest_hash"]
+                    or payload.get("entries_published") != intent["entries"]
+                    or payload.get("lease_generation") != intent["lease_generation"]):
+                return None
+
+        execution_intents = [event for event in execution_events
+                             if event.event_type == "WorkspaceExecutionIntended"
+                             and event.run_id == run_id and event.payload.get("request_id") == operation]
+        execution_stops = [event for event in execution_events
+                           if event.event_type == "WorkspaceExecutionStopped"
+                           and event.run_id == run_id and event.payload.get("request_id") == operation]
+        if len(execution_intents) != 1 or len(execution_stops) != 1:
+            return None
+        execution_intent, execution_stop = execution_intents[0], execution_stops[0]
+        common = {"request_id": operation, "workspace_identity_hash": binding.workspace_identity_hash,
+                  "request_hash": intent["request_hash"], "profile_hash": profile_hash}
+        if (execution_intent.payload != common or execution_stop.payload.get("proof") != "terminated"
+                or execution_stop.payload.get("termination_receipt") is None
+                or any(execution_stop.payload.get(key) != value for key, value in common.items())
+                or execution_stop.payload.get("execution_intent_event_id") != execution_intent.event_id
+                or not exact_context(execution_intent, binding.causation_id)
+                or not exact_context(execution_stop, execution_intent.event_id)):
+            return None
+        tool_stop = SandboxTerminationReceipt(**execution_stop.payload["termination_receipt"])
+        worker_events = self._events.read_stream(OPERATION_STREAM, operation)
+        worker_stop = SandboxTerminationReceipt(**worker_events[1].payload["termination_receipt"])
+        if tool_stop.unit_name == worker_stop.unit_name:
+            return None
+
+        # An operation carrying approval authority can be reconciled only when
+        # the exact accepted attempt and its already-consumed effect receipt are
+        # durable. Recovery never binds, consumes, or repeats an approval.
+        if binding.approval_grant_hash is not None:
+            security = run_events
+            bound = [event for event in security if event.event_type == "ApprovalGrantBound"
+                     and event.run_id == run_id and event.attempt_id == context.attempt_id
+                     and event.fencing_generation == context.fencing_generation]
+            consumed = [event for event in security if event.event_type == "ToolApprovalConsumed"
+                        and event.run_id == run_id and event.payload.get("request_id") == operation]
+            if len(bound) != 1 or len(consumed) != 1:
+                return None
+            bound_payload = bound[0].payload
+            grant_id = bound_payload.get("approval_grant_id")
+            if (type(grant_id) is not str or _hash(grant_id.encode()) != binding.approval_grant_hash
+                    or bound_payload.get("attempt_id") != context.attempt_id
+                    or bound_payload.get("fencing_generation") != context.fencing_generation
+                    or bound_payload.get("isolation_profile_hash") != profile_hash
+                    or bound_payload.get("policy_manifest_hash") != context.policy_manifest_hash
+                    or not exact_context(bound[0])):
+                return None
+            consumed_payload = consumed[0].payload
+            budget = self._events.read_stream("budget", run_id)
+            intent_event = next((event for event in budget
+                                 if event.event_type == "EffectIntentRecorded"
+                                 and event.event_id == consumed_payload.get("effect_intent_event_id")), None)
+            consumed_event = next((event for event in budget
+                                   if event.event_type == "ApprovalGrantConsumed"
+                                   and event.event_id == consumed_payload.get("approval_consumed_event_id")), None)
+            effect_receipts = [event for event in budget if event.event_type == "EffectReceiptRecorded"
+                               and event.payload.get("effect_id") == consumed_payload.get("effect_id")]
+            expected_receipt_hash = _hash_json({
+                "transaction_id": intent["transaction_id"],
+                "manifest_hash": intent["manifest_hash"],
+                "entries_published": intent["entries"],
+                "lease_generation": intent["lease_generation"],
+            })
+            if (consumed_payload.get("approval_grant_id") != grant_id
+                    or consumed_payload.get("request_hash") != intent["request_hash"]
+                    or consumed_payload.get("effect_intent_event_id") != (None if intent_event is None else intent_event.event_id)
+                    or consumed_payload.get("approval_consumed_event_id") != (None if consumed_event is None else consumed_event.event_id)
+                    or intent_event is None or consumed_event is None or len(effect_receipts) != 1
+                    or effect_receipts[0].payload.get("approval_grant_id") != grant_id
+                    or effect_receipts[0].payload.get("outcome") != "applied"
+                    or effect_receipts[0].payload.get("receipt_hash") != expected_receipt_hash
+                    or any(event.attempt_id != context.attempt_id
+                           or event.fencing_generation != context.fencing_generation
+                           for event in (intent_event, consumed_event, effect_receipts[0]))):
+                return None
+
+        return intent, run_intent, workspace_intent, worker_stop, profile_hash
+
+    def _publication_resolution_events(self, binding, operation, intent, run_intent, workspace_intent):
+        streams = (
+            ("security", binding.context.run_id, run_intent),
+            ("workspace_publications", "workspace:" + binding.workspace_identity_hash[7:], workspace_intent),
+        )
+        completion_payloads, abort_payloads = [], []
+        for stream_type, stream_id, intent_event in streams:
+            events = self._events.read_stream(stream_type, stream_id)
+            matches = [event for event in events if event.run_id == binding.context.run_id
+                       and event.payload.get("request_id") == operation
+                       and event.event_type in {"WorkspacePublicationCompleted", "WorkspacePublicationAborted"}]
+            if len(matches) > 1:
+                raise ValueError("publication has conflicting resolution receipts")
+            if not matches:
+                continue
+            event = matches[0]
+            if (event.node_id, event.attempt_id, event.fencing_generation, event.correlation_id,
+                event.causation_id) != (binding.context.node_id, binding.context.attempt_id,
+                binding.context.fencing_generation, None, intent_event.event_id):
+                raise ValueError("publication resolution context conflicts with intent")
+            if (event.event_type == "WorkspacePublicationCompleted"
+                    and event.payload != {**intent, "entries_published": intent["entries"]}):
+                # Completion payloads include the original lease generation;
+                # the exact journal lease is checked separately below.
+                expected = {**intent, "entries_published": intent["entries"]}
+                if event.payload != expected:
+                    raise ValueError("publication completion receipt conflicts with intent")
+            if event.event_type == "WorkspacePublicationCompleted":
+                completion_payloads.append(event.payload)
+            else:
+                if (set(event.payload) != {"request_id", "transaction_id", "manifest_hash", "reason"}
+                        or event.payload.get("transaction_id") != intent["transaction_id"]
+                        or event.payload.get("manifest_hash") != intent["manifest_hash"]
+                        or type(event.payload.get("reason")) is not str):
+                    raise ValueError("publication abort receipt conflicts with intent")
+                abort_payloads.append(event.payload)
+        if completion_payloads and abort_payloads:
+            raise ValueError("publication has both completed and aborted receipts")
+        if abort_payloads and any(payload != abort_payloads[0] for payload in abort_payloads):
+            raise ValueError("workspace and Run abort receipts conflict")
+        return completion_payloads, abort_payloads
+
+    def _record_reconciled_publication(self, binding, operation, intent, receipt, run_intent, workspace_intent):
+        payload = {**intent, "entries_published": receipt.entries_published}
+        self._append_reconciliation_receipt(
+            "security", binding.context.run_id, f"workspace-publication-receipt:{operation}",
+            "WorkspacePublicationCompleted", payload, binding, run_intent.event_id, operation,
+        )
+        self._append_reconciliation_receipt(
+            "workspace_publications", "workspace:" + binding.workspace_identity_hash[7:],
+            f"workspace-publication-receipt:{binding.context.run_id}:{operation}",
+            "WorkspacePublicationCompleted", payload, binding, workspace_intent.event_id, operation,
+        )
+
+    def _record_reconciled_abort(self, binding, operation, intent, recovery, run_intent, workspace_intent):
+        existing_completed, existing_aborted = self._publication_resolution_events(
+            binding, operation, intent, run_intent, workspace_intent
+        )
+        if existing_completed:
+            raise ValueError("cannot abort a publication with a completion receipt")
+        reason = (existing_aborted[0]["reason"] if existing_aborted
+                  else "explicit_reconciliation_not_applied")
+        payload = {"request_id": operation, "transaction_id": recovery.transaction_id,
+                   "manifest_hash": recovery.manifest_hash, "reason": reason}
+        self._append_reconciliation_receipt(
+            "security", binding.context.run_id, f"workspace-publication-aborted:{operation}",
+            "WorkspacePublicationAborted", payload, binding, run_intent.event_id, operation,
+        )
+        self._append_reconciliation_receipt(
+            "workspace_publications", "workspace:" + binding.workspace_identity_hash[7:],
+            f"workspace-publication-aborted:{binding.context.run_id}:{operation}",
+            "WorkspacePublicationAborted", payload, binding, workspace_intent.event_id, operation,
+        )
+
+    def _append_reconciliation_receipt(self, stream_type, stream_id, idempotency_key,
+                                       event_type, payload, binding, causation_id, operation):
+        def append(events, _version):
+            matching = [event for event in events if event.event_type == event_type
+                        and event.run_id == binding.context.run_id
+                        and event.payload.get("request_id") == operation]
+            if matching:
+                if len(matching) != 1 or matching[0].payload != payload:
+                    raise ValueError("publication receipt replay conflicts with evidence")
+                event = matching[0]
+                if (event.node_id, event.attempt_id, event.fencing_generation, event.correlation_id,
+                    event.causation_id) != (binding.context.node_id, binding.context.attempt_id,
+                    binding.context.fencing_generation, None, causation_id):
+                    raise ValueError("publication receipt context conflicts with evidence")
+                return None
+            return [EventDraft(event_type, payload, run_id=binding.context.run_id,
+                node_id=binding.context.node_id, attempt_id=binding.context.attempt_id,
+                fencing_generation=binding.context.fencing_generation,
+                causation_id=causation_id)]
+        self._events.append_checked(stream_type, stream_id, idempotency_key, append)
+
+    def _reconcile_terminal_publication(self, binding, operation, result):
+        if result.outcome != "published" or self._host is None:
+            return result
+        host = self._host
+        try:
+            with acquire_workspace_write_lease(host.workspace, host.lease_root) as lease:
+                names = sorted(os.listdir(host.journal_root))
+                if not names:
+                    return result
+                receipt = WorkspacePublishReceipt(**result.publication_receipt.model_dump())
+                expected_names = {"publish-" + receipt.transaction_id,
+                                  "acknowledged-" + receipt.transaction_id}
+                if len(names) != 1 or names[0] not in expected_names:
+                    return self._result(operation, "outcome_unknown", "execution_unknown")
+                snapshot = inspect_workspace_publication_journal(
+                    host.workspace, lease, host.journal_root, receipt.transaction_id
+                )
+                if snapshot is None:
+                    return self._result(operation, "outcome_unknown", "execution_unknown")
+                if snapshot.status != "committed" or snapshot.manifest_hash != receipt.manifest_hash:
+                    return self._result(operation, "outcome_unknown", "execution_unknown")
+                if (snapshot.entries_published != receipt.entries_published
+                        or snapshot.lease_generation != receipt.lease_generation):
+                    return self._result(operation, "outcome_unknown", "execution_unknown")
+                acknowledge_workspace_publication(host.workspace, lease, host.journal_root, receipt)
+            return result
+        except Exception:
+            return self._result(operation, "outcome_unknown", "execution_unknown")
+
     @staticmethod
     def _result(operation, outcome, reason):
         return WorkspaceExecutionResult(outcome=outcome, reason_code=reason, operation_id=operation)
@@ -380,7 +804,7 @@ class WorkspaceExecutionService:
 
     def _validate_historical_binding(self, binding, operation):
         context = binding.context
-        if operation != operation_id(context.model_dump()):
+        if operation != _operation_id(context.model_dump()):
             raise ValueError("operation identity mismatch")
         expected_scope = _hash(canonical({"context": context.model_dump(mode="json"),
                                           "program_hash": binding.program_hash}))
@@ -417,7 +841,7 @@ class WorkspaceExecutionService:
         role = state.node(identity["node_id"]).spec.role
         manifest = build_worker_input_manifest(run_id=identity["run_id"], node_id=identity["node_id"],
                                                role=role, task_text=text)
-        operation = operation_id(identity | {"input_manifest_hash": manifest.content_hash})
+        operation = _operation_id(identity | {"input_manifest_hash": manifest.content_hash})
         events = self._events.read_stream(OPERATION_STREAM, operation)
         if not events:
             return None
@@ -449,25 +873,59 @@ class WorkspaceExecutionService:
                     binding.context.attempt_id, binding.context.fencing_generation)
         def bound(event):
             return (event.run_id, event.node_id, event.attempt_id, event.fencing_generation) == expected
-        for stream, stream_id in (("security", binding.context.run_id),
-                ("workspace_publications", "workspace:" + binding.workspace_identity_hash[7:])):
-            completed = [event for event in self._events.read_stream(stream, stream_id)
-                         if event.event_type == "WorkspacePublicationCompleted"
+        workspace_stream = "workspace:" + binding.workspace_identity_hash[7:]
+        run_events = self._events.read_stream("security", binding.context.run_id)
+        workspace_events = self._events.read_stream("workspace_publications", workspace_stream)
+        intents = []
+        for events in (run_events, workspace_events):
+            matches = [event for event in events if event.event_type == "WorkspacePublicationIntent"
+                       and event.run_id == binding.context.run_id
+                       and event.payload.get("request_id") == operation]
+            if len(matches) != 1 or not bound(matches[0]) or matches[0].causation_id != binding.causation_id:
+                raise ValueError("Gateway publication intent is missing or misbound")
+            intents.append(matches[0])
+        run_intent, workspace_intent = intents
+        intent = run_intent.payload
+        required = {"request_id", "transaction_id", "request_hash", "manifest_hash", "entries",
+                    "bytes", "workspace_identity_hash", "policy_manifest_hash", "lease_generation"}
+        if (set(intent) != required or workspace_intent.payload != intent
+                or intent.get("request_id") != operation
+                or intent.get("workspace_identity_hash") != binding.workspace_identity_hash
+                or intent.get("policy_manifest_hash") != binding.context.policy_manifest_hash
+                or intent.get("transaction_id") != receipt.transaction_id
+                or intent.get("manifest_hash") != receipt.manifest_hash
+                or intent.get("entries") != receipt.entries_published
+                or intent.get("lease_generation") != receipt.lease_generation):
+            raise ValueError("Gateway publication intent conflicts with service receipt")
+        expected_receipt = {**intent, "entries_published": receipt.entries_published}
+        for events, intent_event in ((run_events, run_intent), (workspace_events, workspace_intent)):
+            completed = [event for event in events if event.event_type == "WorkspacePublicationCompleted"
                          and event.run_id == binding.context.run_id
                          and event.payload.get("request_id") == operation]
-            if len(completed) != 1 or not bound(completed[0]) or any(completed[0].payload.get(key) != value
-                                          for key, value in receipt.model_dump().items()):
+            if (len(completed) != 1 or not bound(completed[0])
+                    or completed[0].payload != expected_receipt
+                    or completed[0].causation_id != intent_event.event_id):
                 raise ValueError("service receipt does not match Gateway publication")
-        stopped = [event for event in self._events.read_stream("workspace_executions",
-                        "workspace:" + binding.workspace_identity_hash[7:])
+        stopped = [event for event in self._events.read_stream("workspace_executions", workspace_stream)
                    if event.payload.get("request_id") == operation
                    and event.run_id == binding.context.run_id
                    and event.payload.get("termination_receipt") is not None]
         from orchestrator.isolation import SandboxTerminationReceipt
         if (len(stopped) != 1 or not bound(stopped[0])
             or stopped[0].event_type != "WorkspaceExecutionStopped"
-            or stopped[0].payload.get("proof") != "terminated"):
+            or stopped[0].payload.get("proof") != "terminated"
+            or stopped[0].correlation_id is not None):
             raise ValueError("tool stop proof missing")
+        execution_intents = [event for event in self._events.read_stream("workspace_executions", workspace_stream)
+                             if event.event_type == "WorkspaceExecutionIntended"
+                             and event.run_id == binding.context.run_id
+                             and event.payload.get("request_id") == operation]
+        if (len(execution_intents) != 1 or stopped[0].causation_id != execution_intents[0].event_id
+                or execution_intents[0].causation_id != binding.causation_id
+                or execution_intents[0].correlation_id is not None
+                or execution_intents[0].payload.get("request_hash") != intent.get("request_hash")
+                or execution_intents[0].payload.get("workspace_identity_hash") != binding.workspace_identity_hash):
+            raise ValueError("tool stop proof is not bound to the exact publication request")
         tool_stop = SandboxTerminationReceipt(**stopped[0].payload["termination_receipt"])
         if tool_stop.unit_name == worker_stop["unit_name"]:
             raise ValueError("Worker and tool units are not distinct")

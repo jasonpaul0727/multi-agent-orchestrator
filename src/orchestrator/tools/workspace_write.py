@@ -48,7 +48,6 @@ from orchestrator.isolation import (
     publish_workspace_diff,
     acknowledge_workspace_publication,
     acknowledge_workspace_recovery,
-    recover_workspace_publications,
     recover_workspace_publications_with_outcomes,
 )
 from orchestrator.persistence.events import EventDraft, StoredEvent
@@ -277,8 +276,14 @@ class WorkspaceWriteGateway:
             self._record_block(request, "workspace_writer_unavailable")
             return ToolExecutionResult(request.request_id, "denied", decision)
         try:
-            recovered = recover_workspace_publications(self._workspace, lease, self._journal_root)
-            if recovered or self._has_unresolved_publication(request.run_id):
+            # Do not implicitly roll back, acknowledge, or clean an older
+            # publication while starting a new request. Only explicit trusted
+            # reconciliation may recover a retained journal.
+            try:
+                pending_journals = os.listdir(self._journal_root)
+            except OSError as exc:
+                raise ToolAuditUnavailable("publication journal history is unavailable") from exc
+            if pending_journals or self._has_unresolved_publication(request.run_id):
                 self._record_block(request, "prior_publication_requires_reconciliation")
                 return ToolExecutionResult(request.request_id, "denied", decision)
             if not self._authorized_now(request, state):

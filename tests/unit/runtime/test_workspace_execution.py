@@ -60,7 +60,8 @@ def execution_case(tmp_path, *, tools=True, command=("/usr/bin/true",), host_cha
         accepted_at=NOW + timedelta(seconds=1), lease_expires_at=NOW + timedelta(hours=1))
     return SimpleNamespace(app=app, workspace=workspace, host=host, text=text, clock=clock,
         identity=dict(run_id="run-1", node_id="node-1", attempt_id=request.attempt_id, fencing_generation=1),
-        lifecycle=lifecycle)
+        lifecycle=lifecycle, registry=reg, config=resolved.config, policy=policy,
+        contract=contract)
 
 
 def api():

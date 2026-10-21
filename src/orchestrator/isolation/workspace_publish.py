@@ -71,6 +71,89 @@ class WorkspacePublicationRecovery:
     lease_generation: int | None = None
 
 
+@dataclass(frozen=True)
+class WorkspacePublicationJournalSnapshot:
+    """Read-only, lease-bound view of one retained transaction journal."""
+
+    transaction_id: str
+    status: Literal["unbound", "preparing", "prepared", "committed", "rolled_back", "not_started"]
+    manifest_hash: str | None = None
+    entries_published: int = 0
+    lease_generation: int | None = None
+    filename: str | None = None
+
+
+def inspect_workspace_publication_journal(
+    workspace_root: str | Path,
+    lease: WorkspaceWriteLease,
+    journal_root: str | Path,
+    transaction_id: str,
+) -> WorkspacePublicationJournalSnapshot | None:
+    """Inspect one exact transaction without replay, rollback, or cleanup."""
+
+    if not isinstance(transaction_id, str) or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
+        raise WorkspacePublishError("transaction_id must be a 128-bit lowercase hexadecimal value")
+    _verify_lease_for_workspace(lease, workspace_root)
+    roots = _open_roots(None, workspace_root, None, journal_root)
+    roots.lease = lease
+    try:
+        _assert_roots_disjoint(roots)
+        lease.assert_current()
+        _verify_workspace_fd(roots.workspace_fd, lease)
+        names = os.listdir(roots.journal_fd)
+        matching = [
+            name for name in names
+            if name in {
+                "publish-" + transaction_id,
+                "staging-" + transaction_id,
+                "acknowledged-" + transaction_id,
+            }
+        ]
+        if len(matching) > 1:
+            raise WorkspacePublishError("ambiguous publication transaction identity")
+        if not matching:
+            return None
+        name = matching[0]
+        info = os.stat(name, dir_fd=roots.journal_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise WorkspacePublishError("publication transaction is not a real directory")
+        transaction_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=roots.journal_fd,
+        )
+        try:
+            _verify_private_directory(transaction_fd, "publication transaction")
+            try:
+                payload = _read_journal(transaction_fd)
+            except FileNotFoundError:
+                try:
+                    os.stat("schema-2", dir_fd=transaction_fd, follow_symlinks=False)
+                    schema2 = True
+                except FileNotFoundError:
+                    schema2 = False
+                if schema2:
+                    raise WorkspacePublishError("publication journal state is missing") from None
+                return WorkspacePublicationJournalSnapshot(
+                    transaction_id=transaction_id,
+                    status="unbound",
+                    filename=name,
+                )
+            _validate_payload(payload, name, lease)
+            return WorkspacePublicationJournalSnapshot(
+                transaction_id=transaction_id,
+                status=payload["status"],
+                manifest_hash=payload["manifest_hash"],
+                entries_published=len(payload["records"]),
+                lease_generation=payload["lease_generation"],
+                filename=name,
+            )
+        finally:
+            os.close(transaction_fd)
+    finally:
+        roots.close()
+
+
 def publish_workspace_diff(
     lower_root: str | Path,
     workspace_root: str | Path,
