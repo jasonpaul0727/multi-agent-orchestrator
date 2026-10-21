@@ -823,7 +823,7 @@ def _service_properties(
 ) -> tuple[str, ...]:
     controls = tuple(
         f"InaccessiblePaths=-{workspace_target / name}"
-        for name in (".git", ".maestro")
+        for name in (".git", ".maestro", ".env")
     )
     return (
         "PrivateNetwork=yes",

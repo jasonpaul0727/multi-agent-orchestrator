@@ -38,6 +38,7 @@ class DurableAttemptAuthority:
         workspace: str | Path,
         policy_manifest_hash: str,
         clock: Callable[[], datetime] | None = None,
+        expected_context=None,
     ) -> None:
         database = Path(database_path)
         workspace_path = Path(workspace)
@@ -60,6 +61,11 @@ class DurableAttemptAuthority:
         self._workspace_identity_hash = workspace_identity_hash(canonical_workspace)
         self._policy_manifest_hash = policy_manifest_hash
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        if expected_context is not None:
+            from orchestrator.runtime.contracts import AttemptContext
+            from orchestrator.validation import revalidate_model
+            expected_context = revalidate_model(AttemptContext, expected_context)
+        self._expected_context = expected_context
 
     def is_current(self, request: ToolRequest) -> bool:
         """Fail closed on stale, inconsistent, expired, or unreadable state."""
@@ -141,6 +147,21 @@ class DurableAttemptAuthority:
         if len(accepted_routes) != 1:
             return False
         route = accepted_routes[0]
+        context = self._expected_context
+        if context is not None and (
+            route.payload.get("verification_context") != context.model_dump(mode="json")
+            or lifecycle.graph_version != context.graph_version
+            or lifecycle.config_hash != context.effective_config_hash
+            or lifecycle.registry_hash != context.registry_hash
+            or node.spec.planning_contract_hash != context.planning_contract_hash
+            or context.run_id != request.run_id or context.node_id != request.node_id
+            or context.attempt_id != request.attempt_id
+            or context.fencing_generation != request.fencing_generation
+            or context.agent_instance_id != expected_agent_id
+            or context.policy_manifest_hash != self._policy_manifest_hash
+            or context.routing_decision_hash != attempt.decision_hash
+        ):
+            return False
         if (
             route.run_id != request.run_id
             or route.node_id != request.node_id

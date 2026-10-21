@@ -92,7 +92,8 @@ def snapshot_workspace(
     The source root is opened once and every descendant is opened relative to
     an already-open directory with ``O_NOFOLLOW``. Only regular files,
     directories, and lexically in-root relative symlinks are copied. The
-    control directories ``.git`` and ``.maestro`` are omitted. The resulting
+    control roots ``.git``, ``.maestro`` and secret config ``.env`` are omitted
+    case-insensitively without opening or following them. The resulting
     tree has no writable mode bits and is suitable for a read-only bind mount.
     """
 
@@ -197,7 +198,7 @@ def snapshot_workspace(
         for name in names:
             if name in (".", "..") or "/" in name or "\x00" in name:
                 raise WorkspaceBoundaryError("workspace contains an invalid directory entry")
-            if not relative and name in (".git", ".maestro"):
+            if not relative and name.casefold() in (".git", ".maestro", ".env"):
                 continue
             try:
                 before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
@@ -408,7 +409,7 @@ def export_overlay_diff(
         for name in names:
             if name in (".", "..") or "/" in name or "\x00" in name:
                 raise WorkspaceBoundaryError("OverlayFS upper contains an invalid path component")
-            if not relative and name in (".git", ".maestro"):
+            if not relative and name.casefold() in (".git", ".maestro", ".env"):
                 raise WorkspaceBoundaryError("OverlayFS diff targets a protected control directory")
             try:
                 before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
@@ -693,7 +694,7 @@ def validate_overlay_candidate(
         if (
             not parts
             or any(part in ("", ".", "..") or "\\" in part for part in parts)
-            or (parts and parts[0] in (".git", ".maestro"))
+            or (parts and parts[0].casefold() in (".git", ".maestro", ".env"))
             or entry.path in entries_by_path
             or isinstance(entry.size, bool)
             or not isinstance(entry.size, int)
@@ -792,7 +793,7 @@ def validate_overlay_candidate(
             entry = entries_by_path.get(path)
             if entry is None or path in seen:
                 raise WorkspaceBoundaryError("candidate tree has an undeclared or duplicate entry")
-            if (path_parts and path_parts[0] in (".git", ".maestro")):
+            if (path_parts and path_parts[0].casefold() in (".git", ".maestro", ".env")):
                 raise WorkspaceBoundaryError("candidate tree includes a protected control path")
             try:
                 before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)

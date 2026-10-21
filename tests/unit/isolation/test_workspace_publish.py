@@ -1076,6 +1076,8 @@ def test_journal_payload_schema_validates_owner_generation_and_paths(tmp_path: P
         invalid_records = [
             {**record, "temporary": "../../escape"},
             {**record, "path": ".git/config"},
+            {**record, "path": ".env"},
+            {**record, "path": ".ENV/key"},
             {**record, "operation": "modify"},
             {**record, "backup": "00000000.backup"},
             {**record, "path": "a/../b"},

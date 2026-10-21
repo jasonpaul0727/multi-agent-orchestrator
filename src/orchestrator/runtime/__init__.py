@@ -61,4 +61,23 @@ __all__ = [
     "validate_verification_evidence",
     "validate_verification_task",
     "validate_worker_result",
+    "WorkspaceToolProgram",
+    "WorkspaceWorkerTask",
+    "WorkspaceWorkerProposal",
+    "IsolatedWorkspaceWorker",
+    "WorkspaceExecutionHost",
+    "WorkspaceExecutionResult",
+    "WorkspaceExecutionService",
 ]
+
+
+def __getattr__(name):
+    # These host services depend on tools/Scheduler, which themselves import
+    # runtime contracts. Load them only after the contracts package is ready.
+    if name in {"WorkspaceToolProgram", "WorkspaceWorkerTask", "WorkspaceWorkerProposal", "IsolatedWorkspaceWorker"}:
+        from . import workspace_worker
+        return getattr(workspace_worker, name)
+    if name in {"WorkspaceExecutionHost", "WorkspaceExecutionResult", "WorkspaceExecutionService"}:
+        from . import workspace_execution
+        return getattr(workspace_execution, name)
+    raise AttributeError(name)

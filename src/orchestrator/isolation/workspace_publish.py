@@ -920,7 +920,7 @@ def _validate_payload(payload: dict[str, Any], name: str, lease: WorkspaceWriteL
             not parts
             or any(part in ("", ".", "..") or "\\" in part
                    or any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in part) for part in parts)
-            or parts[0].casefold() in (".git", ".maestro")
+            or parts[0].casefold() in (".git", ".maestro", ".env")
             or path in seen
             or path.casefold() in folded
             or record["operation"] not in (("add", "modify") if schema == 1 else ("add", "modify", "delete"))

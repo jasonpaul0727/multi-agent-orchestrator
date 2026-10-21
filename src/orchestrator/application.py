@@ -31,6 +31,9 @@ from orchestrator.runtime.verification_journal import (
 from orchestrator.runtime.verifier_process import IsolatedVerifierProcess
 from orchestrator.runtime.contracts import WorkerTask
 from orchestrator.runtime.worker_input_service import WorkerInputService
+from orchestrator.runtime.workspace_execution import (
+    WorkspaceExecutionHost, WorkspaceExecutionResult, WorkspaceExecutionService,
+)
 from orchestrator.scheduler import AcceptedAttempt, ConcurrencyLimits, Scheduler
 from orchestrator.validation import revalidate_model
 
@@ -77,6 +80,7 @@ class ControlPlaneApplication:
         evidence_verifier: ProviderEvidenceVerifier | None = None,
         termination_verifier: AttemptTerminationVerifier | None = None,
         usage_source: AttemptUsageSource | None = None,
+        workspace_execution_host: WorkspaceExecutionHost | None = None,
     ) -> None:
         self._ready = False
         self._closed = False
@@ -96,6 +100,9 @@ class ControlPlaneApplication:
             )
             self._scheduler = Scheduler(store, limits=limits, artifact_store=self._artifact_store)
             self._worker_inputs = WorkerInputService(self._scheduler)
+            self._workspace_execution = WorkspaceExecutionService(
+                scheduler=self._scheduler, database=database, host=workspace_execution_host,
+            )
             self._acceptance_coordinator = (
                 AttemptExecutionCoordinator(
                     scheduler=self._scheduler, artifact_store=self._artifact_store,
@@ -136,6 +143,7 @@ class ControlPlaneApplication:
             after = self._recover_all_runs()
             self._validate_provider_calls(after)
             self._validate_verifier_proposals(after)
+            self._workspace_execution.validate_operations()
             if self._journal.pending_settlements():
                 raise StartupRecoveryFailed("startup left an unapplied Provider proof")
             held = tuple(lease for run in after.values() for lease in run.active_attempts)
@@ -281,6 +289,17 @@ class ControlPlaneApplication:
         return self._acceptance_coordinator.accept_proposal(
             run_id=run_id, node_id=node_id, attempt_id=attempt_id,
             fencing_generation=fencing_generation, task_sha256=task_sha256,
+        )
+
+    def execute_workspace_task(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, task_text: str, approval_grant_id: str | None = None,
+    ) -> WorkspaceExecutionResult:
+        self._require_ready()
+        return self._workspace_execution.execute(
+            run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+            fencing_generation=fencing_generation, task_text=task_text,
+            approval_grant_id=approval_grant_id,
         )
 
     def recover_run(self, run_id: str) -> RecoveredRun:

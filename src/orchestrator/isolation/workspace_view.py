@@ -50,7 +50,7 @@ def _path(path: str, max_depth: int) -> tuple[str, ...]:
     parts = tuple(path.split("/"))
     if (len(parts) > max_depth or any(p in ("", ".", "..") or "\\" in p
             or any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in p) for p in parts)
-            or parts[0].casefold() in (".git", ".maestro")):
+            or parts[0].casefold() in (".git", ".maestro", ".env")):
         raise WorkspaceBoundaryError("invalid or protected workspace path")
     return parts
 
@@ -138,7 +138,7 @@ def _inventory(root: Path, *, max_entries: int, max_bytes: int, max_depth: int,
                 children[relative] = names
                 folded: set[str] = set()
                 for name in names:
-                    if live and not relative and name in (".git", ".maestro"):
+                    if live and not relative and name.casefold() in (".git", ".maestro", ".env"):
                         continue
                     path = "/".join((*relative, name))
                     _path(path, max_depth)
@@ -167,7 +167,7 @@ def _inventory(root: Path, *, max_entries: int, max_bytes: int, max_depth: int,
                         for part in link.split("/"):
                             if part == "..": resolved.pop()
                             elif part not in ("", "."): resolved.append(part)
-                        if resolved and resolved[0].casefold() in (".git", ".maestro"):
+                        if resolved and resolved[0].casefold() in (".git", ".maestro", ".env"):
                             raise WorkspaceBoundaryError("symlink targets a protected path")
                         if os.listxattr(f"/proc/self/fd/{parent}/{name}", follow_symlinks=False):
                             raise WorkspaceBoundaryError("symlink contains extended attributes")
@@ -229,7 +229,7 @@ def _inventory(root: Path, *, max_entries: int, max_bytes: int, max_depth: int,
                 if names != children[relative]:
                     raise WorkspaceBoundaryError("workspace changed during inventory")
                 for name in names:
-                    if live and not relative and name in (".git", ".maestro"):
+                    if live and not relative and name.casefold() in (".git", ".maestro", ".env"):
                         continue
                     parts = (*relative, name)
                     path = "/".join(parts)
