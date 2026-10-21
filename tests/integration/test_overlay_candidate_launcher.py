@@ -190,8 +190,9 @@ def test_live_candidate_gateway_audits_then_publishes_exact_workspace_diff(tmp_p
     assert (workspace / "created.txt").read_text() == "candidate output\n"
     assert list(journal_root.iterdir()) == []
     security_events = events.read_stream("security", "run-live-write")
-    assert [event.event_type for event in security_events][-3:] == [
-        "WorkspacePublicationIntent", "WorkspacePublicationCompleted", "ToolExecutionCompleted",
+    assert [event.event_type for event in security_events][-4:] == [
+        "WorkspacePublicationIntent", "ToolExecutionResultCaptured",
+        "WorkspacePublicationCompleted", "ToolExecutionCompleted",
     ]
     assert not any(str(workspace) in repr(event.payload) for event in security_events)
 

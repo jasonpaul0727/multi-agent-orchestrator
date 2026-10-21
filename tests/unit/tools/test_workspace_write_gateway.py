@@ -535,6 +535,7 @@ def test_allowed_write_is_attempt_bound_audited_and_published(tmp_path: Path) ->
         "ToolCapabilityConsumed",
         "ToolExecutionStarted",
         "WorkspacePublicationIntent",
+        "ToolExecutionResultCaptured",
         "WorkspacePublicationCompleted",
         "ToolExecutionCompleted",
     ]
