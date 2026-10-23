@@ -3,19 +3,28 @@
 Observed on 2026-10-23 in an Ubuntu 24.04 WSL2 environment. This is evidence
 for the candidate source commit `687209fcc7ef4f2c1548298a58cec4b56d052b87`;
 the report and later documentation-only commits do not alter that tested
-source identity. **P0 remains incomplete.** The required wheel build and wheel
-contents inspection could not run because the existing environments do not
-contain the `wheel` build dependency. No dependency was installed.
+source identity. The final full run reports **2,611 passed, 0 failed/errors/
+skipped and 90.29% statement coverage**; the clean-checkout systemd smoke passed
+3 cases. The candidate wheel built in a one-off private environment and its
+contents were independently checked against all 96 tracked Python modules;
+wheel SHA-256 is
+`92b6e9e99b0b08dca6805c7d21c5b1d417d78640903afd603ebc60e379adf6be`.
+No shared dependency environment changed. The final whole-P0 independent review
+concluded that both original P0 acceptance items are met by the implementation,
+tests, and boundary documentation; the original checklist is closed below.
+This is P0 closure only, not full V1 or production readiness.
 
 ## Requirement-to-evidence map
 
 | Original P0 requirement | Evidence in this validation | Status |
 | --- | --- | --- |
-| Safe workspace path operations, validated Overlay diff, reversible publication, and the fixed Worker-to-Gateway path | Full suite; clean-checkout live systemd smoke below; Task 1–5 reports and tests | Implementation evidence is present, but P0 remains open until packaging and the final whole-P0 review pass. This is one fixed tool path, not a general Worker or product capability. |
-| Unsupported isolation/platform paths fail closed as `Blocked(isolation_unavailable)`; document Broker source/lifetime/endpoint and MCP caller trust | Existing admission negative tests and security-boundary docs; full suite has zero skips | Boundary is documented and tested for the existing API. MCP authenticated-caller/Authority Envelope integration is not implemented; P0 remains open until packaging and the final whole-P0 review pass. |
+| Safe workspace path operations, validated Overlay diff, reversible publication, and the fixed Worker-to-Gateway path | Full suite (2,611 passed, 0 skipped; 90.29% statement coverage); clean-checkout live systemd smoke (3 passed); Task 1–5 reports/tests; exact wheel inventory and hash below | **Met for the fixed tool-only path.** The independent final review found the bounded reversible publication and evidence sufficient for this P0 item. This is not a general Worker or product capability. |
+| Unsupported isolation/platform paths fail closed as `Blocked(isolation_unavailable)`; document Broker source/lifetime/endpoint and MCP caller trust | Existing admission negative tests, live missing-control test, full suite (0 skipped), and security-boundary docs | **Met as a fail-closed behavior and documented trust boundary.** Authenticated MCP caller/Authority Envelope integration is not implemented and remains deferred; this P0 item requires documenting that boundary, not shipping MCP authentication. |
 
-The original P0 checkboxes remain unchecked. No product platform is declared
-supported, and no P3/P4/P5/P6/P7 status is advanced by this evidence.
+Both original P0 checkboxes are checked in the full V1 plan based on the
+evidence and final independent-review conclusions recorded here. No product
+platform is declared supported, and no P3/P4/P5/P6/P7 status is advanced by
+this P0 closure.
 
 ## Full verification
 
@@ -163,6 +172,13 @@ metadata, no extra package/test/doc/internal artifacts, and no shared
 dependency change. The ordinary push of `72f1f68bd36bdee3bac98228500bef2335d917d0`
 was verified against `git ls-remote`; local and remote SHA matched.
 
-This closes Task 6's evidence/review/push gates only. The original P0 checklist
-entries remain open because this validation record does not meet their
-complete substantive acceptance requirements.
+The final whole-P0-range independent review of
+`ae12d40458e6c8cf41c925ca52cf01a5c965098f..8d317c3cbc18894004e24ab94b4ca40e32d86296`
+found no source-level P0 security finding blocking the fixed internal scope and
+concluded that both original P0 items are technically justified as complete.
+The reviewer independently confirmed the final full-suite counts and coverage,
+3 clean-checkout systemd smokes, wheel SHA/module inventory/runtime metadata,
+and the distinction between P0 closure and deferred P3/P4/P6/P7/production work.
+The ordinary push of `8d317c3cbc18894004e24ab94b4ca40e32d86296` was verified
+against `git ls-remote`; local and remote SHA matched. This closes the P0
+acceptance rows only; it does not establish full V1 or production readiness.

@@ -51,8 +51,8 @@ P1/P2 的纯数据模型、配置解析和确定性决策逻辑不运行 Agent �
 - [x] 做隔离原语可行性 spike，逐项以 live tests 验证工作区文件边界、符号链接/挂载逃逸、进程树终止、资源限制、原始网络阻断、私有临时目录和 Git worktree。
 - [x] 将已测原语接入真实 `SystemdReadOnlyLauncher`：每次启动核验 cgroup/rlimit，bind 只读 workspace/runtime，隐藏 Home、Git/控制和主机凭证路径，限制网络/临时目录/filesystem、资源、时长和输出；停止通过 systemd unit wait 收据确认。
 - [x] 记录隔离平台矩阵与边界：`docs/security/platform-support.md` 只把 Ubuntu 24.04/WSL2/systemd 255 的只读 profile 列为已测候选，不宣称完整 V1 支持。
-- [ ] 完成 workspace-write 的安全路径操作、Overlay 差异导出/验证/原子应用及 Worker/Gateway 接入；在这些闭环前 WSL2 仍不是完整 V1 支持平台。
-- [ ] 若某平台没有满足规格的可验证后端，将该平台/能力标记为不支持并返回 `Blocked(isolation_unavailable)`；禁止无隔离 fallback。记录 Secret Broker 的密钥来源、生命周期、端点绑定方式和 MCP 调用者身份信任边界。
+- [x] 完成 workspace-write 的安全路径操作、Overlay 差异导出/验证/有界可逆发布及固定 tool-only Worker/Gateway 接入；该固定路径通过 P0 验收，但 WSL2 仍不是完整 V1 支持平台。证据与边界见 [P0 security closure validation](../../validation/2026-10-18-p0-security-closure.md)；最终独立审查确认此项满足原始 P0 要求。
+- [x] 对没有满足规格之可验证后端的平台/能力 fail closed 并返回 `Blocked(isolation_unavailable)`，禁止无隔离 fallback；记录 Secret Broker 的密钥来源、生命周期、端点绑定方式和 MCP 调用者身份信任边界。MCP authenticated-caller/Authority Envelope 实现仍未完成且不属于本 P0 项；该 trust boundary 已明确记录。证据与最终独立审查结论见 [P0 security closure validation](../../validation/2026-10-18-p0-security-closure.md)。
 - [x] 在 README/ADR 明确平台准入状态与边界：目前没有产品支持的执行平台，Ubuntu 24.04/WSL2/systemd 仅是已测只读候选；workspace-write、身份信任和端到端安全门通过前不宣称完整平台支持，也不启用不满足隔离要求的 Worker。
 
 2026-09-22 首轮探测记录：当前 Ubuntu 24.04 / WSL2（kernel `6.6.87.2-microsoft-standard-WSL2`）支持组合 user/mount/PID/network namespace；新 network namespace 仅有 loopback 且无路由；私有 mount namespace 内 tmpfs mount 成功；Landlock ABI 3 的白名单读取/越界拒绝已通过一次性实测；`prlimit` 的 CPU、地址空间、NPROC、文件大小和打开文件数限制在子进程中可见，`NPROC=1` 时 fork 实测被内核拒绝。当时未安装 bubblewrap，且用户不能直接写 cgroup v2 根目录。
