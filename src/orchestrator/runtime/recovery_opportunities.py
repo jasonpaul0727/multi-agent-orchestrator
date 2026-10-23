@@ -80,6 +80,10 @@ def load_recovery_records(
         event.payload["attempt_ref"]: event for event in relevant
         if event.event_type == "RoutingDecisionAccepted"
     }
+    successors = {
+        event.payload["recovery_authorization_hash"]: event for event in sources.values()
+        if event.payload.get("recovery_authorization_hash") is not None
+    }
     classifications = {
         event.payload["attempt_ref"]: FailureClassification.model_validate_json(
             json.dumps(event.payload["classification"])
@@ -95,8 +99,19 @@ def load_recovery_records(
         plan = RecoveryPlan.model_validate_json(json.dumps(event.payload["plan"]))
         node = lifecycle.node(source.node_id)
         attempt = next(item for item in node.attempts if item.attempt_id == source.attempt_id)
+        successor_event = (
+            None if plan.authorization is None
+            else successors.get(plan.authorization.authorization_hash)
+        )
+        successor = (
+            None if successor_event is None
+            else AcceptedModelRoute.model_validate(successor_event.payload["accepted_route"])
+        )
         status, reason = "blocked", plan.reason
-        if lifecycle.status != "running":
+        # Consumption is a historical identity, never current task/dispatch authority.
+        if successor is not None:
+            status, reason = "already_admitted", "recovery_authorization_consumed"
+        elif lifecycle.status != "running":
             reason = "run_" + lifecycle.status
         elif attempt.status == "outcome_unknown" or node.spec.node_id in unresolved_nodes:
             status, reason = "reconciliation_required", "provider_outcome_unknown"
@@ -113,10 +128,11 @@ def load_recovery_records(
             source_decision_hash=source.payload["decision_hash"],
             authorization_hash=None if plan.authorization is None else plan.authorization.authorization_hash,
             evidence_hash=None if evidence is None else evidence.evidence_hash,
-            action=plan.action, status=status, reason=reason,
+            action=plan.action, status=status, reason=reason, successor=successor,
         )
         records.append(RecoverySourceRecord(
             opportunity=opportunity, plan=plan, classification=classification, source_event=source,
+            successor_event=successor_event,
         ))
     return tuple(sorted(records, key=lambda item: (
         item.opportunity.node_id, item.opportunity.source_fencing_generation,

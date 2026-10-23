@@ -48,3 +48,24 @@ def durable_state(store):
         BudgetLedger(store).available("run-1"), control.agents.replay("run-1"),
         recovered.active_attempts,
     )
+
+
+def consume_recovery(case, *, source_decision=None, plan=None, retry_level=1,
+                     exhausted_model_ids=()):
+    """Admit a real successor through the persisted Scheduler authorization."""
+    source_decision = case.decision if source_decision is None else source_decision
+    plan = case.plan if plan is None else plan
+    request, decision = routed_pair(
+        case.registry, case.config, case.policy,
+        attempt=source_decision.fencing_generation + 1, contract_hash=case.contract.contract_hash,
+        recovery_action=plan.action, recovery_authorization=plan.authorization,
+        prior_decision_hash=source_decision.decision_hash, previous_model_id="model-1",
+        failure_category="transient", retry_level=retry_level,
+        exhausted_model_ids=exhausted_model_ids,
+    )
+    accepted = WorkerInputService(case.scheduler).accept_routing_with_input(
+        request, decision, task_text="implement a small change",
+        accepted_at=NOW + timedelta(seconds=6 + request.fencing_generation),
+        lease_expires_at=NOW + timedelta(minutes=2),
+    )
+    return request, decision, accepted

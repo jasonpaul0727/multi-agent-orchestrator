@@ -1,13 +1,14 @@
 """Recovery discovery reads current durable authority without executing work."""
 
 import subprocess
+from datetime import timedelta
 
 import pytest
 
 from orchestrator.persistence import SQLiteEventStore
-from tests.support.recovery_continuation import durable_state, recovery_case
+from tests.support.recovery_continuation import consume_recovery, durable_state, recovery_case
 from tests.unit.lifecycle.test_scheduler import (
-    scheduler, _provider_call_request_for_crash, routed_pair, accept,
+    NOW, scheduler, _provider_call_request_for_crash, routed_pair, accept,
 )
 
 
@@ -136,4 +137,122 @@ def test_unconsumed_source_is_blocked_after_newer_attempt(tmp_path):
         item, = service(case.scheduler).list_opportunities(run_id="run-1")
         assert (item.status, item.reason) == ("blocked", "stale_source_attempt")
         assert item.source_attempt_id == "attempt-node-1-1"
+        assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("successor_state", ["active", "failed", "paused", "outcome_unknown"])
+def test_consumed_successor_reopens_to_exact_accepted_route(tmp_path, successor_state):
+    # Catches rediscovering consumed authorization as stale/ready or inventing a new route.
+    database = tmp_path / "consumed.db"
+    with SQLiteEventStore(database) as store:
+        case = recovery_case(store)
+        request, _, accepted = consume_recovery(case)
+        if successor_state in {"failed", "outcome_unknown"}:
+            case.scheduler.finish_attempt(
+                run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+                fencing_generation=2, completed_at=NOW + timedelta(seconds=10),
+                outcome=successor_state, known_no_effect=successor_state == "failed",
+            )
+        elif successor_state == "paused":
+            case.lifecycle.pause_run("run-1", reason_code="user_request")
+        before = durable_state(store)
+    with SQLiteEventStore(database) as store:
+        query = service(scheduler(store))
+        item, = query.list_opportunities(run_id="run-1")
+        assert (item.status, item.reason) == ("already_admitted", "recovery_authorization_consumed")
+        assert (item.source_attempt_id, item.source_fencing_generation) == ("attempt-node-1-1", 1)
+        assert item.authorization_hash == case.plan.authorization.authorization_hash
+        assert item.source_decision_hash == case.decision.decision_hash
+        assert item.successor == accepted.accepted_route
+        assert (item.successor.run_id, item.successor.node_id, item.successor.attempt_id,
+                item.successor.fencing_generation, item.successor.model_id) == (
+            "run-1", "node-1", "attempt-node-1-2", 2, "model-1",
+        )
+        assert query.list_opportunities(run_id="run-1") == (item,)
+        assert durable_state(store) == before
+
+
+def test_older_consumed_source_stays_bound_while_latest_source_is_ready(tmp_path):
+    # Catches joining by node/latest attempt instead of the exact authorization hash.
+    from orchestrator.models import ModelGatewayFailure
+
+    with SQLiteEventStore(tmp_path / "chain.db") as store:
+        case = recovery_case(store)
+        request, decision, accepted = consume_recovery(case)
+        case.scheduler.finish_attempt(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=2, completed_at=NOW + timedelta(seconds=10),
+            outcome="failed", known_no_effect=True,
+        )
+        plan = case.scheduler.plan_attempt_recovery(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=2, source_decision=decision, contract=case.contract,
+            failure=ModelGatewayFailure(code="rate_limited", phase="provider", outcome="known_failure",
+                                        retryable=True, http_status=429),
+        )
+        before = durable_state(store)
+        older, latest = service(case.scheduler).list_opportunities(run_id="run-1")
+        assert (older.source_fencing_generation, older.status) == (1, "already_admitted")
+        assert older.successor == accepted.accepted_route
+        assert older.authorization_hash == case.plan.authorization.authorization_hash
+        assert (latest.source_fencing_generation, latest.status, latest.reason) == (
+            2, "ready", "bounded_same_model_retry",
+        )
+        assert latest.successor is None and latest.authorization_hash == plan.authorization.authorization_hash
+        assert latest.source_decision_hash == decision.decision_hash
+        assert durable_state(store) == before
+        _, _, third = consume_recovery(
+            case, source_decision=decision, plan=plan, retry_level=2,
+            exhausted_model_ids=("model-1",),
+        )
+        after_third = durable_state(store)
+        older, latest = service(case.scheduler).list_opportunities(run_id="run-1")
+        assert (older.status, latest.status) == ("already_admitted", "already_admitted")
+        assert older.successor == accepted.accepted_route
+        assert latest.successor == third.accepted_route
+        assert (older.successor.attempt_id, latest.successor.attempt_id) == (
+            "attempt-node-1-2", "attempt-node-1-3",
+        )
+        assert durable_state(store) == after_third
+
+
+def test_internal_record_retains_exact_source_and_successor_events(tmp_path):
+    # Catches discarding the durable join needed by the later continuation transaction.
+    from orchestrator.runtime.recovery_opportunities import load_recovery_records
+
+    with SQLiteEventStore(tmp_path / "record.db") as store:
+        case = recovery_case(store)
+        _, _, accepted = consume_recovery(case)
+        before = durable_state(store)
+        records = []
+
+        def read_under_lock(events, _version):
+            records.extend(load_recovery_records(case.scheduler, run_id="run-1", events=events))
+            return None
+
+        store.append_checked("scheduler", "global", "test-recovery-records", read_under_lock)
+        record, = records
+        assert record.source_event.event_type == "RoutingDecisionAccepted"
+        assert record.source_event.attempt_id == "attempt-node-1-1"
+        assert record.successor_event.event_type == "RoutingDecisionAccepted"
+        assert record.successor_event.attempt_id == "attempt-node-1-2"
+        assert record.successor_event.payload["recovery_authorization_hash"] == record.opportunity.authorization_hash
+        assert record.opportunity.successor == accepted.accepted_route
+        assert record.plan == case.plan
+        assert record.classification.disposition == "classified"
+        assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("code,reason", [
+    ("authentication_failed", "failure_not_recoverable"),
+    ("context_length_exceeded", "capability_escalation_not_configured"),
+])
+def test_blocked_plans_preserve_durable_reason(tmp_path, code, reason):
+    # Catches flattening an explicit persisted blocked reason into generic readiness.
+    with SQLiteEventStore(tmp_path / "blocked.db") as store:
+        case = recovery_case(store, failure_code=code)
+        before = durable_state(store)
+        item, = service(case.scheduler).list_opportunities(run_id="run-1")
+        assert (item.status, item.reason) == ("blocked", reason)
+        assert item.action is None and item.authorization_hash is None and item.successor is None
         assert durable_state(store) == before
