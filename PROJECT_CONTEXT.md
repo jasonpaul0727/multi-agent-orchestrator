@@ -2,6 +2,8 @@
 
 ## 当前状态
 
+2026-10-23 P0 Security Closure Task 6 与最终验收：候选源提交 `687209fcc7ef4f2c1548298a58cec4b56d052b87` 的全量测试为 2,611 passed、0 failed/error/skipped，覆盖率 90.29%；新增回归覆盖 symlink 链经普通文件时拒绝解析。compileall、pip check 和干净 checkout 的真实 systemd Worker/Gateway smoke（3 passed）通过。候选 wheel 已在一次性私有构建环境成功构建并检查，内容与 96 个受跟踪 Python 模块一致，无测试/文档/内部工件；共享依赖未变。wheel 证据提交 `72f1f68bd36bdee3bac98228500bef2335d917d0` 经独立窄范围审查，无 Critical/Important/Minor 发现，且普通 push 后本地与远端 SHA 一致。最终全范围独立审查确认两项原始 P0 acceptance 满足要求，现已在完整 V1 计划中关闭；P0 关闭不意味着完整 V1、产品支持平台或生产就绪。固定 workspace 工具路径不接入 Provider 凭据、不等于通用 Worker。证据与日志摘要见 `docs/validation/2026-10-18-p0-security-closure.md`。
+
 2026-09-28 P4 WorkspaceWriteGateway 切片：新增独立 `workspace.write-candidate` request/tool 与 `WorkspaceWriteGateway`，用冻结 Policy 的 `reversible_workspace_write` action、Attempt/fencing + policy 实时重验、一次性 CapabilityGrant 和可选 ApprovalService→新 Attempt/effect receipt 接入真实 private Overlay candidate + journal publisher。写操作从 candidate snapshot 前持有跨进程 workspace lease 到发布完成，publisher 在 journal 前、每个 entry 前和 commit 前再次检查 authority；WorkspacePublicationIntent/Completed/Aborted 同时写入 Run security stream 和按 workspace identity 共享的 stream。未决 intent、重启后 recovered journal 或锁竞争均不重放，回滚必须经同一 lease 确认。测试覆盖拒绝/旧 Attempt、审批 fresh Attempt、审计失败、回执失败后的重试封锁、跨 Run 未决 intent、writer lease 冲突、撤权中途回滚，以及真实 WSL2 systemd candidate→SQLite audit→publish。此 slice 仍是 host 注入式内部 API：profile/authority/身份由 host 配置，不接 Scheduler/Worker service，进程崩溃后的跨流自动 reconciliation 仍没有，未决 post-commit intent 需要人工对账，故 workspace-write 产品能力仍关闭。
 
 2026-09-27 候选后端最终验收：全量 1095 项测试通过，无跳过；总覆盖率 90.76%，未降低 90% 门槛。编译、`pip check`、wheel 构建和 diff 检查通过，独立只读审阅发现的问题已修复并有回归测试。未调用付费 Provider，不构成 Maestro 改善数字的基准证据。
@@ -95,7 +97,6 @@ CLI 与 MCP 共用同一 Python 编排核心。核心下方分为 Model Gateway 
 
 ## 后续设计顺序
 
-1. 完成 P0 隔离后端可行性验证并形成明确的平台支持矩阵。
-2. 按 `docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md` 继续 P3：补齐跨 Run/预算/Registry/租约/副作用的恢复协调及多进程故障矩阵。
-3. P4 继续完成实测 OS 写隔离、Tool Gateway 剩余动作、独立进程/宿主身份边界、Secret Broker 插件后端和 ApprovalService 到 Gateway/Worker 的接线后，才启用 Provider/Worker 产品路径。
-4. 完成 CLI/MCP 与端到端、安全验收，形成可运行且有证据链的 V1 闭环。
+1. 按 `docs/superpowers/plans/2026-09-22-full-v1-product-implementation-plan.md` 继续 P3：补齐跨 Run/预算/Registry/租约/副作用的恢复协调及多进程故障矩阵。
+2. P4 继续完成实测 OS 写隔离、Tool Gateway 剩余动作、独立进程/宿主身份边界、Secret Broker 插件后端和 ApprovalService 到 Gateway/Worker 的接线后，才启用 Provider/Worker 产品路径。
+3. 完成 CLI/MCP 与端到端、安全验收，形成可运行且有证据链的 V1 闭环。

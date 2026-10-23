@@ -357,6 +357,18 @@ def test_safe_symlink_chains_pass_and_cycles_are_bounded(tmp_path, cyclic):
         assert (diff.candidate_root / "first").read_bytes() == b"safe"
 
 
+def test_symlink_chain_rejects_non_directory_intermediate(tmp_path):
+    lower = tmp_path / "lower"
+    view = tmp_path / "view"
+    lower.mkdir()
+    view.mkdir()
+    (view / "file").write_bytes(b"payload")
+    (view / "link").symlink_to("file/child")
+
+    with pytest.raises(isolation.WorkspaceBoundaryError):
+        export(lower, view, tmp_path / "candidate")
+
+
 @pytest.mark.parametrize("mask", [0o022, 0o000, 0o077])
 @pytest.mark.parametrize("kind", ["file", "symlink"])
 def test_changed_payload_under_two_unchanged_ancestors_has_private_scaffolds(tmp_path, mask, kind):

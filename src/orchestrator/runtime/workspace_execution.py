@@ -14,7 +14,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
 
-from orchestrator.approvals import ApprovalService
+from orchestrator.approvals import ApprovalService, ConsumedApproval, ExecutionAttempt
 from orchestrator.isolation import (
     IsolationNotStarted, SandboxLimits, SandboxTerminationReceipt,
     WorkspacePublishReceipt,
@@ -369,7 +369,8 @@ class WorkspaceExecutionService:
             evidence = self._publication_reconciliation_evidence(binding, operation_id, admission.profile_hash)
             if evidence is None:
                 return unknown
-            intent, run_intent, workspace_intent, worker_stop, profile_hash = evidence
+            (intent, run_intent, workspace_intent, worker_stop, profile_hash,
+             tool_started, candidate_result, approval_evidence) = evidence
 
             with acquire_workspace_write_lease(host.workspace, host.lease_root) as lease:
                 lease.assert_current()
@@ -426,8 +427,13 @@ class WorkspaceExecutionService:
                         entries_published=recovery.entries_published,
                         lease_generation=recovery.lease_generation,
                     )
+                    if approval_evidence is not None:
+                        self._record_reconciled_approval_effect(
+                            binding, approval_evidence, receipt
+                        )
                     self._record_reconciled_publication(
-                        binding, operation_id, intent, receipt, run_intent, workspace_intent
+                        binding, operation_id, intent, receipt, run_intent, workspace_intent,
+                        tool_started, candidate_result.payload,
                     )
                     result = WorkspaceExecutionResult(
                         outcome="published", reason_code="workspace_published",
@@ -515,23 +521,54 @@ class WorkspaceExecutionService:
         if (len(starts) != 1 or starts[0].payload.get("request_hash") != intent["request_hash"]
                 or not exact_context(starts[0])):
             return None
+        candidate_results = matching(run_events, "ToolExecutionResultCaptured")
+        if (len(candidate_results) != 1
+                or not exact_context(candidate_results[0], starts[0].event_id)
+                or run_events.index(candidate_results[0]) <= run_events.index(run_intent)):
+            return None
+        candidate_result = candidate_results[0]
+        candidate_payload = candidate_result.payload
+        candidate_fields = {
+            "request_id", "outcome", "returncode", "stdout_sha256", "stdout_bytes",
+            "stderr_sha256", "stderr_bytes", "termination_confirmed", "cancelled",
+            "timed_out", "output_limited", "elapsed_milliseconds",
+        }
+        if (set(candidate_payload) != candidate_fields
+                or candidate_payload.get("request_id") != operation
+                or candidate_payload.get("outcome") != "completed"
+                or type(candidate_payload.get("returncode")) is not int
+                or candidate_payload.get("returncode") != 0
+                or re.fullmatch(_HASH, candidate_payload.get("stdout_sha256", "")) is None
+                or type(candidate_payload.get("stdout_bytes")) is not int
+                or candidate_payload["stdout_bytes"] < 0
+                or re.fullmatch(_HASH, candidate_payload.get("stderr_sha256", "")) is None
+                or type(candidate_payload.get("stderr_bytes")) is not int
+                or candidate_payload["stderr_bytes"] < 0
+                or candidate_payload.get("termination_confirmed") is not True
+                or candidate_payload.get("cancelled") is not False
+                or candidate_payload.get("timed_out") is not False
+                or candidate_payload.get("output_limited") is not False
+                or type(candidate_payload.get("elapsed_milliseconds")) is not int
+                or candidate_payload["elapsed_milliseconds"] < 0):
+            return None
         terminal_types = ("ToolExecutionCompleted", "ToolExecutionCancelled", "ToolExecutionFailed",
                           "ToolExecutionOutcomeUnknown")
         terminals = [event for event in run_events if event.event_type in terminal_types
                      and event.run_id == run_id and event.payload.get("request_id") == operation]
         if len(terminals) > 1 or (terminals and not exact_context(terminals[0], starts[0].event_id)):
             return None
-        if terminals and terminals[0].event_type in {"ToolExecutionCancelled", "ToolExecutionOutcomeUnknown"}:
-            return None
-        if terminals and terminals[0].event_type == "ToolExecutionCompleted":
-            payload = terminals[0].payload
-            if (payload.get("outcome") != "completed" or payload.get("termination_confirmed") is not True
-                    or payload.get("cancelled") is not False or payload.get("timed_out") is not False
-                    or payload.get("output_limited") is not False
-                    or payload.get("publication_transaction_id") != intent["transaction_id"]
-                    or payload.get("publication_manifest_hash") != intent["manifest_hash"]
-                    or payload.get("entries_published") != intent["entries"]
-                    or payload.get("lease_generation") != intent["lease_generation"]):
+        if terminals:
+            if terminals[0].event_type != "ToolExecutionCompleted":
+                return None
+            expected_terminal = {
+                **candidate_payload,
+                "publication_transaction_id": intent["transaction_id"],
+                "publication_manifest_hash": intent["manifest_hash"],
+                "entries_published": intent["entries"],
+                "lease_generation": intent["lease_generation"],
+            }
+            if (terminals[0].payload != expected_terminal
+                    or run_events.index(candidate_result) >= run_events.index(terminals[0])):
                 return None
 
         execution_intents = [event for event in execution_events
@@ -561,54 +598,179 @@ class WorkspaceExecutionService:
         # An operation carrying approval authority can be reconciled only when
         # the exact accepted attempt and its already-consumed effect receipt are
         # durable. Recovery never binds, consumes, or repeats an approval.
+        approval_evidence = None
         if binding.approval_grant_hash is not None:
-            security = run_events
-            bound = [event for event in security if event.event_type == "ApprovalGrantBound"
-                     and event.run_id == run_id and event.attempt_id == context.attempt_id
-                     and event.fencing_generation == context.fencing_generation]
-            consumed = [event for event in security if event.event_type == "ToolApprovalConsumed"
-                        and event.run_id == run_id and event.payload.get("request_id") == operation]
-            if len(bound) != 1 or len(consumed) != 1:
+            approval_evidence = self._publication_approval_evidence(
+                binding, operation, intent, profile_hash, run_events, starts[0]
+            )
+            if approval_evidence is None:
                 return None
-            bound_payload = bound[0].payload
-            grant_id = bound_payload.get("approval_grant_id")
-            if (type(grant_id) is not str or _hash(grant_id.encode()) != binding.approval_grant_hash
-                    or bound_payload.get("attempt_id") != context.attempt_id
-                    or bound_payload.get("fencing_generation") != context.fencing_generation
-                    or bound_payload.get("isolation_profile_hash") != profile_hash
-                    or bound_payload.get("policy_manifest_hash") != context.policy_manifest_hash
-                    or not exact_context(bound[0])):
-                return None
-            consumed_payload = consumed[0].payload
-            budget = self._events.read_stream("budget", run_id)
-            intent_event = next((event for event in budget
-                                 if event.event_type == "EffectIntentRecorded"
-                                 and event.event_id == consumed_payload.get("effect_intent_event_id")), None)
-            consumed_event = next((event for event in budget
-                                   if event.event_type == "ApprovalGrantConsumed"
-                                   and event.event_id == consumed_payload.get("approval_consumed_event_id")), None)
-            effect_receipts = [event for event in budget if event.event_type == "EffectReceiptRecorded"
-                               and event.payload.get("effect_id") == consumed_payload.get("effect_id")]
-            expected_receipt_hash = _hash_json({
-                "transaction_id": intent["transaction_id"],
-                "manifest_hash": intent["manifest_hash"],
-                "entries_published": intent["entries"],
-                "lease_generation": intent["lease_generation"],
-            })
-            if (consumed_payload.get("approval_grant_id") != grant_id
-                    or consumed_payload.get("request_hash") != intent["request_hash"]
-                    or consumed_payload.get("effect_intent_event_id") != (None if intent_event is None else intent_event.event_id)
-                    or consumed_payload.get("approval_consumed_event_id") != (None if consumed_event is None else consumed_event.event_id)
-                    or intent_event is None or consumed_event is None or len(effect_receipts) != 1
-                    or effect_receipts[0].payload.get("approval_grant_id") != grant_id
-                    or effect_receipts[0].payload.get("outcome") != "applied"
-                    or effect_receipts[0].payload.get("receipt_hash") != expected_receipt_hash
-                    or any(event.attempt_id != context.attempt_id
-                           or event.fencing_generation != context.fencing_generation
-                           for event in (intent_event, consumed_event, effect_receipts[0]))):
+        elif matching(run_events, "ToolApprovalConsumed"):
+            return None
+
+        return (
+            intent, run_intent, workspace_intent, worker_stop, profile_hash,
+            starts[0], candidate_result, approval_evidence,
+        )
+
+    def _publication_approval_evidence(
+        self, binding, operation, intent, profile_hash, security, tool_started
+    ):
+        context = binding.context
+
+        def exact_context(event, causation_id=None):
+            return (
+                (event.run_id, event.node_id, event.attempt_id, event.fencing_generation,
+                 event.correlation_id)
+                == (context.run_id, context.node_id, context.attempt_id,
+                    context.fencing_generation, None)
+                and (causation_id is None or event.causation_id == causation_id)
+            )
+
+        bound = [event for event in security if event.event_type == "ApprovalGrantBound"
+                 and event.run_id == context.run_id and event.attempt_id == context.attempt_id
+                 and event.fencing_generation == context.fencing_generation]
+        consumed = [event for event in security if event.event_type == "ToolApprovalConsumed"
+                    and event.run_id == context.run_id
+                    and event.payload.get("request_id") == operation]
+        if len(bound) != 1 or len(consumed) != 1:
+            return None
+
+        bound_event = bound[0]
+        bound_payload = bound_event.payload
+        bound_fields = {
+            "approval_request_id", "approval_grant_id", "binding_hash", "attempt_id",
+            "fencing_generation", "isolation_profile_hash", "policy_manifest_hash",
+            "revocation_version", "emergency_deny_version",
+        }
+        grant_id = bound_payload.get("approval_grant_id")
+        approval_request_id = bound_payload.get("approval_request_id")
+        if (set(bound_payload) != bound_fields
+                or type(grant_id) is not str or _hash(grant_id.encode()) != binding.approval_grant_hash
+                or type(approval_request_id) is not str
+                or bound_payload.get("attempt_id") != context.attempt_id
+                or bound_payload.get("fencing_generation") != context.fencing_generation
+                or bound_payload.get("isolation_profile_hash") != profile_hash
+                or bound_payload.get("policy_manifest_hash") != context.policy_manifest_hash
+                or re.fullmatch(_HASH, bound_payload.get("binding_hash", "")) is None
+                or type(bound_payload.get("revocation_version")) is not int
+                or type(bound_payload.get("emergency_deny_version")) is not int
+                or not exact_context(bound_event)):
+            return None
+
+        consumed_event_from_security = consumed[0]
+        consumed_payload = consumed_event_from_security.payload
+        consumed_fields = {
+            "request_id", "approval_request_id", "approval_grant_id", "effect_id",
+            "effect_intent_event_id", "approval_consumed_event_id", "budget_reservation_id",
+            "request_hash",
+        }
+        if (set(consumed_payload) != consumed_fields
+                or consumed_payload.get("request_id") != operation
+                or consumed_payload.get("approval_request_id") != approval_request_id
+                or consumed_payload.get("approval_grant_id") != grant_id
+                or consumed_payload.get("request_hash") != intent["request_hash"]
+                or type(consumed_payload.get("effect_id")) is not str
+                or type(consumed_payload.get("budget_reservation_id")) is not str
+                or not exact_context(consumed_event_from_security)):
+            return None
+
+        budget = self._events.read_stream("budget", context.run_id)
+        effect_id = consumed_payload["effect_id"]
+        intent_events = [event for event in budget if event.event_type == "EffectIntentRecorded"
+                         and event.payload.get("approval_grant_id") == grant_id
+                         and event.payload.get("effect_id") == effect_id]
+        consumed_events = [event for event in budget if event.event_type == "ApprovalGrantConsumed"
+                           and event.payload.get("approval_grant_id") == grant_id]
+        if len(intent_events) != 1 or len(consumed_events) != 1:
+            return None
+        intent_event, consumed_event = intent_events[0], consumed_events[0]
+        intent_payload = intent_event.payload
+        intent_fields = {
+            "effect_id", "approval_grant_id", "effect_intent_hash", "request_hash",
+            "target_hash", "provider_idempotency_key_hash", "maximum_cost_minor",
+            "recovery_class",
+        }
+        consumed_budget_payload = consumed_event.payload
+        consumed_budget_fields = {
+            "approval_grant_id", "approval_request_id", "effect_id", "effect_intent_hash",
+            "binding_hash",
+        }
+        if (set(intent_payload) != intent_fields
+                or intent_payload.get("effect_id") != effect_id
+                or intent_payload.get("approval_grant_id") != grant_id
+                or set(consumed_budget_payload) != consumed_budget_fields
+                or consumed_budget_payload.get("approval_grant_id") != grant_id
+                or consumed_budget_payload.get("approval_request_id") != approval_request_id
+                or consumed_budget_payload.get("effect_id") != effect_id
+                or consumed_budget_payload.get("effect_intent_hash") != intent_payload.get("effect_intent_hash")
+                or consumed_budget_payload.get("binding_hash") != bound_payload.get("binding_hash")
+                or consumed_payload.get("effect_intent_event_id") != intent_event.event_id
+                or consumed_payload.get("approval_consumed_event_id") != consumed_event.event_id
+                or not exact_context(intent_event, bound_event.event_id)
+                or not exact_context(consumed_event, bound_event.event_id)
+                or not exact_context(consumed_event_from_security, consumed_event.event_id)
+                or not exact_context(tool_started, intent_event.event_id)
+                or tool_started.payload.get("approval_grant_id") != grant_id
+                or tool_started.payload.get("effect_intent_event_id") != intent_event.event_id):
+            return None
+
+        expected_receipt_hash = _hash_json({
+            "transaction_id": intent["transaction_id"],
+            "manifest_hash": intent["manifest_hash"],
+            "entries_published": intent["entries"],
+            "lease_generation": intent["lease_generation"],
+        })
+        effect_receipts = [
+            event for event in budget if event.event_type == "EffectReceiptRecorded"
+            and (event.payload.get("effect_id") == effect_id
+                 or event.payload.get("approval_grant_id") == grant_id)
+        ]
+        if len(effect_receipts) > 1:
+            return None
+        receipt_present = bool(effect_receipts)
+        if receipt_present:
+            effect_receipt = effect_receipts[0]
+            if (effect_receipt.payload != {
+                    "effect_id": effect_id, "approval_grant_id": grant_id,
+                    "outcome": "applied", "receipt_hash": expected_receipt_hash,
+                }
+                    or not exact_context(effect_receipt, intent_event.event_id)):
                 return None
 
-        return intent, run_intent, workspace_intent, worker_stop, profile_hash
+        if self._approvals is None:
+            return None
+        reservation_id = consumed_payload["budget_reservation_id"]
+        reservation = self._approvals._budget.get_reservation(
+            reservation_id, run_id=context.run_id
+        )
+        if (reservation.reservation_id != reservation_id
+                or reservation.run_id != context.run_id
+                or reservation.node_id != context.node_id
+                or reservation.attempt_id != context.attempt_id
+                or reservation.fencing_generation != context.fencing_generation
+                or reservation.causation_id != bound_event.event_id):
+            return None
+
+        return {
+            "consumed": ConsumedApproval(
+                approval_request_id=approval_request_id,
+                approval_grant_id=grant_id,
+                effect_id=effect_id,
+                intent_event_id=intent_event.event_id,
+                consumed_event_id=consumed_event.event_id,
+                reservation=reservation,
+            ),
+            "attempt": ExecutionAttempt(
+                run_id=context.run_id,
+                node_id=context.node_id,
+                attempt_id=context.attempt_id,
+                fencing_generation=context.fencing_generation,
+                isolation_profile_hash=profile_hash,
+            ),
+            "receipt_hash": expected_receipt_hash,
+            "receipt_present": receipt_present,
+        }
 
     def _publication_resolution_events(self, binding, operation, intent, run_intent, workspace_intent):
         streams = (
@@ -652,11 +814,42 @@ class WorkspaceExecutionService:
             raise ValueError("workspace and Run abort receipts conflict")
         return completion_payloads, abort_payloads
 
-    def _record_reconciled_publication(self, binding, operation, intent, receipt, run_intent, workspace_intent):
+    def _record_reconciled_approval_effect(self, binding, evidence, receipt):
+        expected_hash = _hash_json({
+            "transaction_id": receipt.transaction_id,
+            "manifest_hash": receipt.manifest_hash,
+            "entries_published": receipt.entries_published,
+            "lease_generation": receipt.lease_generation,
+        })
+        if expected_hash != evidence["receipt_hash"]:
+            raise ValueError("approval receipt hash conflicts with recovered publication")
+        if not evidence["receipt_present"]:
+            if self._approvals is None:
+                raise ValueError("approval service is unavailable for explicit reconciliation")
+            self._approvals.record_effect_receipt(
+                evidence["consumed"], evidence["attempt"],
+                outcome="applied", receipt_hash=expected_hash,
+            )
+
+    def _record_reconciled_publication(
+        self, binding, operation, intent, receipt, run_intent, workspace_intent,
+        tool_started, candidate_payload,
+    ):
         payload = {**intent, "entries_published": receipt.entries_published}
         self._append_reconciliation_receipt(
             "security", binding.context.run_id, f"workspace-publication-receipt:{operation}",
             "WorkspacePublicationCompleted", payload, binding, run_intent.event_id, operation,
+        )
+        tool_payload = {
+            **candidate_payload,
+            "publication_transaction_id": receipt.transaction_id,
+            "publication_manifest_hash": receipt.manifest_hash,
+            "entries_published": receipt.entries_published,
+            "lease_generation": receipt.lease_generation,
+        }
+        self._append_reconciliation_receipt(
+            "security", binding.context.run_id, f"tool-terminal:{operation}",
+            "ToolExecutionCompleted", tool_payload, binding, tool_started.event_id, operation,
         )
         self._append_reconciliation_receipt(
             "workspace_publications", "workspace:" + binding.workspace_identity_hash[7:],

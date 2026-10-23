@@ -8,6 +8,12 @@ socket 向可信 `ProviderModelGateway` 提供尝试级凭据。生产子进程�
 脱敏授权/不可用记录，不返回凭据。进程内 `AuditedSecretBroker` 和显式 allowlist
 的 `EnvironmentSecretStore` 仍是内部接口，不会自动成为 daemon 的后端。
 
+2026-10-23 P0 验收补充：固定的 `workspace.write-candidate` Worker 路径只执行
+本地隔离命令与宿主发布，不接入 Model Gateway、Secret Broker 或 Provider；这次
+systemd 验收没有读取凭据或发起 Provider 请求。生产 Secret backend 仍 unavailable，
+不能把该路径解释为已完成的 Worker 凭据接线。验证范围和 profile hashes 见
+[`P0 security closure validation`](../validation/2026-10-18-p0-security-closure.md)。
+
 ## 流程与失败规则
 
 1. 可信宿主以有界 bootstrap pipe 发送冻结的 Provider/rule、EventStore 路径及
@@ -107,6 +113,7 @@ fail-closed，没有无隔离 fallback。
   网络隔离。生产身份/Authority Envelope、动态撤销、keyring/plugin、HSM、多租户均未完成。
 - 生产 Broker backend 默认 unavailable；测试 store 只存在 `tests/support`，生产 manager
   不接受 value-store 参数。没有真实/付费 Provider 调用或供应商密钥轮换/权威对账验收。
-- Worker/Verifier、完整 Scheduler/application service、CLI/MCP 的自动接线及崩溃恢复
-  尚未完成。本切片不完成整体 P4 或 Maestro V1，不解除产品 workspace-write 禁用。
+- 通用 Worker/Verifier、完整 Scheduler/application service、CLI/MCP 的自动接线及
+  崩溃恢复尚未完成。P0 有一个不接触凭据的固定 workspace-write Worker workflow；它
+  不完成整体 P4 或 Maestro V1，也不解除产品 workspace-write 禁用。
 - 成本、Token 和重复工作改善目标仍无真实付费 Provider 基准证据。

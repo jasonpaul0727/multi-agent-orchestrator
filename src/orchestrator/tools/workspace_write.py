@@ -331,7 +331,7 @@ class WorkspaceWriteGateway:
                 expected_workspace_identity_hash=self._workspace_identity_hash,
                 expected_profile_hash=self._profile_hash,
             )
-            result, lost = self._wait_with_authority(session, request, state)
+            result, lost = self._wait_with_authority(session, request, state, lease)
             accepted = not lost and self._authorized_now(request, state)
             if not result.execution.termination_confirmed:
                 return self._unknown(request, decision, "candidate_termination_unconfirmed", result)
@@ -450,6 +450,7 @@ class WorkspaceWriteGateway:
                 security_intent_decider,
                 "workspace publication intent was not durably audited",
             )
+            self._record_candidate_result(request, candidate)
             receipt = publish_workspace_diff(
                 candidate.lower_root,
                 self._workspace,
@@ -496,6 +497,38 @@ class WorkspaceWriteGateway:
         self._resolve_publication_completed(request, intent, receipt)
         self._acknowledge_publication(lease, receipt)
         return self._result(request, decision, "completed", candidate, receipt=receipt)
+
+    def _record_candidate_result(self, request, candidate) -> None:
+        payload = _execution_payload(request, candidate)
+
+        def decide(events, _version):
+            start = next((event for event in events
+                          if event.event_type == "ToolExecutionStarted"
+                          and event.run_id == request.run_id
+                          and event.payload.get("request_id") == request.request_id), None)
+            if start is None:
+                raise ToolAuditUnavailable("candidate result has no durable execution start")
+            expected_context = _event_context(request, start.event_id)
+            existing = [event for event in events
+                        if event.event_type == "ToolExecutionResultCaptured"
+                        and event.run_id == request.run_id
+                        and event.payload.get("request_id") == request.request_id]
+            if existing:
+                if (len(existing) != 1 or existing[0].payload != payload
+                        or any(getattr(existing[0], key) != value
+                               for key, value in expected_context.items())):
+                    raise ToolAuditUnavailable(
+                        "candidate result conflicts with durable execution evidence"
+                    )
+                return None
+            return [EventDraft(
+                "ToolExecutionResultCaptured", payload, **expected_context,
+            )]
+
+        self._append_required(
+            "security", request.run_id, f"tool-result:{request.request_id}", decide,
+            "candidate result evidence was not durably audited",
+        )
 
     def _acknowledge_publication(self, lease, receipt):
         if not self._retain_publication:
@@ -946,12 +979,21 @@ class WorkspaceWriteGateway:
                 consumed, attempt, outcome=outcome, receipt_hash=receipt_hash
             )
 
-    def _wait_with_authority(self, session, request, state):
+    def _wait_with_authority(self, session, request, state, lease):
         stop = threading.Event()
         lost = threading.Event()
 
         def monitor():
             while not stop.is_set():
+                try:
+                    lease.assert_current()
+                except Exception:
+                    lost.set()
+                    try:
+                        session.cancel()
+                    except Exception:
+                        pass
+                    return
                 if not self._authorized_now(request, state):
                     lost.set()
                     try:
