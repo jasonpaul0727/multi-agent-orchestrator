@@ -65,11 +65,12 @@ The final whole-P0 review of the earlier documentation range found no
 release-blocking findings. A follow-up independent review of commit
 `4bacdf9ecb2fdad24d9f65a5e28eedeed9a2c08b` also found no release-blocking
 findings: it confirmed the test reaches the non-directory intermediate guard,
-the source implementation is unchanged, the reported totals and hashes match
-the retained artifacts, and both original P0 checkboxes remain unchecked. The
-ordinary push was verified with local and remote branch SHA both equal to
-`4bacdf9ecb2fdad24d9f65a5e28eedeed9a2c08b`. The wheel build/content gate
-remains blocked, so the P0 checkboxes remain open.
+the source implementation is unchanged, and the reported totals and hashes
+match the retained artifacts. At that historical review point the checkboxes
+were still unchecked and the wheel gate was still blocked; the later private
+wheel build and final whole-P0 review below supersede those two status facts.
+The ordinary push was verified with local and remote branch SHA both equal to
+`4bacdf9ecb2fdad24d9f65a5e28eedeed9a2c08b`.
 
 SHA-256 evidence digests for the post-review run:
 

@@ -95,6 +95,8 @@ secret-backend integration and full Gateway/Worker composition remain open.
 
 The P0 clean-checkout smoke was local security/correctness evidence only. It
 made no Provider request and does not establish provider delivery/charges or
-production reconciliation. Exact environment, test counts, profile hashes,
-limits, and the package-build blocker are recorded in
+production reconciliation. The final full suite, private wheel build and
+contents review, exact environment, profile hashes, and limits are recorded in
 [`P0 security closure validation`](../validation/2026-10-18-p0-security-closure.md).
+The two original P0 acceptance items are closed; this does not close the
+production credential backend, general Worker composition, or V1 platform gate.
