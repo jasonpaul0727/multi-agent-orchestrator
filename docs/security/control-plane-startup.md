@@ -73,9 +73,12 @@ connection and rejects subsequent operations with `application_not_ready`.
 Bootstrap failures use `startup_recovery_failed` and suppress backend exception
 text, raw evidence, secrets, and protected paths.
 
-This composition root is a Python host API. Functional Worker execution,
-automatic recovery-plan dispatch, CLI/MCP, and complete end-to-end security
-acceptance remain to integrate. The default Provider transport is the fixed
+This composition root is a Python host API. A separate P0 path now executes one
+fixed `workspace.write-candidate` tool for an accepted Attempt through a real
+systemd Worker and host `WorkspaceWriteGateway`; it does not dispatch a general
+Worker, model task, or recovery plan. Automatic recovery-plan dispatch, general
+Worker/Scheduler integration, CLI/MCP, and complete end-to-end security
+acceptance remain unimplemented. The default Provider transport is the fixed
 systemd sender, with bounded host stop waits and exact unit/cgroup receipts.
 An unconfirmed stop returns an unknown failure, retains staging, and cannot
 release effect/budget holds. The urllib thread transport is an explicit legacy
@@ -89,3 +92,9 @@ and absent from runtime/source binds. Its production backend remains
 `UnavailableSecretValueStore`; the application does not automatically start or
 wire a production credential store. Production authoritative Provider evidence,
 secret-backend integration and full Gateway/Worker composition remain open.
+
+The P0 clean-checkout smoke was local security/correctness evidence only. It
+made no Provider request and does not establish provider delivery/charges or
+production reconciliation. Exact environment, test counts, profile hashes,
+limits, and the package-build blocker are recorded in
+[`P0 security closure validation`](../validation/2026-10-18-p0-security-closure.md).
