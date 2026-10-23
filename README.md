@@ -7,7 +7,7 @@
 > 已完成严格四层配置及 Run 快照、Policy Engine、确定性分类/Planning 冻结、候选成本路由、事件存储驱动的健康熔断/ProbeLease、Recovery Controller，以及三种 Provider codec 和受限 HTTPS transport。
 > P3 尚未完整：ProviderCallJournal 已实现持久调用意图、脱敏终态及可信对账证明契约；Gateway 默认 HTTPS transport 现由独立 systemd sender 子进程执行，并把宿主验证的停止收据绑定到调用及 Attempt。`ControlPlaneApplication` 可在一个启动事务中核对 Run/调用绑定并恢复待结算证明。2026-10-05 已为指定预算/审批/外部 effect/Artifact 持久化边界补充离线真实 SIGKILL 与重开恢复证据；这不覆盖真实 Worker 全生命周期。生产 Provider 权威证据源/费用对账、Worker 生命周期中断与自动执行恢复循环仍缺。Host Python 入口说明见 [启动恢复](docs/security/control-plane-startup.md)。
 > P4 新增内部 `WorkspaceWriteGateway`：以专用 `workspace.write-candidate` 能力执行隔离候选，经 Attempt/策略重验、一次性能力/可选 Approval、工作区租约、持久发布意图和 journal publisher 后才写入工作区；固定 accepted-Attempt Worker→Gateway 路径通过真实 WSL2 systemd 测试，覆盖增加、修改、删除、rename-as-delete-plus-add 和重放。它不是通用 Scheduler/Worker application service；生产 credential backend 仍固定 unavailable，产品 workspace-write 仍关闭。
-> 2026-10-23 P0 Task 6 验证：全量 **2,610 passed、0 skipped，90.30% 覆盖率**；干净 checkout 的真实 systemd smoke **3 passed**。wheel 构建/内容检查因现有环境缺少 `wheel` 依赖而阻塞，未安装依赖、未关闭任何原始 P0 勾选项；证据见 [P0 security closure validation](docs/validation/2026-10-18-p0-security-closure.md)。项目仍不具备生产就绪状态。
+> 2026-10-23 P0 Task 6 验证：全量 **2,611 passed、0 skipped，90.29% 覆盖率**，并补充了 symlink 链经过普通文件时 fail-closed 的回归用例；干净 checkout 的真实 systemd smoke **3 passed**。wheel 构建/内容检查因现有环境缺少 `wheel` 依赖而阻塞，未安装依赖、未关闭任何原始 P0 勾选项；独立全范围审查未发现 release-blocking 问题，新增测试与最终文档的窄范围复审仍待完成。证据见 [P0 security closure validation](docs/validation/2026-10-18-p0-security-closure.md)。项目仍不具备生产就绪状态。
 > P5 已有 blocked-only Worker IPC、Artifact 来源准入及独立只读格式 Verifier，**没有真正执行模型/工具任务的 Worker，也没有节点语义验收**。P6 CLI/MCP、P7 完整 E2E/安全验收仍未完成；离线基准评估器没有真实数据，默认 Provider broker 仍 fail-closed。
 > 本项目**不具备生产就绪状态**。
 

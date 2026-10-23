@@ -36,6 +36,35 @@ pre-documentation `git diff --check` passed. Evidence logs and JUnit XML are
 retained under the ignored Task 6 evidence directory. The reported percentage
 is aggregate statement coverage; branch coverage was not separately measured.
 
+## Post-review security-branch regression run (2026-10-23)
+
+After the whole-P0 review, inspection of the coverage report identified an
+uncovered fail-closed guard in `WorkspaceView` for a symlink chain that
+continues through a non-directory target. Added
+`test_symlink_chain_rejects_non_directory_intermediate` to
+`tests/unit/isolation/test_workspace_view.py`. The test passed against the
+current implementation, failed when the guard was temporarily disabled, and
+passed again after restoring the guard. The production source tree was not
+changed. The focused file run reported **74 passed**; the subsequent full run
+reported **2,611 passed, 0 failed, 0 errors, 0 skipped** in 594.02 seconds.
+Aggregate statement coverage was **90.29%** (19,125 statements, 1,857 missed).
+
+The full run used the same isolated candidate worktree and existing test
+environment, with a separate coverage data file so the earlier evidence was
+preserved. Its logs and XML are under the ignored Task 6 evidence directory.
+The final whole-P0 review of the earlier documentation range found no
+release-blocking findings; review of this added regression test and the updated
+evidence documents remains pending. The original P0 checkboxes remain
+unchecked.
+
+SHA-256 evidence digests for the post-review run:
+
+| Artifact | Digest |
+| --- | --- |
+| `full-pytest-after-review.log` | `d3bf5702ee3bf51d80b15a808b573a276bc3a7140649e14b3faa3e6987313696` |
+| `full-pytest-after-review.xml` | `3d3dbd934203e1e07d3f933f702be21d5388720700cd17a5039cdeeab97d5bb8` |
+| `coverage-report-after-review.log` | `a9b26266384035c252d4394ea0ab3d374ce790497b1f9b58506c4a69d3c00cf4` |
+
 SHA-256 evidence digests:
 
 | Artifact | Digest |
@@ -116,6 +145,9 @@ charge, or authoritative reconciliation.
 1. Obtain an already-available clean wheel build environment without installing
    dependencies, or request a decision to change that constraint; inspect the
    resulting candidate wheel contents.
-2. Obtain independent review of the complete P0 range, address any Critical or
-   Important findings, and verify the final local branch matches the ordinary
-   remote push. Until then, both original P0 checklist entries stay open.
+2. Independently review the added regression test and updated evidence docs;
+   address any Critical or Important finding. The earlier whole-P0 range
+   review found no release-blocking findings, but did not include this new test.
+3. Verify the final local branch matches the ordinary remote push. The wheel
+   gate and final review/push verification remain open; both original P0
+   checklist entries stay unchecked.
