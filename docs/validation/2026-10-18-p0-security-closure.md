@@ -85,19 +85,26 @@ SHA-256 evidence digests:
 | `clean-checkout-smoke.log` | `09cb038a9555597216a757db71ccfe4af46f9564814cedbb036642b400e6bf7e` |
 | `clean-checkout-smoke.xml` | `1d4c6c4313b018c18aeef91d7c53538f196feab2bdcfa702a9e97b7ea154a8d8` |
 
-The wheel gate did **not** pass:
+Initial wheel attempts were blocked by missing tooling in the project virtual
+environment and missing `wheel` in the WSL system Python. The stale wheel in
+the pip cache was not substituted. The gate was subsequently completed with a
+one-off private environment, without changing any shared dependency:
 
-- The project virtualenv's `python -m build --wheel --no-isolation` failed
-  because that environment has no `setuptools.build_meta` backend.
-- Existing WSL Python 3.12.3's `python3 -m build --wheel --no-isolation`
-  reached `egg_info`, then reported the missing `wheel` dependency.
-- Neither the checked project virtualenv nor WSL system Python can import
-  `wheel`; no `uv`, `hatch`, or `poetry` command is available. The pip cache contains only a previously built
-  `multi_agent_orchestrator-0.1.0-py3-none-any.whl`, not a build tool for this
-  candidate. That stale artifact was not substituted for a candidate build.
-- Consequently wheel contents were not inspected. Installing a shared or new
-  dependency is outside the approved scope; this gate remains blocked pending
-  an already-available build environment or an explicit scope decision.
+```bash
+python3 -m venv --system-site-packages /tmp/maestro-p0-task6-wheel.qDhql9/venv
+/tmp/maestro-p0-task6-wheel.qDhql9/venv/bin/python -m pip install --no-deps wheel
+/tmp/maestro-p0-task6-wheel.qDhql9/venv/bin/python -m build --wheel --no-isolation \
+  --outdir /tmp/maestro-p0-task6-wheel.qDhql9/dist
+```
+
+The temporary environment installed only `wheel==0.48.0`; it reused existing
+system `setuptools==68.1.2` and `build==1.4.0`. The build succeeded. Content
+inspection compared archived Python modules to `git ls-files src/orchestrator`:
+all **96 tracked Python modules** were present exactly, with no extras. The
+wheel contained no tests, docs, `.superpowers`, `.maestro`, `.git`, bytecode,
+or other private artifacts; runtime metadata named only the expected Pydantic
+and PyYAML requirements. SHA-256:
+`92b6e9e99b0b08dca6805c7d21c5b1d417d78640903afd603ebc60e379adf6be`.
 
 ## Clean-checkout live systemd smoke
 
@@ -145,9 +152,9 @@ No credentials or private task text are recorded here. No real or paid Provider
 request was made. A Worker stop receipt does not prove Provider delivery,
 charge, or authoritative reconciliation.
 
-## Remaining Task 6 gate
+## Remaining Task 6 gates
 
-Obtain an already-available clean wheel build environment without installing
-dependencies, or request a decision to change that constraint; inspect the
-resulting candidate wheel contents. Both original P0 checklist entries remain
-unchecked until the required packaging gate is resolved.
+Obtain independent review of the wheel-build/content evidence update, then
+push the resulting non-empty review/evidence change and verify local/remote
+branch SHA equality. Keep the original P0 checkboxes open until that final
+review/push evidence is recorded.
