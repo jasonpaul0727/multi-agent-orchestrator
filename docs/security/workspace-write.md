@@ -4,8 +4,9 @@ The repository now contains an internal, attempt-fenced workspace-write
 vertical slice, but product workspace-write remains disabled. Its
 `WorkspaceWriteGateway` exposes only `workspace.write-candidate`, evaluates the
 frozen `reversible_workspace_write` policy action, runs against a private
-OverlayFS candidate, and publishes only validated additions/updates through a
-lease-bound journaled host publisher. Approval-required policy is wired to the
+OverlayFS candidate, and publishes validated additions, updates, and deletions
+through a lease-bound journaled host publisher. Renames are represented as a
+source deletion plus a destination addition. Approval-required policy is wired to the
 existing `ApprovalService`; it binds the exact command/workspace/policy/profile
 scope to a newer accepted Attempt and records an effect receipt. See
 [`tool-gateway.md`](tool-gateway.md) and [`approvals.md`](approvals.md) for the
@@ -55,7 +56,7 @@ content-neutral kernel xattrs (`user.overlay.uuid` with a 16-byte value,
 `user.overlay.impure=y`, and empty `user.overlay.origin`). Every other xattr is
 rejected; index/metacopy/redirect-following are disabled and the command cannot
 set xattrs. The existing exporter still rejects all remaining xattrs,
-deletions/whiteouts, hardlinks, escaping symlinks, protected paths and bounds.
+hardlinks, escaping symlinks, protected paths and bounds.
 
 `session.wait()` returns `OverlayCandidateResult(execution, lower_root, diff,
 candidate_error)`. A diff is available only after clean execution, complete
@@ -82,9 +83,10 @@ with WSL driver submounts; arbitrary installed packages, networking and project
 test environments are not promised. Missing kernel/runtime controls fail
 closed. The launcher itself does not create Attempt/approval/audit events,
 authorize publication, supply model/tool mediation or accept lifecycle state.
-The new host Gateway composes those repository APIs for one tested
-workspace-write path, but remains an internal adapter rather than a functional
-Worker or enabled product capability.
+The fixed-tool application path now carries an accepted Attempt through an
+isolated Worker to the host `WorkspaceWriteGateway`, publication audit and
+journaled publisher. It is a narrow, explicit internal workflow, not a general
+dynamic Worker/Scheduler execution service or enabled product capability.
 
 ## Lease contract
 
@@ -150,11 +152,12 @@ transaction.
   appended before the workspace-wide stream is resolved, leaving failures
   fail-closed. A process crash after a committed publication but before its
   durable receipt still needs operator reconciliation.
-- A real Ubuntu 24.04/WSL2 test exercises
-  `WorkspaceWriteGateway → SystemdOverlayCandidateLauncher → SQLite audit →
-  journaled publisher`. The approval branch is covered using the actual
-  `ApprovalService` and a fake candidate transport; neither proves a deployed
-  Worker/Scheduler application service.
+- Real Ubuntu 24.04/WSL2 systemd tests exercise the fixed accepted-Attempt
+  Worker path through `SystemdOverlayCandidateLauncher`,
+  `WorkspaceWriteGateway`, SQLite audit, and journaled publisher. A clean
+  checkout smoke also covers serial and concurrent replay and a fresh-Attempt
+  ApprovalService path. This does not prove a deployed general Worker/Scheduler
+  service or enable product workspace-write.
 - Isolation profile hash, AttemptAuthority, policy-state provider, policy
   snapshot, authenticated approval requester, event store, and private
   lease/journal roots are host-injected. Production provisioning, a separate
@@ -163,14 +166,16 @@ transaction.
 - The conflict report by itself remains advisory. The publisher holds a lease
   and repeats checks, but the lock only serializes cooperating writers; it is
   not an OS lock against arbitrary same-user edits.
-- Current diff export rejects deletions/whiteouts and therefore does not
-  implement complete rename or deletion semantics.
-- A batch is crash-recoverable, not atomically visible as one change to
-  unrelated readers: each file/symlink replacement is atomic, but a reader
-  racing a multi-entry publish may observe an intermediate tree.
-- The internal Gateway binds publication to Attempt authority, policy,
-  optional ApprovalService, one-use capability events and durable publication
-  audit, but is not yet invoked by the Scheduler/Worker application service.
+- Validated schema-2 diffs represent deletion explicitly; a rename is exposed
+  as a source deletion plus destination addition. Publication records retain
+  preimages so rollback can restore both sides. This does not make a multi-path
+  batch globally atomic to readers: each file/symlink replacement is atomic,
+  while a concurrent reader may observe an intermediate tree.
+- The narrow fixed-tool Worker path invokes the internal Gateway with
+  host-injected Attempt authority, policy, optional ApprovalService, one-use
+  capability events and durable publication audit. It is not the general
+  Scheduler/Worker application service and does not enable product
+  workspace-write.
 - The publisher remains a host-side primitive and no Worker receives this
   lease API. The Gateway is opt-in and does not enable workspace-write in the
   product.
@@ -181,13 +186,15 @@ directory rollback, and the hard-link/temp-unlink window. Lease/conflict tests
 cover cross-process exclusion, generation replay, partial journal-tail
 recovery, corrupt-journal rejection, root/file symlink boundaries,
 permissions, root replacement, mount identity, and uncertain persistence.
-The live `test_systemd_scope_contains_preexec_user_mount_overlay_and_cgroup_limits`
-integration test creates and validates a candidate in a real systemd/OverlayFS
-scope and invokes the host publisher. The
-`test_live_candidate_gateway_audits_then_publishes_exact_workspace_diff`
-integration test exercises the full candidate Gateway/audit/publisher path on
-that host. These are still not Worker/Scheduler service integration or a
-product platform-support claim.
+The live
+`test_real_worker_gateway_publication_and_replay` integration test exercises
+the fixed accepted-Attempt Worker/Gateway/audit/publisher path through a real
+systemd/OverlayFS scope, in serial and concurrent modes. It demonstrates
+add/modify/delete/rename-as-delete-plus-add/symlink publication and idempotent
+replay, not a general Worker/Scheduler service or product platform support.
+The full Task 6 environment, profile hashes, limits, command, and evidence
+digests are recorded in
+[`2026-10-18-p0-security-closure.md`](../validation/2026-10-18-p0-security-closure.md).
 `tests/integration/test_overlay_candidate_launcher.py` now exercises the
 actual launcher API, including source immutability, hidden host paths, syscall
 denials, trusted import shadowing, detached descendants, SIGTERM resistance,

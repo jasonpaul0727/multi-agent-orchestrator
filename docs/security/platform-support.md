@@ -7,7 +7,7 @@ full security acceptance suite are integrated and pass.
 
 | Platform | Observed runtime | Read-only command profile | Workspace-write profile | Product support |
 | --- | --- | --- | --- | --- |
-| Ubuntu 24.04 under WSL2 | Microsoft kernel `6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.17` | Live-tested through `SystemdReadOnlyLauncher`; no-follow snapshot, exact cgroup/rlimits, Landlock, private network/tmp/home and read-only binds. Trusted Python startup rejects workspace import shadowing. | `SystemdOverlayCandidateLauncher` and `WorkspaceWriteGateway` live-test private candidate execution, Attempt/policy checks, SQLite publication intent/receipt, exclusive lease and journaled host publication; optional ApprovalService path has unit integration tests. Product workspace-write remains disabled: not invoked by Worker/Scheduler, host injects profile/authority/identity, and no automatic cross-stream reconciliation. Deletions/whiteouts unsupported; multi-entry publication not reader-atomic. | Measured internal backends only, not a complete V1 execution platform. |
+| Ubuntu 24.04 under WSL2 | Microsoft kernel `6.6.87.2-microsoft-standard-WSL2`, systemd `255.4-1ubuntu8.18` | Live-tested through `SystemdReadOnlyLauncher`; no-follow snapshot, exact cgroup/rlimits, Landlock, private network/tmp/home and read-only binds. Trusted Python startup rejects workspace import shadowing. | `SystemdOverlayCandidateLauncher` and the fixed accepted-Attempt workspace Worker path exercise Attempt/policy checks, `WorkspaceWriteGateway`, SQLite publication intent/receipt, exclusive lease and journaled host publication through a real systemd scope. The tested path supports validated additions, updates, deletions and rename-as-delete-plus-add; publication is reversible but multi-entry changes are not reader-atomic. Profile, identity and authority remain host-injected; general Worker/Scheduler integration and cross-stream recovery remain incomplete. Product workspace-write remains disabled. | Measured internal backends only, not a complete V1 execution platform. |
 | Other Linux distributions | Not measured | Unverified; do not infer support from the presence of systemd. | Unsupported | Unsupported/unverified. |
 | Windows and macOS | Not measured | Unsupported by this backend | Unsupported | Unsupported. |
 
@@ -49,11 +49,12 @@ Its frozen cgroup identity is checked before command start and its kernel
 emptiness after transport exit; unknown start/stop retains private staging.
 The curated runtime does not promise arbitrary project packages or test
 environments. See `workspace-write.md` for lifetime and cleanup obligations.
-The launcher itself does not make policy, Attempt, or approval decisions; the
-new opt-in `WorkspaceWriteGateway` composes those checks and durable audit with
-the publisher, but is not connected to the application service. Its multi-entry
-changes are not a single reader-visible atomic swap, and the product capability
-remains disabled.
+The launcher itself does not make policy, Attempt, or approval decisions. The
+fixed P0 workspace tool path now composes those checks and durable audit through
+`WorkspaceWriteGateway` and the publisher in an accepted-Attempt Worker flow.
+This is not the general Scheduler/Worker application service; profile, identity
+and authority are host-injected. Multi-entry changes are not a single
+reader-visible atomic swap, and the product capability remains disabled.
 The Tool Gateway evaluates a frozen
 `PolicyManifest`, records `PolicyDecision` and a one-use capability in the
 security event stream, checks an injected attempt/fencing authority before and
@@ -64,7 +65,10 @@ not implement workspace writes, candidate validation or artifact publication,
 workspace-write approval-grant consumption, or a Secret Broker. Its fixed
 read-only command has an internal ApprovalService path; reversible workspace
 changes use the separate `WorkspaceWriteGateway` ApprovalService path. Other
-effects remain blocked, and no functional Worker application service is
-connected.
+effects remain blocked. The fixed P0 workspace-write path is not a
+general-purpose or dynamic Worker application service.
 Model and managed-web network access are not provided inside the command unit;
 future network access must go through their own Gateway.
+
+The 2026-10-23 clean-checkout smoke and profile hashes are recorded in
+[`P0 security closure validation`](../validation/2026-10-18-p0-security-closure.md).
