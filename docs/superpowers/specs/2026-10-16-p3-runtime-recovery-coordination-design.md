@@ -18,8 +18,8 @@ the lifecycle interruption matrix, and authoritative Provider reconciliation.
 
 This proposal chooses a prerequisite slice: durable recovery-to-admission
 coordination. It does NOT redefine that full demonstration or P3 as complete.
-The choice to build this slice before functional Worker mediation is the
-builder's recommendation, not an already approved human design decision.
+The choice to build this slice before general functional Worker mediation was
+the builder's recommendation and was explicitly approved on 2026-10-23.
 
 ## Verified starting point
 
