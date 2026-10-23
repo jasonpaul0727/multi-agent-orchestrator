@@ -53,9 +53,14 @@ The full run used the same isolated candidate worktree and existing test
 environment, with a separate coverage data file so the earlier evidence was
 preserved. Its logs and XML are under the ignored Task 6 evidence directory.
 The final whole-P0 review of the earlier documentation range found no
-release-blocking findings; review of this added regression test and the updated
-evidence documents remains pending. The original P0 checkboxes remain
-unchecked.
+release-blocking findings. A follow-up independent review of commit
+`4bacdf9ecb2fdad24d9f65a5e28eedeed9a2c08b` also found no release-blocking
+findings: it confirmed the test reaches the non-directory intermediate guard,
+the source implementation is unchanged, the reported totals and hashes match
+the retained artifacts, and both original P0 checkboxes remain unchecked. The
+ordinary push was verified with local and remote branch SHA both equal to
+`4bacdf9ecb2fdad24d9f65a5e28eedeed9a2c08b`. The wheel build/content gate
+remains blocked, so the P0 checkboxes remain open.
 
 SHA-256 evidence digests for the post-review run:
 
@@ -140,14 +145,9 @@ No credentials or private task text are recorded here. No real or paid Provider
 request was made. A Worker stop receipt does not prove Provider delivery,
 charge, or authoritative reconciliation.
 
-## Remaining Task 6 gates
+## Remaining Task 6 gate
 
-1. Obtain an already-available clean wheel build environment without installing
-   dependencies, or request a decision to change that constraint; inspect the
-   resulting candidate wheel contents.
-2. Independently review the added regression test and updated evidence docs;
-   address any Critical or Important finding. The earlier whole-P0 range
-   review found no release-blocking findings, but did not include this new test.
-3. Verify the final local branch matches the ordinary remote push. The wheel
-   gate and final review/push verification remain open; both original P0
-   checklist entries stay unchecked.
+Obtain an already-available clean wheel build environment without installing
+dependencies, or request a decision to change that constraint; inspect the
+resulting candidate wheel contents. Both original P0 checklist entries remain
+unchecked until the required packaging gate is resolved.
