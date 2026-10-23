@@ -152,9 +152,17 @@ No credentials or private task text are recorded here. No real or paid Provider
 request was made. A Worker stop receipt does not prove Provider delivery,
 charge, or authoritative reconciliation.
 
-## Remaining Task 6 gates
+## Task 6 review and push closure
 
-Obtain independent review of the wheel-build/content evidence update, then
-push the resulting non-empty review/evidence change and verify local/remote
-branch SHA equality. Keep the original P0 checkboxes open until that final
-review/push evidence is recorded.
+The wheel-evidence delta in commit
+`4b27417509e39da26e7760c2cb5dd68f85aa7db0..72f1f68bd36bdee3bac98228500bef2335d917d0`
+received an independent read-only review with no Critical, Important, or Minor
+findings. The reviewer independently confirmed the wheel SHA-256, exact match
+between the 96 wheel modules and tracked module paths/bytes, expected runtime
+metadata, no extra package/test/doc/internal artifacts, and no shared
+dependency change. The ordinary push of `72f1f68bd36bdee3bac98228500bef2335d917d0`
+was verified against `git ls-remote`; local and remote SHA matched.
+
+This closes Task 6's evidence/review/push gates only. The original P0 checklist
+entries remain open because this validation record does not meet their
+complete substantive acceptance requirements.
