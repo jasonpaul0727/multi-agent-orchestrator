@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
 import re
 from types import UnionType
 from typing import Annotated, Literal, Union, get_args, get_origin
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
+from pydantic_core import TzInfo
 
 from orchestrator.models import AcceptedModelRoute, FXSnapshot, TokenizerSnapshot
 from orchestrator.routing import (
@@ -28,6 +30,14 @@ from orchestrator.validation import revalidate_model
 
 
 _IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$"
+_TRUSTED_TIMEZONE_TYPES = (timezone, TzInfo, ZoneInfo)
+
+
+def _is_data_datetime(value):
+    """Inspect exact built-in slots without invoking caller timezone methods."""
+    return type(value) is datetime and any(
+        type(value.tzinfo) is trusted for trusted in _TRUSTED_TIMEZONE_TYPES
+    )
 
 
 def _check_declared_routing_data(value, expected):
@@ -47,7 +57,9 @@ def _check_declared_routing_data(value, expected):
         if type(value) is not expected:
             raise ValueError("unexpected routing model type")
         extra = value.model_extra
-        if (not set(value.__dict__) <= set(expected.model_fields)
+        values = value.__dict__
+        if (type(values) is not dict
+            or any(type(key) is not str or key not in expected.model_fields for key in values)
             or extra is not None and (type(extra) is not dict or len(extra) != 0)):
             raise ValueError("unexpected routing model data")
         for name, field in expected.model_fields.items():
@@ -58,7 +70,10 @@ def _check_declared_routing_data(value, expected):
         element_type = get_args(expected)[0]
         for item in value:
             _check_declared_routing_data(item, element_type)
-    elif type(value) not in {str, int, bool, datetime, type(None)}:
+    elif expected is datetime or type(value) is datetime:
+        if not _is_data_datetime(value):
+            raise ValueError("unexpected routing datetime data")
+    elif all(type(value) is not trusted for trusted in (str, int, bool, type(None))):
         raise ValueError("unexpected routing scalar data")
 
 
@@ -144,8 +159,7 @@ class RecoveryContinuationService:
             if (any(type(value) is not str or re.fullmatch(_IDENTIFIER, value) is None
                     for value in (run_id, node_id, source_attempt_id))
                 or type(source_fencing_generation) is not int or source_fencing_generation <= 0
-                or any(not isinstance(value, datetime) or value.tzinfo is None
-                       or value.utcoffset() is None for value in (accepted_at, lease_expires_at))
+                or any(not _is_data_datetime(value) for value in (accepted_at, lease_expires_at))
                 or lease_expires_at <= accepted_at):
                 raise RecoveryContinuationError("recovery_continuation_invalid")
             result = None

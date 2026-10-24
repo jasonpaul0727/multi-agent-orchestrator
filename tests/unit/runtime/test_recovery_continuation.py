@@ -601,3 +601,166 @@ def test_malformed_nested_data_never_executes_model_callbacks_under_lock(tmp_pat
             admit(case, routing_inputs=supplied)
         assert calls == []
         assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("location", [
+    "accepted_at", "lease_expires_at", "tokenizer-effective", "tokenizer-expiry", "fx-effective", "fx-expiry",
+])
+@pytest.mark.parametrize("kind", ["custom-timezone", "datetime-subclass", "zoneinfo-subclass", "timezone-metaclass"])
+def test_executable_datetime_objects_are_rejected_before_any_callback(tmp_path, location, kind):
+    # Catches exact datetimes carrying executable tzinfo and timestamp subclasses.
+    from datetime import datetime, tzinfo
+    from zoneinfo import ZoneInfo
+    from orchestrator.runtime.recovery_continuation import RecoveryRoutingInputs
+    calls = []
+    with SQLiteEventStore(tmp_path / "timezone.db") as store:
+        case = recovery_case(store, routing_budget=True)
+        class CallbackTimezone(tzinfo):
+            def utcoffset(self, value):
+                calls.append(("custom-offset", store._connection.in_transaction))
+                return timedelta(0)
+            def dst(self, value):
+                calls.append(("custom-dst", store._connection.in_transaction))
+                return timedelta(0)
+            def tzname(self, value):
+                calls.append(("custom-name", store._connection.in_transaction))
+                return "timezone-private-payload"
+        class CallbackZoneInfo(ZoneInfo):
+            def utcoffset(self, value):
+                calls.append(("zoneinfo-offset", store._connection.in_transaction))
+                return timedelta(0)
+        class CallbackMeta(type):
+            def __hash__(cls):
+                calls.append(("timezone-class-hash", store._connection.in_transaction))
+                return super().__hash__()
+        class MetaTimezone(CallbackTimezone, metaclass=CallbackMeta):
+            pass
+        class CallbackDatetime(datetime):
+            def __getattribute__(self, name):
+                if name in {"tzinfo", "utcoffset", "isoformat"}:
+                    calls.append(("datetime-access", store._connection.in_transaction))
+                return super().__getattribute__(name)
+            def utcoffset(self):
+                calls.append(("datetime-offset", store._connection.in_transaction))
+                return timedelta(0)
+        observations = routing_observations(case)
+        if location in {"accepted_at", "lease_expires_at"}:
+            original = NOW + (timedelta(seconds=7) if location == "accepted_at" else timedelta(minutes=2))
+        elif location.startswith("tokenizer"):
+            field = "effective_from" if location.endswith("effective") else "expires_at"
+            original = getattr(observations["tokenizer_snapshot"].bindings[0], field)
+        else:
+            field = "effective_from" if location.endswith("effective") else "expires_at"
+            original = getattr(observations["fx_snapshot"], field)
+        if kind == "datetime-subclass":
+            poisoned = CallbackDatetime(original.year, original.month, original.day, original.hour,
+                                        original.minute, original.second, tzinfo=original.tzinfo)
+        else:
+            zone = {"custom-timezone": CallbackTimezone, "zoneinfo-subclass": lambda: CallbackZoneInfo("UTC"),
+                    "timezone-metaclass": MetaTimezone}[kind]()
+            poisoned = original.replace(tzinfo=zone)
+        changes = {}
+        if location in {"accepted_at", "lease_expires_at"}:
+            changes[location] = poisoned
+        else:
+            if location.startswith("tokenizer"):
+                binding = observations["tokenizer_snapshot"].bindings[0].model_copy(update={field: poisoned})
+                observations["tokenizer_snapshot"] = observations["tokenizer_snapshot"].model_copy(update={"bindings": (binding,)})
+            else:
+                observations["fx_snapshot"] = observations["fx_snapshot"].model_copy(update={field: poisoned})
+            changes["routing_inputs"] = RecoveryRoutingInputs(**observations)
+        before = durable_state(store)
+        calls.clear()
+        error = None
+        try:
+            admit(case, **changes)
+        except RecoveryContinuationError as exc:
+            error = exc
+        assert calls == []
+        assert error is not None
+        assert error.code == ("recovery_continuation_invalid" if location in {
+            "accepted_at", "lease_expires_at",
+        } else "recovery_continuation_failed")
+        assert error.__context__ is None and error.__cause__ is None
+        assert "timezone-private-payload" not in "".join(traceback.format_exception(error))
+        assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("representation", ["utc", "fixed-offset", "pydantic", "zoneinfo", "json-parsed"])
+def test_trusted_concrete_timezone_representations_preserve_admission(tmp_path, representation):
+    # Catches rejecting supported host/JSON timestamps while closing executable timezones.
+    from datetime import timezone
+    from pydantic_core import TzInfo
+    from zoneinfo import ZoneInfo
+    from orchestrator.models import FXSnapshot, TokenizerBinding, TokenizerSnapshot
+    from orchestrator.runtime.recovery_continuation import RecoveryRoutingInputs
+    zones = {"utc": timezone.utc, "fixed-offset": timezone(timedelta(hours=5, minutes=30)),
+             "pydantic": TzInfo(-7 * 3600), "zoneinfo": ZoneInfo("America/Los_Angeles")}
+    with SQLiteEventStore(tmp_path / "trusted-timezone.db") as store:
+        case = recovery_case(store, routing_budget=True)
+        observations = routing_observations(case)
+        if representation == "json-parsed":
+            observations["tokenizer_snapshot"] = TokenizerSnapshot(bindings=tuple(
+                TokenizerBinding.model_validate_json(binding.model_dump_json())
+                for binding in observations["tokenizer_snapshot"].bindings
+            ))
+            observations["fx_snapshot"] = FXSnapshot.model_validate_json(observations["fx_snapshot"].model_dump_json())
+            zone = observations["fx_snapshot"].expires_at.tzinfo
+            assert type(zone) is TzInfo
+        else:
+            zone = zones[representation]
+            binding = observations["tokenizer_snapshot"].bindings[0]
+            binding = binding.model_copy(update={name: getattr(binding, name).astimezone(zone)
+                                                  for name in ("effective_from", "expires_at")})
+            observations["tokenizer_snapshot"] = observations["tokenizer_snapshot"].model_copy(update={"bindings": (binding,)})
+            fx = observations["fx_snapshot"]
+            observations["fx_snapshot"] = fx.model_copy(update={name: getattr(fx, name).astimezone(zone)
+                                                                 for name in ("effective_from", "expires_at")})
+        result = admit(case, routing_inputs=RecoveryRoutingInputs(**observations),
+                       accepted_at=(NOW + timedelta(seconds=7)).astimezone(zone),
+                       lease_expires_at=(NOW + timedelta(minutes=2)).astimezone(zone))
+        assert result.status == "admitted" and result.accepted_route.fencing_generation == 2
+
+
+@pytest.mark.parametrize("kind", ["scalar-metaclass", "str-subclass-key", "foreign-key"])
+def test_declared_data_rejection_does_not_execute_class_or_copied_key_callbacks(tmp_path, kind):
+    # Catches hashing foreign scalar types or comparing copied model dictionary keys.
+    from orchestrator.runtime.recovery_continuation import RecoveryRoutingInputs
+    calls = []
+    with SQLiteEventStore(tmp_path / "guard-callback.db") as store:
+        case = recovery_case(store, routing_budget=True)
+        class CallbackMeta(type):
+            def __hash__(cls):
+                calls.append(("scalar-class-hash", store._connection.in_transaction))
+                return super().__hash__()
+        class ForeignScalar(metaclass=CallbackMeta):
+            pass
+        class CallbackKey(str):
+            def __hash__(self):
+                calls.append(("key-hash", store._connection.in_transaction))
+                return hash("budget_currency")
+            def __eq__(self, other):
+                calls.append(("key-compare", store._connection.in_transaction))
+                return str.__eq__(self, other)
+        class ForeignKey:
+            def __hash__(self):
+                calls.append(("foreign-key-hash", store._connection.in_transaction))
+                return hash("budget_currency")
+            def __eq__(self, other):
+                calls.append(("foreign-key-compare", store._connection.in_transaction))
+                return False
+        observations = routing_observations(case)
+        if kind == "scalar-metaclass":
+            update = {"budget_ledger_version": ForeignScalar()}
+        else:
+            key = CallbackKey("unexpected-copy-key") if kind == "str-subclass-key" else ForeignKey()
+            update = {key: "bounded-copy-payload"}
+        observations["eligibility"] = observations["eligibility"].model_copy(update=update)
+        supplied = RecoveryRoutingInputs(**observations)
+        before = durable_state(store)
+        calls.clear()
+        with pytest.raises(RecoveryContinuationError) as caught:
+            admit(case, routing_inputs=supplied)
+        assert calls == []
+        assert caught.value.__context__ is None and caught.value.__cause__ is None
+        assert durable_state(store) == before
