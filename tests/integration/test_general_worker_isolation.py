@@ -50,7 +50,7 @@ def cleanup_owned(launcher):
     # These tests alone own every session in this fresh launcher. On an ack
     # failure, kill/drain the actual transport and require existing host stop
     # proof before staging can be discarded. No fabricated receipt is used.
-    for session in launcher._sessions.values():
+    for session in tuple(launcher._sessions.values()):
         if session._result is not None and session._result.termination_confirmed:
             empty(session._result.termination_receipt)
             continue
@@ -80,6 +80,7 @@ def test_real_request_and_complete_turns_are_readonly_nonetwork(tmp_path):
                 ControlGroup=receipt.control_group, PrivateNetwork="yes")
             result = session.wait()
             empty(result.termination_receipt)
+            assert prepared.launch_id not in launcher._sessions
             assert result.proposal is not None and result.returncode == 0 and result.input_written
             if phase == "request":
                 assert type(result.proposal) is GeneralWorkerRequest
@@ -144,6 +145,7 @@ def test_real_sigkill_worker_proves_empty_cgroup(tmp_path):
         assert result.proposal is None and result.returncode != 0
         assert result.launch_receipt == session.launch_receipt
         empty(result.termination_receipt)
+        assert prepared.launch_id not in launcher._sessions
     finally:
         cleanup_owned(launcher)
 
@@ -186,6 +188,7 @@ def test_prepared_unacked_launch_never_retries(tmp_path):
     finally:
         release.touch()
         cleanup_owned(launcher)
+    assert prepared.launch_id not in launcher._sessions
     with pytest.raises(IsolationNotStarted):
         worker.start_turn(workspace, turn, prepared_launch=prepared)
 
@@ -202,5 +205,6 @@ def test_real_legal_fractional_cpu_quota_profile(tmp_path):
         result = session.wait()
         assert type(result.proposal) is GeneralWorkerRequest
         empty(result.termination_receipt)
+        assert prepared.launch_id not in launcher._sessions
     finally:
         cleanup_owned(launcher)

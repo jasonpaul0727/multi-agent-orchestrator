@@ -18,6 +18,7 @@ import threading
 import time
 from typing import Literal, Sequence
 import uuid
+import weakref
 
 from .workspace import WorkspaceBoundaryError, snapshot_workspace
 
@@ -213,6 +214,15 @@ class SystemdReadOnlyLauncher:
         if not valid:
             raise IsolationNotStarted("prepared_launch_invalid_or_consumed")
 
+    def _retire_session(self, session: SandboxSession) -> None:
+        """Release launcher-owned buffers after the caller proved exact stop."""
+
+        with self._prepare_lock:
+            identity = session._owner_launch_id
+            if self._sessions.get(identity) is session:
+                self._sessions.pop(identity)
+                session._input_bytes = None
+
     def stop_prepared_launch(
         self, prepared_launch: PreparedSandboxLaunch, launch_receipt: SandboxLaunchReceipt,
     ) -> SandboxTerminationReceipt:
@@ -237,7 +247,8 @@ class SystemdReadOnlyLauncher:
             cgroup = _CGROUP_ROOT / launch_receipt.control_group.lstrip("/")
             binding_state = _observe_prepared_binding(prepared_launch, launch_receipt, self._systemctl, environment)
             if binding_state is not None:
-                session = self._sessions.get(prepared_launch.launch_id)
+                with self._prepare_lock:
+                    session = self._sessions.get(prepared_launch.launch_id)
                 if session is not None:
                     session.cancel()
                     session.wait()
@@ -256,6 +267,7 @@ class SystemdReadOnlyLauncher:
                     result = None
                 if result is not None and session is not None:
                     _discard_staging(session._staging)
+                    self._retire_session(session)
         except Exception:
             result = None
         if result is None:
@@ -423,7 +435,10 @@ class SystemdReadOnlyLauncher:
             cancel_after_transport_exit=prepared_launch is not None,
         )
         if prepared_launch is not None:
-            self._sessions[prepared_launch.launch_id] = session
+            session._owner_ref = weakref.ref(self)
+            session._owner_launch_id = prepared_launch.launch_id
+            with self._prepare_lock:
+                self._sessions[prepared_launch.launch_id] = session
             receipt = _read_launch_receipt(prepared_launch=prepared_launch,
                 expected_cgroup=scope_cgroup, expected_profile=expected_profile,
                 client_env=client_env, systemctl=self._systemctl)
@@ -480,6 +495,8 @@ class SandboxSession:
         self._wait_lock = threading.Lock()
         self._result: SandboxResult | None = None
         self._launch_receipt: SandboxLaunchReceipt | None = None
+        self._owner_ref: weakref.ReferenceType[SystemdReadOnlyLauncher] | None = None
+        self._owner_launch_id: str | None = None
 
     @property
     def launch_receipt(self) -> SandboxLaunchReceipt | None:
@@ -551,9 +568,12 @@ class SandboxSession:
                 if self._process.poll() is not None:
                     if self._scope_cgroup is None:
                         self._staging.cleanup()
-                    elif self._cleanup_on_termination and self._result is not None:
-                        if self._result.termination_confirmed:
+                    elif self._result is not None and self._result.termination_confirmed:
+                        if self._cleanup_on_termination:
                             _discard_staging(self._staging)
+                        owner = self._owner_ref() if self._owner_ref is not None else None
+                        if owner is not None:
+                            owner._retire_session(self)
 
     def _collect(self) -> SandboxResult:
         assert self._process.stdout is not None and self._process.stderr is not None
@@ -856,16 +876,18 @@ def _validate_prepared(value: PreparedSandboxLaunch) -> None:
 
 def _validate_launch_receipt(prepared: PreparedSandboxLaunch, receipt: SandboxLaunchReceipt) -> None:
     _validate_prepared(prepared)
-    if (type(receipt) is not SandboxLaunchReceipt or receipt.launch_id != prepared.launch_id
-        or receipt.unit_name != prepared.unit_name or type(receipt.invocation_id) is not str
+    if type(receipt) is not SandboxLaunchReceipt:
+        raise ValueError("invalid observed binding")
+    if any(type(value) is not str for value in (receipt.launch_id, receipt.unit_name,
+        receipt.control_group, receipt.invocation_id, receipt.profile_sha256)):
+        raise ValueError("invalid observed binding")
+    if (receipt.launch_id != prepared.launch_id or receipt.unit_name != prepared.unit_name
         or not re.fullmatch(r"[0-9a-f]{32}", receipt.invocation_id)
-        or receipt.invocation_id == "0" * 32 or type(receipt.profile_sha256) is not str
+        or receipt.invocation_id == "0" * 32
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt.profile_sha256)):
         raise ValueError("invalid observed binding")
     # Apply the same exact path constraints as termination receipts, without
     # constructing a termination receipt from a launch acknowledgement.
-    if type(receipt.control_group) is not str:
-        raise ValueError("invalid observed cgroup")
     path = Path(receipt.control_group)
     if (not path.is_absolute() or path.as_posix() != receipt.control_group
         or path.name != prepared.unit_name or path.parent.name != "app.slice"

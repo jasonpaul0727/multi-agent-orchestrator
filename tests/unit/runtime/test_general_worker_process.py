@@ -193,3 +193,16 @@ def test_transport_exception_is_detached_stop_unknown(tmp_path):
             raise RuntimeError("private-response-sentinel")
     detached(IsolationStopUnknown, lambda: GeneralWorkerProcess(launcher=Launcher(FailingSession())).run_turn(
         tmp_path, turn(), prepared_launch=prepared()))
+
+
+@pytest.mark.parametrize("field", ["launch_id", "unit_name"])
+def test_hostile_ack_identity_rejected_before_comparison_callback(tmp_path, field):
+    calls = []
+    class HostileIdentity:
+        def __ne__(self, other):
+            calls.append("ne")
+            return False
+    receipt = replace(ack(), **{field: HostileIdentity()})
+    detached(IsolationStartUnknown, lambda: GeneralWorkerProcess(launcher=Launcher(Session(receipt=receipt))).start_turn(
+        tmp_path, turn(), prepared_launch=prepared()))
+    assert calls == []

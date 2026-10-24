@@ -1227,3 +1227,118 @@ def test_effective_resource_timespans_normalize_finite_fractions_exactly(value, 
 def test_resource_timespans_reject_nonfinite_negative_submicrosecond_and_overflow(value):
     with pytest.raises(ValueError):
         launcher_module._duration_usec(value)
+
+
+@pytest.mark.parametrize("field", ["launch_id", "unit_name", "control_group", "invocation_id", "profile_sha256"])
+def test_constructed_launch_receipt_fields_rejected_before_any_callback(monkeypatch, field):
+    from dataclasses import replace
+    calls = []
+    class Hostile:
+        def __ne__(self, other):
+            calls.append("ne")
+            return False
+        def __eq__(self, other):
+            calls.append("eq")
+            return True
+        def __str__(self):
+            calls.append("str")
+            return "private-receipt-sentinel"
+        def __fspath__(self):
+            calls.append("fspath")
+            return "/private-receipt-sentinel"
+    prepared, receipt = _reconstructed_launch()
+    unsafe = replace(receipt, **{field: Hostile()})
+    with pytest.raises(ValueError):
+        launcher_module._validate_launch_receipt(prepared, unsafe)
+    assert calls == []
+    monkeypatch.setattr(launcher_module, "_systemd_client_environment",
+        lambda: pytest.fail("invalid receipt must fail before consulting the host"))
+    with pytest.raises(launcher_module.IsolationStartUnknown) as caught:
+        SystemdReadOnlyLauncher().stop_prepared_launch(prepared, unsafe)
+    assert calls == []
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "private-" not in str(caught.value) + repr(caught.value)
+
+
+def _local_prepared_lifecycle(monkeypatch):
+    # Use actual bounded pipe collection; replace only systemd observations
+    # and the systemd transport with a controlled local echo interpreter.
+    popen = subprocess.Popen
+    _mock_prepared_launch(monkeypatch)
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kw: popen(
+        ["/usr/bin/python3", "-c", "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0))
+    def acknowledge(**kw):
+        prepared = kw["prepared_launch"]
+        group = "/" + kw["expected_cgroup"].relative_to(Path("/sys/fs/cgroup")).as_posix()
+        return launcher_module.SandboxLaunchReceipt(prepared.launch_id, prepared.unit_name,
+            group, "a" * 32, launcher_module._profile_sha256(kw["expected_profile"]))
+    def stopped(**kw):
+        return launcher_module.SandboxTerminationReceipt(kw["unit_name"],
+            "/" + kw["expected_cgroup"].relative_to(Path("/sys/fs/cgroup")).as_posix(), "inactive", True)
+    monkeypatch.setattr(launcher_module, "_read_launch_receipt", acknowledge)
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", stopped)
+    monkeypatch.setattr(launcher_module, "_observe_prepared_binding", lambda *_args: "stopped")
+    return stopped
+
+
+def test_confirmed_stopped_sessions_do_not_accumulate_or_retain_input(monkeypatch, tmp_path):
+    import weakref
+    _local_prepared_lifecycle(monkeypatch)
+    launcher = SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl")
+    for _ in range(8):
+        prepared = launcher.prepare_launch()
+        payload = b"private-input-sentinel" * 1024
+        session = launcher.launch(tmp_path, ["/usr/bin/cat"], prepared_launch=prepared, input_bytes=payload)
+        result = session.wait()
+        try:
+            assert result.stdout == payload and result.termination_confirmed
+            assert session.wait() is result
+            assert prepared.launch_id not in launcher._sessions
+            assert session._input_bytes is None
+            assert prepared.launch_id in launcher._consumed
+            reference = weakref.ref(session)
+        finally:
+            # Every test transport is controlled and has already exited.
+            launcher_module._discard_staging(session._staging)
+        del session, result
+        assert reference() is None
+    assert not launcher._sessions
+
+
+def test_unknown_sessions_remain_strongly_retained_with_no_retry(monkeypatch, tmp_path):
+    import weakref
+    _local_prepared_lifecycle(monkeypatch)
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", lambda **_kw: None)
+    launcher = SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl")
+    prepared = launcher.prepare_launch()
+    payload = b"private-unknown-input"
+    session = launcher.launch(tmp_path, ["/usr/bin/cat"], prepared_launch=prepared, input_bytes=payload)
+    result = session.wait()
+    assert not result.termination_confirmed and session.wait() is result
+    reference = weakref.ref(session)
+    del session
+    assert reference() is launcher._sessions[prepared.launch_id]
+    assert reference()._input_bytes == payload
+    with pytest.raises(launcher_module.IsolationNotStarted):
+        launcher.launch(tmp_path, ["/usr/bin/cat"], prepared_launch=prepared)
+    launcher_module._discard_staging(reference()._staging)  # Controlled local test transport only.
+
+
+def test_fresh_recovered_stop_retires_prior_cached_unknown_and_replays_wait(monkeypatch, tmp_path):
+    stopped = _local_prepared_lifecycle(monkeypatch)
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", lambda **_kw: None)
+    launcher = SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl")
+    prepared = launcher.prepare_launch()
+    session = launcher.launch(tmp_path, ["/usr/bin/cat"], prepared_launch=prepared, input_bytes=b"private-recovery-input")
+    cached = session.wait()
+    assert not cached.termination_confirmed and prepared.launch_id in launcher._sessions
+    receipt = session.launch_receipt
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", stopped)
+    fresh = launcher.stop_prepared_launch(prepared, receipt)
+    assert fresh.cgroup_empty and prepared.launch_id not in launcher._sessions
+    assert session._input_bytes is None
+    assert session.wait() is cached
+    assert launcher.stop_prepared_launch(prepared, receipt) == fresh
+    with pytest.raises(launcher_module.IsolationNotStarted):
+        launcher.launch(tmp_path, ["/usr/bin/cat"], prepared_launch=prepared)

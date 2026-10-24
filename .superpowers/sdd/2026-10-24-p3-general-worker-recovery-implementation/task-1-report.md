@@ -205,3 +205,53 @@ Coverage came from that same completed final run, without executing tests again:
 Final self-review found no unresolved Feature C correctness concern. All observed live profile differences were parser/lifecycle representation defects and were fixed through retained RED/GREEN regressions; no control was skipped or relaxed to pass. Required readiness/cleanup remained bounded and actual host stop/cgroup proof was used. New evidence is ignored; only the already-tracked report is updated in Git. C commit uses the subject above (containing commit; SHA returned to controller separately).
 
 The controller's externally modified design spec and any plan changes for Task 2 are intentionally **excluded** from the C commit and left uncommitted for root packaging, without reading/reviewing/modifying their bodies. The worktree may therefore remain dirty solely for those root-owned documentation changes. Feature C is stopped here for controller push/quota and the independent Task 1 review; no further task, push, or delegation was performed.
+
+## Task 1 review fixes — round 1 of 5, FIX_BASE 95e423a
+
+Status: both Important findings fixed; stopped for controller push/quota and scoped rereview. Read the complete `task-1-review.md`, inspected both implementation paths, and followed the receiving-code-review/TDD workflow one finding at a time. No review was delegated.
+
+### Important 1: exact receipt types before callbacks
+
+Added hostile constructed-field cases for all five receipt fields plus Worker acknowledgement adapter cases for both identity fields. The hostile identity `__ne__` returned False, reproducing acceptance of malformed identities rather than merely an error-message difference. Initial RED:
+
+```text
+PYTHONPATH=src:. /home/paul2/workspace/multi-agent-orchestrator/.venv/bin/python -m pytest -o addopts= -q tests/unit/isolation/test_launcher.py tests/unit/runtime/test_general_worker_process.py -k "constructed_launch_receipt_fields or hostile_ack_identity"
+4 failed, 3 passed, 186 deselected in 2.13s
+```
+
+Failures were the expected missing rejection for `launch_id`/`unit_name` in the validator and Worker adapter. Full log: ignored `task-1-fix1-receipt-red.log`.
+
+Fix: `_validate_launch_receipt` first checks exact receipt class, then exact `str` for **every** receipt field in a separate guard, before receipt equality, regex, or Path operations. Added tests require zero `__ne__`/`__eq__`/`__str__`/`__fspath__` calls, no host consultation for malformed stop receipts, and detached fixed errors. Same command GREEN: **7 passed, 186 deselected in 1.70s**, retained in `task-1-fix1-receipt-green.log`.
+
+### Important 2: retire confirmed-stopped launcher ownership
+
+Added lifecycle regressions using real local bounded pipe collection while replacing only systemd launch/observation: eight repeated completed turns must leave no launcher registry entries or input buffers, be garbage-collectable when callers drop references, and preserve cached `wait()` result identity. Separate cases require unknown/no-proof sessions to remain strongly retained/non-retryable, and a fresh recovered stop to retire a prior cached-unknown session while preserving old `wait()` identity and repeated stop behavior. Initial RED:
+
+```text
+PYTHONPATH=src:. /home/paul2/workspace/multi-agent-orchestrator/.venv/bin/python -m pytest -o addopts= -q tests/unit/isolation/test_launcher.py -k "do_not_accumulate or unknown_sessions_remain or fresh_recovered_stop"
+2 failed, 1 passed, 175 deselected in 1.51s
+```
+
+Both expected failures showed confirmed-stopped sessions still present in `_sessions`; unknown retention already passed. Full log: ignored `task-1-fix1-retirement-red.log`.
+
+Fix: prepared sessions carry a private weak owner reference and launch identity. After normal exact stop proof, or fresh exact recovered stop proof after a cached unknown result, the owning launcher removes only the identical registered session under its short registry lock and clears its input frame. The caller's cached SandboxResult is preserved for idempotent `wait()`; its output buffers are no longer strongly owned by the launcher. Sessions without stop proof remain strongly retained, including their bounded buffers, and consumed-epoch protection remains unchanged. Registry insert/read/retire use the same short owner lock; cancel, wait, and systemd/cgroup observation occur outside it. No public callback or test-hook API was added. The real-test cleanup iterates a tuple snapshot because confirmed cleanup may now retire entries; all four real cases also assert retirement after actual stop proof.
+
+Same focused command GREEN: **3 passed, 175 deselected in 1.84s**, retained in `task-1-fix1-retirement-green.log`.
+
+### Post-fix focused compatibility and self-review
+
+After all source/test changes, ran:
+
+```text
+PYTHONPATH=src:. /home/paul2/workspace/multi-agent-orchestrator/.venv/bin/python -m pytest -o addopts= -q tests/unit/isolation/test_launcher.py tests/unit/isolation/test_provider_sender.py tests/unit/isolation/test_overlay_launcher.py tests/unit/runtime/test_general_worker_protocol.py tests/unit/runtime/test_general_worker_process.py tests/unit/runtime/test_worker_process.py tests/unit/runtime/test_worker_output.py tests/unit/runtime/test_workspace_worker.py tests/unit/runtime/test_verifier_process.py tests/integration/test_general_worker_isolation.py tests/integration/test_systemd_launcher.py --junitxml=.superpowers/sdd/2026-10-24-p3-general-worker-recovery-implementation/task-1-fix1-focused.xml
+
+666 passed in 30.96s
+```
+
+Ignored `task-1-fix1-focused.log` / `.xml` retain full output. Parsed JUnit confirms **666 tests, 0 failures, 0 errors, 0 skips**, including **all four real Worker isolation cases**. Existing real unprepared systemd launcher, Provider sender, overlay, blocked Worker, candidate output, workspace Worker and verifier coverage passed. `git diff --check` passed on the affected files.
+
+Self-reviewed all owned source/test diffs: exact-type checks precede receipt operations, retirement is gated by exact stop and ended transport, only the identical owner registry entry is removed, unresolved sessions stay retained, no owner lock spans cancellation/wait, consumed IDs remain protected, and caller-side cached results remain unchanged. No unresolved correctness concerns from this scoped fix.
+
+**Evidence boundary:** the retained **3,013-pass full suite and 90.51% overall coverage are now pre-review-fix evidence at 95e423a**, not a claim about the current fixed source. Current-source evidence is the **666-pass focused run above**, including four real cases. Per controller instruction, no broad full suite or new full coverage run was performed merely to reconfirm prior results; the new source will receive full verification in the next application/final slice.
+
+Owned files: `src/orchestrator/isolation/launcher.py`, `tests/unit/isolation/test_launcher.py`, `tests/unit/runtime/test_general_worker_process.py`, `tests/integration/test_general_worker_isolation.py`, and this already-tracked report. Fix commit subject: `fix(isolation): reject hostile receipts and retire stopped sessions` (containing commit; SHA returned separately). All new raw evidence remains ignored. Root-owned pending Task 2 plan/spec changes are untouched and excluded from this commit. No push, main change, dependency installation, paid call, credentials, user-evidence cleanup, delegation, or history rewrite occurred.
