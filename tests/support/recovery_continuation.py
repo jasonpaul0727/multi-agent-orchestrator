@@ -15,11 +15,14 @@ from tests.unit.lifecycle.test_scheduler import (
 
 
 def recovery_case(store, *, failure_code="rate_limited", unknown=False,
-                  legacy_input=False, escalation_role=None, accounted_usage=False):
-    if escalation_role is None:
+                  legacy_input=False, escalation_role=None, accounted_usage=False,
+                  routing_budget=False):
+    if escalation_role is None and not routing_budget:
         reg, config, lifecycle, policy, contract = run_setup_with_frozen_contract(store)
     else:
-        reg, config, lifecycle, policy, contract = _role_recovery_setup(store, escalation_role)
+        reg, config, lifecycle, policy, contract = _role_recovery_setup(
+            store, escalation_role, routing_budget=routing_budget,
+        )
     control = scheduler(store)
     request, decision = routed_pair(reg, config, policy, contract_hash=contract.contract_hash)
     times = dict(accepted_at=NOW + timedelta(seconds=1), lease_expires_at=NOW + timedelta(minutes=1))
@@ -84,7 +87,7 @@ def consume_recovery(case, *, source_decision=None, plan=None, retry_level=1,
     return request, decision, accepted
 
 
-def _role_recovery_setup(store, role):
+def _role_recovery_setup(store, role, *, routing_budget=False):
     from orchestrator.config import ConfigCandidate, ConfigManager, EffectiveConfig, resolve_effective_config
     from orchestrator.lifecycle import LifecycleController, NodeSpec
     from orchestrator.security import PolicyAuthority, PolicyManifest
@@ -93,6 +96,10 @@ def _role_recovery_setup(store, role):
     values = effective_config(reg).config.model_dump(mode="json")
     for preset in values["presets"].values():
         preset["roles"]["coder"]["escalate_to"] = role
+        if routing_budget:
+            preset["requested_budget"]["max_total_tokens"] = 5000
+    if routing_budget:
+        values["policy_envelope"]["max_total_tokens"] = 5000
     resolved = resolve_effective_config(EffectiveConfig.model_validate(values), registry=reg)
     policy = PolicyManifest(authorities=(PolicyAuthority(
         source="system", max_permission="read-only", allowed_actions={"model_invoke"},
@@ -108,6 +115,56 @@ def _role_recovery_setup(store, role):
     ),), expected_graph_version=0, idempotency_key="initial-graph", policy_manifest=policy)
     lifecycle.start_run("run-1")
     return reg, resolved.config, lifecycle, policy, contract
+
+
+def routing_observations(case):
+    """Data-only observations for the real Router; no credentials are acquired."""
+    from orchestrator.models import FXSnapshot, TokenizerBinding, TokenizerSnapshot
+    from orchestrator.routing import (
+        EligibilitySnapshot, HealthAggregateKey, HealthController,
+        ModelHealthSnapshot, SecretAvailability,
+    )
+
+    balance = BudgetLedger(case.store).available("run-1")
+    preset = case.config.presets[case.config.active_preset]
+    policy = case.config.health_policies[preset.health_policy_ref]
+    controller = HealthController(case.store)
+    health = []
+    for model in case.registry.models:
+        provider_key = HealthAggregateKey(
+            registry_manifest_hash=case.registry.content_hash,
+            scope="provider", provider_id=model.provider,
+        )
+        model_key = HealthAggregateKey(
+            registry_manifest_hash=case.registry.content_hash,
+            scope="model", provider_id=model.provider, model_id=model.id,
+        )
+        health.append(ModelHealthSnapshot(
+            provider_id=model.provider, model_id=model.id,
+            provider=controller.read(provider_key, default_policy=policy).routing_ref,
+            model=controller.read(model_key, default_policy=policy).routing_ref,
+        ))
+    return dict(
+        eligibility=EligibilitySnapshot(
+            policy_manifest_hash=case.policy.content_hash,
+            budget_ledger_version=case.store.current_version("budget", "run-1"),
+            budget_currency=balance.currency, available_cost_minor=balance.available_minor,
+            available_tokens=balance.available_tokens,
+            secret_availability=(SecretAvailability(
+                secret_ref="env:MODEL_KEY", available=True, version=0,
+            ),), model_health=tuple(health), revocation_version=0, emergency_deny_version=0,
+        ),
+        policy_manifest=case.policy,
+        tokenizer_snapshot=TokenizerSnapshot(bindings=tuple(TokenizerBinding(
+            model_id=model.id, tokenizer_id="tokenizer.fixed", tokenizer_version="1",
+            estimator_id="tokens.v1", estimator_version="1",
+            effective_from=NOW - timedelta(days=1), expires_at=NOW + timedelta(days=1),
+        ) for model in case.registry.models)),
+        fx_snapshot=FXSnapshot(
+            base_currency="USD", source_id="fx.fixture", rates=(),
+            effective_from=NOW - timedelta(days=1), expires_at=NOW + timedelta(days=1),
+        ),
+    )
 
 
 def rewrite_event_payload(store, event_type, mutate, *, attempt_id=None, stream_type="scheduler",
