@@ -72,12 +72,12 @@ packaged task diff/report without rerunning suites absent a concrete doubt.
 **Files:** this plan; design spec; `docs/superpowers/specs/2026-10-24-p3-general-worker-recovery-preflight.md`.
 **Interfaces:** consumes existing acceptance/Provider/isolation contracts; produces the concrete contracts below and a recorded architecture gate.
 
-- [ ] Read independent design-review.md, resolve its three important questions in the spec and obtain scoped reviewer verification.
-- [ ] Commit/push A: reviewed design and its precise authority/replay decisions.
-- [ ] Complete this plan, scan every shared-file/interface pair and each task for contradictions, record the table and rulings in this plan's ledger.
-- [ ] Commit/push B: complete implementation plan after self-review against the spec.
-- [ ] Record focused baseline345/0, source tree identity, environment and retained diagnostic limitations in the preflight document; no product edits.
-- [ ] Commit/push C: durable preflight/acceptance map. Package the Task0 diff and run one task-scoped spec/quality gate; close only after findings resolved.
+- [x] Read independent design-review.md, resolve its three important questions in the spec and obtain scoped reviewer verification.
+- [x] Commit/push A: reviewed design and its precise authority/replay decisions (a5bfd34).
+- [x] Complete this plan, scan every shared-file/interface pair and each task for contradictions, record the table and rulings in this plan's ledger.
+- [x] Commit/push B: complete implementation plan after self-review against the spec (c319f3f).
+- [x] Record focused baseline345/0, source tree identity, environment and retained diagnostic limitations in the preflight document; no product edits.
+- [x] Commit/push C: durable preflight/acceptance map (f6d6f72). Task0 spec/quality gate Approved, zero Critical/Important/Minor; ledger records closure and LAcount2/5.
 
 ### Task 1: Bounded useful isolated Worker turns and prepared launch lifecycle
 
@@ -92,12 +92,12 @@ extend existing launcher tests as required.
 **Interfaces:**
 - `GeneralWorkerTurn(phase: Literal["request","complete"], launch_id: str, task: WorkerTask, response_text: str|None=None)` in protocol module; exact task/context and terminal text bounds.
 - `encode_general_worker_turn(turn: GeneralWorkerTurn) -> bytes` and `decode_general_worker_turn(payload: bytes) -> GeneralWorkerTurn`.
-- `GeneralWorkerRequest(context: AttemptContext, launch_id: str, input_commitment: str)` is a non-authoritative request proposal, not a ModelRequest.
+- `GeneralWorkerRequest(context: AttemptContext, launch_id: str, input_commitment: str)` is a non-authoritative request proposal, not a ModelRequest. Its input_commitment is SHA256 of `b"maestro.general-worker-input.v1\0" + canonical_full_WorkerTask_JSON`, distinct from existing admission `task.context.input_manifest_hash`; bind both independently.
 - `decode_general_worker_proposal(payload: bytes, turn: GeneralWorkerTurn) -> GeneralWorkerRequest|DecodedWorkerOutput` validates the echoed launch identity and uses existing candidate decoder.
 - `PreparedSandboxLaunch(launch_id: str, unit_name: str)`; `SystemdReadOnlyLauncher.prepare_launch() -> PreparedSandboxLaunch` generates unique owned UUID identities without launch.
-- Extend launcher `launch(..., prepared_launch: PreparedSandboxLaunch|None=None)`; preserve omitted default behavior. `SandboxSession.launch_receipt` is available only after exact systemd identity/profile observation. Its data contains prepared identity plus verified control_group, never a claimed stop.
-- `SystemdReadOnlyLauncher.stop_prepared_launch(prepared_launch, launch_receipt) -> SandboxTerminationReceipt` requires exact verified owned binding; unacknowledged launch raises detached ambiguous-start error.
-- `GeneralWorkerProcess.run_turn(workspace: Path, turn: GeneralWorkerTurn, *, prepared_launch: PreparedSandboxLaunch, cancellation=None) -> GeneralWorkerTurnResult` synchronously supervises a turn, exposing host launch receipt before wait via a separate `start_turn(...) -> GeneralWorkerSession`; the session's `wait()` returns result plus termination receipt. The service can persist ack before wait without an injected callback under a DB lock.
+- Extend launcher `launch(..., prepared_launch: PreparedSandboxLaunch|None=None)`; preserve omitted default behavior. `SandboxSession.launch_receipt` is available only after exact systemd identity/profile observation. `SandboxLaunchReceipt(launch_id, unit_name, control_group, invocation_id, profile_sha256)` contains observed canonical32hex systemd InvocationID and a commitment to all effective security/resource properties emitted by existing _service_properties, including normalized RO binds/inaccessible path sets and assumed sanitized environment/exec binding; unrelated systemd defaults need not match. No raw filesystem profile paths in the durable journal and never a claimed stop.
+- `SystemdReadOnlyLauncher.stop_prepared_launch(prepared_launch, launch_receipt) -> SandboxTerminationReceipt` accepts exact reconstructed receipts from the validated same-store journal after host restart; new launches still require in-process prepare/consumption ownership. Loaded/running unit Id/cgroup/InvocationID must agree before stop. A collected unit needs the previously verified ack plus authoritative stopped/empty exact retained cgroup proof; unacknowledged launch raises detached ambiguous-start error. Application never accepts caller receipts; process-local sets cannot be the recovery authority.
+- `GeneralWorkerProcess.run_turn(workspace: Path, turn: GeneralWorkerTurn, *, prepared_launch: PreparedSandboxLaunch, cancellation=None) -> GeneralWorkerTurnResult` synchronously supervises a turn, exposing host launch receipt before wait via a separate `start_turn(...) -> GeneralWorkerSession`; the session's `wait()` returns result plus termination receipt. `GeneralWorkerTurnResult` has proposal, launch_receipt, termination_receipt, returncode, cancelled, timed_out, output_limited and input_written; confirmed stopped invalid/cancelled transport returns proposal=None, absent/mismatched stop raises detached IsolationStopUnknown. The service can persist ack before wait without an injected callback under a DB lock.
 
 **Feature A — pure protocol (first substantive commit/push):**
 - [ ] Write failing tests `test_request_roundtrip_binds_epoch_and_context`, `test_complete_emits_real_utf8_candidate`, `test_protocol_rejects_duplicate_unknown_nonfinite_stale_and_oversize`, `test_constructed_subclass_rejected_without_callback`. Assert1MiB frame and16,384 output cap, exact context, SHA256 of actual content, no sensitive error text.
