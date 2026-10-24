@@ -145,6 +145,16 @@ class RecoveryContinuationService:
     """Route and consume one persisted authorization in one checked transaction."""
 
     def __init__(self, scheduler: Scheduler, worker_inputs: WorkerInputService) -> None:
+        if type(worker_inputs) is not WorkerInputService:
+            raise RecoveryContinuationError("recovery_continuation_invalid")
+        # Require the owned implementation and its exact authority owner before
+        # admission. Only the legacy clock is injectable; instance methods must
+        # not become foreign callbacks in the recovery preparation transaction.
+        inputs_state = vars(worker_inputs)
+        if (type(inputs_state) is not dict or len(inputs_state) != 2
+            or any(type(key) is not str or key not in {"_scheduler", "_clock"} for key in inputs_state)
+            or inputs_state.get("_scheduler") is not scheduler):
+            raise RecoveryContinuationError("recovery_continuation_invalid")
         self._scheduler = scheduler
         self._worker_inputs = worker_inputs
 
