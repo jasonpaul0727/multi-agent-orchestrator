@@ -9,6 +9,9 @@ Scheduler authority, and a separate current-authority transaction prepares the
 exact successor's `WorkerTask`. These APIs never launch a Worker, fetch a
 credential, or contact a Provider. Unknown outcomes retain holds and withhold
 task authority; historical consumption is not live dispatch permission.
+Inventory is read-only; application construction performs existing atomic
+startup recovery and can durably apply already recorded pending Provider
+settlements. That startup behavior does not launch Worker or Provider activity.
 
 ## Identity and current gate status
 
@@ -21,13 +24,19 @@ task authority; historical consumption is not live dispatch permission.
   `eb90f1a4c7e2026f432158eb49617996f1a8f8bbe9afd9351c3578040374599c`.
 - Git path/mode/blob manifest:
   `452cdda206df9b69fe7eedba0623d63407f945826ea278eddc96a9ab6d923c35`.
-- Final documentation/reviewed branch HEAD: **pending root commit/push/review
-  bookkeeping**. Documentation changes must preserve the frozen source/test
-  trees and manifests above.
+- Independently reviewed and root-remote-verified candidate:
+  `5d82fc03f352ac4a4137a7910d65e750c75312a3`. Task 4 spec/quality and the
+  whole-slice review both approved this exact head, with zero Critical/Important
+  findings. Its source/test trees match the frozen identities above.
+- Current documentation correction: **scoped review and root push pending**.
+  Its eventual commit identity is recorded in the retained report, not invented
+  inside the commit itself; source/tests must remain unchanged.
 - Final verified remote `main` full SHA: **pending root integration**. No merge
   or `main` push has occurred at this evidence checkpoint.
-- Independent Task 4 review and broad whole-slice review: **pending**. This
-  document does not mark Task 4, the plan, or full P3 complete.
+- Task 4 acceptance: **passed on the original reviewed candidate** after all
+  mandatory gates. The nonblocking construction wording is corrected here,
+  with scoped review required before integration. This does not complete full
+  P3 or claim a merged-main run/verified remote main SHA.
 
 All private logs, JUnit, coverage data, manifests, the wheel checker and wheel
 are retained under this plan's ignored directory:
@@ -37,9 +46,10 @@ No sibling plan's scratch evidence was inspected or changed for this task.
 
 ## Process and crash acceptance
 
-Task 4 A (`b183b36fc7784f45ed41667dc02bb05c4d00a4d1`) and B
-(`f39de87df674d84cb552fe1e84dcf7e659b6f375`) are root-pushed and remotely
-verified. Their 12 real process cases cover:
+All three substantive feature pushes are root-remote-verified: A
+`b183b36fc7784f45ed41667dc02bb05c4d00a4d1`, B
+`f39de87df674d84cb552fe1e84dcf7e659b6f375`, and C
+`5d82fc03f352ac4a4137a7910d65e750c75312a3`. A/B's 12 real process cases cover:
 
 - Two independent spawned ready application/store owners contending for one
   authorization, with same/conflicting input and observations. Full durable
@@ -121,6 +131,8 @@ attempted there. Packaging reused the already available private Python at
 `/tmp/maestro-p0-task6-wheel.qDhql9/venv/bin/python`: build 1.4.0,
 setuptools 68.1.2 and wheel 0.48.0, with no installs. Its upstream `bdist_wheel`
 FutureWarning is retained; build output is not described as warning-free.
+Any refresh of this existing build environment is separate maintenance with
+its own authorization; this slice changes no shared dependencies or toolchain.
 
 The private candidate wheel is
 `task-4-c-wheel/multi_agent_orchestrator-0.1.0-py3-none-any.whl`, SHA-256
@@ -193,8 +205,15 @@ git diff --check
 ## Security branch self-review
 
 Reviewed all five changed production files from implementation base to the
-frozen source, including the full two new recovery modules. This self-review
-does not replace the pending independent reviews.
+frozen source, including the full two new recovery modules. Independent Task 4
+spec/quality and whole-slice reviews subsequently approved candidate
+`5d82fc03f352ac4a4137a7910d65e750c75312a3`. The latter covered the full range
+from implementation base `621cacd7931725ef7c7bf97132192925bc32e0f8` and
+returned Ready to merge: Yes for the approved prerequisite. Both reported zero
+Critical/Important findings. The two nonblocking Minors were the construction
+wording (corrected here, scoped review pending) and the retained build-tool
+warning (separate maintenance). Reports remain in `task-4-review.md` and
+`whole-slice-review.md` under this plan's private evidence directory.
 
 | Branch/boundary | Observed control and verification |
 | --- | --- |
@@ -204,7 +223,7 @@ does not replace the pending independent reviews.
 | Untrusted observation data | Exact concrete types/storage/keys and trusted concrete timezone identities precede revalidation; subclasses/copied extras, executable timezone or scalar/key callbacks fail without execution. Errors are detached and bounded. |
 | Committed replay/preparation | Existing consumption is resolved before new observations; input still must match. Separate running/latest/active/unexpired/unknown checks use the exact owned Scheduler/store and callback-free UTC sampled after locking. Shared WorkerInputService context/frame validation remains authoritative; no public time override. |
 | New-child compatibility | Run replay accepts only the already persisted reviewer/director role authorization shape with exact source/evidence/role bindings; same-node consumption still requires an authorized same-node plan. No child node is created here. |
-| Application/privacy | Public methods require committed readiness. Constructors, inventory and continuation have no execution boundary; raw text remains memory-only. Hook/kill/guard code lives only in tests. |
+| Application/privacy | Public methods require committed readiness. Construction may apply recorded settlements in atomic startup recovery; inventory is read-only. None launches Worker/Provider activity; raw text remains memory-only. Hook/kill/guard code lives only in tests. |
 
 ## Rulings carried into this acceptance
 
@@ -232,8 +251,11 @@ after that operation; it is intentionally pending above.
 
 ## Remaining gates
 
-Independent Task 4 and whole-slice reviews, root's C push/quota checkpoint,
-review closure and verified ordinary `main` integration remain outstanding.
+The original reviewed candidate passed Task 4 acceptance, all three feature
+pushes, and independent task/whole-slice reviews. This documentation correction's
+scoped review/root push and verified ordinary `main` integration remain
+outstanding. Root will run the merged-main full suite and record the verified
+remote main full SHA after those operations; neither is claimed here.
 General resumed Worker execution and lifecycle interruption/restart, production
 credential backend, authoritative Provider delivery/charge evidence and cost
 reconciliation, full crash coverage and full P3/V1 acceptance remain open.

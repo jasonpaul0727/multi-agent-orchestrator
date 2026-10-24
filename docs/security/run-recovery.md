@@ -9,8 +9,10 @@ plans.
 The trusted host now has a separate explicit recovery continuation API. It
 discovers durable opportunities, consumes an eligible persisted authorization
 once through Scheduler, and prepares data for the exact successor only after
-the host re-supplies the original input. Construction and inventory are
-read-only; continuation launches no Worker, Broker, transport or Provider call.
+the host re-supplies the original input. Inventory is read-only. Application
+construction performs the existing atomic startup recovery and can durably
+apply previously recorded pending Provider settlements. Construction,
+inventory and continuation do not launch Workers or make Provider requests.
 Admission and task preparation have separate checked transaction boundaries.
 See [host API and trust sources](control-plane-startup.md#explicit-recovery-continuation).
 
@@ -151,7 +153,10 @@ loss and the admission/preparation seam; unknown-call fresh reopens retain
 holds and return no task. Final coverage, required live isolation, wheel and
 source-identity evidence are recorded in
 [P3 recovery coordination validation](../validation/2026-10-23-p3-recovery-coordination.md).
-Independent Task 4 and whole-slice reviews remain pending. A later same-model
+Independent Task 4 and whole-slice reviews approved candidate
+`5d82fc03f352ac4a4137a7910d65e750c75312a3`, with no Critical/Important findings.
+The documentation correction's scoped review and root's main integration
+remain pending. A later same-model
 retry may still be planned while Router's exhausted-model rule blocks that
 candidate; the conservative block preserves authority and holds, but leaves
 retry liveness unresolved. Run-scoped artifact accounting covers

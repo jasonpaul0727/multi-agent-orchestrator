@@ -177,8 +177,10 @@ SIGKILL before/after admission commit and before preparation, exact input
 re-supply, and fresh reopens with unresolved Provider calls. Their source
 identity, full coverage, required real-isolation matrix and package checks are
 recorded in [P3 recovery coordination validation](../validation/2026-10-23-p3-recovery-coordination.md).
-Independent Task 4 and whole-slice reviews remain pending, as do general
-resumed Worker execution, production credential/evidence
+Independent Task 4 and whole-slice reviews approved candidate
+`5d82fc03f352ac4a4137a7910d65e750c75312a3`, with no Critical/Important findings.
+The documentation correction's scoped review and root's main integration
+remain pending, as do general resumed Worker execution, production credential/evidence
 integration and complete P3 acceptance. A later same-model retry plan may still
 authorize a model excluded by Router exhaustion; that unresolved upstream
 policy mismatch stays safely blocked without acquiring new holds.
