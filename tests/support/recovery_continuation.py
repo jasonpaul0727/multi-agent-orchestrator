@@ -16,15 +16,21 @@ from tests.unit.lifecycle.test_scheduler import (
 
 def recovery_case(store, *, failure_code="rate_limited", unknown=False,
                   legacy_input=False, escalation_role=None, accounted_usage=False,
-                  routing_budget=False):
-    if escalation_role is None and not routing_budget:
+                  routing_budget=False, multi_model=False):
+    if escalation_role is None and not routing_budget and not multi_model:
         reg, config, lifecycle, policy, contract = run_setup_with_frozen_contract(store)
     else:
         reg, config, lifecycle, policy, contract = _role_recovery_setup(
-            store, escalation_role, routing_budget=routing_budget,
+            store, escalation_role, routing_budget=routing_budget, multi_model=multi_model,
         )
     control = scheduler(store)
     request, decision = routed_pair(reg, config, policy, contract_hash=contract.contract_hash)
+    if multi_model:
+        from orchestrator.routing import ModelRouter
+        seed = SimpleNamespace(store=store, scheduler=control, registry=reg, config=config, policy=policy)
+        decision = ModelRouter().route(
+            request, config=config, registry=reg, contract=contract, **routing_observations(seed),
+        )
     times = dict(accepted_at=NOW + timedelta(seconds=1), lease_expires_at=NOW + timedelta(minutes=1))
     if legacy_input:
         accepted = control.accept_routing(request, decision, **times)
@@ -87,23 +93,36 @@ def consume_recovery(case, *, source_decision=None, plan=None, retry_level=1,
     return request, decision, accepted
 
 
-def _role_recovery_setup(store, role, *, routing_budget=False):
+def _role_recovery_setup(store, role, *, routing_budget=False, multi_model=False):
     from orchestrator.config import ConfigCandidate, ConfigManager, EffectiveConfig, resolve_effective_config
     from orchestrator.lifecycle import LifecycleController, NodeSpec
     from orchestrator.security import PolicyAuthority, PolicyManifest
 
     reg = registry()
+    if multi_model:
+        from orchestrator.config.models import ModelRegistryManifest, ModelSpec
+        original = reg.models[0].model_dump()
+        reg = ModelRegistryManifest(providers=reg.providers, models=(reg.models[0], *(
+            ModelSpec(**{**original, "id": model_id, "remote_model": "remote-" + model_id, "tier": tier})
+            for model_id, tier in (("model-2", "economy"), ("model-3", "standard"))
+        )))
     values = effective_config(reg).config.model_dump(mode="json")
     for preset in values["presets"].values():
         preset["roles"]["coder"]["escalate_to"] = role
+        if multi_model:
+            preset["roles"]["coder"]["candidates"] = [
+                model.id for model in reg.models if role is None or model.tier == "economy"
+            ]
         if routing_budget:
             preset["requested_budget"]["max_total_tokens"] = 5000
     if routing_budget:
         values["policy_envelope"]["max_total_tokens"] = 5000
+    if multi_model:
+        values["policy_envelope"]["allowed_models"] = [model.id for model in reg.models]
     resolved = resolve_effective_config(EffectiveConfig.model_validate(values), registry=reg)
     policy = PolicyManifest(authorities=(PolicyAuthority(
         source="system", max_permission="read-only", allowed_actions={"model_invoke"},
-        allowed_tools={"model:model-1"},
+        allowed_tools={"model:" + model.id for model in reg.models},
     ),))
     contract = _fixture_contract(reg, resolved.config, policy)
     ConfigManager(ConfigCandidate(resolved=resolved, registry=reg)).start_run("run-1", store)
@@ -125,7 +144,7 @@ def routing_observations(case):
         ModelHealthSnapshot, SecretAvailability,
     )
 
-    balance = BudgetLedger(case.store).available("run-1")
+    balance = case.scheduler._ledger_for_run("run-1").available("run-1")
     preset = case.config.presets[case.config.active_preset]
     policy = case.config.health_policies[preset.health_policy_ref]
     controller = HealthController(case.store)

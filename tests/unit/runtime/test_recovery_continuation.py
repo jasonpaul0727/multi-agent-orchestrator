@@ -11,9 +11,9 @@ from orchestrator.persistence import SQLiteEventStore
 from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
 from orchestrator.runtime.worker_input_service import WorkerInputService
 from tests.support.recovery_continuation import (
-    durable_state, recovery_case, rewrite_event_payload, routing_observations,
+    consume_recovery, durable_state, recovery_case, rewrite_event_payload, routing_observations,
 )
-from tests.unit.lifecycle.test_scheduler import NOW
+from tests.unit.lifecycle.test_scheduler import NOW, routed_pair, scheduler
 
 
 TEXT = "implement a small change"
@@ -132,3 +132,145 @@ def test_nested_acceptance_failure_rolls_back_all_resources(tmp_path, monkeypatc
         with pytest.raises(RecoveryContinuationError):
             admit(case)
         assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("code,escalate,action,model", [
+    ("provider_unavailable", None, "same_tier_fallback", "model-2"),
+    ("context_length_exceeded", "tier:standard", "capability_escalation", "model-3"),
+])
+def test_real_router_admits_fallback_and_escalation(tmp_path, code, escalate, action, model):
+    # Catches reusing the failed model or ignoring the persisted authorized candidates.
+    with SQLiteEventStore(tmp_path / "recovery.db") as store:
+        case = recovery_case(store, routing_budget=True, multi_model=True,
+                             failure_code=code, escalation_role=escalate)
+        assert case.decision.selected_model_id == "model-1"
+        assert len(case.decision.candidate_assessments) == (3 if escalate is None else 2)
+        assert case.plan.action == action
+        source_events = tuple(store.read_stream("scheduler", "global"))
+        result = admit(case)
+        assert (result.status, result.accepted_route.model_id) == ("admitted", model)
+        event = store.read_stream("scheduler", "global")[-1]
+        assert event.payload["recovery_action"] == action
+        assert event.payload["prior_decision_hash"] == case.decision.decision_hash
+        assert event.payload["recovery_authorization_hash"] == case.plan.authorization.authorization_hash
+        assert tuple(store.read_stream("scheduler", "global")[:-1]) == source_events
+        assert case.scheduler.agents.replay("run-1").total_created == 2
+        before = durable_state(store)
+        assert admit(case, routing_inputs=None).accepted_route == result.accepted_route
+        assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["derived", "existing-scheduler-api"])
+def test_committed_response_loss_replays_exact_identity_before_routing(tmp_path, monkeypatch, legacy):
+    # Catches duplicate holds after lost response, new observations/time or legacy consumed IDs.
+    database = tmp_path / "replay.db"
+    with SQLiteEventStore(database) as store:
+        case = recovery_case(store, routing_budget=True)
+        if legacy:
+            _, _, accepted = consume_recovery(case)
+            route = accepted.accepted_route
+        else:
+            append = store.append_checked
+
+            def lose_outer_response(stream_type, stream_id, key, decide):
+                result = append(stream_type, stream_id, key, decide)
+                if key == "recovery-continuation-snapshot":
+                    raise RuntimeError("response lost after commit")
+                return result
+
+            with monkeypatch.context() as patch:
+                patch.setattr(store, "append_checked", lose_outer_response)
+                with pytest.raises(RecoveryContinuationError):
+                    admit(case)
+            from orchestrator.models import AcceptedModelRoute
+            route = AcceptedModelRoute.model_validate(
+                store.read_stream("scheduler", "global")[-1].payload["accepted_route"],
+            )
+        before = durable_state(store)
+    with SQLiteEventStore(database) as reopened:
+        case.store, case.scheduler = reopened, scheduler(reopened)
+        from orchestrator.runtime.recovery_continuation import RecoveryRoutingInputs
+        observations = routing_observations(case)
+        observations["eligibility"] = observations["eligibility"].model_copy(update={
+            "available_tokens": 0, "authorization_revoked": True,
+        })
+        for routing in (None, RecoveryRoutingInputs(**observations)):
+            result = admit(case, routing_inputs=routing, accepted_at=NOW + timedelta(seconds=20),
+                           lease_expires_at=NOW + timedelta(minutes=4))
+            assert result.status == "already_admitted" and result.accepted_route == route
+            assert result.task is None and result.opportunity.successor == route
+            assert durable_state(reopened) == before
+        waiting = admit(case, task_text=None, routing_inputs=None)
+        assert waiting.status == "waiting_for_input" and waiting.accepted_route == route
+        with pytest.raises(RecoveryContinuationError) as caught:
+            admit(case, task_text="different explicit input", routing_inputs=None)
+        assert caught.value.code == "recovery_input_mismatch"
+        assert durable_state(reopened) == before
+
+
+@pytest.mark.parametrize("state", ["failed", "paused", "cancelling", "expired", "unknown", "newer"])
+def test_consumed_inactive_successor_keeps_identity_without_stale_authority(tmp_path, state):
+    # Catches historical consumption being returned as current active authority.
+    with SQLiteEventStore(tmp_path / "inactive.db") as store:
+        case = recovery_case(store, routing_budget=True)
+        _, _, accepted = consume_recovery(case)
+        as_of = NOW + timedelta(seconds=20)
+        if state in {"failed", "unknown", "newer"}:
+            case.scheduler.finish_attempt(
+                run_id="run-1", node_id="node-1", attempt_id=accepted.accepted_route.attempt_id,
+                fencing_generation=2, completed_at=NOW + timedelta(seconds=12),
+                outcome="outcome_unknown" if state == "unknown" else "failed",
+                known_no_effect=state != "unknown",
+            )
+        if state == "paused":
+            case.lifecycle.pause_run("run-1", reason_code="user_request")
+        elif state == "cancelling":
+            case.lifecycle.request_cancel("run-1", reason_code="user_request")
+        elif state == "expired":
+            as_of = NOW + timedelta(minutes=2)
+        elif state == "newer":
+            request, decision = routed_pair(case.registry, case.config, case.policy, attempt=3,
+                                            contract_hash=case.contract.contract_hash)
+            WorkerInputService(case.scheduler).accept_routing_with_input(
+                request, decision, task_text=TEXT, accepted_at=NOW + timedelta(seconds=15),
+                lease_expires_at=NOW + timedelta(minutes=3),
+            )
+        before = durable_state(store)
+        result = admit(case, routing_inputs=None, accepted_at=as_of,
+                       lease_expires_at=NOW + timedelta(minutes=4))
+        assert result.status == "successor_inactive"
+        assert result.accepted_route == accepted.accepted_route and result.task is None
+        assert result.opportunity.successor == accepted.accepted_route
+        assert durable_state(store) == before
+
+
+def test_later_same_model_retry_preserves_exhausted_model_safety_boundary(tmp_path):
+    # Catches bypassing Router's conservative exhausted-model rule to force a retry.
+    from orchestrator.models import ModelGatewayFailure
+    from orchestrator.runtime.recovery_opportunities import RecoveryOpportunityService
+
+    with SQLiteEventStore(tmp_path / "retry.db") as store:
+        case = recovery_case(store, routing_budget=True)
+        request, decision, _ = consume_recovery(case)
+        case.scheduler.finish_attempt(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=2, completed_at=NOW + timedelta(seconds=12),
+            outcome="failed", known_no_effect=True,
+        )
+        plan = case.scheduler.plan_attempt_recovery(
+            run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+            fencing_generation=2, source_decision=decision, contract=case.contract,
+            failure=ModelGatewayFailure(code="rate_limited", phase="provider",
+                                       outcome="known_failure", retryable=True, http_status=429),
+        )
+        assert plan.action == "same_model_retry"
+        latest = RecoveryOpportunityService(case.scheduler).list_opportunities(run_id="run-1")[-1]
+        assert latest.status == "ready"
+        before = durable_state(store)
+        result = admit(case, source_attempt_id=request.attempt_id, source_fencing_generation=2,
+                       accepted_at=NOW + timedelta(seconds=15))
+        assert result.status == "blocked" and result.accepted_route is None
+        assert durable_state(store) == before
+        classified = store.read_stream("scheduler", "global")[-2]
+        evidence = classified.payload["classification"]["evidence"]
+        assert (evidence["retry_level"], evidence["exhausted_model_ids"]) == (1, ["model-1"])

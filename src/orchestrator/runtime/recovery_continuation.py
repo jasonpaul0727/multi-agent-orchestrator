@@ -19,7 +19,7 @@ from orchestrator.runtime.recovery_opportunities import (
 )
 from orchestrator.runtime.worker_input import WorkerInputError, build_worker_input_manifest
 from orchestrator.runtime.worker_input_service import WorkerInputService
-from orchestrator.scheduler import Scheduler
+from orchestrator.scheduler import Scheduler, SchedulerError
 from orchestrator.security import PolicyManifest
 from orchestrator.validation import revalidate_model
 
@@ -106,7 +106,8 @@ class RecoveryContinuationService:
                     )
 
                 # Terminal sources have historical commitments, not active task authority.
-                node = self._scheduler.lifecycle.replay(run_id).node(node_id)
+                state = self._scheduler.lifecycle.replay(run_id)
+                node = state.node(node_id)
                 binding = source.payload.get("verification_admission")
                 if task_text is not None:
                     try:
@@ -126,6 +127,23 @@ class RecoveryContinuationService:
                     result = respond("waiting_for_input", "explicit_input_required")
                     return None
                 if existing is not None:
+                    # Consumption is historical; only the exact current lease
+                    # can still be considered an active successor. Resolve it
+                    # before touching new routing observations or request IDs.
+                    active = None
+                    if state.status == "running" and node.attempts[-1].attempt_id == existing.attempt_id:
+                        try:
+                            active = self._scheduler.resolve_active_attempt(
+                                run_id=run_id, node_id=node_id, attempt_id=existing.attempt_id,
+                                fencing_generation=existing.fencing_generation, as_of=accepted_at,
+                            )
+                        except SchedulerError:
+                            pass
+                    if active is None:
+                        result = respond("successor_inactive", "recovery_successor_inactive")
+                        return None
+                    if active.accepted_route != existing:
+                        raise RecoveryContinuationError("recovery_continuation_failed")
                     result = respond("already_admitted", "recovery_authorization_consumed")
                     return None
                 if routing_inputs is None:
