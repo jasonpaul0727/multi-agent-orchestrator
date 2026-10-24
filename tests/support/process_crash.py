@@ -7,6 +7,23 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 
 
+def receive_process_message(pipe: Connection, *, timeout_seconds: float = 15.0):
+    """Receive a test rendezvous without leaving the parent or child unbounded."""
+    assert pipe.poll(timeout_seconds), "process rendezvous timed out"
+    return pipe.recv()
+
+
+def reap_process(process: BaseProcess, *, timeout_seconds: float = 10.0) -> None:
+    """Bound cleanup even when an assertion leaves a spawned child at a barrier."""
+    if process.pid is None:
+        return
+    process.join(timeout=timeout_seconds)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=timeout_seconds)
+    assert not process.is_alive(), "spawned child was not reaped"
+
+
 def _point_bytes(point: str) -> bytes:
     if not isinstance(point, str):
         raise ValueError("crash point must be a non-empty ASCII name up to 96 bytes")

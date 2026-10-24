@@ -14,6 +14,21 @@ from tests.unit.lifecycle.test_scheduler import (
 )
 
 
+def application_recovery_case(database, **options):
+    """Seed durable recovery through one owned application connection."""
+    from orchestrator.application import ControlPlaneApplication
+    from tests.unit.lifecycle.test_scheduler import _application_limits
+
+    app = ControlPlaneApplication(database, limits=_application_limits())
+    try:
+        case = recovery_case(app._event_store, **options)
+        case.app, case.scheduler = app, app._scheduler
+        return case
+    except BaseException:
+        app.close()
+        raise
+
+
 def recovery_case(store, *, failure_code="rate_limited", unknown=False,
                   legacy_input=False, escalation_role=None, accounted_usage=False,
                   routing_budget=False, multi_model=False, limits=None, priced=False,
