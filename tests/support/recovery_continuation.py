@@ -153,7 +153,7 @@ def _role_recovery_setup(store, role, *, routing_budget=False, multi_model=False
     return reg, resolved.config, lifecycle, policy, contract
 
 
-def routing_observations(case):
+def routing_observations(case, *, as_of=NOW):
     """Data-only observations for the real Router; no credentials are acquired."""
     from orchestrator.models import FXSnapshot, TokenizerBinding, TokenizerSnapshot
     from orchestrator.routing import (
@@ -194,11 +194,11 @@ def routing_observations(case):
         tokenizer_snapshot=TokenizerSnapshot(bindings=tuple(TokenizerBinding(
             model_id=model.id, tokenizer_id="tokenizer.fixed", tokenizer_version="1",
             estimator_id="tokens.v1", estimator_version="1",
-            effective_from=NOW - timedelta(days=1), expires_at=NOW + timedelta(days=1),
+            effective_from=as_of - timedelta(days=1), expires_at=as_of + timedelta(days=1),
         ) for model in case.registry.models)),
         fx_snapshot=FXSnapshot(
             base_currency="USD", source_id="fx.fixture", rates=(),
-            effective_from=NOW - timedelta(days=1), expires_at=NOW + timedelta(days=1),
+            effective_from=as_of - timedelta(days=1), expires_at=as_of + timedelta(days=1),
         ),
     )
 

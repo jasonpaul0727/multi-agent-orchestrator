@@ -20,7 +20,7 @@ from orchestrator.routing import (
 )
 from orchestrator.runtime.contracts import WorkerTask
 from orchestrator.runtime.recovery_opportunities import (
-    RecoveryContinuationError, RecoveryOpportunity, load_recovery_records,
+    RecoveryContinuationError, RecoveryOpportunity, _unsettled_nodes, load_recovery_records,
 )
 from orchestrator.runtime.worker_input import WorkerInputError, build_worker_input_manifest
 from orchestrator.runtime.worker_input_service import WorkerInputService
@@ -141,22 +141,104 @@ class RecoveryContinuationResult(BaseModel):
         return self
 
 
+def _check_owned_worker_inputs(scheduler, worker_inputs):
+    if type(worker_inputs) is not WorkerInputService:
+        raise RecoveryContinuationError("recovery_continuation_invalid")
+    # Require owned storage so instance methods cannot become foreign callbacks.
+    inputs_state = vars(worker_inputs)
+    if (type(inputs_state) is not dict or len(inputs_state) != 2
+        or any(type(key) is not str or key not in {"_scheduler", "_clock"} for key in inputs_state)
+        or inputs_state.get("_scheduler") is not scheduler):
+        raise RecoveryContinuationError("recovery_continuation_invalid")
+
+
 class RecoveryContinuationService:
     """Route and consume one persisted authorization in one checked transaction."""
 
     def __init__(self, scheduler: Scheduler, worker_inputs: WorkerInputService) -> None:
-        if type(worker_inputs) is not WorkerInputService:
-            raise RecoveryContinuationError("recovery_continuation_invalid")
-        # Require the owned implementation and its exact authority owner before
-        # admission. Only the legacy clock is injectable; instance methods must
-        # not become foreign callbacks in the recovery preparation transaction.
-        inputs_state = vars(worker_inputs)
-        if (type(inputs_state) is not dict or len(inputs_state) != 2
-            or any(type(key) is not str or key not in {"_scheduler", "_clock"} for key in inputs_state)
-            or inputs_state.get("_scheduler") is not scheduler):
-            raise RecoveryContinuationError("recovery_continuation_invalid")
+        _check_owned_worker_inputs(scheduler, worker_inputs)
         self._scheduler = scheduler
         self._worker_inputs = worker_inputs
+
+    def continue_recovery(
+        self, *, run_id: str, node_id: str, source_attempt_id: str,
+        source_fencing_generation: int, task_text: str | None = None,
+        routing_inputs: RecoveryRoutingInputs | None = None,
+        accepted_at: datetime, lease_expires_at: datetime,
+    ) -> RecoveryContinuationResult:
+        """Commit admission, then independently recheck current task authority."""
+        _check_owned_worker_inputs(self._scheduler, self._worker_inputs)
+        admitted = self.admit(
+            run_id=run_id, node_id=node_id, source_attempt_id=source_attempt_id,
+            source_fencing_generation=source_fencing_generation, task_text=task_text,
+            routing_inputs=routing_inputs, accepted_at=accepted_at, lease_expires_at=lease_expires_at,
+        )
+        route = admitted.accepted_route
+        if route is None or task_text is None:
+            return admitted
+        result = admitted.model_copy(update={"status": "admitted", "reason": "task_preparation_failed"})
+        try:
+            def prepare_under_lock(events, _version):
+                nonlocal result
+                records = load_recovery_records(self._scheduler, run_id=run_id, events=events)
+                record = next(item for item in records if (
+                    item.opportunity.node_id == node_id
+                    and item.opportunity.source_attempt_id == source_attempt_id
+                    and item.opportunity.source_fencing_generation == source_fencing_generation
+                ))
+                if record.opportunity.successor != route:
+                    raise RecoveryContinuationError("recovery_continuation_failed")
+
+                def respond(status, reason, task=None):
+                    return RecoveryContinuationResult(
+                        status=status, reason=reason, opportunity=record.opportunity,
+                        accepted_route=route, task=task,
+                    )
+
+                recovered = self._scheduler.recovery.recover(run_id)
+                state = recovered.lifecycle
+                node = state.node(node_id)
+                if state.status != "running":
+                    result = respond("blocked", "run_" + state.status)
+                    return None
+                sources = {event.payload["attempt_ref"]: event for event in events
+                           if event.event_type == "RoutingDecisionAccepted" and event.run_id == run_id}
+                if (node_id in _unsettled_nodes(self._scheduler, run_id=run_id, sources=sources)
+                    or any(effect.node_id == node_id and effect.status == "outcome_unknown"
+                           for effect in recovered.effects)
+                    or any(attempt.node_id == node_id and attempt.status == "outcome_unknown"
+                           for attempt in recovered.active_attempts)):
+                    result = respond("reconciliation_required", "provider_outcome_unknown")
+                    return None
+                if node.attempts[-1].attempt_id != route.attempt_id:
+                    result = respond("successor_inactive", "recovery_successor_inactive")
+                    return None
+                try:
+                    active = self._scheduler.resolve_active_attempt(
+                        run_id=run_id, node_id=node_id, attempt_id=route.attempt_id,
+                        fencing_generation=route.fencing_generation, as_of=datetime.now(timezone.utc),
+                    )
+                except SchedulerError:
+                    result = respond("successor_inactive", "recovery_successor_inactive")
+                    return None
+                if active.accepted_route != route:
+                    raise RecoveryContinuationError("recovery_continuation_failed")
+                task = WorkerInputService._prepare_recovery_worker_task(
+                    self._worker_inputs, run_id=run_id, node_id=node_id,
+                    attempt_id=route.attempt_id, fencing_generation=route.fencing_generation,
+                    task_text=task_text,
+                )
+                result = respond("prepared", "recovery_task_prepared", task)
+                return None
+
+            self._scheduler.event_store.append_checked(
+                "scheduler", "global", "recovery-preparation-snapshot", prepare_under_lock,
+            )
+            return result
+        except Exception:
+            pass
+        # Admission is already committed even if preparation or its response fails.
+        return admitted.model_copy(update={"status": "admitted", "reason": "task_preparation_failed"})
 
     def admit(
         self, *, run_id: str, node_id: str, source_attempt_id: str,
