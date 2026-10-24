@@ -30,6 +30,10 @@ from orchestrator.runtime.verification_journal import (
 )
 from orchestrator.runtime.verifier_process import IsolatedVerifierProcess
 from orchestrator.runtime.contracts import WorkerTask
+from orchestrator.runtime.recovery_continuation import (
+    RecoveryContinuationResult, RecoveryContinuationService, RecoveryRoutingInputs,
+)
+from orchestrator.runtime.recovery_opportunities import RecoveryOpportunity, RecoveryOpportunityService
 from orchestrator.runtime.worker_input_service import WorkerInputService
 from orchestrator.runtime.workspace_execution import (
     WorkspaceExecutionHost, WorkspaceExecutionResult, WorkspaceExecutionService,
@@ -100,6 +104,8 @@ class ControlPlaneApplication:
             )
             self._scheduler = Scheduler(store, limits=limits, artifact_store=self._artifact_store)
             self._worker_inputs = WorkerInputService(self._scheduler)
+            self._recovery_opportunities = RecoveryOpportunityService(self._scheduler)
+            self._recovery_continuation = RecoveryContinuationService(self._scheduler, self._worker_inputs)
             self._workspace_execution = WorkspaceExecutionService(
                 scheduler=self._scheduler, database=database, host=workspace_execution_host,
             )
@@ -314,6 +320,25 @@ class ControlPlaneApplication:
     def recover_run(self, run_id: str) -> RecoveredRun:
         self._require_ready()
         return self._scheduler.recovery.recover(run_id)
+
+    def list_recovery_opportunities(self, *, run_id: str) -> tuple[RecoveryOpportunity, ...]:
+        """Read durable recovery metadata after startup has committed."""
+        self._require_ready()
+        return self._recovery_opportunities.list_opportunities(run_id=run_id)
+
+    def continue_recovery(
+        self, *, run_id: str, node_id: str, source_attempt_id: str,
+        source_fencing_generation: int, task_text: str | None = None,
+        routing_inputs: RecoveryRoutingInputs | None = None,
+        accepted_at: datetime, lease_expires_at: datetime,
+    ) -> RecoveryContinuationResult:
+        """Explicitly re-supply input to admit and prepare a recovery successor."""
+        self._require_ready()
+        return self._recovery_continuation.continue_recovery(
+            run_id=run_id, node_id=node_id, source_attempt_id=source_attempt_id,
+            source_fencing_generation=source_fencing_generation, task_text=task_text,
+            routing_inputs=routing_inputs, accepted_at=accepted_at, lease_expires_at=lease_expires_at,
+        )
 
     def reconcile_provider_call(
         self, stream_id: str, *, raw_evidence: bytes,

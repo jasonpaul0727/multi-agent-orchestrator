@@ -530,6 +530,7 @@ class RunRecoveryCoordinator:
                     plan_event, plan = persisted
                     if (
                         plan_event.run_id != run_id
+                        or plan.outcome != "authorized"
                         or plan_event.payload.get("decision_hash") != prior_decision_hash
                         or plan.action != recovery_action
                         or route.model_id not in plan.authorized_model_ids
@@ -665,7 +666,9 @@ class RunRecoveryCoordinator:
                 except (TypeError, ValueError) as exc:
                     raise RunRecoveryError("persisted RecoveryPlan is invalid") from exc
                 authorization = plan.authorization
-                if plan.outcome == "authorized":
+                if plan.outcome == "authorized" or (
+                    plan.outcome == "new_child_required" and authorization is not None
+                ):
                     if (
                         authorization is None
                         or authorization.source_decision_hash != record.get("decision_hash")
@@ -675,6 +678,11 @@ class RunRecoveryCoordinator:
                         != authorization.authorized_model_ids
                     ):
                         raise RunRecoveryError("persisted recovery authorization is inconsistent")
+                    if plan.outcome == "new_child_required" and (
+                        plan.action not in {"reviewer_node", "director_node"}
+                        or plan.target_role != plan.action.removesuffix("_node")
+                    ):
+                        raise RunRecoveryError("new-child recovery authorization has invalid role bindings")
                     if authorization.authorization_hash in plans_by_authorization:
                         raise RunRecoveryError("recovery authorization is persisted more than once")
                     plans_by_authorization[authorization.authorization_hash] = (event, plan)

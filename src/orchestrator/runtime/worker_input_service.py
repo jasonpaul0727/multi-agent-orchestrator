@@ -44,9 +44,30 @@ class WorkerInputService:
         fencing_generation: int, task_text: str,
     ) -> WorkerTask:
         """Return bounded data at a serialized validity point, without execution."""
+        return WorkerInputService._prepare_worker_task(
+            self, run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+            fencing_generation=fencing_generation, task_text=task_text, recovery=False,
+        )
+
+    def _prepare_recovery_worker_task(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, task_text: str,
+    ) -> WorkerTask:
+        """Owned recovery path; sample standard-library UTC only after locking."""
+        return WorkerInputService._prepare_worker_task(
+            self, run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+            fencing_generation=fencing_generation, task_text=task_text, recovery=True,
+        )
+
+    def _prepare_worker_task(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, task_text: str, recovery: bool,
+    ) -> WorkerTask:
+        """Share all binding/input/context/frame validation between both paths."""
         error_code = "worker_input_preparation_failed"
         try:
-            if (any(not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None
+            if (any((type(value) is not str if recovery else not isinstance(value, str))
+                    or _IDENTIFIER.fullmatch(value) is None
                     for value in (run_id, node_id, attempt_id))
                 or type(fencing_generation) is not int or fencing_generation <= 0):
                 raise WorkerInputError("worker_input_invalid")
@@ -56,7 +77,7 @@ class WorkerInputService:
 
             def prepare_under_lock(_events, _version):
                 nonlocal result
-                now = self._now()
+                now = datetime.now(timezone.utc) if recovery else self._now()
                 binding = self._scheduler.resolve_verification_binding(**identity, as_of=now)
                 context = revalidate_model(AttemptContext, binding.context)
                 state = self._scheduler.lifecycle.replay(run_id)
@@ -96,7 +117,8 @@ class WorkerInputService:
                 return None
 
             self._scheduler.event_store.append_checked(
-                "scheduler", "global", "worker-input-preparation-snapshot", prepare_under_lock,
+                "scheduler", "global", "worker-input-recovery-preparation-snapshot"
+                if recovery else "worker-input-preparation-snapshot", prepare_under_lock,
             )
             if result is None:
                 raise WorkerInputError("worker_input_preparation_failed")

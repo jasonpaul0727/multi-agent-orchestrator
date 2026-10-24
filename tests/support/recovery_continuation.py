@@ -1,0 +1,291 @@
+"""Real SQLite histories for explicit recovery continuation tests."""
+
+from contextlib import contextmanager
+from datetime import timedelta
+import hashlib
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from orchestrator.budget import BudgetLedger, UsageRecord
+from orchestrator.models import ModelGatewayFailure
+from orchestrator.runtime.worker_input_service import WorkerInputService
+from tests.unit.lifecycle.test_scheduler import (
+    NOW, _fixture_contract, _resolver_durable_state, effective_config, registry,
+    routed_pair, run_setup_with_frozen_contract, scheduler,
+)
+
+
+def application_recovery_case(database, **options):
+    """Seed durable recovery through one owned application connection."""
+    from orchestrator.application import ControlPlaneApplication
+    from tests.unit.lifecycle.test_scheduler import _application_limits
+
+    app = ControlPlaneApplication(database, limits=_application_limits())
+    try:
+        case = recovery_case(app._event_store, **options)
+        case.app, case.scheduler = app, app._scheduler
+        return case
+    except BaseException:
+        app.close()
+        raise
+
+
+@contextmanager
+def forbid_recovery_execution():
+    """Guard external effects before startup, recording even swallowed attempts."""
+    import subprocess
+    from orchestrator.models.gateway import ModelGateway
+    from orchestrator.models.transport import UrllibHTTPSTransport
+    from orchestrator.runtime.worker_process import IsolatedWorkerProcess
+    from orchestrator.secrets.broker import AuditedSecretBroker
+
+    attempted = []
+    with pytest.MonkeyPatch.context() as patch:
+        for target, method in (
+            (subprocess, "Popen"),
+            (ModelGateway, "__init__"), (ModelGateway, "invoke"),
+            (UrllibHTTPSTransport, "__init__"), (UrllibHTTPSTransport, "post_json"),
+            (IsolatedWorkerProcess, "__init__"), (IsolatedWorkerProcess, "execute"),
+            (AuditedSecretBroker, "__init__"),
+            (AuditedSecretBroker, "acquire_provider_credential_decision"),
+        ):
+            def forbidden(*args, boundary=f"{target.__name__}.{method}", **kwargs):
+                attempted.append(boundary)
+                raise AssertionError("recovery crossed an external execution boundary")
+
+            patch.setattr(target, method, forbidden)
+        yield attempted
+
+
+def recovery_case(store, *, failure_code="rate_limited", unknown=False,
+                  legacy_input=False, escalation_role=None, accounted_usage=False,
+                  routing_budget=False, multi_model=False, limits=None, priced=False,
+                  accounted_cost=1, tool_ids=(), task_text="implement a small change"):
+    if escalation_role is None and not routing_budget and not multi_model and not limits and not priced and not tool_ids:
+        reg, config, lifecycle, policy, contract = run_setup_with_frozen_contract(store)
+    else:
+        reg, config, lifecycle, policy, contract = _role_recovery_setup(
+            store, escalation_role, routing_budget=routing_budget, multi_model=multi_model,
+            limits=limits, priced=priced, tool_ids=tool_ids,
+        )
+    control = scheduler(store)
+    request, decision = routed_pair(reg, config, policy, contract_hash=contract.contract_hash)
+    if multi_model or priced:
+        from orchestrator.routing import ModelRouter
+        seed = SimpleNamespace(store=store, scheduler=control, registry=reg, config=config, policy=policy)
+        decision = ModelRouter().route(
+            request, config=config, registry=reg, contract=contract, **routing_observations(seed),
+        )
+    times = dict(accepted_at=NOW + timedelta(seconds=1), lease_expires_at=NOW + timedelta(minutes=1))
+    if legacy_input:
+        accepted = control.accept_routing(request, decision, **times)
+    else:
+        accepted = WorkerInputService(control).accept_routing_with_input(
+            request, decision, task_text=task_text, **times,
+        )
+    usage = UsageRecord(run_id="run-1", reservation_id=accepted.reservation.reservation_id,
+                        settlement_key="accounted-provider-usage", currency="USD", cost_minor=accounted_cost) if accounted_usage else None
+    control.finish_attempt(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, completed_at=NOW + timedelta(seconds=5),
+        outcome="outcome_unknown" if unknown else "failed",
+        known_no_effect=not unknown and usage is None, usage=usage,
+    )
+    plan = control.plan_attempt_recovery(
+        run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
+        fencing_generation=1, source_decision=decision, contract=contract,
+        failure=ModelGatewayFailure(
+            code=failure_code, phase="provider", outcome="unknown" if unknown else "known_failure",
+            retryable=not unknown, http_status=None if unknown else 429,
+        ),
+    )
+    return SimpleNamespace(
+        store=store, scheduler=control, registry=reg, config=config, lifecycle=lifecycle,
+        policy=policy, contract=contract, request=request, decision=decision,
+        accepted=accepted, plan=plan,
+    )
+
+
+def durable_state(store):
+    """Include all SQLite rows plus public resource projections."""
+    control = scheduler(store)
+    recovered = control.recovery.recover("run-1")
+    return (
+        tuple(store._connection.iterdump()), _resolver_durable_state(store),
+        BudgetLedger(store).available("run-1"), control.agents.replay("run-1"),
+        recovered.active_attempts,
+    )
+
+
+def consume_recovery(case, *, source_decision=None, plan=None, retry_level=1,
+                     exhausted_model_ids=()):
+    """Admit a real successor through the persisted Scheduler authorization."""
+    source_decision = case.decision if source_decision is None else source_decision
+    plan = case.plan if plan is None else plan
+    request, decision = routed_pair(
+        case.registry, case.config, case.policy,
+        attempt=source_decision.fencing_generation + 1, contract_hash=case.contract.contract_hash,
+        recovery_action=plan.action, recovery_authorization=plan.authorization,
+        prior_decision_hash=source_decision.decision_hash, previous_model_id="model-1",
+        failure_category="transient", retry_level=retry_level,
+        exhausted_model_ids=exhausted_model_ids,
+    )
+    accepted = WorkerInputService(case.scheduler).accept_routing_with_input(
+        request, decision, task_text="implement a small change",
+        accepted_at=NOW + timedelta(seconds=6 + request.fencing_generation),
+        lease_expires_at=NOW + timedelta(minutes=2),
+    )
+    return request, decision, accepted
+
+
+def _role_recovery_setup(store, role, *, routing_budget=False, multi_model=False,
+                         limits=None, priced=False, tool_ids=()):
+    from orchestrator.config import ConfigCandidate, ConfigManager, EffectiveConfig, resolve_effective_config
+    from orchestrator.lifecycle import LifecycleController, NodeSpec
+    from orchestrator.security import PolicyAuthority, PolicyManifest
+
+    reg = registry()
+    if priced:
+        from orchestrator.config.models import ModelRegistryManifest, ModelSpec, PriceSpec
+        reg = ModelRegistryManifest(providers=reg.providers, models=(ModelSpec(**{
+            **reg.models[0].model_dump(), "local_zero_cost": False,
+            "price": PriceSpec(
+                currency="USD", input_minor_per_million=10000, output_minor_per_million=10000,
+                max_tool_cost_minor=0, estimator_id="tokens.v1",
+                effective_from=NOW - timedelta(days=1), expires_at=NOW + timedelta(days=1),
+            ),
+        }),))
+    if multi_model:
+        from orchestrator.config.models import ModelRegistryManifest, ModelSpec
+        original = reg.models[0].model_dump()
+        reg = ModelRegistryManifest(providers=reg.providers, models=(reg.models[0], *(
+            ModelSpec(**{**original, "id": model_id, "remote_model": "remote-" + model_id, "tier": tier})
+            for model_id, tier in (("model-2", "economy"), ("model-3", "standard"))
+        )))
+    values = effective_config(reg).config.model_dump(mode="json")
+    for preset in values["presets"].values():
+        preset["roles"]["coder"]["escalate_to"] = role
+        if multi_model:
+            preset["roles"]["coder"]["candidates"] = [
+                model.id for model in reg.models if role is None or model.tier == "economy"
+            ]
+        if routing_budget:
+            preset["requested_budget"]["max_total_tokens"] = 5000
+    if routing_budget:
+        values["policy_envelope"]["max_total_tokens"] = 5000
+    if multi_model:
+        values["policy_envelope"]["allowed_models"] = [model.id for model in reg.models]
+    caps = {key: value for key, value in (limits or {}).items() if key != "max_attempts"}
+    values["policy_envelope"].update(caps)
+    for preset in values["presets"].values():
+        preset["requested_budget"].update(caps)
+    resolved = resolve_effective_config(EffectiveConfig.model_validate(values), registry=reg)
+    policy = PolicyManifest(authorities=(PolicyAuthority(
+        source="system", max_permission="read-only", allowed_actions={"model_invoke"},
+        allowed_tools={"model:" + model.id for model in reg.models},
+    ),))
+    contract = _fixture_contract(reg, resolved.config, policy)
+    ConfigManager(ConfigCandidate(resolved=resolved, registry=reg)).start_run("run-1", store)
+    lifecycle = LifecycleController(store)
+    lifecycle.initialize_run("run-1")
+    lifecycle.append_nodes("run-1", (NodeSpec(
+        node_id="node-1", role="coder", planning_contract_hash=contract.contract_hash,
+        planning_contract=contract, max_attempts=(limits or {}).get("max_attempts", 3), tool_ids=tool_ids,
+    ),), expected_graph_version=0, idempotency_key="initial-graph", policy_manifest=policy)
+    lifecycle.start_run("run-1")
+    return reg, resolved.config, lifecycle, policy, contract
+
+
+def routing_observations(case, *, as_of=NOW):
+    """Data-only observations for the real Router; no credentials are acquired."""
+    from orchestrator.models import FXSnapshot, TokenizerBinding, TokenizerSnapshot
+    from orchestrator.routing import (
+        EligibilitySnapshot, HealthAggregateKey, HealthController,
+        ModelHealthSnapshot, SecretAvailability,
+    )
+
+    balance = case.scheduler._ledger_for_run("run-1").available("run-1")
+    preset = case.config.presets[case.config.active_preset]
+    policy = case.config.health_policies[preset.health_policy_ref]
+    controller = HealthController(case.store)
+    health = []
+    for model in case.registry.models:
+        provider_key = HealthAggregateKey(
+            registry_manifest_hash=case.registry.content_hash,
+            scope="provider", provider_id=model.provider,
+        )
+        model_key = HealthAggregateKey(
+            registry_manifest_hash=case.registry.content_hash,
+            scope="model", provider_id=model.provider, model_id=model.id,
+        )
+        health.append(ModelHealthSnapshot(
+            provider_id=model.provider, model_id=model.id,
+            provider=controller.read(provider_key, default_policy=policy).routing_ref,
+            model=controller.read(model_key, default_policy=policy).routing_ref,
+        ))
+    return dict(
+        eligibility=EligibilitySnapshot(
+            policy_manifest_hash=case.policy.content_hash,
+            budget_ledger_version=case.store.current_version("budget", "run-1"),
+            budget_currency=balance.currency, available_cost_minor=balance.available_minor,
+            available_tokens=balance.available_tokens,
+            secret_availability=(SecretAvailability(
+                secret_ref="env:MODEL_KEY", available=True, version=0,
+            ),), model_health=tuple(health), revocation_version=0, emergency_deny_version=0,
+        ),
+        policy_manifest=case.policy,
+        tokenizer_snapshot=TokenizerSnapshot(bindings=tuple(TokenizerBinding(
+            model_id=model.id, tokenizer_id="tokenizer.fixed", tokenizer_version="1",
+            estimator_id="tokens.v1", estimator_version="1",
+            effective_from=as_of - timedelta(days=1), expires_at=as_of + timedelta(days=1),
+        ) for model in case.registry.models)),
+        fx_snapshot=FXSnapshot(
+            base_currency="USD", source_id="fx.fixture", rates=(),
+            effective_from=as_of - timedelta(days=1), expires_at=as_of + timedelta(days=1),
+        ),
+    )
+
+
+def rewrite_event_payload(store, event_type, mutate, *, attempt_id=None, stream_type="scheduler",
+                          stream_id="global"):
+    """Inject hostile serialized history without weakening production write APIs."""
+    event = next(event for event in store.read_stream(stream_type, stream_id)
+                 if event.event_type == event_type
+                 and (attempt_id is None or event.attempt_id == attempt_id))
+    payload = json.loads(json.dumps(event.payload))
+    mutate(payload)
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    trigger = store._connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='events_immutable_update'"
+    ).fetchone()[0]
+    store._connection.execute("DROP TRIGGER events_immutable_update")
+    try:
+        store._connection.execute(
+            "UPDATE events SET payload_json=?, payload_hash=? WHERE event_id=?",
+            (encoded, hashlib.sha256(encoded.encode()).hexdigest(), event.event_id),
+        )
+    finally:
+        store._connection.execute(trigger)
+
+
+def duplicate_event(store, event_type):
+    """Clone a corrupt row directly, preserving valid JSON hashes and stream numbering."""
+    row = store._connection.execute(
+        "SELECT * FROM events WHERE event_type=? ORDER BY stream_version LIMIT 1", (event_type,),
+    ).fetchone()
+    values = dict(row)
+    values["event_id"] = "corrupt-duplicate-event"
+    version = store._connection.execute(
+        "SELECT current_version FROM stream_versions WHERE stream_type=? AND stream_id=?",
+        (values["stream_type"], values["stream_id"]),
+    ).fetchone()[0] + 1
+    values["stream_version"] = version
+    names = ",".join(values)
+    parameters = ",".join("?" for _ in values)
+    store._connection.execute(f"INSERT INTO events ({names}) VALUES ({parameters})", tuple(values.values()))
+    store._connection.execute(
+        "UPDATE stream_versions SET current_version=? WHERE stream_type=? AND stream_id=?",
+        (version, values["stream_type"], values["stream_id"]),
+    )
