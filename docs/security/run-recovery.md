@@ -131,9 +131,14 @@ an automatic Worker retry loop; the host still has to decide to call it and
 route the next Attempt.
 
 The measured 2026-10-05 matrix covers only the specified offline durable
-boundaries. Functional Worker/OS lifecycle stop coordination, bounded retry
-execution through a Worker/application service, and provider-side effect
-reconciliation remain unimplemented. Run-scoped artifact accounting covers
+boundaries. The host now supports explicit recovery inventory, persisted
+successor admission and separately gated task preparation; see
+[explicit recovery continuation](control-plane-startup.md#explicit-recovery-continuation)
+for typed observation trust sources, exact input re-supply and failure/replay
+behavior. These APIs do not execute the task. General resumed Worker execution,
+functional Worker/OS lifecycle recovery coordination and provider-side effect
+reconciliation remain open, along with this slice's Task 4 process/crash
+acceptance and independent whole-slice review. Run-scoped artifact accounting covers
 only durable publication intents; legacy or bare filesystem orphans remain
 unattributable. This is not full crash recovery and does not satisfy the P3 or
 V1 delivery gate by itself.

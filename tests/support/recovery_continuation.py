@@ -17,7 +17,7 @@ from tests.unit.lifecycle.test_scheduler import (
 def recovery_case(store, *, failure_code="rate_limited", unknown=False,
                   legacy_input=False, escalation_role=None, accounted_usage=False,
                   routing_budget=False, multi_model=False, limits=None, priced=False,
-                  accounted_cost=1, tool_ids=()):
+                  accounted_cost=1, tool_ids=(), task_text="implement a small change"):
     if escalation_role is None and not routing_budget and not multi_model and not limits and not priced and not tool_ids:
         reg, config, lifecycle, policy, contract = run_setup_with_frozen_contract(store)
     else:
@@ -38,7 +38,7 @@ def recovery_case(store, *, failure_code="rate_limited", unknown=False,
         accepted = control.accept_routing(request, decision, **times)
     else:
         accepted = WorkerInputService(control).accept_routing_with_input(
-            request, decision, task_text="implement a small change", **times,
+            request, decision, task_text=task_text, **times,
         )
     usage = UsageRecord(run_id="run-1", reservation_id=accepted.reservation.reservation_id,
                         settlement_key="accounted-provider-usage", currency="USD", cost_minor=accounted_cost) if accounted_usage else None
