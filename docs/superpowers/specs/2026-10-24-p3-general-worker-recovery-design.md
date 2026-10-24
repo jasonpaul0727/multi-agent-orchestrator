@@ -56,9 +56,39 @@ Router exhaustion mismatch remains safely blocked; do not bypass it.
 - Exact input text is re-supplied and checked against existing commitment.
   Validated response/candidate bytes may live only in explicitly configured
   private ArtifactStore content, never a new ad-hoc plaintext journal.
-- Host callbacks, Gateway, filesystem, systemd and clocks with caller code
-  never run inside SQLite checked callbacks. Use owned concrete validation
-  and trusted stdlib UTC sampled after authority-lock acquisition.
+- The new service rejects private SQLite/ArtifactStore/owner-lease roots that
+  resolve inside either readable workspace or trusted runtime-source tree.
+  Also reject roots within the bootstrap's ambient read grants (`/usr`,
+  canonical `/bin`/`/lib`/`/lib64`, `/etc` and `/dev`); merely being outside
+  workspace/runtime is insufficient when Landlock deliberately grants those.
+  Validate this host storage layout before any launch, outside SQLite locks;
+  keep state outside those readable trees rather than relying on a private
+  directory name. Legacy callers remain unchanged. Real isolation tests must
+  show that out-of-tree private state cannot be read by the child.
+- In the new general-Worker authority paths, host callbacks, Gateway,
+  filesystem, systemd and clocks with caller code never run inside SQLite
+  checked callbacks. Use owned concrete validation and trusted stdlib UTC
+  sampled after authority-lock acquisition. Existing legacy/bootstrap artifact
+  recovery still performs its prior file verification; this design does not
+  retroactively label that existing path callback/IO-free or refactor it all.
+
+Existing Scheduler active/binding resolution calls full Run recovery, which
+reads ArtifactStore files. Add an owned metadata-only control projection and
+internal Scheduler active/verification binding resolvers sharing the same
+lifecycle/agent/budget/effect consistency algorithm. The control projection
+has an explicit type that does not claim artifact-byte verification; never
+fake an ArtifactStore or silently set a public skip-verification flag. New
+general preparation, dispatch, continuation and terminal locked checks use
+that path. WorkerInputService gains an owned general preparation entry using
+the same exact-input validator and locked stdlib UTC. Existing non-general
+resolution keeps full recovery. AcceptanceCoordinator detects a registered
+general operation itself and uses the control binding, then independently
+reads/verifies artifacts outside the terminal transaction as before; callers
+cannot select a weaker resolver. Scheduler's direct general terminal entry
+also verifies required private artifact bytes before acquiring its own checked
+transaction, then atomically rechecks exact metadata/proposal/stop bindings.
+It rejects an ambient caller transaction before doing that file preflight;
+new general APIs never nest file verification inside a held SQLite lock.
 
 ## Components
 
@@ -89,6 +119,20 @@ ProviderCallJournal. Stable operation identity includes Run/Node/Attempt/
 generation/input commitment; immutable config/registry/route/workspace binding
 must match on every replay. Event version, causation, phase transitions,
 unique launch epochs and capped stream size are validated fail-closed.
+Each operation also binds a host-scope hash derived outside DB locks from
+trusted Linux boot identity, effective user identity and the concrete SQLite
+file authority (canonical-path commitment plus device/inode). The new runtime
+requires a regular file-backed DB and rejects hardlinked DB aliases, keeping
+one canonical ownership-lease authority; in-memory DB execution is unsupported.
+Copying into another DB file/path even within the same boot changes this
+authority. Restoring/rewinding a journal in place is outside this recovery
+contract and requires separate restore authority. This slice resumes
+within the same host boot only. A copied database or changed host/boot scope
+blocks before credentials, Worker launch or terminal acceptance; missing
+local units cannot prove that a different host's old Worker stopped. OS-boot
+and host migration resolution remain future authority work. Store the scope
+commitment only, not raw host identity; process-local ownership is still not
+a stop proof.
 
 Phases: `requested -> worker_requested -> worker_stopped -> call_reserved ->
 response_captured -> completion_requested -> completion_stopped -> proposed ->
@@ -160,6 +204,11 @@ acceptance, but cannot retroactively revoke delivery or release held usage.
 The journal's same-request single-writer claim remains mandatory. The service
 requires this owned authority; the Gateway's existing optional integration
 preserves other callers, and a plain is_accepted callback is insufficient here.
+Gateway also detects a registered general operation in its concrete same-store
+journal before invoking a route verifier/broker: that operation requires the
+owned dispatch authority even through the existing Gateway API. Omission or
+foreign authority cannot fall through to the legacy path. Non-general calls
+retain their prior behavior.
 
 Before ANY invoke on reopen, inspect all same-node Provider/effect history.
 Any dispatching/unknown/unrelated-unsettled outcome blocks credentials,
@@ -215,7 +264,9 @@ acceptance/invoke. Thus a kill after terminal commit but before API reply
 does not need the released active binding. A kill after proposal but before
 terminal commit still requires current authority. Existing terminal gates for
 failed outcomes also prohibit releasing a general operation with an unproved
-Worker stop; outcome_unknown keeps its holds. Cancellation/fencing/expiry
+Worker stop, including finish_attempt and reconcile_attempt and startup
+settlement paths; a Provider sender receipt cannot discharge this gate.
+outcome_unknown keeps its holds. Cancellation/fencing/expiry
 committed before acceptance wins. Existing non-general Attempts are unchanged.
 
 ## Recovery truth table

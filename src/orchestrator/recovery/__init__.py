@@ -17,6 +17,7 @@ from .bootstrap import (
 from .run import (
     RecoveredArtifact,
     RecoveredAttemptLease,
+    RecoveredControlState,
     RecoveredEffect,
     RecoveredPendingArtifact,
     RecoveredRun,
@@ -34,6 +35,7 @@ __all__ = [
     "RecoveryResult",
     "RecoveredArtifact",
     "RecoveredAttemptLease",
+    "RecoveredControlState",
     "RecoveredEffect",
     "RecoveredPendingArtifact",
     "RecoveredRun",

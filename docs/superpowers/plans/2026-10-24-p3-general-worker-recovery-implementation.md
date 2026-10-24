@@ -22,7 +22,7 @@
 - Same concrete SQLiteEventStore owns Scheduler, general operation journal and Provider journal.
 - Missing trusted usage, stop proof, response checkpoint or dispatch authority blocks; no caller-zero-cost success.
 - Unknown Provider effects never authorize invoke, credentials, rotated IDs or changed-attempt retry.
-- No callback, filesystem, systemd, broker or transport under SQLite checked callbacks; trusted UTC after lock acquisition.
+- In new general-Worker authority paths, no callback, filesystem, systemd, broker or transport under SQLite checked callbacks; trusted UTC after lock acquisition. Existing legacy/bootstrap artifact recovery retains its prior file checks and is not retroactively labelled IO-free.
 - Preserve existing blocked-only Worker, non-general Attempt paths and unavailable production usage defaults.
 - Work only in the existing codex/p3-systemd-termination-receipts worktree; no PR, deployment, main integration, cleanup, force-push, real credentials or paid Provider calls.
 - TDD, independent task spec/quality review and final whole-slice review; retain all evidence.
@@ -49,6 +49,9 @@
 - `application.py`: optional trusted composition, explicit ready-gated APIs and startup validation.
 - `models/transport.py`: optional concrete post-credential intent authority; existing callers preserved.
 - `scheduler/core.py`: operation-specific stop/capture gates, atomic accepted terminal linkage and validation.
+- `recovery/run.py`: explicit metadata-only control projection sharing control-state consistency validation with full recovery; full recovery still verifies artifact files.
+- `runtime/acceptance_coordinator.py`: chooses registered general operation's metadata binding itself, with independent byte verification outside terminal transaction.
+- `runtime/worker_input_service.py`: owned general preparation with metadata binding and locked stdlib UTC; shared exact-input validator, existing legacy path preserved.
 - Existing artifact, input, Provider journal and verifier APIs are reused. Avoid copying their validators/acceptance logic.
 
 Signatures below define cross-task contracts. Additional private helpers are
@@ -100,20 +103,20 @@ extend existing launcher tests as required.
 - `GeneralWorkerProcess.run_turn(workspace: Path, turn: GeneralWorkerTurn, *, prepared_launch: PreparedSandboxLaunch, cancellation=None) -> GeneralWorkerTurnResult` synchronously supervises a turn, exposing host launch receipt before wait via a separate `start_turn(...) -> GeneralWorkerSession`; the session's `wait()` returns result plus termination receipt. `GeneralWorkerTurnResult` has proposal, launch_receipt, termination_receipt, returncode, cancelled, timed_out, output_limited and input_written; confirmed stopped invalid/cancelled transport returns proposal=None, absent/mismatched stop raises detached IsolationStopUnknown. The service can persist ack before wait without an injected callback under a DB lock.
 
 **Feature A — pure protocol (first substantive commit/push):**
-- [ ] Write failing tests `test_request_roundtrip_binds_epoch_and_context`, `test_complete_emits_real_utf8_candidate`, `test_protocol_rejects_duplicate_unknown_nonfinite_stale_and_oversize`, `test_constructed_subclass_rejected_without_callback`. Assert1MiB frame and16,384 output cap, exact context, SHA256 of actual content, no sensitive error text.
-- [ ] Run focused protocol tests and retain expected missing-interface RED.
-- [ ] Implement exact pure stdlib codecs and fixed request/complete child behavior; no Pydantic import in isolated child startup.
-- [ ] Run same tests GREEN; self-review; commit A, then wait for controller push/quota gate.
+- [x] Write failing tests `test_request_roundtrip_binds_epoch_and_context`, `test_complete_emits_real_utf8_candidate`, `test_protocol_rejects_duplicate_unknown_nonfinite_stale_and_oversize`, `test_constructed_subclass_rejected_without_callback`. Assert1MiB frame and16,384 output cap, exact context, SHA256 of actual content, no sensitive error text.
+- [x] Run focused protocol tests and retain expected missing-interface RED.
+- [x] Implement exact pure stdlib codecs and fixed request/complete child behavior; no Pydantic import in isolated child startup.
+- [x] Run same tests GREEN; self-review; commit A, then wait for controller push/quota gate.
 
 **Feature B — supervised lifecycle (second substantive commit/push):**
-- [ ] Add failing tests `test_prepared_identity_precedes_launch`, `test_ack_requires_observed_identity`, `test_epoch_cannot_be_reused_or_substituted`, `test_missing_stop_never_yields_candidate`, `test_old_worker_remains_blocked`.
-- [ ] Implement prepared launcher extension, start/wait session and exact whole-unit stop using owned existing primitives. No receipt constructed from returncode or Provider sender stop. Detached no-start/start-unknown/stop-unknown states remain distinct.
-- [ ] Run focused new and existing launcher/Worker suites GREEN; commit B, wait for gate.
+- [x] Add failing tests `test_prepared_identity_precedes_launch`, `test_ack_requires_observed_identity`, `test_epoch_cannot_be_reused_or_substituted`, `test_missing_stop_never_yields_candidate`, `test_old_worker_remains_blocked`.
+- [x] Implement prepared launcher extension, start/wait session and exact whole-unit stop using owned existing primitives. No receipt constructed from returncode or Provider sender stop. Detached no-start/start-unknown/stop-unknown states remain distinct.
+- [x] Run focused new and existing launcher/Worker suites GREEN; commit B, wait for gate.
 
 **Feature C — required real isolation (third substantive commit/push):**
-- [ ] Add required-isolation tests `test_real_request_and_complete_turns_are_readonly_nonetwork`, `test_real_sigkill_worker_proves_empty_cgroup`, `test_prepared_unacked_launch_never_retries`. A real MainPID is killed with SIGKILL; no mocked receipt substitutes for it. No runtime test-hook API.
-- [ ] Execute real isolation with bounded waits/cleanup; required cases must have zero skips. Run full suite once, retain JUnit/log, self-review compatibility diff; commit C.
-- [ ] Controller packages/reviews this task, resolves findings via implementer, then marks complete.
+- [x] Add required-isolation tests `test_real_request_and_complete_turns_are_readonly_nonetwork`, `test_real_sigkill_worker_proves_empty_cgroup`, `test_prepared_unacked_launch_never_retries`. A real MainPID is killed with SIGKILL; no mocked receipt substitutes for it. No runtime test-hook API.
+- [x] Execute real isolation with bounded waits/cleanup; required cases must have zero skips. Run full suite once, retain JUnit/log, self-review compatibility diff; commit C.
+- [x] Controller packages/reviews this task, resolves findings via implementer, then marks complete.
 
 ### Task 2: Durable mediation, dispatch and atomic acceptance authority
 
@@ -121,32 +124,36 @@ extend existing launcher tests as required.
 `src/orchestrator/runtime/general_worker_authority.py`,
 `tests/unit/runtime/test_general_worker_journal.py`,
 `tests/unit/runtime/test_general_worker_authority.py`;
-modify `models/transport.py`, `scheduler/core.py` and their focused tests.
+modify `src/orchestrator/models/transport.py`, `src/orchestrator/scheduler/core.py`,
+`src/orchestrator/recovery/run.py`, `src/orchestrator/runtime/acceptance_coordinator.py`
+and their focused tests.
 
 **Interfaces:**
 - `GeneralWorkerIdentity(run_id: str,node_id: str,attempt_id: str,fencing_generation: int)`.
-- `GeneralWorkerOperation`: immutable projection of identity, operation_id, input/config/registry/route/workspace commitments, phase, epochs/acks/stops, stable call identity, capture metadata and optional accepted result. Contains no task/response text.
+- `GeneralWorkerOperation`: immutable projection of identity, operation_id, input/config/registry/route/workspace/host-scope commitments, phase, epochs/acks/stops, stable call identity, capture metadata and optional accepted result. Contains no task/response text. Host scope is SHA256 of domain-separated canonical trusted Linux boot UUID, effective UID and concrete SQLite canonical-path commitment/device/inode, read before DB locks by owned authority; same-store same-boot processes agree, different scope (including same-host DB copy) blocks external work/terminal acceptance. Require regular file-backed DB, reject hardlinked DB aliases/in-memory execution so canonical lease authority is unique. Store only hash, never raw host/path identity. This slice supports same-host-boot restart, not OS-boot/host/store migration.
 - `GeneralWorkerJournal(event_store: SQLiteEventStore)`; `read(identity) -> GeneralWorkerOperation|None`, `validate_operations() -> None`; concrete checked methods for request, prepare/ack/stop turn, reserve call, capture response and proposal. Strict versioned events, bounded history, exact context/causation/idempotency replay; no generic caller event append or success setter.
 - `GeneralWorkerResult(identity, operation_id, status: Literal["accepted","blocked","in_progress"], code: str, artifacts: tuple[ArtifactRef,...], task_sha256: str|None, evidence_sha256: str|None)`; ArtifactRef is the existing runtime contract; accepted fields reflect historical proof.
 - `SchedulerProviderDispatchAuthority(scheduler: Scheduler, journal: GeneralWorkerJournal)` with async `is_accepted(request: ModelRequest)->bool` and synchronous `record_intent(request: ModelRequest, *, provider_id, provider_adapter, request_body, provider_correlation_id)->str`. The concrete authority owns existing Provider journal and stable operation request matching.
-- Add optional `dispatch_authority` to ProviderModelGateway; new service requires exact owned class/same store. After credential validation and encoding it calls this authority instead of plain journal.record_intent. Legacy omitted path stays unchanged. Authority validation and nested record_intent share one append_checked transaction and post-lock trusted UTC.
+- Add optional `dispatch_authority` to ProviderModelGateway; new service requires exact owned class/same store. After credential validation and encoding it calls this authority instead of plain journal.record_intent. Gateway detects registered general identity from its concrete journal before route-verifier/broker callbacks, and that operation always requires the owned same-store authority; omitted/foreign authority cannot fall through legacy behavior. Non-general omitted path stays unchanged. Authority validation and nested record_intent share one append_checked transaction and post-lock trusted UTC.
 - Phase eligibility helper accepts exact operation and purpose request/dispatch/completion/acceptance; only completion/acceptance exempt own captured known_success with exact usage/receipt/capture bindings. No invoke exemption.
 - Scheduler internal concrete journal acceptance transaction records accepted linkage; public success/failure entry points consult operation state when present. validate_success_proofs includes reciprocal general checkpoint validation.
+- `RecoveredControlState(lifecycle, agents, budget, active_attempts, effects)` is a frozen projection with no artifact-byte claim; `RunRecoveryCoordinator.recover_control_state(run_id: str) -> RecoveredControlState` shares the existing control-consistency algorithm, while ordinary recover still checks actual artifacts/pending files. Never use a fake ArtifactStore, copied validation algorithm or public skip flag.
+- Scheduler owned `_resolve_general_active_attempt(...) -> ActiveAttemptSnapshot` and `_resolve_general_verification_binding(...) -> VerificationBinding` take the existing identity/as_of parameters and use metadata-only control replay. Share frozen binding checks with existing resolvers; ordinary resolvers preserve full recovery. New general dispatch/continuation/terminal uses owned path; Coordinator selects it from registered same-store operation, never caller flag. Direct general terminal entry verifies required private files before acquiring its checked transaction and rejects an ambient caller transaction before any file read; final locked decision rechecks exact byte commitments/metadata/proposal/stop identities.
 
 **Feature A — durable projection (commit/push A):**
 - [ ] RED tests `test_metadata_replay_rejects_missing_cross_epoch_transition`, `test_operation_binds_all_frozen_commitments`, `test_db_wal_repr_and_errors_exclude_payload`, `test_constructed_operation_rejected_before_callback`.
-- [ ] Implement journal/projection and stable operation/request IDs derived from trusted identity/commitments; strict exact-shape bounded event schemas and causation. No new network/process/storage effects in validation.
+- [ ] Implement journal/projection and stable operation/request IDs derived from trusted identity/commitments; strict exact-shape bounded event schemas and causation. Extract shared control-state replay plus typed metadata projection/owned Scheduler resolvers. RED/GREEN `test_general_control_projection_never_reads_artifact_files_under_lock`, `test_full_recovery_still_rejects_corrupt_artifacts`, and `test_general_binding_matches_full_frozen_context`; no fake ArtifactStore or validation-copy fork.
 - [ ] GREEN focused tests; commit A, wait for gate.
 
 **Feature B — send authority (commit/push B):**
 - [ ] RED tests `test_delayed_broker_pause_before_intent_sends_nothing`, parameterize expiry/fencing/new same-node hold; `test_intent_committed_before_withdrawal_retains_inflight_hold`; `test_two_dispatch_authorities_claim_once`; `test_plain_verifier_or_mismatched_store_cannot_authorize_general_dispatch`.
 - [ ] Add concrete authority/Gateway integration; no awaits under locks. Recheck cancellation before authority where possible; durable authority is the serialized send boundary, not a promise that subsequent pause erases delivery.
-- [ ] Test exact own captured success allowed only for completion, unrelated unknown/knownsuccess/effect holds block, request rotation cannot bypass. Existing Gateway behavior preserved.
+- [ ] Test exact own captured success allowed only for completion, unrelated unknown/knownsuccess/effect holds block, request rotation cannot bypass. Add `test_registered_general_gateway_cannot_use_legacy_authority_path` with zero callback/broker/transport, and `test_host_scope_mismatch_blocks_before_external_work`; non-general Gateway behavior preserved.
 - [ ] GREEN focused transport/authority tests; commit B, wait for gate.
 
 **Feature C — terminal transaction (commit/push C):**
-- [ ] RED tests `test_direct_acceptance_cannot_bypass_general_stop`, `test_failure_cannot_release_unproved_worker`, `test_accepted_terminal_and_usage_commit_roll_back_together`, `test_lost_reply_replays_historical_result_without_active_lease`, `test_bootstrap_rejects_unpaired_success`; include existing non-general success regression.
-- [ ] Extend Scheduler success path with concrete journal eligibility, accepted metadata in same SQLite transaction; private ArtifactPublished stays earlier. Rollback includes general accepted, Scheduler terminal, usage, agent and slot writes. Historical reads validate exact original completed_at/usagehash/settlement/proposal/artifact references, never resample/reaccept.
+- [ ] RED tests `test_direct_acceptance_cannot_bypass_general_stop`, `test_failure_cannot_release_unproved_worker` (finish_attempt/reconcile_attempt/startup Provider settlement; sender-stop alone insufficient), `test_accepted_terminal_and_usage_commit_roll_back_together`, `test_lost_reply_replays_historical_result_without_active_lease`, `test_bootstrap_rejects_unpaired_success`; include existing non-general success regression.
+- [ ] Extend Scheduler/Coordinator success paths with concrete journal eligibility, independent bytes outside transaction and metadata binding inside, accepted metadata in same SQLite transaction; private ArtifactPublished stays earlier. RED/GREEN `test_direct_general_terminal_verifies_files_before_lock`, `test_ambient_transaction_cannot_trigger_general_file_preflight`, and a tripwire on filesystem/process/broker callbacks during every new general checked claim. Rollback includes general accepted, Scheduler terminal, usage, agent and slot writes. Historical reads validate exact original completed_at/usagehash/settlement/proposal/artifact references, never resample/reaccept.
 - [ ] GREEN focused Scheduler/acceptance/journal tests, one full suite, commit C; independent task review.
 
 ### Task 3: Explicit useful host execution and restart recovery
@@ -156,29 +163,32 @@ modify `models/transport.py`, `scheduler/core.py` and their focused tests.
 `tests/unit/runtime/test_general_worker_execution.py`,
 `tests/unit/runtime/test_general_worker_recovery.py`,
 `tests/integration/test_general_worker_application.py`;
-modify `src/orchestrator/application.py` and public runtime exports as needed.
+modify `src/orchestrator/application.py`, `src/orchestrator/runtime/worker_input_service.py`
+and public runtime exports as needed.
 
 **Interfaces:**
 - `GeneralWorkerExecutionService(scheduler, input_service, artifact_store, grant_authority, proposal_journal, acceptance_coordinator, provider_gateway, worker_process, workspace: Path)` requires exact owned dependencies and store/registry binding; unavailable usage remains default.
 - async `execute(*, identity: GeneralWorkerIdentity, task_text: str) -> GeneralWorkerResult` and `recover(*, identity: GeneralWorkerIdentity, task_text: str) -> GeneralWorkerResult`.
 - `recover` is explicit after bootstrap. `execute` also recognizes an existing operation and uses the same recovery decision table rather than a second implementation.
 - `GeneralWorkerOwnership` private nonblocking OS advisory lease keyed by canonical DB authority and operation ID; released on crash/exit. It is never stop proof. Busy contender returns in_progress with no external work.
+- Constructor validates canonical SQLite/ArtifactStore/owner-lease roots outside both readable workspace and runtime-source tree and outside bootstrap ambient read grants (`/usr`, canonical `/bin`/`/lib`/`/lib64`, `/etc`, `/dev`), before process/Provider work and outside SQLite locks. Reject overlapping/ambient-readable layouts with detached unavailable error; keep legacy constructors unchanged. Do not infer secrecy from a directory name or allow a symlink to bypass the canonical-root check; inspect `_exec._runtime_grants` and prove the selected out-of-tree layout unreadable with a real child.
+- `WorkerInputService._prepare_general_worker_task(*, run_id, node_id, attempt_id, fencing_generation, task_text) -> WorkerTask` uses the owned general metadata-only Scheduler binding and locked stdlib UTC, sharing existing exact-input validation. Both execute/recover use it; existing `_prepare_recovery_worker_task` still transitively calls full file recovery and is insufficient for this new no-IO claim.
 - `GeneralWorkerHostConfig(workspace: Path, registry, secret_broker=None, transport=None)` is trusted constructor-only configuration; None uses existing unavailable broker/default isolated transport. `ControlPlaneApplication.__init__` gains optional `general_worker_config: GeneralWorkerHostConfig|None=None`, then composes its own service from its existing concrete Scheduler/store/artifact/usage authority. It never accepts an already-bound foreign service. Public async `execute_general_worker_task(...)` / `recover_general_worker_task(...)` accept identity and exact task_text only. Missing configuration returns detached unavailable error. Startup validates journal even when execution unconfigured and never launches.
 
 **Feature A — normal host mediation (commit/push A):**
 - [ ] RED `test_real_candidate_bytes_flow_through_independent_acceptance`, `test_host_derives_frozen_request_not_worker_model_or_route`, `test_gateway_capture_requires_known_success_usage_and_sender_stop`, `test_tool_nonterminal_empty_or_oversized_response_blocks`, `test_unavailable_usage_cannot_succeed`.
-- [ ] Compose prepare exact WorkerTask, durable prepared intent/ack/request stop, one stable host ModelRequest and call_reserved, owned Gateway invoke and private canonical capture. Publish response with operation-specific readable scope/source/type; access on resume uses a signed digest-bound grant and verifies matching metadata, not just digest. Candidate output uses existing decoder, attested publication, frozen VerificationTask, real verifier/proposal/coordinator.
+- [ ] Compose prepare exact WorkerTask through owned general input method (RED `test_general_input_preparation_uses_control_binding_without_files_or_caller_clock_under_lock`), durable prepared intent/ack/request stop, one stable host ModelRequest and call_reserved, owned Gateway invoke and private canonical capture. Publish response with operation-specific readable scope/source/type; access on resume uses a signed digest-bound grant and verifies matching metadata, not just digest. Candidate output uses existing decoder, attested publication, frozen VerificationTask, real verifier/proposal/coordinator.
 - [ ] Canonical response bytes include needed validated output/usage/request identity; no raw provider HTTP or credentials. DB/WAL only metadata. Run blocking process supervision outside event-loop critical sections; no thread shares SQLite connection or callback under transaction.
 - [ ] GREEN focused service tests; commit A, wait for gate.
 
 **Feature B — restart decision table (commit/push B):**
 - [ ] RED `test_captured_success_resumes_without_gateway_or_broker`, `test_dispatching_unknown_and_reserved_gap_block_every_external_boundary`, `test_missing_capture_never_regenerates`, `test_verified_orphan_stopped_before_successor`, `test_unacked_or_stop_unknown_retains_lease`, `test_cross_operation_or_corrupt_capture_blocks`.
 - [ ] Implement single-owner explicit resume with trusted current phase checks. Before ackless launch return launch_unknown; verified orphan gets exact stop/empty proof before new epoch. Captured response resume never invokes; proposed resume accepts only under current authority; accepted replay validates historical result before active-lease lookup.
-- [ ] Test pause/cancel/expiry/new generation between phases blocks launch/acceptance and retains unresolved effects. No automated reconciliation/retry/replan.
+- [ ] Test pause/cancel/expiry/new generation between phases blocks launch/acceptance and retains unresolved effects; changed host-scope/boot blocks before credentials/Worker/terminal, while new same-boot application process agrees. No automated reconciliation/retry/replan or host migration.
 - [ ] GREEN focused recovery/service tests; commit B, wait for gate.
 
 **Feature C — public ready gates/privacy (commit/push C):**
-- [ ] RED `test_startup_validates_without_dispatch`, `test_explicit_application_reopen_requires_exact_input`, `test_public_methods_fail_before_ready_or_unconfigured`, `test_same_node_unknown_other_attempt_blocks`, `test_recovered_owner_contention_has_one_winner`.
+- [ ] RED `test_startup_validates_without_dispatch`, `test_explicit_application_reopen_requires_exact_input`, `test_public_methods_fail_before_ready_or_unconfigured`, `test_same_node_unknown_other_attempt_blocks`, `test_recovered_owner_contention_has_one_winner`, `test_private_storage_layout_rejected_if_visible_to_worker` (workspace/runtime overlap and symlink alias, zero launch/broker/transport), plus real child denial of out-of-tree SQLite/artifact roots.
 - [ ] Wire application explicit methods/startup validation; validate all same-store dependencies and immutable commitments on reopen. No caller clock, usage, ModelRequest, success flag or arbitrary continuation cursor.
 - [ ] GREEN focused application/recovery tests, one full suite, commit C; independent task review. Daily cap may require Task4 on next LA date.
 

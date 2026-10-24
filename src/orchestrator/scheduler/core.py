@@ -134,6 +134,24 @@ class Scheduler:
         self.recovery = RunRecoveryCoordinator(event_store, artifact_store=artifact_store)
 
     def resolve_active_attempt(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, as_of: datetime,
+    ) -> ActiveAttemptSnapshot:
+        """Resolve ordinary authority, preserving full artifact recovery."""
+        return self._resolve_active_attempt(run_id=run_id, node_id=node_id,
+            attempt_id=attempt_id, fencing_generation=fencing_generation,
+            as_of=as_of, control_only=False)
+
+    def _resolve_general_active_attempt(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, as_of: datetime,
+    ) -> ActiveAttemptSnapshot:
+        """Owned general authority; this projection makes no artifact-byte claim."""
+        return self._resolve_active_attempt(run_id=run_id, node_id=node_id,
+            attempt_id=attempt_id, fencing_generation=fencing_generation,
+            as_of=as_of, control_only=True)
+
+    def _resolve_active_attempt(
         self,
         *,
         run_id: str,
@@ -141,6 +159,7 @@ class Scheduler:
         attempt_id: str,
         fencing_generation: int,
         as_of: datetime,
+        control_only: bool,
     ) -> ActiveAttemptSnapshot:
         """Resolve exact accepted authority without changing durable state.
 
@@ -199,7 +218,8 @@ class Scheduler:
             )
             if not accepted_at <= as_of < lease_expires_at:
                 raise SchedulerError("Attempt is not accepted and unexpired at the trusted time")
-            recovered = self.recovery.recover(run_id)
+            recovered = (self.recovery.recover_control_state(run_id) if control_only
+                         else self.recovery.recover(run_id))
             lease = next(
                 (item for item in recovered.active_attempts
                  if item.attempt_ref == attempt_ref
@@ -754,15 +774,31 @@ class Scheduler:
         self, *, run_id: str, node_id: str, attempt_id: str,
         fencing_generation: int, as_of: datetime,
     ) -> VerificationBinding:
+        return self._resolve_verification_binding(run_id=run_id, node_id=node_id,
+            attempt_id=attempt_id, fencing_generation=fencing_generation,
+            as_of=as_of, control_only=False)
+
+    def _resolve_general_verification_binding(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, as_of: datetime,
+    ) -> VerificationBinding:
+        return self._resolve_verification_binding(run_id=run_id, node_id=node_id,
+            attempt_id=attempt_id, fencing_generation=fencing_generation,
+            as_of=as_of, control_only=True)
+
+    def _resolve_verification_binding(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, as_of: datetime, control_only: bool,
+    ) -> VerificationBinding:
         """Reload independent admission authority; missing/changed bindings fail closed."""
         result = None
         attempt_ref = _attempt_ref(run_id, node_id, attempt_id)
 
         def resolve(events, _version):
             nonlocal result
-            active = self.resolve_active_attempt(
+            active = self._resolve_active_attempt(
                 run_id=run_id, node_id=node_id, attempt_id=attempt_id,
-                fencing_generation=fencing_generation, as_of=as_of,
+                fencing_generation=fencing_generation, as_of=as_of, control_only=control_only,
             )
             accepted = _active_acceptance(events, attempt_ref)
             if accepted is None:
