@@ -6,6 +6,14 @@ and artifact-publication state before new scheduling is admitted. It does not
 start, terminate, or recreate Worker processes and does not execute recovery
 plans.
 
+The trusted host now has a separate explicit recovery continuation API. It
+discovers durable opportunities, consumes an eligible persisted authorization
+once through Scheduler, and prepares data for the exact successor only after
+the host re-supplies the original input. Construction and inventory are
+read-only; continuation launches no Worker, Broker, transport or Provider call.
+Admission and task preparation have separate checked transaction boundaries.
+See [host API and trust sources](control-plane-startup.md#explicit-recovery-continuation).
+
 ## External effects
 
 - An `EffectIntentRecorded` without a matching `EffectReceiptRecorded` is
@@ -137,8 +145,16 @@ successor admission and separately gated task preparation; see
 for typed observation trust sources, exact input re-supply and failure/replay
 behavior. These APIs do not execute the task. General resumed Worker execution,
 functional Worker/OS lifecycle recovery coordination and provider-side effect
-reconciliation remain open, along with this slice's Task 4 process/crash
-acceptance and independent whole-slice review. Run-scoped artifact accounting covers
+reconciliation remain open. This slice now has real process-contention and
+parent-issued SIGKILL regression evidence for nested rollback, committed reply
+loss and the admission/preparation seam; unknown-call fresh reopens retain
+holds and return no task. Final coverage, required live isolation, wheel and
+source-identity evidence are recorded in
+[P3 recovery coordination validation](../validation/2026-10-23-p3-recovery-coordination.md).
+Independent Task 4 and whole-slice reviews remain pending. A later same-model
+retry may still be planned while Router's exhausted-model rule blocks that
+candidate; the conservative block preserves authority and holds, but leaves
+retry liveness unresolved. Run-scoped artifact accounting covers
 only durable publication intents; legacy or bare filesystem orphans remain
 unattributable. This is not full crash recovery and does not satisfy the P3 or
 V1 delivery gate by itself.

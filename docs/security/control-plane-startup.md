@@ -171,8 +171,14 @@ The two original P0 acceptance items are closed; this does not close the
 production credential backend, general Worker composition, or V1 platform gate.
 
 The explicit recovery inventory/admission/task preparation APIs are a partial
-P3 slice. The Task 4 process-race/crash acceptance and whole-slice review remain
-open, as do general resumed Worker execution, production credential/evidence
+P3 slice. The process-race/crash regressions cover two independent spawned
+application owners, cancellation/health/budget lock winners, real parent-issued
+SIGKILL before/after admission commit and before preparation, exact input
+re-supply, and fresh reopens with unresolved Provider calls. Their source
+identity, full coverage, required real-isolation matrix and package checks are
+recorded in [P3 recovery coordination validation](../validation/2026-10-23-p3-recovery-coordination.md).
+Independent Task 4 and whole-slice reviews remain pending, as do general
+resumed Worker execution, production credential/evidence
 integration and complete P3 acceptance. A later same-model retry plan may still
 authorize a model excluded by Router exhaustion; that unresolved upstream
 policy mismatch stays safely blocked without acquiring new holds.
