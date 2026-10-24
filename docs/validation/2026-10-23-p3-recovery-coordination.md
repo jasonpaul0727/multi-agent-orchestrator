@@ -28,15 +28,15 @@ settlements. That startup behavior does not launch Worker or Provider activity.
   `5d82fc03f352ac4a4137a7910d65e750c75312a3`. Task 4 spec/quality and the
   whole-slice review both approved this exact head, with zero Critical/Important
   findings. Its source/test trees match the frozen identities above.
-- Current documentation correction: **scoped review and root push pending**.
-  Its eventual commit identity is recorded in the retained report, not invented
-  inside the commit itself; source/tests must remain unchanged.
+- Documentation correction: `c49cf6c06f205e1b39a0f53f65c15bec7879ab3c`,
+  ordinarily pushed and remote-verified. Independent scoped re-review returned
+  all findings addressed, no new breakage; source/tests remain unchanged.
 - Final verified remote `main` full SHA: **pending root integration**. No merge
   or `main` push has occurred at this evidence checkpoint.
-- Task 4 acceptance: **passed on the original reviewed candidate** after all
-  mandatory gates. The nonblocking construction wording is corrected here,
-  with scoped review required before integration. This does not complete full
-  P3 or claim a merged-main run/verified remote main SHA.
+- Task 4 acceptance: **complete**, including original independent task and
+  whole-slice approval and the final documentation scoped re-review. LA
+  2026-10-24 completion count is 1/5. This does not complete full P3 or claim
+  a merged-main run/verified remote main SHA.
 
 All private logs, JUnit, coverage data, manifests, the wheel checker and wheel
 are retained under this plan's ignored directory:
@@ -252,9 +252,9 @@ after that operation; it is intentionally pending above.
 ## Remaining gates
 
 The original reviewed candidate passed Task 4 acceptance, all three feature
-pushes, and independent task/whole-slice reviews. This documentation correction's
-scoped review/root push and verified ordinary `main` integration remain
-outstanding. Root will run the merged-main full suite and record the verified
+pushes, and independent task/whole-slice reviews. The documentation correction
+was pushed and passed scoped re-review. Verified ordinary `main` integration
+remains outstanding. Root will run the merged-main full suite and record the verified
 remote main full SHA after those operations; neither is claimed here.
 General resumed Worker execution and lifecycle interruption/restart, production
 credential backend, authoritative Provider delivery/charge evidence and cost
