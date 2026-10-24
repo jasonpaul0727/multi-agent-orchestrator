@@ -888,18 +888,29 @@ _PROFILE_PROPERTIES = _DURATION_PROPERTIES | _LIMIT_PROPERTIES | _BOOLEAN_PROPER
 
 def _duration_usec(value: str) -> str:
     # systemctl prints normalized human-readable timespans rather than the
-    # numeric microsecond D-Bus value. Support finite exact integer units only.
+    # numeric microsecond D-Bus value. Convert finite fractions with integer
+    # arithmetic: never round an observed limit into the requested profile.
     factors = {"us": 1, "ms": 1000, "s": 1_000_000, "min": 60_000_000,
         "h": 3_600_000_000, "d": 86_400_000_000}
+    if type(value) is not str or len(value) > 128:
+        raise ValueError("invalid duration")
     chunks = value.split()
     if not chunks:
         raise ValueError("missing duration")
     total = 0
     for chunk in chunks:
-        match = re.fullmatch(r"([0-9]+)(us|ms|s|min|h|d)", chunk)
+        match = re.fullmatch(r"([0-9]+)(?:\.([0-9]{1,6}))?(us|ms|s|min|h|d)", chunk)
         if match is None:
             raise ValueError("unsupported duration")
-        total += int(match[1]) * factors[match[2]]
+        fraction = match[2] or ""
+        denominator = 10 ** len(fraction)
+        numerator = int(match[1]) * denominator + int(fraction or "0")
+        microseconds, remainder = divmod(numerator * factors[match[3]], denominator)
+        total += microseconds
+        # Every requested profile duration is bounded by SandboxLimits' day
+        # maximum. Infinity/overflow and sub-microsecond values fail closed.
+        if remainder or total > 86_400_000_000:
+            raise ValueError("duration outside profile bounds")
     return str(total)
 
 
@@ -980,14 +991,27 @@ def _expected_launch_profile(properties: tuple[str, ...], command: list[str]) ->
 
 
 def _query_launch_properties(unit_name: str, systemctl: str, environment: dict[str, str], timeout: float) -> dict | None:
-    required = _PROFILE_PROPERTIES | {"Id", "LoadState", "ActiveState", "ControlGroup", "InvocationID"}
+    identity = {"Id", "LoadState", "ActiveState", "ControlGroup", "InvocationID"}
+    required = _PROFILE_PROPERTIES | identity
     try:
         result = subprocess.run([systemctl, "--user", "show", unit_name,
             *(f"--property={name}" for name in sorted(required))], stdin=subprocess.DEVNULL,
             capture_output=True, env=environment, check=False, timeout=timeout)
         if result.returncode == 0:
-            return _parse_systemd_properties(result.stdout, required)
-    except (OSError, subprocess.TimeoutExpired):
+            values = {}
+            for line in result.stdout.decode("ascii", errors="strict").splitlines():
+                if "=" not in line:
+                    return None
+                name, value = line.split("=", 1)
+                if name not in required or name in values:
+                    return None
+                values[name] = value
+            # Collected services omit service-only properties such as
+            # ExecStart. Only authoritative identity/state is meaningful then;
+            # loaded units still require the entire effective profile.
+            if identity <= values.keys() and (values["LoadState"] == "not-found" or values.keys() == required):
+                return values
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
         pass
     return None
 
@@ -1003,16 +1027,21 @@ def _read_launch_receipt(*, prepared_launch: PreparedSandboxLaunch, expected_cgr
             values = _query_launch_properties(prepared_launch.unit_name, systemctl, client_env,
                 min(3, max(0.001, deadline - time.monotonic())))
             if values is not None and values["LoadState"] == "loaded":
-                if (values["Id"] != prepared_launch.unit_name or values["ControlGroup"] != control_group
-                    or values["ActiveState"] not in {"active", "activating"}):
+                if values["Id"] != prepared_launch.unit_name:
                     return None
-                profile = _normalise_launch_profile({key: values[key] for key in _PROFILE_PROPERTIES})
-                if profile != expected_profile:
-                    return None
-                receipt = SandboxLaunchReceipt(prepared_launch.launch_id, prepared_launch.unit_name,
-                    control_group, values["InvocationID"], _profile_sha256(profile))
-                _validate_launch_receipt(prepared_launch, receipt)
-                return receipt
+                pending = (values["ActiveState"] in {"inactive", "activating"}
+                    and not values["ControlGroup"] and not values["InvocationID"])
+                if not pending:
+                    if (values["ControlGroup"] != control_group
+                        or values["ActiveState"] not in {"active", "activating"}):
+                        return None
+                    profile = _normalise_launch_profile({key: values[key] for key in _PROFILE_PROPERTIES})
+                    if profile != expected_profile:
+                        return None
+                    receipt = SandboxLaunchReceipt(prepared_launch.launch_id, prepared_launch.unit_name,
+                        control_group, values["InvocationID"], _profile_sha256(profile))
+                    _validate_launch_receipt(prepared_launch, receipt)
+                    return receipt
         except Exception:
             return None
         if time.monotonic() >= deadline:

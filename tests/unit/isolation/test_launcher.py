@@ -1182,3 +1182,48 @@ def test_reconstructed_live_launch_is_killed_as_whole_unit_before_stop_proof(mon
     monkeypatch.setattr(launcher_module, "_cgroup_is_empty", lambda _path: True)
     result = SystemdReadOnlyLauncher(systemctl="ctl").stop_prepared_launch(prepared, receipt)
     assert killed == [prepared.unit_name] and result.cgroup_empty
+
+
+def test_collected_systemd_unit_may_omit_execstart_but_requires_exact_stopped_identity(monkeypatch):
+    prepared, receipt = _reconstructed_launch()
+    # Captured real systemd shape: no ExecStart at all for a collected unit.
+    properties = dict(Id=prepared.unit_name, LoadState="not-found", ActiveState="inactive",
+        ControlGroup="", InvocationID="", PrivateNetwork="no")
+    monkeypatch.setattr(subprocess, "run", lambda args, **_kw: subprocess.CompletedProcess(args, 0,
+        stdout="".join(f"{k}={v}\n" for k, v in properties.items()).encode()))
+    assert launcher_module._observe_prepared_binding(prepared, receipt, "ctl", {}) == "stopped"
+    properties["InvocationID"] = "b" * 32
+    assert launcher_module._observe_prepared_binding(prepared, receipt, "ctl", {}) is None
+
+
+def test_loaded_inactive_without_invocation_is_polled_until_actual_launch_observation(monkeypatch):
+    prepared, receipt = _reconstructed_launch()
+    profile = _observed_worker_profile()
+    pending = dict(profile, Id=prepared.unit_name, LoadState="loaded", ActiveState="inactive",
+        ControlGroup="", InvocationID="")
+    running = pending | dict(ActiveState="active", ControlGroup=receipt.control_group, InvocationID=receipt.invocation_id)
+    calls = []
+    def systemctl(args, **_kw):
+        calls.append(args)
+        value = pending if len(calls) == 1 else running
+        return subprocess.CompletedProcess(args, 0, stdout="".join(f"{k}={v}\n" for k, v in value.items()).encode())
+    monkeypatch.setattr(subprocess, "run", systemctl)
+    observed = launcher_module._read_launch_receipt(prepared_launch=prepared,
+        expected_cgroup=Path("/sys/fs/cgroup") / receipt.control_group.lstrip("/"),
+        expected_profile=launcher_module._normalise_launch_profile(profile), client_env={}, timeout_seconds=0.1)
+    assert observed == receipt and len(calls) == 2
+
+
+@pytest.mark.parametrize(("value", "microseconds"), [("1.250000s", "1250000"),
+    ("0.001ms", "1"), ("1.5ms", "1500"), ("1min 0.5s", "60500000"),
+    ("0.000001s", "1"), ("24h", "86400000000"), ("0.000000s", "0")])
+def test_effective_resource_timespans_normalize_finite_fractions_exactly(value, microseconds):
+    assert launcher_module._duration_usec(value) == microseconds
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "inf", "1e999s", "-1s", "+1s",
+    "0.1us", "1.0000001s", "1.0000000s", "24h 1us", "999999999d",
+    "18446744073709551615us", "1.2.3s", "9" * 200 + "s"])
+def test_resource_timespans_reject_nonfinite_negative_submicrosecond_and_overflow(value):
+    with pytest.raises(ValueError):
+        launcher_module._duration_usec(value)
