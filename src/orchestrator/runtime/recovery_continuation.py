@@ -7,12 +7,15 @@ import hashlib
 import hmac
 import json
 import re
-from typing import Literal
+from types import UnionType
+from typing import Annotated, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
 
 from orchestrator.models import AcceptedModelRoute, FXSnapshot, TokenizerSnapshot
-from orchestrator.routing import EligibilitySnapshot, ModelRouter, RoutingRequest
+from orchestrator.routing import (
+    EligibilitySnapshot, HealthAggregateKey, HealthController, ModelRouter, RoutingRequest,
+)
 from orchestrator.runtime.contracts import WorkerTask
 from orchestrator.runtime.recovery_opportunities import (
     RecoveryContinuationError, RecoveryOpportunity, load_recovery_records,
@@ -25,6 +28,67 @@ from orchestrator.validation import revalidate_model
 
 
 _IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$"
+
+
+def _check_declared_routing_data(value, expected):
+    """Reject unsafe copies/subclasses before revalidation can discard extras."""
+    origin = get_origin(expected)
+    if origin is Annotated:
+        return _check_declared_routing_data(value, get_args(expected)[0])
+    if origin in {Union, UnionType}:
+        alternatives = get_args(expected)
+        if value is None and type(None) in alternatives:
+            return
+        nonnull = tuple(item for item in alternatives if item is not type(None))
+        if len(nonnull) != 1:
+            raise ValueError("unexpected routing union data")
+        return _check_declared_routing_data(value, nonnull[0])
+    if isinstance(expected, type) and issubclass(expected, BaseModel):
+        if type(value) is not expected:
+            raise ValueError("unexpected routing model type")
+        extra = value.model_extra
+        if (not set(value.__dict__) <= set(expected.model_fields)
+            or extra is not None and (type(extra) is not dict or len(extra) != 0)):
+            raise ValueError("unexpected routing model data")
+        for name, field in expected.model_fields.items():
+            _check_declared_routing_data(getattr(value, name), field.annotation)
+    elif origin in {tuple, list, set, frozenset}:
+        if type(value) is not origin:
+            raise ValueError("unexpected routing sequence data")
+        element_type = get_args(expected)[0]
+        for item in value:
+            _check_declared_routing_data(item, element_type)
+    elif type(value) not in {str, int, bool, datetime, type(None)}:
+        raise ValueError("unexpected routing scalar data")
+
+
+def _check_current_routing_inputs(scheduler, run_id, snapshot, observations):
+    balance = scheduler._ledger_for_run(run_id).available(run_id)
+    eligibility = observations.eligibility
+    if (eligibility.budget_currency, eligibility.budget_ledger_version,
+        eligibility.available_cost_minor, eligibility.available_tokens) != (
+            balance.currency, balance.reservation_version, balance.available_minor, balance.available_tokens,
+        ):
+        raise ValueError("stale routing budget observations")
+    config = snapshot.resolved_config.config
+    policy = config.health_policies[config.presets[config.active_preset].health_policy_ref]
+    controller = HealthController(scheduler.event_store)
+    models = {model.id: model for model in snapshot.registry_manifest.models}
+    for entry in eligibility.model_health:
+        model = models.get(entry.model_id)
+        if model is None or model.provider != entry.provider_id:
+            raise ValueError("invalid routing health binding")
+        provider_key = HealthAggregateKey(
+            registry_manifest_hash=snapshot.registry_manifest_hash,
+            scope="provider", provider_id=model.provider,
+        )
+        model_key = HealthAggregateKey(
+            registry_manifest_hash=snapshot.registry_manifest_hash,
+            scope="model", provider_id=model.provider, model_id=model.id,
+        )
+        if (entry.provider != controller.read(provider_key, default_policy=policy).routing_ref
+            or entry.model != controller.read(model_key, default_policy=policy).routing_ref):
+            raise ValueError("stale routing health observations")
 
 
 class RecoveryRoutingInputs(BaseModel):
@@ -149,8 +213,10 @@ class RecoveryContinuationService:
                 if routing_inputs is None:
                     result = respond("waiting_for_routing", "routing_inputs_required")
                     return None
+                _check_declared_routing_data(routing_inputs, RecoveryRoutingInputs)
                 observations = revalidate_model(RecoveryRoutingInputs, routing_inputs)
                 snapshot = self._scheduler.lifecycle.config_snapshot(run_id)
+                _check_current_routing_inputs(self._scheduler, run_id, snapshot, observations)
                 evidence = record.classification.evidence
                 authorization = record.plan.authorization
                 if (evidence is None or authorization is None or binding is None

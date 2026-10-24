@@ -16,16 +16,18 @@ from tests.unit.lifecycle.test_scheduler import (
 
 def recovery_case(store, *, failure_code="rate_limited", unknown=False,
                   legacy_input=False, escalation_role=None, accounted_usage=False,
-                  routing_budget=False, multi_model=False):
-    if escalation_role is None and not routing_budget and not multi_model:
+                  routing_budget=False, multi_model=False, limits=None, priced=False,
+                  accounted_cost=1, tool_ids=()):
+    if escalation_role is None and not routing_budget and not multi_model and not limits and not priced and not tool_ids:
         reg, config, lifecycle, policy, contract = run_setup_with_frozen_contract(store)
     else:
         reg, config, lifecycle, policy, contract = _role_recovery_setup(
             store, escalation_role, routing_budget=routing_budget, multi_model=multi_model,
+            limits=limits, priced=priced, tool_ids=tool_ids,
         )
     control = scheduler(store)
     request, decision = routed_pair(reg, config, policy, contract_hash=contract.contract_hash)
-    if multi_model:
+    if multi_model or priced:
         from orchestrator.routing import ModelRouter
         seed = SimpleNamespace(store=store, scheduler=control, registry=reg, config=config, policy=policy)
         decision = ModelRouter().route(
@@ -39,7 +41,7 @@ def recovery_case(store, *, failure_code="rate_limited", unknown=False,
             request, decision, task_text="implement a small change", **times,
         )
     usage = UsageRecord(run_id="run-1", reservation_id=accepted.reservation.reservation_id,
-                        settlement_key="accounted-provider-usage", currency="USD", cost_minor=1) if accounted_usage else None
+                        settlement_key="accounted-provider-usage", currency="USD", cost_minor=accounted_cost) if accounted_usage else None
     control.finish_attempt(
         run_id="run-1", node_id="node-1", attempt_id=request.attempt_id,
         fencing_generation=1, completed_at=NOW + timedelta(seconds=5),
@@ -93,12 +95,23 @@ def consume_recovery(case, *, source_decision=None, plan=None, retry_level=1,
     return request, decision, accepted
 
 
-def _role_recovery_setup(store, role, *, routing_budget=False, multi_model=False):
+def _role_recovery_setup(store, role, *, routing_budget=False, multi_model=False,
+                         limits=None, priced=False, tool_ids=()):
     from orchestrator.config import ConfigCandidate, ConfigManager, EffectiveConfig, resolve_effective_config
     from orchestrator.lifecycle import LifecycleController, NodeSpec
     from orchestrator.security import PolicyAuthority, PolicyManifest
 
     reg = registry()
+    if priced:
+        from orchestrator.config.models import ModelRegistryManifest, ModelSpec, PriceSpec
+        reg = ModelRegistryManifest(providers=reg.providers, models=(ModelSpec(**{
+            **reg.models[0].model_dump(), "local_zero_cost": False,
+            "price": PriceSpec(
+                currency="USD", input_minor_per_million=10000, output_minor_per_million=10000,
+                max_tool_cost_minor=0, estimator_id="tokens.v1",
+                effective_from=NOW - timedelta(days=1), expires_at=NOW + timedelta(days=1),
+            ),
+        }),))
     if multi_model:
         from orchestrator.config.models import ModelRegistryManifest, ModelSpec
         original = reg.models[0].model_dump()
@@ -119,6 +132,10 @@ def _role_recovery_setup(store, role, *, routing_budget=False, multi_model=False
         values["policy_envelope"]["max_total_tokens"] = 5000
     if multi_model:
         values["policy_envelope"]["allowed_models"] = [model.id for model in reg.models]
+    caps = {key: value for key, value in (limits or {}).items() if key != "max_attempts"}
+    values["policy_envelope"].update(caps)
+    for preset in values["presets"].values():
+        preset["requested_budget"].update(caps)
     resolved = resolve_effective_config(EffectiveConfig.model_validate(values), registry=reg)
     policy = PolicyManifest(authorities=(PolicyAuthority(
         source="system", max_permission="read-only", allowed_actions={"model_invoke"},
@@ -130,7 +147,7 @@ def _role_recovery_setup(store, role, *, routing_budget=False, multi_model=False
     lifecycle.initialize_run("run-1")
     lifecycle.append_nodes("run-1", (NodeSpec(
         node_id="node-1", role="coder", planning_contract_hash=contract.contract_hash,
-        planning_contract=contract, max_attempts=3,
+        planning_contract=contract, max_attempts=(limits or {}).get("max_attempts", 3), tool_ids=tool_ids,
     ),), expected_graph_version=0, idempotency_key="initial-graph", policy_manifest=policy)
     lifecycle.start_run("run-1")
     return reg, resolved.config, lifecycle, policy, contract
