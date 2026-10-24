@@ -5,22 +5,34 @@ import hashlib
 import json
 import multiprocessing
 import os
+from pathlib import Path
 import sys
+import traceback
 from types import SimpleNamespace
 
 import pytest
 
 from orchestrator.application import ControlPlaneApplication
 from orchestrator.budget import BudgetLedger
+from orchestrator.models import AcceptedModelRoute
+from orchestrator.models.gateway import ModelMessage
+from orchestrator.models.provider_calls import SQLiteProviderCallJournal
 from orchestrator.routing import HealthAggregateKey, HealthController
 from orchestrator.runtime.recovery_continuation import RecoveryRoutingInputs
 from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
-from tests.support.process_crash import reap_process, receive_process_message
-from tests.support.recovery_continuation import application_recovery_case, routing_observations
-from tests.unit.lifecycle.test_scheduler import NOW, _application_limits
+from tests.support.process_crash import (
+    block_at_crash_point, kill_at_crash_point, reap_process, receive_process_message,
+)
+from tests.support.recovery_continuation import (
+    application_recovery_case, forbid_recovery_execution, routing_observations,
+)
+from tests.unit.lifecycle.test_scheduler import (
+    NOW, _application_limits, _provider_call_request_for_crash,
+)
 
 
 TEXT = "implement a small change"
+SENTINEL = "private-recovery-process-input-39d6b842"
 
 
 def _durable_digest(app):
@@ -29,8 +41,8 @@ def _durable_digest(app):
     return hashlib.sha256(dump).hexdigest()
 
 
-def _seed(database):
-    case = application_recovery_case(database, routing_budget=True, priced=True)
+def _seed(database, *, task_text=TEXT):
+    case = application_recovery_case(database, routing_budget=True, priced=True, task_text=task_text)
     with case.app as app:
         opportunity, = app.list_recovery_opportunities(run_id="run-1")
         assert opportunity.status == "ready" and opportunity.successor is None
@@ -288,3 +300,230 @@ def test_spawned_durable_change_wins_outer_lock_without_successor_writes(tmp_pat
         assert _durable_digest(app) == mutated[1]
         _assert_resources(app, admitted=False, authorization_hash=authorization_hash,
                           budget_mutation=mutation == "budget")
+
+
+def _crash_recovery_owner(database, pipe, observations, text, lease, point):
+    with forbid_recovery_execution() as attempted:
+        with ControlPlaneApplication(database, limits=_application_limits()) as app:
+            def checkpoint():
+                accepted = [event for event in app._event_store.read_stream("scheduler", "global")
+                            if event.event_type == "RoutingDecisionAccepted"]
+                assert len(accepted) == 2
+                assert app._event_store._connection.in_transaction == (point == "nested")
+                assert attempted == []
+                pipe.send((dict(accepted[-1].payload["accepted_route"]), _durable_digest(app)))
+                block_at_crash_point(pipe, "recovery-" + point)
+
+            if point == "nested":
+                real_accept = app._scheduler.accept_routing
+
+                def stop_after_nested(*args, **kwargs):
+                    accepted = real_accept(*args, **kwargs)
+                    checkpoint()
+                    return accepted
+
+                app._scheduler.accept_routing = stop_after_nested
+            else:
+                real_append = app._event_store.append_checked
+
+                def stop_at_boundary(*args, **kwargs):
+                    if point == "before-preparation" and args[2] == "recovery-preparation-snapshot":
+                        checkpoint()
+                    result = real_append(*args, **kwargs)
+                    if point == "committed" and args[2] == "recovery-continuation-snapshot":
+                        checkpoint()
+                    return result
+
+                app._event_store.append_checked = stop_at_boundary
+            _continue(app, observations, text, lease)
+            raise AssertionError("continuation returned without its crash barrier")
+
+
+def _kill_recovery_owner(database, observations, lease, point):
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(target=_crash_recovery_owner,
+                              args=(database, child, observations, SENTINEL, lease, point))
+    try:
+        process.start()
+        child.close()
+        checkpoint = receive_process_message(parent)
+        kill_at_crash_point(process, parent, expected_point="recovery-" + point, timeout_seconds=15)
+        return checkpoint
+    finally:
+        reap_process(process)
+        parent.close()
+        child.close()
+
+
+def _resume_recovery_owner(database, pipe, observations, text, lease):
+    with forbid_recovery_execution() as attempted:
+        with ControlPlaneApplication(database, limits=_application_limits()) as app:
+            before = _durable_digest(app)
+            opportunity, = app.list_recovery_opportunities(run_id="run-1")
+            missing = _continue(app, None, None, lease)
+            try:
+                _continue(app, observations, text + " changed", lease)
+            except RecoveryContinuationError as error:
+                changed_code = error.code
+                error_report = "".join(traceback.format_exception(error))
+            else:
+                changed_code, error_report = "accepted", ""
+            after_invalid_input = _durable_digest(app)
+            # A committed successor must replay without any new routing input.
+            routing = observations if opportunity.successor is None else None
+            result = _continue(app, routing, text, lease)
+            after_exact_input = _durable_digest(app)
+            repeated = _continue(app, None, text, lease)
+            task = result.task
+            report = dict(
+                initial_digest=before, after_invalid_input=after_invalid_input,
+                initial_status=opportunity.status, initial_reason=opportunity.reason,
+                missing_status=missing.status, missing_task=missing.task is None,
+                initial_successor=(opportunity.successor.model_dump(mode="json")
+                                   if opportunity.successor else None),
+                changed_code=changed_code, status=result.status, reason=result.reason,
+                route=result.accepted_route.model_dump(mode="json") if result.accepted_route else None,
+                context=task.context.model_dump(mode="json") if task else None,
+                exact_text=task.task_text == text if task else None,
+                role=task.role if task else None,
+                repeated_status=repeated.status, same_task=repeated.task == task,
+                same_route=repeated.accepted_route == result.accepted_route,
+                after_exact_input=after_exact_input, final_digest=_durable_digest(app),
+                public_reports=repr((app.startup_report, opportunity, missing, result, task)) + error_report,
+                unresolved_calls=app.startup_report.unresolved_provider_calls,
+            )
+        report["external_attempts"] = list(attempted)
+        pipe.send(report)
+
+
+def _resume_in_fresh_process(database, observations, lease):
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(target=_resume_recovery_owner,
+                              args=(database, child, observations, SENTINEL, lease))
+    try:
+        process.start()
+        child.close()
+        report = receive_process_message(parent)
+        process.join(timeout=15)
+        assert process.exitcode == 0, "fresh recovery process failed or was not reaped"
+        return report
+    finally:
+        reap_process(process)
+        parent.close()
+        child.close()
+
+
+def _assert_private_recovery_surfaces(database, report, *, capfd, caplog):
+    assert SENTINEL not in json.dumps(report)
+    captured = capfd.readouterr()
+    assert SENTINEL not in captured.out + captured.err + caplog.text
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(str(database) + suffix)
+        if path.exists():
+            assert SENTINEL.encode() not in path.read_bytes()
+
+
+@pytest.mark.parametrize("point", ["nested", "committed", "before-preparation"])
+def test_sigkill_reopens_atomic_recovery_and_requires_exact_input(tmp_path, point, capfd, caplog):
+    # Catches partial nested commits, duplicate lost-reply admission, or a seam
+    # retaining input in durable storage instead of requiring exact re-supply.
+    assert sys.platform == "linux", "crash acceptance requires parent-issued Linux SIGKILL"
+    database = tmp_path / "recovery-crash.db"
+    observations, authorization_hash = _seed(database, task_text=SENTINEL)
+    lease = datetime.now(timezone.utc) + timedelta(minutes=5)
+    with ControlPlaneApplication(database, limits=_application_limits()) as app:
+        before = _durable_digest(app)
+        input_commitment = app._event_store.read_stream("scheduler", "global")[0].payload[
+            "verification_admission"]["input_manifest_hash"]
+    route_at_crash, digest_at_crash = _kill_recovery_owner(database, observations, lease, point)
+    with forbid_recovery_execution() as attempted:
+        with ControlPlaneApplication(database, limits=_application_limits()) as app:
+            reopened = _durable_digest(app)
+            if point == "nested":
+                assert reopened == before and reopened != digest_at_crash
+                _assert_resources(app, admitted=False, authorization_hash=authorization_hash)
+            else:
+                assert reopened == digest_at_crash
+                assert _assert_resources(app, admitted=True, authorization_hash=authorization_hash) == route_at_crash
+            _assert_private_recovery_surfaces(database, {}, capfd=capfd, caplog=caplog)
+        assert attempted == []
+    report = _resume_in_fresh_process(database, observations, lease)
+    assert report["initial_digest"] == report["after_invalid_input"] == reopened
+    assert report["initial_status"] == ("ready" if point == "nested" else "already_admitted")
+    assert report["initial_successor"] == (None if point == "nested" else route_at_crash)
+    assert report["missing_status"] == "waiting_for_input"
+    assert report["missing_task"]
+    assert report["changed_code"] == "recovery_input_mismatch"
+    assert report["status"] == report["repeated_status"] == "prepared"
+    assert report["same_task"] and report["same_route"] and report["exact_text"]
+    assert report["role"] == "coder" and report["external_attempts"] == []
+    assert report["route"] == route_at_crash
+    assert (report["context"]["attempt_id"], report["context"]["fencing_generation"]) == (route_at_crash["attempt_id"], 2)
+    assert report["context"]["input_manifest_hash"] == input_commitment
+    assert report["after_exact_input"] == report["final_digest"]
+    if point != "nested":
+        assert report["final_digest"] == reopened
+    with ControlPlaneApplication(database, limits=_application_limits()) as app:
+        assert _durable_digest(app) == report["final_digest"]
+        assert _assert_resources(app, admitted=True, authorization_hash=authorization_hash) == route_at_crash
+        _assert_private_recovery_surfaces(database, report, capfd=capfd, caplog=caplog)
+    _assert_private_recovery_surfaces(database, report, capfd=capfd, caplog=caplog)
+
+
+@pytest.mark.parametrize("call_status", ["dispatching", "unknown"])
+def test_unresolved_call_blocks_recovery_across_fresh_processes_without_execution(
+    tmp_path, call_status, capfd, caplog,
+):
+    # Catches startup or consumed-successor replay treating a pending Provider
+    # call as retry/preparation authority or crossing any external effect boundary.
+    assert sys.platform == "linux", "reopen acceptance requires real Linux processes"
+    database = tmp_path / "unknown-recovery.db"
+    observations, authorization_hash = _seed(database, task_text=SENTINEL)
+    lease = datetime.now(timezone.utc) + timedelta(minutes=5)
+    route_at_crash, _ = _kill_recovery_owner(database, observations, lease, "before-preparation")
+    with forbid_recovery_execution() as attempted:
+        with ControlPlaneApplication(database, limits=_application_limits()) as app:
+            route = AcceptedModelRoute.model_validate(route_at_crash)
+            registry = app._scheduler.lifecycle.config_snapshot("run-1").registry_manifest
+            request = _provider_call_request_for_crash(SimpleNamespace(accepted_route=route), registry)
+            request = request.model_copy(update={"messages": (ModelMessage(role="user", content=SENTINEL),)})
+            journal = SQLiteProviderCallJournal(app._event_store)
+            journal.record_intent(
+                request, provider_id="primary", provider_adapter="openai_responses",
+                provider_correlation_id="recovery-unknown-call", request_body=json.dumps({"input": SENTINEL}).encode(),
+            )
+            if call_status == "unknown":
+                journal.record_outcome(request, outcome="unknown", failure_code="timeout")
+            call = journal.read(request)
+            assert call.status == call_status
+            call_id = call.stream_id
+            before = _durable_digest(app)
+            _assert_resources(app, admitted=True, authorization_hash=authorization_hash)
+            _assert_private_recovery_surfaces(database, {}, capfd=capfd, caplog=caplog)
+        assert attempted == []
+    for _ in range(2):
+        report = _resume_in_fresh_process(database, observations, lease)
+        assert (report["initial_status"], report["initial_reason"]) == (
+            "already_admitted", "recovery_authorization_consumed",
+        )
+        assert report["missing_status"] == "waiting_for_input" and report["missing_task"]
+        assert report["status"] == report["repeated_status"] == "reconciliation_required"
+        assert report["reason"] == "provider_outcome_unknown"
+        assert report["changed_code"] == "recovery_input_mismatch"
+        assert report["route"] == report["initial_successor"] == route_at_crash
+        assert report["context"] is None and report["exact_text"] is None
+        assert report["same_task"] and report["same_route"]
+        assert report["external_attempts"] == [] and report["unresolved_calls"] == (call_id,)
+        assert report["initial_digest"] == report["after_invalid_input"] == report["final_digest"] == before
+        _assert_private_recovery_surfaces(database, report, capfd=capfd, caplog=caplog)
+    with forbid_recovery_execution() as attempted:
+        with ControlPlaneApplication(database, limits=_application_limits()) as app:
+            assert _durable_digest(app) == before
+            call = app._journal.read_call(call_id)
+            assert call.status == call_status and call.reconciliation is None
+            _assert_resources(app, admitted=True, authorization_hash=authorization_hash)
+            _assert_private_recovery_surfaces(database, report, capfd=capfd, caplog=caplog)
+        assert attempted == []
+    _assert_private_recovery_surfaces(database, report, capfd=capfd, caplog=caplog)

@@ -1,9 +1,12 @@
 """Real SQLite histories for explicit recovery continuation tests."""
 
+from contextlib import contextmanager
 from datetime import timedelta
 import hashlib
 import json
 from types import SimpleNamespace
+
+import pytest
 
 from orchestrator.budget import BudgetLedger, UsageRecord
 from orchestrator.models import ModelGatewayFailure
@@ -27,6 +30,33 @@ def application_recovery_case(database, **options):
     except BaseException:
         app.close()
         raise
+
+
+@contextmanager
+def forbid_recovery_execution():
+    """Guard external effects before startup, recording even swallowed attempts."""
+    import subprocess
+    from orchestrator.models.gateway import ModelGateway
+    from orchestrator.models.transport import UrllibHTTPSTransport
+    from orchestrator.runtime.worker_process import IsolatedWorkerProcess
+    from orchestrator.secrets.broker import AuditedSecretBroker
+
+    attempted = []
+    with pytest.MonkeyPatch.context() as patch:
+        for target, method in (
+            (subprocess, "Popen"),
+            (ModelGateway, "__init__"), (ModelGateway, "invoke"),
+            (UrllibHTTPSTransport, "__init__"), (UrllibHTTPSTransport, "post_json"),
+            (IsolatedWorkerProcess, "__init__"), (IsolatedWorkerProcess, "execute"),
+            (AuditedSecretBroker, "__init__"),
+            (AuditedSecretBroker, "acquire_provider_credential_decision"),
+        ):
+            def forbidden(*args, boundary=f"{target.__name__}.{method}", **kwargs):
+                attempted.append(boundary)
+                raise AssertionError("recovery crossed an external execution boundary")
+
+            patch.setattr(target, method, forbidden)
+        yield attempted
 
 
 def recovery_case(store, *, failure_code="rate_limited", unknown=False,
