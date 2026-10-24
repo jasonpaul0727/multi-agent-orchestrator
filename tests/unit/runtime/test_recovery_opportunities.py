@@ -2,11 +2,15 @@
 
 import subprocess
 from datetime import timedelta
+import json
+import traceback
 
 import pytest
 
 from orchestrator.persistence import SQLiteEventStore
-from tests.support.recovery_continuation import consume_recovery, durable_state, recovery_case
+from tests.support.recovery_continuation import (
+    consume_recovery, duplicate_event, durable_state, recovery_case, rewrite_event_payload,
+)
 from tests.unit.lifecycle.test_scheduler import (
     NOW, scheduler, _provider_call_request_for_crash, routed_pair, accept,
 )
@@ -256,3 +260,407 @@ def test_blocked_plans_preserve_durable_reason(tmp_path, code, reason):
         assert (item.status, item.reason) == ("blocked", reason)
         assert item.action is None and item.authorization_hash is None and item.successor is None
         assert durable_state(store) == before
+
+
+_PRIVATE = "private_input_sentinel_c87f"
+
+
+def assert_owned_error(error, code="recovery_continuation_failed"):
+    assert type(error).__name__ == "RecoveryContinuationError"
+    assert error.code == code and error.args == (code,) and vars(error) == {"code": code}
+    assert error.__cause__ is None and error.__context__ is None
+    assert _PRIVATE not in "".join(traceback.format_exception(error))
+
+
+@pytest.mark.parametrize("role", ["reviewer", "director"])
+def test_role_plan_from_real_producer_reopens_for_new_child_only(tmp_path, role):
+    # Catches replay rejecting valid producer output, or accidentally admitting its role authorization.
+    from orchestrator.scheduler import SchedulerError
+
+    database = tmp_path / "role-plan.db"
+    with SQLiteEventStore(database) as store:
+        case = recovery_case(store, failure_code="context_length_exceeded", escalation_role=role)
+        assert (case.plan.outcome, case.plan.action, case.plan.target_role) == (
+            "new_child_required", role + "_node", role,
+        )
+        before = tuple(store._connection.iterdump())
+    with SQLiteEventStore(database) as store:
+        control = scheduler(store)
+        assert control.recovery.recover("run-1").active_attempts == ()
+        item, = service(control).list_opportunities(run_id="run-1")
+        assert (item.status, item.reason, item.action) == (
+            "new_child_required", "independent_role_node_required", role + "_node",
+        )
+        assert item.authorization_hash == case.plan.authorization.authorization_hash
+        assert item.successor is None
+        request, decision = routed_pair(
+            case.registry, case.config, case.policy, attempt=2,
+            contract_hash=case.contract.contract_hash, recovery_action=case.plan.action,
+            recovery_authorization=case.plan.authorization,
+            prior_decision_hash=case.decision.decision_hash, previous_model_id="model-1",
+            failure_category="capability_failure", retry_level=1,
+        )
+        with pytest.raises(SchedulerError, match="graph or health-control"):
+            accept(control, request, decision)
+        assert tuple(store._connection.iterdump()) == before
+
+
+@pytest.mark.parametrize("role", ["reviewer", "director"])
+def test_role_plan_malformed_authorization_is_rejected(tmp_path, role):
+    # Catches relaxing source/evidence/authorization binding while admitting the supported plan shape.
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    with SQLiteEventStore(tmp_path / "bad-role.db") as store:
+        recovery_case(store, failure_code="context_length_exceeded", escalation_role=role)
+        rewrite_event_payload(store, "RecoveryPlanCreated", lambda payload:
+                              payload["plan"]["authorization"].update(evidence_hash="sha256:" + "0" * 64))
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(scheduler(store)).list_opportunities(run_id="run-1")
+        assert_owned_error(caught.value)
+        assert tuple(store._connection.iterdump()) == before
+
+
+def test_legacy_source_without_input_commitment_is_blocked(tmp_path):
+    # Catches presenting a legacy accepted route as eligible for input-bound continuation.
+    with SQLiteEventStore(tmp_path / "legacy.db") as store:
+        case = recovery_case(store, legacy_input=True)
+        before = durable_state(store)
+        item, = service(case.scheduler).list_opportunities(run_id="run-1")
+        assert (item.status, item.reason) == ("blocked", "source_input_unavailable")
+        assert item.authorization_hash == case.plan.authorization.authorization_hash
+        assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("run_id", "other-run"), ("node_id", "other-node"), ("attempt_id", "other-attempt"),
+    ("agent_instance_id", "other-agent"), ("fencing_generation", True),
+    ("fencing_generation", 2), ("graph_version", True), ("graph_version", 2),
+    ("input_manifest_hash", "sha256:" + "0" * 64),
+    ("effective_config_hash", "sha256:" + "0" * 64),
+    ("registry_hash", "sha256:" + "0" * 64), ("policy_manifest_hash", "sha256:" + "0" * 64),
+    ("routing_decision_hash", "sha256:" + "0" * 64),
+    ("planning_contract_hash", "sha256:" + "0" * 64), ("undeclared", _PRIVATE),
+], ids=["run", "node", "attempt", "agent", "generation-bool", "generation-mismatch",
+        "graph-bool", "graph-mismatch", "input-hash", "config-hash", "registry-hash",
+        "policy-hash", "decision-hash", "contract-hash", "undeclared-field"])
+def test_corrupt_historical_context_fails_closed_without_writes(tmp_path, field, value):
+    # Catches trusting a valid-looking copied context instead of exact historical admission authority.
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    with SQLiteEventStore(tmp_path / "bad-context.db") as store:
+        case = recovery_case(store)
+        rewrite_event_payload(store, "RoutingDecisionAccepted", lambda payload:
+                              payload["verification_context"].update({field: value}))
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id="run-1")
+        assert_owned_error(caught.value)
+        assert tuple(store._connection.iterdump()) == before
+
+
+@pytest.mark.parametrize("mutation", [
+    "partial-commitment", "missing-context", "contract-id", "checks", "extra-commitment",
+    "graph-version-bool", "route-decision", "provider-id", "source-generation-bool",
+    "nested-route-bool", "source-extra",
+])
+def test_corrupt_source_commitment_is_owned_and_private(tmp_path, mutation):
+    # Catches ignored source/admission fields and unsafe nested route payloads.
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    def mutate(payload):
+        if mutation == "partial-commitment":
+            payload["verification_admission"] = None
+        elif mutation == "missing-context":
+            payload["verification_context"] = None
+        elif mutation == "contract-id":
+            payload["verification_contract"] = _PRIVATE
+        elif mutation == "checks":
+            payload["required_check_ids"] = [_PRIVATE]
+        elif mutation == "extra-commitment":
+            payload["verification_admission"][_PRIVATE] = _PRIVATE
+        elif mutation == "graph-version-bool":
+            payload["graph_version"] = True
+        elif mutation == "route-decision":
+            payload["accepted_route"]["decision_id"] = "other-decision"
+        elif mutation == "provider-id":
+            payload["provider_id"] = "other-provider"
+        elif mutation == "source-generation-bool":
+            payload["fencing_generation"] = True
+        elif mutation == "nested-route-bool":
+            payload["accepted_route"]["fencing_generation"] = True
+        else:
+            payload[_PRIVATE] = _PRIVATE
+
+    with SQLiteEventStore(tmp_path / "bad-source.db") as store:
+        case = recovery_case(store)
+        rewrite_event_payload(store, "RoutingDecisionAccepted", mutate)
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id="run-1")
+        assert_owned_error(caught.value)
+        assert tuple(store._connection.iterdump()) == before
+
+
+@pytest.mark.parametrize("target", ["plan", "classification"])
+@pytest.mark.parametrize("reason", [_PRIVATE, _PRIVATE + "\nraw task", "x" * 1000],
+                         ids=["private-code", "multiline", "oversized"])
+def test_corrupt_persisted_reasons_do_not_escape(tmp_path, target, reason, caplog):
+    # Catches echoing even syntactically valid arbitrary persisted reason strings as metadata.
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    with SQLiteEventStore(tmp_path / "bad-reason.db") as store:
+        case = recovery_case(store)
+        event_type = "RecoveryPlanCreated" if target == "plan" else "AttemptFailureClassified"
+        rewrite_event_payload(store, event_type, lambda payload: payload[target].update(reason=reason))
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id="run-1")
+        assert_owned_error(caught.value)
+        assert reason not in caplog.text
+        assert tuple(store._connection.iterdump()) == before
+
+
+@pytest.mark.parametrize("event_type", ["RoutingDecisionAccepted", "AttemptFailureClassified", "RecoveryPlanCreated"])
+def test_duplicate_durable_history_is_rejected_without_writes(tmp_path, event_type):
+    # Catches lossy dictionary joins hiding duplicated durable evidence or authorization.
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    with SQLiteEventStore(tmp_path / "duplicate.db") as store:
+        case = recovery_case(store)
+        duplicate_event(store, event_type)
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id="run-1")
+        assert_owned_error(caught.value)
+        assert tuple(store._connection.iterdump()) == before
+
+
+@pytest.mark.parametrize("event_type", ["AttemptFailureClassified", "RecoveryPlanCreated"])
+def test_orphaned_durable_recovery_history_is_rejected(tmp_path, event_type):
+    # Catches joining source/evidence solely by node rather than exact persisted identity.
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    with SQLiteEventStore(tmp_path / "orphan.db") as store:
+        case = recovery_case(store)
+        rewrite_event_payload(store, event_type, lambda payload: payload.update(attempt_ref="sha256:" + "0" * 64))
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id="run-1")
+        assert_owned_error(caught.value)
+        assert tuple(store._connection.iterdump()) == before
+
+
+def test_historical_graph_version_survives_later_graph_append(tmp_path):
+    # Catches substituting the current graph for the source's frozen admission graph.
+    from orchestrator.lifecycle import NodeSpec
+    from tests.unit.lifecycle.test_scheduler import _fixture_contract
+
+    with SQLiteEventStore(tmp_path / "graph.db") as store:
+        case = recovery_case(store)
+        extra = _fixture_contract(case.registry, case.config, case.policy, node_id="node-2")
+        case.lifecycle.append_nodes("run-1", (NodeSpec(
+            node_id="node-2", role="coder", planning_contract_hash=extra.contract_hash,
+            planning_contract=extra,
+        ),), expected_graph_version=1, idempotency_key="later-graph", policy_manifest=case.policy)
+        before = durable_state(store)
+        item, = service(case.scheduler).list_opportunities(run_id="run-1")
+        assert item.status == "ready"
+        assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("run_id", ["", "bad id", "node\n", "a" * 129, True, 1, None])
+def test_malformed_query_identity_is_owned_and_read_only(tmp_path, run_id):
+    # Catches coercing or accepting caller-controlled identifiers before acquiring the snapshot.
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    with SQLiteEventStore(tmp_path / "identity.db") as store:
+        case = recovery_case(store)
+        before = durable_state(store)
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id=run_id)
+        assert_owned_error(caught.value, "recovery_continuation_invalid")
+        assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("mutation", ["generation", "extra-field", "model-extra"])
+def test_opportunity_revalidates_unsafe_nested_route_model(tmp_path, mutation):
+    # Catches Pydantic trusting unchecked nested model_copy data across the metadata boundary.
+    from pydantic import ValidationError
+    from orchestrator.runtime.recovery_opportunities import RecoveryOpportunity
+
+    with SQLiteEventStore(tmp_path / "unsafe.db") as store:
+        case = recovery_case(store)
+        _, _, accepted = consume_recovery(case)
+        unsafe = accepted.accepted_route.model_copy(update={
+            "fencing_generation" if mutation == "generation" else "undeclared":
+            True if mutation == "generation" else _PRIVATE,
+        })
+        if mutation == "model-extra":
+            unsafe = accepted.accepted_route.model_copy()
+            object.__setattr__(unsafe, "__pydantic_extra__", {"undeclared": _PRIVATE})
+        item, = service(case.scheduler).list_opportunities(run_id="run-1")
+        before = durable_state(store)
+        with pytest.raises(ValidationError):
+            RecoveryOpportunity(**{**item.model_dump(), "successor": unsafe})
+        assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("outcome", [None, "unknown", "known_success"])
+def test_current_unsettled_journal_preserves_holds_and_requires_reconciliation(tmp_path, outcome):
+    # Catches reopening dispatch, unknown, or unaccounted success as a fresh continuation opportunity.
+    from orchestrator.models.provider_calls import SQLiteProviderCallJournal
+
+    database = tmp_path / "journal.db"
+    with SQLiteEventStore(database) as store:
+        case = recovery_case(store)
+        request = _provider_call_request_for_crash(case.accepted, case.registry)
+        journal = SQLiteProviderCallJournal(store)
+        journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses",
+                              provider_correlation_id="current-call", request_body=b"{}")
+        if outcome is not None:
+            journal.record_outcome(request, outcome=outcome, http_status=200 if outcome == "known_success" else None)
+        before = durable_state(store)
+    with SQLiteEventStore(database) as store:
+        item, = service(scheduler(store)).list_opportunities(run_id="run-1")
+        assert (item.status, item.reason) == ("reconciliation_required", "provider_outcome_unknown")
+        assert durable_state(store) == before
+
+
+def test_query_privacy_includes_metadata_events_logs_and_errors(tmp_path, caplog):
+    # Catches exposing task/provider observations through public metadata or failure surfaces.
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    with SQLiteEventStore(tmp_path / "privacy.db") as store:
+        case = recovery_case(store)
+        item, = service(case.scheduler).list_opportunities(run_id="run-1")
+        assert set(type(item).model_fields) == {
+            "run_id", "node_id", "source_attempt_id", "source_fencing_generation", "source_decision_hash",
+            "authorization_hash", "evidence_hash", "action", "status", "reason", "successor",
+        }
+        assert "implement a small change" not in repr(item) + json.dumps(item.model_dump(mode="json"))
+        assert "implement a small change" not in repr(tuple(store._connection.iterdump()))
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id=_PRIVATE + " ")
+        assert_owned_error(caught.value, "recovery_continuation_invalid")
+        assert _PRIVATE not in caplog.text
+
+
+@pytest.mark.parametrize("outcome", ["not_sent", "known_failure", "known_success"])
+def test_accounted_or_known_failure_journal_does_not_block_retry(tmp_path, outcome):
+    # Catches broad journal-status blocking that breaks ordinary settled retry paths.
+    from orchestrator.models.provider_calls import SQLiteProviderCallJournal
+
+    with SQLiteEventStore(tmp_path / "known-call.db") as store:
+        case = recovery_case(store, accounted_usage=outcome == "known_success")
+        request = _provider_call_request_for_crash(case.accepted, case.registry)
+        journal = SQLiteProviderCallJournal(store)
+        journal.record_intent(request, provider_id="primary", provider_adapter="openai_responses",
+                              provider_correlation_id="known-call", request_body=b"{}")
+        journal.record_outcome(request, outcome=outcome, http_status=200 if outcome == "known_success" else None)
+        before = durable_state(store)
+        item, = service(case.scheduler).list_opportunities(run_id="run-1")
+        assert (item.status, item.reason) == ("ready", "bounded_same_model_retry")
+        assert durable_state(store) == before
+
+
+@pytest.mark.parametrize("mutation", ["missing", "unsafe-field", "config-hash"])
+def test_inconsistent_frozen_contract_is_owned_error(tmp_path, mutation):
+    # Catches overlooking missing or changed frozen source authority after input was committed.
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    def mutate(payload):
+        contract = payload["nodes"][0]["planning_contract"]
+        if mutation == "missing":
+            payload["nodes"][0]["planning_contract"] = None
+        elif mutation == "unsafe-field":
+            contract["context_tokens"] = True
+        else:
+            contract["config_hash"] = "sha256:" + "0" * 64
+
+    with SQLiteEventStore(tmp_path / "contract.db") as store:
+        case = recovery_case(store)
+        rewrite_event_payload(store, "GraphNodesAppended", mutate,
+                              stream_type="run_lifecycle", stream_id="run-1")
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id="run-1")
+        assert_owned_error(caught.value)
+        assert tuple(store._connection.iterdump()) == before
+
+
+@pytest.mark.parametrize("mutation", ["unknown-event", "bool-generation", "source-route"])
+def test_malformed_current_journal_is_sanitized(tmp_path, mutation):
+    # Catches trusting journal identities without validating current serialized durable facts.
+    from orchestrator.models.provider_calls import SQLiteProviderCallJournal
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    with SQLiteEventStore(tmp_path / "bad-journal.db") as store:
+        case = recovery_case(store)
+        request = _provider_call_request_for_crash(case.accepted, case.registry)
+        stream_id = SQLiteProviderCallJournal(store).record_intent(
+            request, provider_id="primary", provider_adapter="openai_responses",
+            provider_correlation_id="bad-call", request_body=b"{}",
+        )
+        field, value = {
+            "unknown-event": (_PRIVATE, _PRIVATE), "bool-generation": ("fencing_generation", True),
+            "source-route": ("accepted_route_id", "other-route"),
+        }[mutation]
+        rewrite_event_payload(store, "ProviderCallIntentRecorded", lambda payload: payload.update({field: value}),
+                              stream_type="provider_call", stream_id=stream_id)
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id="run-1")
+        assert_owned_error(caught.value)
+        assert tuple(store._connection.iterdump()) == before
+
+
+@pytest.mark.parametrize("field", ["evidence_hash", "policy_manifest_hash"])
+def test_well_formed_but_misbound_authorization_is_rejected(tmp_path, field):
+    # Catches accepting a freshly hashed authorization that references the wrong source commitment.
+    from orchestrator.routing import RecoveryAuthorization
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    with SQLiteEventStore(tmp_path / "misbound.db") as store:
+        case = recovery_case(store)
+
+        def mutate(payload):
+            values = dict(payload["plan"]["authorization"])
+            values.pop("authorization_hash")
+            values[field] = "sha256:" + "0" * 64
+            payload["plan"]["authorization"] = RecoveryAuthorization.create(**values).model_dump(mode="json")
+
+        rewrite_event_payload(store, "RecoveryPlanCreated", mutate)
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id="run-1")
+        assert_owned_error(caught.value)
+        assert tuple(store._connection.iterdump()) == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("failure_code", "context_length_exceeded"), ("retry_level", 1),
+    ("failure_category", "capability_failure"), ("retry_safe", False),
+    ("failed_model_unavailable", True), ("provider_code_hash", "sha256:" + "0" * 64),
+    ("exhausted_model_ids", ["model-1"]),
+], ids=["failure-code", "retry-counter", "category", "retry-safety", "availability", "provider-code-hash", "exhaustion"])
+def test_classification_must_match_committed_failure_and_source_counters(tmp_path, field, value):
+    # Catches well-typed evidence edits that preserve the old authorization/evidence hash.
+    from orchestrator.runtime.recovery_opportunities import RecoveryContinuationError
+
+    def mutate(payload):
+        if field == "failure_code":
+            payload["failure"]["code"] = value
+        elif field == "provider_code_hash":
+            payload[field] = value
+        else:
+            payload["classification"]["evidence"][field] = value
+
+    with SQLiteEventStore(tmp_path / "failure-binding.db") as store:
+        case = recovery_case(store)
+        rewrite_event_payload(store, "AttemptFailureClassified", mutate)
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(RecoveryContinuationError) as caught:
+            service(case.scheduler).list_opportunities(run_id="run-1")
+        assert_owned_error(caught.value)
+        assert tuple(store._connection.iterdump()) == before
