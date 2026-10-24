@@ -388,7 +388,12 @@ def _check_classification(event, classification, source, sources, events):
 
 
 def _unsettled_nodes(scheduler, *, run_id, sources):
-    result = set()
+    return {call.node_id for call in _unsettled_calls(scheduler, run_id=run_id, sources=sources)}
+
+
+def _unsettled_calls(scheduler, *, run_id, sources):
+    """Shared Provider hold definitions, retaining exact call identities."""
+    result = []
     journal = SQLiteProviderCallJournal(scheduler.event_store)
     for stream_id in scheduler.event_store.stream_ids("provider_call"):
         call = journal.read_call(stream_id)
@@ -407,12 +412,12 @@ def _unsettled_nodes(scheduler, *, run_id, sources):
             or call.registry_manifest_hash != route.registry_manifest_hash):
             raise ValueError("Provider journal source bindings disagree")
         if call.status in {"dispatching", "unknown", "settlement_pending"}:
-            result.add(call.node_id)
+            result.append(call)
         elif call.status == "known_success":
             reservation = scheduler._ledger_for_run(run_id).get_reservation(call.budget_reservation_id, run_id=run_id)
             if reservation.status != "committed":
-                result.add(call.node_id)
-    return result
+                result.append(call)
+    return tuple(result)
 
 
 class RecoveryOpportunityService:
