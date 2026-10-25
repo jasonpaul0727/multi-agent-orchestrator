@@ -7,6 +7,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import json
 from pathlib import Path
 import stat
 from typing import Literal, TYPE_CHECKING
@@ -14,13 +15,15 @@ from uuid import UUID
 from weakref import WeakKeyDictionary
 
 from orchestrator.persistence import SQLiteEventStore
-from orchestrator.models.gateway import ModelRequest, validate_gateway_request
+from orchestrator.artifacts import ArtifactStore
+from orchestrator.models.gateway import ModelRequest, ModelResponse, TokenUsage, validate_gateway_request
 from orchestrator.models.provider_calls import SQLiteProviderCallJournal
 from orchestrator.runtime.general_worker_journal import (
     GeneralWorkerIdentity, GeneralWorkerJournal, GeneralWorkerOperation,
-    GeneralWorkerJournalError, STREAM_TYPE, _guard, _identity_value, _safe, metadata_hash,
+    GeneralWorkerJournalError, STREAM_TYPE, _guard, _identity_value, _safe, metadata_hash, _request_retry_allowed,
+    _publication_for_operation,
 )
-from orchestrator.runtime.general_worker_protocol import _canonical, _model_fields, _text, _DIGEST
+from orchestrator.runtime.general_worker_protocol import _canonical, _model_fields, _text, _DIGEST, _pairs, _constant
 from orchestrator.runtime.recovery_opportunities import _unsettled_calls
 from orchestrator.tools.workspace_write import _unresolved_executions, _unresolved_publications
 
@@ -83,6 +86,118 @@ MAX_DISPATCH_PERMITS = 1024
 GeneralWorkerPurpose = Literal["request", "dispatch", "completion", "acceptance"]
 
 
+def _preflight_general_bytes(scheduler, journal, operation, proposal):
+    """Read bounded private bytes once outside SQL; return publication IDs only."""
+    artifacts = scheduler.recovery.artifact_store
+    if (scheduler.event_store._connection.in_transaction or type(artifacts) is not ArtifactStore
+        or artifacts._event_store is not scheduler.event_store or operation.capture is None):
+        raise ValueError()
+    response_ref = operation.capture.response_artifact
+    output_ref, = proposal.task.candidate_artifacts
+    if response_ref.artifact_type != "general-model-response" or response_ref.media_type != "application/json":
+        raise ValueError()
+    def read(ref, kind):
+        record = _publication_for_operation(scheduler.event_store, operation, ref, kind)
+        with artifacts._require_artifact_path(ref.digest).open("rb") as file:
+            raw = file.read(ref.size_bytes + 1)
+        if len(raw) != ref.size_bytes or "sha256:" + hashlib.sha256(raw).hexdigest() != ref.digest:
+            raise ValueError()
+        return raw, record.publication_id
+    raw, response_id = read(response_ref, "response")
+    value = json.loads(raw.decode("utf-8", errors="strict"), object_pairs_hook=_pairs, parse_constant=_constant)
+    response = ModelResponse.model_validate(value)
+    call = journal._provider_success(operation)
+    if (raw != _canonical(response.model_dump(mode="json")) or response.request_id != operation.request_id
+        or response.model_id != call.model_id or response.provider_request_id != call.provider_request_id
+        or response.finish_reason != "stop" or response.tool_calls
+        or response.usage != TokenUsage.model_validate(dict(call.usage))):
+        raise ValueError()
+    output, output_id = read(output_ref, "output")
+    if not 0 < len(output) <= operation.output_byte_limit or response.output_text.encode("utf-8") != output:
+        raise ValueError()
+    return response_id, output_id
+
+
+def _validate_general_usage(journal, operation, usage):
+    call = journal._provider_success(operation)
+    _validate_call_usage(call, usage)
+
+
+def _validate_call_usage(call, usage):
+    if usage.status != "committed":
+        raise ValueError()
+    for name in ("input_tokens", "output_tokens", "reasoning_tokens", "cached_input_tokens", "provider_fee_minor"):
+        if call.usage.get(name) is not None and getattr(usage, name) != call.usage[name]:
+            raise ValueError()
+
+
+def _require_no_other_general_holds(scheduler, operation, recovered):
+    if any(effect.node_id == operation.identity.node_id and effect.status == "outcome_unknown"
+           for effect in recovered.effects):
+        raise ValueError()
+    workspace_stream = "workspace:" + operation.workspace_identity_hash[7:]
+    if (_unresolved_publications(scheduler.event_store.read_stream("security", operation.identity.run_id),
+            run_id=operation.identity.run_id)
+        or _unresolved_publications(scheduler.event_store.read_stream("workspace_publications", workspace_stream))
+        or _unresolved_executions(scheduler.event_store.read_stream("workspace_executions", workspace_stream),
+            operation.workspace_identity_hash)):
+        raise ValueError()
+
+
+@_guard
+def _validate_general_release_authority(scheduler, journal, operation, *, events, entry, usage, known_no_effect, at):
+    """Classify a known release from immutable Provider authority, never flags alone.
+
+    Return True only when an external trusted usage sample is also required.
+    Durable reconciliation is a separate metadata-only authority for startup.
+    """
+    identity = operation.identity
+    recovered = scheduler.recovery.recover_control_state(identity.run_id)
+    node = recovered.lifecycle.node(identity.node_id)
+    sources = {event.payload["attempt_ref"]: event for event in events
+        if event.event_type == "RoutingDecisionAccepted" and event.run_id == identity.run_id}
+    source = next((event for event in sources.values() if event.node_id == identity.node_id
+        and event.attempt_id == identity.attempt_id and event.fencing_generation == identity.fencing_generation), None)
+    if (source is None or not node.attempts or node.attempts[-1].attempt_id != identity.attempt_id
+        or node.attempts[-1].fencing_generation != identity.fencing_generation
+        or _canonical(source.payload.get("verification_context")) != _canonical(_safe(operation.context))
+        or recovered.lifecycle.workspace_identity_hash != operation.workspace_identity_hash):
+        raise ValueError()
+    own = None if operation.call is None else journal._provider_call(operation)
+    for call in _unsettled_calls(scheduler, run_id=identity.run_id, sources=sources):
+        if call.node_id == identity.node_id and (own is None or call.stream_id != own.stream_id):
+            raise ValueError()
+    provider = SQLiteProviderCallJournal(scheduler.event_store)
+    for stream_id in scheduler.event_store.stream_ids("provider_call"):
+        call = provider.read_call(stream_id)
+        if call.run_id != identity.run_id or call.node_id != identity.node_id:
+            continue
+        if call.attempt_id == identity.attempt_id and (own is None or own.stream_id != stream_id):
+            raise ValueError()
+        if (call.status == "known_failure" and (own is None or own.stream_id != stream_id)
+            and scheduler._ledger_for_run(identity.run_id).get_reservation(
+                call.budget_reservation_id, run_id=identity.run_id).status not in {"committed", "released"}):
+            raise ValueError()
+    _require_no_other_general_holds(scheduler, operation, recovered)
+    if own is None:
+        if operation.call is not None or not known_no_effect or usage is not None:
+            raise ValueError()
+        return False
+    if entry == "reconcile":
+        proof = own.reconciliation
+        if (own.status not in {"settlement_pending", "reconciled"} or proof is None
+            or own.reconciled_at != at or proof.usage != usage
+            or known_no_effect != (proof.effect == "not_received")):
+            raise ValueError()
+        return False
+    if (own.status not in {"known_success", "known_failure"} or own.termination_receipt is None
+        or own.usage is None or own.usage.get("status") not in {"reported", "estimated"}
+        or known_no_effect or usage is None):
+        raise ValueError()
+    _validate_call_usage(own, usage)
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class _DispatchPermit:
     """Bounded process-local metadata; never request/response or credentials."""
@@ -138,12 +253,12 @@ def _validate_general_eligibility(scheduler, journal, operation, *, purpose, hos
         host_scope_hash=host_scope_hash)
     phases = {"request": {"requested"}, "dispatch": {"worker_stopped", "call_reserved"},
         "completion": {"response_captured", "completion_stopped"}, "acceptance": {"proposed"}}
-    if operation.phase not in phases[purpose]:
+    if operation.phase not in phases[purpose] and not (purpose == "request" and _request_retry_allowed(operation)):
         raise ValueError()
     if purpose != "request" and (not operation.turns or any(
         turn.launch_receipt is None or turn.termination_receipt is None for turn in operation.turns)):
         raise ValueError()
-    if purpose == "dispatch" and not operation.turns[0].request_observed:
+    if purpose == "dispatch" and not operation.turns[-1].request_observed:
         raise ValueError()
     sources = {event.payload["attempt_ref"]: event for event in events
         if event.event_type == "RoutingDecisionAccepted" and event.run_id == operation.identity.run_id}
@@ -156,16 +271,7 @@ def _validate_general_eligibility(scheduler, journal, operation, *, purpose, hos
             or call.status != "known_success"):
             raise ValueError()
         journal._validate_links(operation)
-    if any(effect.node_id == operation.identity.node_id and effect.status == "outcome_unknown"
-           for effect in recovered.effects):
-        raise ValueError()
-    workspace_stream = "workspace:" + operation.workspace_identity_hash[7:]
-    if (_unresolved_publications(journal.event_store.read_stream("security", operation.identity.run_id),
-            run_id=operation.identity.run_id)
-        or _unresolved_publications(journal.event_store.read_stream("workspace_publications", workspace_stream))
-        or _unresolved_executions(journal.event_store.read_stream("workspace_executions", workspace_stream),
-            operation.workspace_identity_hash)):
-        raise ValueError()
+    _require_no_other_general_holds(scheduler, operation, recovered)
     return binding
 
 

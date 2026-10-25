@@ -7,44 +7,19 @@ transaction can consume the proof and release the Attempt's resource holds.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import hashlib
-import json
 import re
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable
 
 from orchestrator.artifacts import ArtifactStore, EphemeralArtifactGrantAuthority
 from orchestrator.budget import UsageRecord
 from orchestrator.scheduler import Scheduler
-from orchestrator.scheduler.core import ActiveAttemptSnapshot
 from orchestrator.validation import revalidate_model
 
-from .contracts import (
-    BUILTIN_VERIFIER_ID, VerificationEvidence, validate_verification_evidence,
-)
+from .proposal_verification import verify_proposal
 from .verification_journal import VerifierProposalJournal, VerifierProposalRecord
 from .verifier_process import IsolatedVerifierProcess
-
-
-class ProposalAcceptanceError(RuntimeError):
-    """Acceptance cannot prove every prerequisite; durable state stays held."""
-
-    code = "proposal_acceptance_rejected"
-
-
-@runtime_checkable
-class AttemptUsageSource(Protocol):
-    """Trusted host settlement service; no production backend exists in this slice."""
-
-    def usage_for(self, snapshot: ActiveAttemptSnapshot) -> UsageRecord:
-        """Return validated usage for the snapshot's exact budget reservation."""
-        ...
-
-
-class UnavailableAttemptUsageSource:
-    """The default cannot authorize settlement without Provider usage evidence."""
-
-    def usage_for(self, snapshot: ActiveAttemptSnapshot) -> UsageRecord:
-        raise ProposalAcceptanceError("trusted Attempt usage is unavailable")
+from .general_worker_journal import GeneralWorkerIdentity
+from .attempt_usage import AttemptUsageSource, ProposalAcceptanceError, UnavailableAttemptUsageSource
 
 
 def _utc_now() -> datetime:
@@ -91,6 +66,10 @@ class AttemptExecutionCoordinator:
                 raise ProposalAcceptanceError("proposal acceptance dependencies are unavailable")
             identity = dict(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
                             fencing_generation=fencing_generation)
+            if self._scheduler._general_operation(**identity) is not None:
+                self._scheduler._finish_general_verified_attempt(
+                    identity=GeneralWorkerIdentity(**identity), task_sha256=task_sha256)
+                return self._journal.read_proposal(run_id, task_sha256)
             started_at = self._now()
             binding = self._scheduler.resolve_verification_binding(**identity, as_of=started_at)
             proposal = self._journal.read_proposal(run_id, task_sha256)
@@ -102,21 +81,8 @@ class AttemptExecutionCoordinator:
             ):
                 raise ProposalAcceptanceError("proposal does not match frozen Attempt authority")
 
-            evidence = self._verifier.verify(
-                proposal.task, self._artifact_store,
-                grant_for_digest=lambda digest: self._grants.issue(
-                    digest=digest, run_id=run_id,
-                    expires_at=binding.active_attempt.lease_expires_at,
-                ),
-            )
-            evidence = revalidate_model(VerificationEvidence, evidence)
-            validate_verification_evidence(proposal.task, evidence)
-            encoded = json.dumps(evidence.model_dump(mode="json"), ensure_ascii=False,
-                                 sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-            evidence_hash = "sha256:" + hashlib.sha256(encoded).hexdigest()
-            if (evidence.verifier_id != BUILTIN_VERIFIER_ID or evidence.outcome != "accepted"
-                or evidence_hash != proposal.evidence_sha256):
-                raise ProposalAcceptanceError("independent verification differs from durable proof")
+            verify_proposal(proposal, binding, verifier=self._verifier,
+                artifact_store=self._artifact_store, grants=self._grants)
             usage = revalidate_model(UsageRecord, self._usage_source.usage_for(binding.active_attempt))
             completed_at = self._now()
             if completed_at < started_at:

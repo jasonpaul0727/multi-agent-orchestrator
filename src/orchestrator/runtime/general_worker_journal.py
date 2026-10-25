@@ -7,11 +7,14 @@ owned Scheduler authorities supply live eligibility at each execution boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
+from datetime import datetime, timedelta
 from functools import wraps
 import hashlib
 import json
 from typing import Literal
 
+from orchestrator.artifacts import ArtifactStore
+from orchestrator.budget import BudgetLedger
 from orchestrator.isolation import PreparedSandboxLaunch, SandboxLaunchReceipt, SandboxTerminationReceipt
 from orchestrator.isolation.launcher import _validate_prepared, _validate_launch_receipt
 from orchestrator.models.gateway import AcceptedModelRoute, CostSnapshotRefs, ModelMessage, ModelRequest
@@ -109,6 +112,20 @@ class GeneralWorkerCapture:
 
 
 @dataclass(frozen=True, slots=True)
+class GeneralWorkerAcceptance:
+    task_sha256: str
+    evidence_sha256: str
+    artifacts: tuple[ArtifactRef, ...]
+    usage_sha256: str
+    settlement_key: str
+    completed_at: str
+    capture_sha256: str
+    turns_sha256: str
+    response_publication_id: str
+    output_publication_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class GeneralWorkerOperation:
     identity: GeneralWorkerIdentity
     operation_id: str
@@ -127,10 +144,11 @@ class GeneralWorkerOperation:
     task_sha256: str | None = None
     evidence_sha256: str | None = None
     accepted_result: GeneralWorkerResult | None = None
+    acceptance: GeneralWorkerAcceptance | None = None
 
 
 _DATACLASSES = (GeneralWorkerIdentity, GeneralWorkerResult, GeneralWorkerTurnCheckpoint,
-    GeneralWorkerCall, GeneralWorkerCapture, GeneralWorkerOperation,
+    GeneralWorkerCall, GeneralWorkerCapture, GeneralWorkerOperation, GeneralWorkerAcceptance,
     PreparedSandboxLaunch, SandboxLaunchReceipt, SandboxTerminationReceipt, GeneralWorkerRequest)
 _MODELS = (AttemptContext, ArtifactRef, AcceptedModelRoute, ModelRequest, ModelMessage, CostSnapshotRefs)
 
@@ -191,6 +209,34 @@ def _artifact(value):
     return ArtifactRef.model_validate(value)
 
 
+def _request_retry_allowed(operation):
+    return (operation.phase == "worker_stopped" and operation.call is None and operation.capture is None
+        and operation.turns and all(turn.phase == "request" and turn.launch_receipt is not None
+            and turn.termination_receipt is not None and not turn.request_observed for turn in operation.turns))
+
+
+def _require_worker_stopped(operation):
+    if any(turn.launch_receipt is None or turn.termination_receipt is None for turn in operation.turns):
+        raise ValueError()
+
+
+def _publication_for_operation(store, operation, artifact, kind, publication_id=None):
+    """Pure event metadata/provenance; never opens an artifact path."""
+    source = {**{key: str(value) for key, value in _identity_value(operation.identity).items()},
+        "agent_instance_id": operation.context.agent_instance_id,
+        "general_worker_operation_id": operation.operation_id, "general_worker_kind": kind}
+    scope = (operation.operation_id,) if kind == "response" else (operation.identity.run_id,)
+    for event in store.read_stream("artifact", artifact.digest):
+        if event.event_type != "ArtifactPublished":
+            continue
+        record = ArtifactStore._record_from_event(event, artifact.digest)
+        if (record.source == source and record.readable_scope == scope and record.size == artifact.size_bytes
+            and record.artifact_type == artifact.artifact_type and record.media_type == artifact.media_type
+            and (publication_id is None or publication_id == record.publication_id)):
+            return record
+    raise ValueError()
+
+
 def _apply(operation, action, data):
     """The sole state-transition algorithm, used for both writes and replay."""
     _plain(data)
@@ -208,7 +254,7 @@ def _apply(operation, action, data):
         phase = data["phase"]
         if (phase not in {"request", "complete"} or len(operation.turns) >= MAX_TURNS
             or any(turn.prepared.launch_id == prepared.launch_id for turn in operation.turns)
-            or (phase == "request" and operation.phase != "requested")
+            or (phase == "request" and operation.phase != "requested" and not _request_retry_allowed(operation))
             or (phase == "complete" and operation.phase not in {"response_captured", "completion_stopped"})):
             raise ValueError()
         return replace(operation, phase="worker_requested" if phase == "request" else "completion_requested",
@@ -267,6 +313,30 @@ def _apply(operation, action, data):
         if operation.phase != "completion_stopped" or operation.capture is None:
             raise ValueError()
         return replace(operation, phase="proposed", **data)
+    if action == "Accepted":
+        _fields(data, {field.name for field in fields(GeneralWorkerAcceptance)})
+        _hashes(data, ("task_sha256", "evidence_sha256", "usage_sha256", "capture_sha256", "turns_sha256"))
+        for name in ("settlement_key", "response_publication_id", "output_publication_id"):
+            _text(data[name], maximum=128, pattern=_IDENTIFIER)
+        _text(data["completed_at"], maximum=64)
+        completed = datetime.fromisoformat(data["completed_at"])
+        if completed.utcoffset() != timedelta(0) or completed.isoformat() != data["completed_at"]:
+            raise ValueError()
+        if type(data["artifacts"]) is not list or len(data["artifacts"]) != 1:
+            raise ValueError()
+        artifacts = tuple(_artifact(value) for value in data["artifacts"])
+        if (operation.phase != "proposed" or operation.capture is None
+            or data["task_sha256"] != operation.task_sha256 or data["evidence_sha256"] != operation.evidence_sha256
+            or data["capture_sha256"] != metadata_hash(_safe(operation.capture))
+            or data["turns_sha256"] != metadata_hash(_safe(operation.turns))
+            or artifacts != (ArtifactRef(digest=operation.capture.output_digest, size_bytes=operation.capture.output_byte_count,
+                artifact_type="text", media_type="text/plain; charset=utf-8"),)):
+            raise ValueError()
+        _require_worker_stopped(operation)
+        acceptance = GeneralWorkerAcceptance(**{**data, "artifacts": artifacts})
+        return replace(operation, phase="accepted", acceptance=acceptance,
+            accepted_result=GeneralWorkerResult(operation.identity, operation.operation_id, "accepted",
+                "general_worker_accepted", artifacts, operation.task_sha256, operation.evidence_sha256))
     raise ValueError()
 
 
@@ -320,6 +390,7 @@ class GeneralWorkerJournal:
         operation = _replay(identity, events, version)
         if operation is not None:
             self._validate_links(operation)
+            self._validate_terminal_links(operation)
         return operation
 
     @_guard
@@ -334,6 +405,7 @@ class GeneralWorkerJournal:
                 raise ValueError()
             operation = _replay(identity, events, version)
             self._validate_links(operation)
+            self._validate_terminal_links(operation)
 
     @_guard
     def request(self, *, context: AttemptContext, input_commitment: str,
@@ -419,6 +491,13 @@ class GeneralWorkerJournal:
         evidence_sha256: str) -> GeneralWorkerOperation:
         return self._append(operation, "Proposed", _safe(dict(task_sha256=task_sha256, evidence_sha256=evidence_sha256)))
 
+    @_guard
+    def _record_accepted(self, operation: GeneralWorkerOperation, *, acceptance: GeneralWorkerAcceptance):
+        """Scheduler-only nested checkpoint; public APIs cannot set success."""
+        if not self.event_store._connection.in_transaction or type(acceptance) is not GeneralWorkerAcceptance:
+            raise ValueError()
+        return self._append(operation, "Accepted", _safe(acceptance))
+
     def _validate_operation(self, operation):
         if type(operation) is not GeneralWorkerOperation:
             raise ValueError()
@@ -464,11 +543,17 @@ class GeneralWorkerJournal:
         return result
 
     def _provider_success(self, operation):
+        call = self._provider_call(operation)
+        if (call.status != "known_success" or call.usage is None
+            or call.usage.get("status") not in {"reported", "estimated"} or call.termination_receipt is None):
+            raise ValueError()
+        return call
+
+    def _provider_call(self, operation):
         if operation.call is None:
             raise ValueError()
         call = SQLiteProviderCallJournal(self.event_store).read_call(operation.call.provider_call_stream_id)
-        if (call is None or call.status != "known_success" or call.usage is None
-            or call.usage.get("status") not in {"reported", "estimated"} or call.termination_receipt is None
+        if (call is None
             or any(getattr(call, name) != value for name, value in _identity_value(operation.identity).items())
             or call.request_id != operation.request_id or call.registry_manifest_hash != operation.context.registry_hash
             or call.request_hash != operation.call.request_body_sha256
@@ -493,3 +578,34 @@ class GeneralWorkerJournal:
             if (proposal is None or proposal.evidence_sha256 != operation.evidence_sha256
                 or proposal.task.context != operation.context or proposal.task.candidate_artifacts != (expected,)):
                 raise ValueError()
+
+    def _validate_terminal_links(self, operation):
+        """Reciprocal immutable success/usage links, without fresh time or files."""
+        matches = [event for event in self.event_store.read_stream("scheduler", "global")
+            if event.event_type == "AttemptSlotReleased" and
+            all(getattr(event, key) == value for key, value in _identity_value(operation.identity).items())]
+        successes = [event for event in matches if event.payload.get("outcome") == "succeeded"]
+        if operation.phase != "accepted":
+            if successes:
+                raise ValueError()
+            if matches:
+                _require_worker_stopped(operation)
+            return
+        if len(matches) != 1 or len(successes) != 1 or operation.acceptance is None:
+            raise ValueError()
+        accepted, release = operation.acceptance, successes[0]
+        if (release.payload.get("completed_at") != accepted.completed_at
+            or release.payload.get("usage_hash") != accepted.usage_sha256
+            or release.payload.get("task_sha256") != accepted.task_sha256
+            or release.payload.get("evidence_sha256") != accepted.evidence_sha256):
+            raise ValueError()
+        states = BudgetLedger._replay_states(operation.identity.run_id,
+            self.event_store.read_stream("budget", operation.identity.run_id))
+        state = states[operation.call.budget_reservation_id]
+        if (state.reservation.status != "committed" or state.usage is None
+            or state.usage.settlement_key != accepted.settlement_key
+            or metadata_hash(state.usage.model_dump(mode="json")) != accepted.usage_sha256):
+            raise ValueError()
+        _publication_for_operation(self.event_store, operation, operation.capture.response_artifact, "response",
+            accepted.response_publication_id)
+        _publication_for_operation(self.event_store, operation, accepted.artifacts[0], "output", accepted.output_publication_id)

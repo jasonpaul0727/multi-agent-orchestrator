@@ -102,7 +102,9 @@ class ControlPlaneApplication:
                 )
                 if artifact_root is not None else None
             )
-            self._scheduler = Scheduler(store, limits=limits, artifact_store=self._artifact_store)
+            resolved_usage_source = usage_source if usage_source is not None else UnavailableAttemptUsageSource()
+            self._scheduler = Scheduler(store, limits=limits, artifact_store=self._artifact_store,
+                usage_source=resolved_usage_source, artifact_grants=self._artifact_grants)
             self._worker_inputs = WorkerInputService(self._scheduler)
             self._recovery_opportunities = RecoveryOpportunityService(self._scheduler)
             self._recovery_continuation = RecoveryContinuationService(self._scheduler, self._worker_inputs)
@@ -114,7 +116,7 @@ class ControlPlaneApplication:
                     scheduler=self._scheduler, artifact_store=self._artifact_store,
                     verifier=IsolatedVerifierProcess(), journal=VerifierProposalJournal(store),
                     grants=self._artifact_grants,
-                    usage_source=usage_source if usage_source is not None else UnavailableAttemptUsageSource(),
+                    usage_source=resolved_usage_source,
                 ) if self._artifact_store is not None else None
             )
             self._journal = SQLiteProviderCallJournal(store)
@@ -166,9 +168,13 @@ class ControlPlaneApplication:
         # Nested settlement appends share this BEGIN IMMEDIATE transaction.
         # Returning None appends no synthetic readiness event; readiness is a
         # process-local gate set only after the database commit returns.
-        self._event_store.append_checked(
-            "application_bootstrap", "global", "startup-recovery", recover_under_lock
-        )
+        self._scheduler._prepare_general_recovery_scope()
+        try:
+            self._event_store.append_checked(
+                "application_bootstrap", "global", "startup-recovery", recover_under_lock
+            )
+        finally:
+            self._scheduler._general_recovery_scope = None
         if report is None:
             raise StartupRecoveryFailed("startup produced no recovery report")
         return report

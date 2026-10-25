@@ -107,7 +107,7 @@ def test_operation_binding_uses_exact_frozen_route_and_context(prepared):
                 binding, workspace_identity_hash=workspace, host_scope_hash=scope)
 
 
-def dispatch_case(tmp_path, *, register=True):
+def dispatch_case(tmp_path, *, register=True, request_observed=True, required_check_ids=("artifact-integrity",)):
     """Offline model and broker, with actual frozen admission and durable store."""
     from orchestrator.config import ConfigCandidate, ConfigManager
     from orchestrator.lifecycle import LifecycleController, NodeSpec
@@ -144,7 +144,7 @@ def dispatch_case(tmp_path, *, register=True):
     routing, decision = routed_pair(reg, resolved.config, policy, contract_hash=contract.contract_hash)
     now = datetime.now(timezone.utc)
     accepted = scheduler.accept_routing(routing, decision, accepted_at=now-timedelta(seconds=1),
-        lease_expires_at=now+timedelta(minutes=5), **ADMISSION)
+        lease_expires_at=now+timedelta(minutes=5), **{**ADMISSION, "required_check_ids": required_check_ids})
     identity = dict(run_id="run-1", node_id="node-1", attempt_id=routing.attempt_id, fencing_generation=1)
     binding = scheduler._resolve_general_verification_binding(**identity, as_of=now)
     journal = GeneralWorkerJournal(store)
@@ -159,7 +159,7 @@ def dispatch_case(tmp_path, *, register=True):
         operation = journal.prepare_turn(operation, phase="request", prepared=prepared)
         operation = journal.ack_turn(operation, receipt=ack)
         operation = journal.stop_turn(operation, receipt=stop, request_proposal=GeneralWorkerRequest(
-            operation.context, prepared.launch_id, operation.input_commitment))
+            operation.context, prepared.launch_id, operation.input_commitment) if request_observed else None)
     request = ModelRequest(request_id=operation.request_id, idempotency_key=operation.idempotency_key,
         **identity, budget_reservation_id=accepted.reservation.reservation_id,
         model_id=accepted.accepted_route.model_id, accepted_route=accepted.accepted_route,
@@ -619,3 +619,48 @@ def test_general_dispatch_rejects_ambient_transaction_before_external_work(dispa
     assert (touched, broker.calls, transport.calls) == ([], 0, 0)
     assert dispatch.provider_journal.read(dispatch.request) is None
     assert not dispatch.authority._pending and not dispatch.authority._claims
+
+
+def test_interrupted_request_with_exact_stop_can_claim_fresh_pure_request_epoch(tmp_path):
+    from tests.unit.runtime.test_general_worker_journal import epoch
+    from orchestrator.runtime.general_worker_protocol import GeneralWorkerRequest
+    case = dispatch_case(tmp_path, request_observed=False)
+    try:
+        assert case.authority.resolve_eligibility(case.operation, purpose="request").context == case.operation.context
+        prepared, ack, stop = epoch("9c483536-3c61-41e7-977b-6559b2732937")
+        operation = case.journal.prepare_turn(case.operation, phase="request", prepared=prepared)
+        operation = case.journal.ack_turn(operation, receipt=ack)
+        operation = case.journal.stop_turn(operation, receipt=stop, request_proposal=GeneralWorkerRequest(
+            operation.context, prepared.launch_id, operation.input_commitment))
+        case.operation = operation
+        reserve(case)
+        assert len(case.operation.turns) == 2 and case.operation.phase == "call_reserved"
+        with pytest.raises(GeneralWorkerJournalError):
+            case.authority.resolve_eligibility(case.operation, purpose="request")
+        assert case.provider_journal.read(case.request) is None
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("state", ["reserved", "unacknowledged", "unstopped"])
+def test_interrupted_request_without_exact_stop_cannot_retry(tmp_path, state):
+    from tests.unit.runtime.test_general_worker_journal import epoch
+    case = dispatch_case(tmp_path, register=state == "reserved")
+    try:
+        if state == "reserved":
+            reserve(case)
+            operation = case.operation
+        else:
+            operation = case.journal.request(**case.registration)
+            prepared, ack, _stop = epoch()
+            operation = case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+            if state == "unstopped":
+                operation = case.journal.ack_turn(operation, receipt=ack)
+        assert case.journal.read(operation.identity) == operation
+        with pytest.raises(GeneralWorkerJournalError):
+            case.authority.resolve_eligibility(operation, purpose="request")
+        with pytest.raises(GeneralWorkerJournalError):
+            case.journal.prepare_turn(operation, phase="request",
+                prepared=epoch("9c483536-3c61-41e7-977b-6559b2732937")[0])
+    finally:
+        case.store.close()

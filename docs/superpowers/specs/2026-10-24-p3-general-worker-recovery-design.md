@@ -240,7 +240,26 @@ Missing trusted usage or unavailable production authority remains blocked.
 
 No new caller-supplied zero-cost success path. Test-only deterministic usage
 authority and Provider fixtures are explicitly labeled offline. Production
-default UnavailableAttemptUsageSource stays unavailable. Private artifact
+default UnavailableAttemptUsageSource stays unavailable. Scheduler gains the
+same optional constructor-owned trusted usage service; Application resolves
+one service object and wires Scheduler and Coordinator consistently. Shared
+protocol/default/error definitions live in a cycle-free module with old import
+aliases preserved. A general direct terminal call samples that source outside
+transactions and rejects supplied UsageRecord mismatches and captured Provider
+token mismatches. Coordinator's general path delegates to the same owned
+Scheduler preflight/commit with no caller usage or prevalidated-proof token,
+so the trusted service is sampled once. General Scheduler preflight also runs
+one NEW owned concrete isolated verifier and compares its validated evidence
+hash with the durable proposal: byte integrity alone cannot authenticate an
+untrusted claimed accepted proof or its frozen format checks. Application
+supplies Scheduler the same trusted artifact-grant authority used by its
+ArtifactStore/Coordinator; missing authority blocks. A shared out-of-lock
+proposal-verification helper avoids duplicated logic; general Coordinator
+delegation avoids launching a second fresh verifier. No public skip flag or
+prevalidated-proof token is added. Non-general paths retain their prior
+contract. General current-time authority is standard-library UTC after locking,
+so a caller completion timestamp cannot revive an expired/fenced Attempt.
+Private artifact
 publication (ArtifactPublished) is an earlier durable prerequisite, not part
 of the terminal transaction and not workspace publication. Its bytes and
 provenance are reverified before acceptance; unaccepted private bytes confer
