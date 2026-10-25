@@ -181,7 +181,10 @@ requires its fresh final full suite and real independent-process matrix.
 `tests/integration/test_general_worker_application.py`;
 modify `src/orchestrator/application.py`, `src/orchestrator/runtime/worker_input_service.py`
 and `src/orchestrator/runtime/general_worker_process.py`; extend their focused tests
-and public runtime exports as needed.
+and public runtime exports as needed. The async ownership seam also permits
+narrow shared changes to verifier_process.py, proposal_verification.py,
+Scheduler general-acceptance internals and Coordinator, plus focused tests;
+no duplicated acceptance algorithm or public prevalidated-proof parameter.
 
 **Interfaces:**
 - `GeneralWorkerExecutionService(scheduler, input_service, artifact_store, grant_authority, proposal_journal, acceptance_coordinator, provider_gateway, worker_process, workspace: Path)` requires exact owned dependencies and store/registry binding; unavailable usage remains default.
@@ -195,9 +198,10 @@ and public runtime exports as needed.
 
 **Feature A — normal host mediation (commit/push A):**
 - [ ] RED `test_real_candidate_bytes_flow_through_independent_acceptance`, `test_host_derives_frozen_request_not_worker_model_or_route`, `test_gateway_capture_requires_known_success_usage_and_sender_stop`, `test_tool_nonterminal_empty_or_oversized_response_blocks`, `test_unavailable_usage_cannot_succeed`.
-- [ ] RED/GREEN owned facade identity/recovered-stop delegation and `test_workspace_changed_after_precheck_cannot_launch_general_turn`: change workspace bytes after frozen commitment, require actual snapshot rejection before Popen/credentials/transport. Forwarding-only mocks do not replace this behavioral check.
+- [ ] RED/GREEN owned facade identity/recovered-stop delegation and `test_workspace_changed_after_precheck_cannot_launch_general_turn`: replace/move the bound workspace directory after precheck, require actual path/device/inode snapshot rejection before Popen/credentials/transport. Same-directory byte edits are not a content-freeze claim; preserve existing bounded no-follow snapshots. Forwarding-only mocks do not replace this behavioral check.
 - [ ] Compose prepare exact WorkerTask through owned general input method (RED `test_general_input_preparation_uses_control_binding_without_files_or_caller_clock_under_lock`), durable prepared intent/ack/request stop, one stable host ModelRequest and call_reserved, owned Gateway invoke and private canonical capture. Publish response with operation-specific readable scope/source/type; access on resume uses a signed digest-bound grant and verifies matching metadata, not just digest. Candidate output uses existing decoder, attested publication, frozen VerificationTask, real verifier/proposal/coordinator.
 - [ ] Canonical response bytes include needed validated output/usage/request identity; no raw provider HTTP or credentials. DB/WAL only metadata. Run blocking process supervision outside event-loop critical sections; no thread shares SQLite connection or callback under transaction.
+- [ ] Split verifier metadata/grant/byte preparation on the SQLite owner thread from DB-free immutable staged-byte/process execution off the event loop. Share sync/async owned general acceptance preparation, fresh evidence validation and terminal commit; no caller proof/skip capability. RED/GREEN owner-thread metadata tripwire and event-loop heartbeat during verifier wait, preserving sync/legacy proof, rollback and final-hold rechecks.
 - [ ] GREEN focused service tests; commit A, wait for gate.
 
 **Feature B — restart decision table (commit/push B):**

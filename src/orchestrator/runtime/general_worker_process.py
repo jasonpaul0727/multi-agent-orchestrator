@@ -128,7 +128,14 @@ class GeneralWorkerProcess:
         limits = limits if limits is not None else SandboxLimits(timeout_seconds=10, output_bytes=MAX_FRAME_BYTES)
         self._limits = replace(limits, output_bytes=min(limits.output_bytes, MAX_FRAME_BYTES))
 
-    def start_turn(self, workspace: Path, turn: GeneralWorkerTurn, *, prepared_launch, cancellation=None) -> GeneralWorkerSession:
+    def prepare_launch(self):
+        return self._launcher.prepare_launch()
+
+    def stop_prepared_launch(self, prepared_launch, launch_receipt):
+        return self._launcher.stop_prepared_launch(prepared_launch, launch_receipt)
+
+    def start_turn(self, workspace: Path, turn: GeneralWorkerTurn, *, prepared_launch, cancellation=None,
+        expected_workspace_identity_hash: str | None = None) -> GeneralWorkerSession:
         from orchestrator.isolation import IsolationNotStarted, IsolationStartUnknown
         from orchestrator.isolation.launcher import _validate_prepared, _validate_launch_receipt
         from .general_worker_protocol import encode_general_worker_turn
@@ -148,9 +155,11 @@ class GeneralWorkerProcess:
         failure = None
         session = None
         try:
+            options = {} if expected_workspace_identity_hash is None else {
+                "expected_workspace_identity_hash": expected_workspace_identity_hash}
             session = self._launcher.launch(workspace, ["/usr/bin/python3", "-I", "-S",
                 "@maestro-runtime@/orchestrator/runtime/general_worker_process.py", "--child"],
-                limits=self._limits, input_bytes=raw, prepared_launch=prepared_launch)
+                limits=self._limits, input_bytes=raw, prepared_launch=prepared_launch, **options)
             _validate_launch_receipt(prepared_launch, session.launch_receipt)
         except IsolationNotStarted:
             failure = IsolationNotStarted
@@ -160,8 +169,10 @@ class GeneralWorkerProcess:
             raise failure("general_worker_not_started" if failure is IsolationNotStarted else "general_worker_start_unknown")
         return GeneralWorkerSession(session, turn, cancellation=cancellation)
 
-    def run_turn(self, workspace: Path, turn: GeneralWorkerTurn, *, prepared_launch, cancellation=None) -> GeneralWorkerTurnResult:
-        return self.start_turn(workspace, turn, prepared_launch=prepared_launch, cancellation=cancellation).wait()
+    def run_turn(self, workspace: Path, turn: GeneralWorkerTurn, *, prepared_launch, cancellation=None,
+        expected_workspace_identity_hash: str | None = None) -> GeneralWorkerTurnResult:
+        return self.start_turn(workspace, turn, prepared_launch=prepared_launch, cancellation=cancellation,
+            expected_workspace_identity_hash=expected_workspace_identity_hash).wait()
 
 
 __all__ = ["GeneralWorkerProcess", "GeneralWorkerSession", "GeneralWorkerTurnResult"]

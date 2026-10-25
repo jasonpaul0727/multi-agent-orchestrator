@@ -1114,6 +1114,41 @@ class Scheduler:
 
     def _accept_general_proposal(self, *, identity: GeneralWorkerIdentity, task_sha256: str,
         expected_usage: UsageRecord | None = None):
+        steps = self._general_acceptance_steps(identity=identity, task_sha256=task_sha256,
+            expected_usage=expected_usage)
+        try:
+            proposal, binding = next(steps)
+            verify_proposal(proposal, binding, verifier=IsolatedVerifierProcess(max_artifact_bytes=16_384),
+                artifact_store=self.recovery.artifact_store, grants=self._general_artifact_grants)
+            next(steps)
+        except StopIteration as completed:
+            return completed.value
+        except Exception:
+            pass
+        finally:
+            steps.close()
+        raise SchedulerError("general verified completion prerequisites failed")
+
+    async def _finish_general_verified_attempt_async(self, *, identity: GeneralWorkerIdentity,
+        task_sha256: str) -> GeneralWorkerResult:
+        from orchestrator.runtime.proposal_verification import verify_proposal_async
+        steps = self._general_acceptance_steps(identity=identity, task_sha256=task_sha256)
+        try:
+            proposal, binding = next(steps)
+            await verify_proposal_async(proposal, binding,
+                verifier=IsolatedVerifierProcess(max_artifact_bytes=16_384),
+                artifact_store=self.recovery.artifact_store, grants=self._general_artifact_grants)
+            next(steps)
+        except StopIteration as completed:
+            return completed.value
+        except Exception:
+            pass
+        finally:
+            steps.close()
+        raise SchedulerError("general verified completion prerequisites failed")
+
+    def _general_acceptance_steps(self, *, identity: GeneralWorkerIdentity, task_sha256: str,
+        expected_usage: UsageRecord | None = None):
         """Owned preflight and atomic acceptance. No caller preflight capability."""
         if self.event_store._connection.in_transaction:
             raise SchedulerError("general completion must own its transaction")
@@ -1143,8 +1178,9 @@ class Scheduler:
             response_id, output_id = _preflight_general_bytes(self, journal, operation, proposal)
             if type(self._general_artifact_grants) is not EphemeralArtifactGrantAuthority:
                 raise ValueError()
-            verify_proposal(proposal, binding, verifier=IsolatedVerifierProcess(max_artifact_bytes=16_384),
-                artifact_store=self.recovery.artifact_store, grants=self._general_artifact_grants)
+            # Only owned sync/async drivers advance this private continuation,
+            # after a fresh concrete verifier and shared evidence validation.
+            yield proposal, binding
             usage = revalidate_model(UsageRecord, self._general_usage_source.usage_for(binding.active_attempt))
             _validate_usage(usage, run_id=identity.run_id,
                 reservation_id=binding.active_attempt.reservation.reservation_id)

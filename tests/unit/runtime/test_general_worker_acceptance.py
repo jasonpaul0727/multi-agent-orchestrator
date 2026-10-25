@@ -158,6 +158,36 @@ def test_accepted_terminal_and_usage_commit_roll_back_together(terminal, monkeyp
     assert _resolver_durable_state(terminal.store) == before
 
 
+def test_async_owned_acceptance_fresh_verifier_then_current_hold_recheck(terminal, monkeypatch):
+    import asyncio
+    import threading
+    from orchestrator.runtime import verifier_process
+    owner = threading.get_ident()
+    waited = threading.Event()
+    release = threading.Event()
+    original = _ChildLauncher.launch
+    def launch(self, *args, **kwargs):
+        assert threading.get_ident() != owner
+        waited.set()
+        assert release.wait(3)
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(_ChildLauncher, "launch", launch)
+    async def run():
+        pending = asyncio.create_task(terminal.coordinator.accept_general_proposal_async(
+            identity=terminal.operation.identity, task_sha256=terminal.proposal.task_sha256))
+        while not waited.is_set():
+            if pending.done():
+                return await pending
+            await asyncio.sleep(0.005)
+        terminal.lifecycle.pause_run("run-1", reason_code="user_request")
+        release.set()
+        with pytest.raises((SchedulerError, ProposalAcceptanceError)):
+            await pending
+        assert terminal.journal.read(terminal.operation.identity).accepted_result is None
+        assert terminal.source.calls == 1
+    asyncio.run(run())
+
+
 def test_lost_reply_replays_historical_result_without_active_lease(terminal, monkeypatch):
     direct(terminal)
     before = _resolver_durable_state(terminal.store)
@@ -440,12 +470,18 @@ def test_fresh_accepted_evidence_must_match_exact_durable_hash(tmp_path, monkeyp
         case.store.close()
 
 
-def test_general_preflight_error_does_not_retain_private_provider_exception(terminal, monkeypatch):
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_general_preflight_error_does_not_retain_private_provider_exception(terminal, monkeypatch, asynchronous):
+    import asyncio
     def private_error(*args, **kwargs):
         raise ValueError("private-output-sentinel")
-    monkeypatch.setattr(IsolatedVerifierProcess, "verify", private_error)
+    monkeypatch.setattr(IsolatedVerifierProcess, "verify_async" if asynchronous else "verify", private_error)
     with pytest.raises(SchedulerError) as error:
-        direct(terminal)
+        if asynchronous:
+            asyncio.run(terminal.coordinator.accept_general_proposal_async(
+                identity=terminal.operation.identity, task_sha256=terminal.proposal.task_sha256))
+        else:
+            direct(terminal)
     assert error.value.__cause__ is None and error.value.__context__ is None
     assert "private-output-sentinel" not in str(error.value)
 

@@ -16,6 +16,19 @@ def verify_proposal(proposal, binding, *, verifier, artifact_store, grants):
             expires_at=binding.active_attempt.lease_expires_at,
         ),
     )
+    _validate_proposal_evidence(proposal, evidence)
+
+
+async def verify_proposal_async(proposal, binding, *, verifier, artifact_store, grants):
+    evidence = await verifier.verify_async(
+        proposal.task, artifact_store,
+        grant_for_digest=lambda digest: grants.issue(digest=digest,
+            run_id=proposal.task.context.run_id, expires_at=binding.active_attempt.lease_expires_at),
+    )
+    _validate_proposal_evidence(proposal, evidence)
+
+
+def _validate_proposal_evidence(proposal, evidence):
     evidence = revalidate_model(VerificationEvidence, evidence)
     validate_verification_evidence(proposal.task, evidence)
     encoded = json.dumps(evidence.model_dump(mode="json"), ensure_ascii=False,

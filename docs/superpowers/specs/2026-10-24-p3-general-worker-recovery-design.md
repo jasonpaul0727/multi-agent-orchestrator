@@ -163,6 +163,13 @@ ack is durable only AFTER verified systemd identity/profile observation. The
 default launcher API/behavior is preserved. Child cannot choose the unit.
 Never reuse unit names across launches or derive them solely from caller data.
 
+The frozen workspace identity reuses the existing canonical path/device/inode
+binding. Forward it to the actual launcher snapshot boundary and reject a
+directory replacement or move after precheck, before Popen. It is not a tree
+content commitment: same-directory byte edits do not change this identity.
+Existing bounded no-follow snapshot checks remain; no new content-admission
+schema or promise of immutable workspace contents is introduced.
+
 Worker stop is host-observed inactive/failed AND empty exact cgroup, with
 unit identity tied to journal launch epoch, not process returncode, a child
 message or Provider sender receipt. During normal wait, cancellation, timeout,
@@ -183,6 +190,15 @@ Scheduler, input service, ArtifactStore, grants, existing verifier/proposal
 journal, Provider journal and trusted host configuration. Explicit async
 execute/recover methods take identity and exact task_text only. Dependencies
 must share the same durable store/authority; no Worker-supplied route or URL.
+
+Async execution keeps SQLite, ArtifactStore metadata/grant reads and final
+acceptance on the owning thread. The verifier separates preparation from its
+DB-free staged-byte/process supervision, which runs outside the event loop.
+Only immutable bounded validated data crosses that thread boundary, never a
+store, connection or grant callback. Owned synchronous/asynchronous acceptance
+share preparation, evidence validation and terminal commit; both independently
+run the fixed fresh verifier and trusted usage, without a public skip flag or
+prevalidated-proof capability. Existing synchronous/non-general APIs remain.
 
 After the request Worker has stopped, host derives ONE stable ModelRequest
 from accepted routing and frozen limits/snapshots and records `call_reserved`

@@ -6,6 +6,7 @@ read-only checks in the systemd boundary and never writes lifecycle state.
 
 from __future__ import annotations
 
+import asyncio
 import ast
 import hashlib
 import json
@@ -77,6 +78,14 @@ class IsolatedVerifierProcess:
         grant_for_digest: Callable[[str], ArtifactAccessGrant],
     ) -> VerificationEvidence:
         """Re-read verified ArtifactStore bytes and return a non-authoritative proposal."""
+        return self._execute_prepared(*self._prepare(task, artifact_store, grant_for_digest=grant_for_digest))
+
+    async def verify_async(self, task, artifact_store, *, grant_for_digest):
+        """Keep store/grants on their owner; supervise the child without blocking it."""
+        prepared = self._prepare(task, artifact_store, grant_for_digest=grant_for_digest)
+        return await asyncio.to_thread(self._execute_prepared, *prepared)
+
+    def _prepare(self, task, artifact_store, *, grant_for_digest):
 
         from orchestrator.artifacts import ArtifactAccessGrant
         from orchestrator.runtime.contracts import (
@@ -151,7 +160,13 @@ class IsolatedVerifierProcess:
         payload = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if len(payload) > _MAX_FRAME_BYTES:
             raise VerifierProcessError("Verifier input exceeds the IPC frame limit")
+        return task, payload, tuple(staged_bytes)
 
+    def _execute_prepared(self, task, payload, staged_bytes):
+        """DB-free process supervision receives only bounded immutable data."""
+        from orchestrator.runtime.contracts import (
+            RuntimeContractError, decode_verification_evidence, validate_verification_evidence,
+        )
         try:
             with tempfile.TemporaryDirectory(prefix="maestro-verifier-") as temporary:
                 root = Path(temporary)

@@ -51,6 +51,12 @@ class AttemptExecutionCoordinator:
             raise ProposalAcceptanceError("trusted clock must return an aware UTC time")
         return now
 
+    async def accept_general_proposal_async(self, *, identity: GeneralWorkerIdentity,
+        task_sha256: str):
+        """Owned async entry; Scheduler derives fresh proof, usage and completion."""
+        return await self._scheduler._finish_general_verified_attempt_async(
+            identity=identity, task_sha256=task_sha256)
+
     def accept_proposal(
         self, *, run_id: str, node_id: str, attempt_id: str,
         fencing_generation: int, task_sha256: str,

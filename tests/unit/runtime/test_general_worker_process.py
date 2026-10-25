@@ -103,6 +103,56 @@ def test_observed_launch_receipt_available_before_wait(tmp_path):
     assert kwargs["prepared_launch"] == prepared()
 
 
+def test_owned_prepare_and_recovered_stop_delegate_to_same_launcher():
+    class OwnedLauncher(Launcher):
+        def prepare_launch(self):
+            return prepared()
+
+        def stop_prepared_launch(self, intent, receipt):
+            assert intent == prepared() and receipt == ack()
+            return terminal().termination_receipt
+
+    process = GeneralWorkerProcess(launcher=OwnedLauncher())
+    assert process.prepare_launch() == prepared()
+    assert process.stop_prepared_launch(prepared(), ack()).cgroup_empty
+
+
+def test_workspace_changed_after_precheck_cannot_launch_general_turn(tmp_path, monkeypatch):
+    import orchestrator.isolation.launcher as module
+    from orchestrator.isolation import SystemdReadOnlyLauncher
+    from orchestrator.workspace_identity import workspace_identity_hash
+
+    (tmp_path / "input.txt").write_text("frozen")
+    commitment = workspace_identity_hash(tmp_path)
+    replacement = tmp_path.with_name(tmp_path.name + "-replacement")
+    tmp_path.rename(replacement)
+    tmp_path.mkdir()
+    (tmp_path / "input.txt").write_text("replacement after admission")
+    snapshots = []
+    original = module.snapshot_workspace
+    def snapshot(*args, **kwargs):
+        snapshots.append(kwargs["expected_identity_hash"])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, "snapshot_workspace", snapshot)
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0))
+    monkeypatch.setattr(module, "_systemd_cgroup_parent", lambda *args: Path("/unused"))
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("mutated snapshot launched"))
+    process = GeneralWorkerProcess(launcher=SystemdReadOnlyLauncher(systemd_run="/usr/bin/true", systemctl="/usr/bin/true"))
+    intent = process.prepare_launch()
+    with pytest.raises(IsolationNotStarted):
+        process.start_turn(tmp_path, replace(turn(), launch_id=intent.launch_id), prepared_launch=intent,
+            expected_workspace_identity_hash=commitment)
+    assert snapshots == [commitment]
+
+
+def test_workspace_identity_is_not_a_content_freeze(tmp_path):
+    from orchestrator.workspace_identity import workspace_identity_hash
+    (tmp_path / "input.txt").write_text("first")
+    commitment = workspace_identity_hash(tmp_path)
+    (tmp_path / "input.txt").write_text("second")
+    assert workspace_identity_hash(tmp_path) == commitment
+
+
 def test_missing_stop_never_yields_candidate(tmp_path):
     for receipt in (None, SandboxTerminationReceipt(UNIT,
         "/user.slice/other/app.slice/" + UNIT, "inactive", True)):

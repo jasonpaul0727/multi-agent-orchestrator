@@ -43,6 +43,39 @@ def _context(*, attempt_id="attempt-1"):
     )
 
 
+def test_async_verifier_keeps_store_on_owner_and_wait_off_event_loop(tmp_path):
+    import asyncio
+    import threading
+    import time
+    owner = threading.get_ident()
+    events, store, record = _artifact_store(tmp_path)
+    original = store.read_bytes
+    def read(*args, **kwargs):
+        assert threading.get_ident() == owner
+        return original(*args, **kwargs)
+    store.read_bytes = read
+    class SlowChild(_ChildLauncher):
+        def launch(self, *args, **kwargs):
+            assert threading.get_ident() != owner
+            time.sleep(0.08)
+            return super().launch(*args, **kwargs)
+    async def run():
+        ticks = 0
+        async def heartbeat():
+            nonlocal ticks
+            for _ in range(8):
+                await asyncio.sleep(0.01)
+                ticks += 1
+        evidence, _ = await asyncio.gather(
+            verifier_process.IsolatedVerifierProcess(launcher=SlowChild()).verify_async(
+                _task(record), store, grant_for_digest=lambda digest: _grant(record)), heartbeat())
+        assert evidence.outcome == "accepted" and ticks == 8
+    try:
+        asyncio.run(run())
+    finally:
+        events.close()
+
+
 class _ChildLauncher:
     def __init__(self, *, receipt: bool = True):
         self.receipt = receipt

@@ -61,7 +61,7 @@ class WorkerInputService:
 
     def _prepare_worker_task(
         self, *, run_id: str, node_id: str, attempt_id: str,
-        fencing_generation: int, task_text: str, recovery: bool,
+        fencing_generation: int, task_text: str, recovery: bool, general: bool = False,
     ) -> WorkerTask:
         """Share all binding/input/context/frame validation between both paths."""
         error_code = "worker_input_preparation_failed"
@@ -78,7 +78,9 @@ class WorkerInputService:
             def prepare_under_lock(_events, _version):
                 nonlocal result
                 now = datetime.now(timezone.utc) if recovery else self._now()
-                binding = self._scheduler.resolve_verification_binding(**identity, as_of=now)
+                resolver = (self._scheduler._resolve_general_verification_binding if general
+                    else self._scheduler.resolve_verification_binding)
+                binding = resolver(**identity, as_of=now)
                 context = revalidate_model(AttemptContext, binding.context)
                 state = self._scheduler.lifecycle.replay(run_id)
                 node = state.node(node_id)
@@ -132,6 +134,16 @@ class WorkerInputService:
             pass
         # Detach owned errors, including validation inputs and opaque codes.
         raise WorkerInputError(error_code) from None
+
+    def _prepare_general_worker_task(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, task_text: str,
+    ) -> WorkerTask:
+        """Use owned metadata-only recovery and locked standard-library UTC."""
+        return WorkerInputService._prepare_worker_task(
+            self, run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+            fencing_generation=fencing_generation, task_text=task_text, recovery=True, general=True,
+        )
 
     def accept_routing_with_input(
         self, request: RoutingRequest, decision: RoutingDecision, *, task_text: str,
