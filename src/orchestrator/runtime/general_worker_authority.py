@@ -144,6 +144,23 @@ def _require_no_other_general_holds(scheduler, operation, recovered):
         raise ValueError()
 
 
+def _general_unsettled_calls(scheduler, *, run_id, sources):
+    """Pure general policy: failure does not settle a Provider cost reservation.
+
+    Reuse the legacy validator/hold definitions without changing legacy policy.
+    Missing or unavailable failure usage is not evidence of zero cost.
+    """
+    result = list(_unsettled_calls(scheduler, run_id=run_id, sources=sources))
+    journal = SQLiteProviderCallJournal(scheduler.event_store)
+    for stream_id in scheduler.event_store.stream_ids("provider_call"):
+        call = journal.read_call(stream_id)
+        if call.run_id == run_id and call.status == "known_failure":
+            reservation = scheduler._ledger_for_run(run_id).get_reservation(call.budget_reservation_id, run_id=run_id)
+            if reservation.status not in {"committed", "released"}:
+                result.append(call)
+    return tuple(result)
+
+
 @_guard
 def _validate_general_release_authority(scheduler, journal, operation, *, events, entry, usage, known_no_effect, at):
     """Classify a known release from immutable Provider authority, never flags alone.
@@ -164,7 +181,7 @@ def _validate_general_release_authority(scheduler, journal, operation, *, events
         or recovered.lifecycle.workspace_identity_hash != operation.workspace_identity_hash):
         raise ValueError()
     own = None if operation.call is None else journal._provider_call(operation)
-    for call in _unsettled_calls(scheduler, run_id=identity.run_id, sources=sources):
+    for call in _general_unsettled_calls(scheduler, run_id=identity.run_id, sources=sources):
         if call.node_id == identity.node_id and (own is None or call.stream_id != own.stream_id):
             raise ValueError()
     provider = SQLiteProviderCallJournal(scheduler.event_store)
@@ -173,10 +190,6 @@ def _validate_general_release_authority(scheduler, journal, operation, *, events
         if call.run_id != identity.run_id or call.node_id != identity.node_id:
             continue
         if call.attempt_id == identity.attempt_id and (own is None or own.stream_id != stream_id):
-            raise ValueError()
-        if (call.status == "known_failure" and (own is None or own.stream_id != stream_id)
-            and scheduler._ledger_for_run(identity.run_id).get_reservation(
-                call.budget_reservation_id, run_id=identity.run_id).status not in {"committed", "released"}):
             raise ValueError()
     _require_no_other_general_holds(scheduler, operation, recovered)
     if own is None:
@@ -262,7 +275,7 @@ def _validate_general_eligibility(scheduler, journal, operation, *, purpose, hos
         raise ValueError()
     sources = {event.payload["attempt_ref"]: event for event in events
         if event.event_type == "RoutingDecisionAccepted" and event.run_id == operation.identity.run_id}
-    for call in _unsettled_calls(scheduler, run_id=operation.identity.run_id, sources=sources):
+    for call in _general_unsettled_calls(scheduler, run_id=operation.identity.run_id, sources=sources):
         if call.node_id != operation.identity.node_id:
             continue
         # Only this captured success may be consumed; never an invoke exemption.

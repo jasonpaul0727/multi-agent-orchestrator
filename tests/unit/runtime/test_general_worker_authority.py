@@ -14,6 +14,7 @@ from orchestrator.runtime.general_worker_authority import general_worker_host_sc
 from orchestrator.runtime.general_worker_authority import SchedulerProviderDispatchAuthority
 from orchestrator.runtime.general_worker_journal import GeneralWorkerJournalError
 from tests.unit.runtime.test_attempt_execution_coordinator import prepare_application
+from tests.unit.lifecycle.test_scheduler import _resolver_durable_state
 
 
 @pytest.fixture
@@ -107,7 +108,8 @@ def test_operation_binding_uses_exact_frozen_route_and_context(prepared):
                 binding, workspace_identity_hash=workspace, host_scope_hash=scope)
 
 
-def dispatch_case(tmp_path, *, register=True, request_observed=True, required_check_ids=("artifact-integrity",)):
+def dispatch_case(tmp_path, *, register=True, request_observed=True, required_check_ids=("artifact-integrity",),
+    previous_status=None):
     """Offline model and broker, with actual frozen admission and durable store."""
     from orchestrator.config import ConfigCandidate, ConfigManager
     from orchestrator.lifecycle import LifecycleController, NodeSpec
@@ -145,7 +147,25 @@ def dispatch_case(tmp_path, *, register=True, request_observed=True, required_ch
     now = datetime.now(timezone.utc)
     accepted = scheduler.accept_routing(routing, decision, accepted_at=now-timedelta(seconds=1),
         lease_expires_at=now+timedelta(minutes=5), **{**ADMISSION, "required_check_ids": required_check_ids})
-    identity = dict(run_id="run-1", node_id="node-1", attempt_id=routing.attempt_id, fencing_generation=1)
+    previous = None
+    if previous_status is not None:
+        from orchestrator.budget import UsageRecord
+        from orchestrator.models import ModelGatewayFailure
+        previous = accepted
+        usage = (UsageRecord(run_id="run-1", reservation_id=accepted.reservation.reservation_id,
+            settlement_key="older-call-usage", currency="USD", cost_minor=1, input_tokens=1, output_tokens=2)
+            if previous_status == "committed" else None)
+        scheduler.finish_attempt(run_id="run-1", node_id="node-1", attempt_id=routing.attempt_id,
+            fencing_generation=1, completed_at=now, outcome="failed", usage=usage, known_no_effect=usage is None)
+        plan = scheduler.plan_attempt_recovery(run_id="run-1", node_id="node-1", attempt_id=routing.attempt_id,
+            fencing_generation=1, source_decision=decision, contract=contract,
+            failure=ModelGatewayFailure(code="rate_limited", phase="provider", outcome="known_failure", retryable=True, http_status=429))
+        routing, decision = routed_pair(reg, resolved.config, policy, attempt=2, contract_hash=contract.contract_hash,
+            recovery_action=plan.action, recovery_authorization=plan.authorization,
+            prior_decision_hash=decision.decision_hash, previous_model_id="model-1", failure_category="transient", retry_level=1)
+        accepted = scheduler.accept_routing(routing, decision, accepted_at=now,
+            lease_expires_at=now+timedelta(minutes=5), **{**ADMISSION, "required_check_ids": required_check_ids})
+    identity = dict(run_id="run-1", node_id="node-1", attempt_id=routing.attempt_id, fencing_generation=routing.fencing_generation)
     binding = scheduler._resolve_general_verification_binding(**identity, as_of=now)
     journal = GeneralWorkerJournal(store)
     authority = SchedulerProviderDispatchAuthority(scheduler, journal)
@@ -171,7 +191,7 @@ def dispatch_case(tmp_path, *, register=True, request_observed=True, required_ch
     body = adapter_for(provider.adapter).encode_request(request, model).body_json.encode()
     return SimpleNamespace(store=store, scheduler=scheduler, lifecycle=lifecycle, authority=authority,
         journal=journal, operation=operation, request=request, body=body, registry=reg,
-        provider_journal=SQLiteProviderCallJournal(store), identity=identity, registration=registration)
+        provider_journal=SQLiteProviderCallJournal(store), identity=identity, registration=registration, previous=previous)
 
 
 @pytest.fixture
@@ -380,6 +400,90 @@ def captured(case):
     reserve(case)
     provider_success(case.store, case.request, body=case.body)
     case.operation = capture(case.journal, case.operation)
+
+
+def known_failure(case, *, request=None, usage="reported"):
+    request = request or case.request.model_copy(update={"request_id": "other-request", "idempotency_key": "other-key"})
+    value = {"reported": {"status": "reported", "input_tokens": 100, "output_tokens": 200},
+        "settled": {"status": "reported", "input_tokens": 1, "output_tokens": 2},
+        "estimated": {"status": "estimated", "input_tokens": 100, "output_tokens": 200},
+        "unavailable": {"status": "unavailable"}, "missing": None}[usage]
+    case.provider_journal.record_intent(request, provider_id=request.accepted_route.provider_id,
+        provider_adapter="openai_responses", request_body=case.body, provider_correlation_id="offline-failed-correlation")
+    case.provider_journal.record_outcome(request, outcome="known_failure", failure_code="provider_error", usage=value)
+    return case.provider_journal.read(request)
+
+
+@pytest.mark.parametrize("purpose", ["request", "dispatch", "completion"])
+@pytest.mark.parametrize("usage", ["reported", "estimated", "unavailable", "missing"])
+def test_known_failure_cost_hold_blocks_general_phase(tmp_path, purpose, usage):
+    case = dispatch_case(tmp_path, register=purpose != "request")
+    try:
+        if purpose == "request":
+            case.operation = case.journal.request(**case.registration)
+        if purpose == "completion":
+            captured(case)
+        known_failure(case, usage=usage)
+        before = _resolver_durable_state(case.store)
+        with pytest.raises(GeneralWorkerJournalError):
+            case.authority.resolve_eligibility(case.operation, purpose=purpose)
+        assert _resolver_durable_state(case.store) == before
+    finally:
+        case.store.close()
+
+
+def test_known_failure_cost_hold_blocks_fresh_reservation(dispatch):
+    known_failure(dispatch)
+    before = _resolver_durable_state(dispatch.store)
+    with pytest.raises(GeneralWorkerJournalError):
+        reserve(dispatch)
+    assert _resolver_durable_state(dispatch.store) == before
+    assert dispatch.journal.read(dispatch.operation.identity).call is None
+
+
+@pytest.mark.parametrize("own", [False, True], ids=["unrelated-same-attempt", "own-failed-call"])
+def test_known_failure_cost_hold_blocks_gateway_before_broker(dispatch, own):
+    from orchestrator.models import ModelGatewayError
+    reserve(dispatch)
+    known_failure(dispatch, request=dispatch.request if own else None)
+    before = _resolver_durable_state(dispatch.store)
+    with pytest.raises(GeneralWorkerJournalError):
+        dispatch.authority.resolve_eligibility(dispatch.operation, purpose="dispatch")
+    broker, transport = OfflineBroker(), OfflineTransport()
+    with pytest.raises(ModelGatewayError):
+        asyncio.run(gateway(dispatch, broker=broker, transport=transport).invoke(dispatch.request))
+    assert (broker.calls, transport.calls) == (0, 0)
+    assert _resolver_durable_state(dispatch.store) == before
+
+
+def test_known_failure_appearing_during_broker_blocks_intent(dispatch):
+    from orchestrator.models import ModelGatewayError
+    reserve(dispatch)
+    async def change():
+        assert not dispatch.store._connection.in_transaction
+        known_failure(dispatch)
+    broker, transport = OfflineBroker(change), OfflineTransport()
+    with pytest.raises(ModelGatewayError):
+        asyncio.run(gateway(dispatch, broker=broker, transport=transport).invoke(dispatch.request))
+    assert (broker.calls, transport.calls) == (1, 0)
+    assert dispatch.provider_journal.read(dispatch.request) is None
+
+
+@pytest.mark.parametrize("settled", ["committed", "released"])
+def test_settled_older_same_node_known_failure_does_not_block_completion(tmp_path, settled):
+    case = dispatch_case(tmp_path, previous_status=settled)
+    try:
+        old = case.previous.accepted_route
+        request = case.request.model_copy(update={"request_id": "older-request", "idempotency_key": "older-key",
+            "attempt_id": old.attempt_id, "fencing_generation": old.fencing_generation,
+            "budget_reservation_id": old.budget_reservation_id, "accepted_route": old})
+        call = known_failure(case, request=request, usage="settled" if settled == "committed" else "unavailable")
+        assert call.attempt_id != case.identity["attempt_id"] and call.node_id == case.identity["node_id"]
+        assert case.scheduler._ledger_for_run("run-1").get_reservation(call.budget_reservation_id, run_id="run-1").status == settled
+        captured(case)
+        assert case.authority.resolve_eligibility(case.operation, purpose="completion").context == case.operation.context
+    finally:
+        case.store.close()
 
 
 def test_own_captured_success_is_only_completion_or_acceptance_authority(dispatch):

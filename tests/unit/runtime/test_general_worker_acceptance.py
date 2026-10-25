@@ -15,7 +15,7 @@ from orchestrator.runtime.verification_journal import VerifierProposalJournal
 from orchestrator.runtime.verifier_process import IsolatedVerifierProcess
 from orchestrator.scheduler import Scheduler, SchedulerError
 from tests.unit.runtime.test_attempt_execution_coordinator import TrustedUsage
-from tests.unit.runtime.test_general_worker_authority import dispatch_case, reserve
+from tests.unit.runtime.test_general_worker_authority import dispatch_case, reserve, known_failure
 from tests.unit.runtime.test_general_worker_journal import epoch, provider_success
 from tests.unit.runtime.test_verification_journal import _evidence
 from tests.unit.runtime.test_verifier_process import _ChildLauncher
@@ -42,10 +42,11 @@ class CountedUsage(TrustedUsage):
         return super().usage_for(snapshot)
 
 
-def terminal_case(tmp_path, *, stopped=True, trusted=True, required_check_ids=("artifact-integrity",), response_changes=None):
+def terminal_case(tmp_path, *, stopped=True, trusted=True, required_check_ids=("artifact-integrity",), response_changes=None,
+    previous_status=None):
     import hashlib
     import json
-    case = dispatch_case(tmp_path, required_check_ids=required_check_ids)
+    case = dispatch_case(tmp_path, required_check_ids=required_check_ids, previous_status=previous_status)
     grants = EphemeralArtifactGrantAuthority()
     artifacts = ArtifactStore(tmp_path / "artifacts", event_store=case.store, grant_verifier=grants.verify)
     source = CountedUsage(case.store)
@@ -684,3 +685,44 @@ def test_known_cost_release_rechecks_new_same_node_hold_after_usage(terminal):
         terminal.scheduler.finish_attempt(**terminal.identity, completed_at=datetime.now(timezone.utc), outcome="failed", usage=usage)
     assert terminal.source.calls == 1
     assert not any(event.event_type == "AttemptSlotReleased" for event in terminal.store.read_stream("scheduler", "global"))
+
+
+@pytest.mark.parametrize("during_usage", [False, True], ids=["before-preflight", "after-usage-callback"])
+@pytest.mark.parametrize("usage", ["reported", "unavailable", "missing"])
+def test_known_failure_hold_cannot_be_erased_by_general_acceptance(terminal, during_usage, usage):
+    if during_usage:
+        original = terminal.source.usage_for
+        def introduce(snapshot):
+            value = original(snapshot)
+            known_failure(terminal, usage=usage)
+            return value
+        terminal.source.usage_for = introduce
+    else:
+        known_failure(terminal, usage=usage)
+        with pytest.raises(GeneralWorkerJournalError):
+            terminal.authority.resolve_eligibility(terminal.operation, purpose="acceptance")
+    with pytest.raises(SchedulerError):
+        direct(terminal)
+    assert terminal.source.calls == int(during_usage)
+    assert terminal.journal.read(terminal.operation.identity).accepted_result is None
+    assert terminal.scheduler._ledger_for_run("run-1").get_reservation(
+        terminal.request.budget_reservation_id, run_id="run-1").status == "reserved"
+    assert not any(event.event_type in {"AttemptSlotReleased", "GeneralWorkerAccepted", "CostCommitted", "UsageObserved"}
+        for stream_type, stream_id in (("scheduler", "global"), ("general_worker", terminal.operation.identity.stream_id), ("budget", "run-1"))
+        for event in terminal.store.read_stream(stream_type, stream_id))
+
+
+@pytest.mark.parametrize("settled", ["committed", "released"])
+def test_settled_older_known_failure_does_not_block_general_acceptance(tmp_path, settled):
+    case = terminal_case(tmp_path, previous_status=settled)
+    try:
+        old = case.previous.accepted_route
+        request = case.request.model_copy(update={"request_id": "older-request", "idempotency_key": "older-key",
+            "attempt_id": old.attempt_id, "fencing_generation": old.fencing_generation,
+            "budget_reservation_id": old.budget_reservation_id, "accepted_route": old})
+        known_failure(case, request=request, usage="settled" if settled == "committed" else "unavailable")
+        direct(case)
+        assert case.source.calls == 1
+        assert case.scheduler.read_general_worker_result(case.operation.identity).status == "accepted"
+    finally:
+        case.store.close()
