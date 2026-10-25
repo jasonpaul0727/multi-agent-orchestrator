@@ -183,6 +183,13 @@ not-found unit as non-start or automatically retry; return launch_unknown,
 retain occupancy and require authoritative host resolution. Tests pin this
 conservative boundary. Do not fabricate persistence of a process-local receipt.
 
+Recovered stopping may observe a transient systemd collection state. After the
+exact acknowledged binding has become authoritatively stopped, a bounded reread
+may collect the existing standard termination receipt and exact retained-cgroup
+empty proof. Revalidate the same stopped binding after collection. Do not relax
+the legacy collector, synthesize a receipt, accept not-found alone, or retry an
+unacknowledged, foreign, mismatched or unresolved transport binding.
+
 ### 4. Host mediation and response checkpoint
 
 `GeneralWorkerExecutionService` is composed with the application's concrete

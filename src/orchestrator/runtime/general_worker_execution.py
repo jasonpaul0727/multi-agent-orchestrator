@@ -7,9 +7,9 @@ dispatch, publication and terminal authority on the SQLite owner thread.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
-import os
+import json
 from pathlib import Path
 
 from orchestrator.artifacts import ArtifactStore, EphemeralArtifactGrantAuthority
@@ -29,7 +29,10 @@ from .general_worker_journal import (
     _publication_for_operation, metadata_hash,
 )
 from .general_worker_process import GeneralWorkerProcess
-from .general_worker_protocol import GeneralWorkerRequest, GeneralWorkerTurn, _canonical, _input_commitment
+from .general_worker_protocol import (
+    GeneralWorkerRequest, GeneralWorkerTurn, _canonical, _input_commitment, _pairs, _constant,
+)
+from .general_worker_recovery import GeneralWorkerOwnership, recovery_action
 from .verification_journal import VerifierProposalJournal
 from .verifier_process import IsolatedVerifierProcess
 from .worker_input_service import WorkerInputService
@@ -39,31 +42,6 @@ from .worker_output import DecodedWorkerOutput
 class GeneralWorkerUnavailable(RuntimeError):
     def __init__(self):
         super().__init__("general_worker_unavailable")
-
-
-class GeneralWorkerOwnership:
-    """Private nonblocking advisory ownership; never evidence of process stop."""
-
-    def __init__(self, root, operation_id):
-        self._root, self._operation_id, self._descriptor = root, operation_id, None
-
-    def acquire(self):
-        import fcntl
-        self._root.mkdir(mode=0o700, exist_ok=True)
-        descriptor = os.open(self._root / (self._operation_id + ".lock"),
-            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(descriptor)
-            return False
-        self._descriptor = descriptor
-        return True
-
-    def close(self):
-        if self._descriptor is not None:
-            os.close(self._descriptor)
-            self._descriptor = None
 
 
 class GeneralWorkerExecutionService:
@@ -116,88 +94,201 @@ class GeneralWorkerExecutionService:
         self._authority, self._journal, self._owner_root = authority, authority.journal, owner_root
 
     async def execute(self, *, identity: GeneralWorkerIdentity, task_text: str) -> GeneralWorkerResult:
+        return await self._execute_or_recover(identity=identity, task_text=task_text, create=True)
+
+    async def recover(self, *, identity: GeneralWorkerIdentity, task_text: str) -> GeneralWorkerResult:
+        return await self._execute_or_recover(identity=identity, task_text=task_text, create=False)
+
+    def _register(self, identity, task):
+        scope = self._authority._scope()
+        result = None
+        def request(events, _version):
+            nonlocal result
+            binding = self._scheduler._resolve_general_verification_binding(**_identity_value(identity),
+                as_of=datetime.now(timezone.utc))
+            state = self._scheduler.lifecycle.replay(identity.run_id)
+            result = self._journal.request(context=task.context,
+                input_commitment=_input_commitment(task.model_dump(mode="json")),
+                accepted_route_sha256=metadata_hash(binding.active_attempt.accepted_route.model_dump(mode="json")),
+                workspace_identity_hash=state.workspace_identity_hash, host_scope_hash=scope,
+                output_byte_limit=min(task.output_byte_limit, 16_384))
+            _validate_general_eligibility(self._scheduler, self._journal, result,
+                purpose="request", host_scope_hash=scope, as_of=datetime.now(timezone.utc), events=events)
+        self._scheduler.event_store.append_checked("scheduler", "global", "general-request", request)
+        return result
+
+    async def _execute_or_recover(self, *, identity, task_text, create):
         operation = None
         ownership = None
         code = "general_worker_preparation_blocked"
         try:
             values = _identity_value(identity)
-            task = self._inputs._prepare_general_worker_task(**values, task_text=task_text)
             operation = self._journal.read(identity)
-            if operation is not None:
-                # Explicit restart handling is added by the separately gated
-                # recovery slice. No replay ever remints a dispatch permit.
-                return GeneralWorkerResult(identity, operation.operation_id, "blocked", "general_worker_recovery_required")
-            scope = self._authority._scope()
-            result = None
-            def request(events, _version):
-                nonlocal result
-                binding = self._scheduler._resolve_general_verification_binding(**values,
-                    as_of=datetime.now(timezone.utc))
-                state = self._scheduler.lifecycle.replay(identity.run_id)
-                result = self._journal.request(context=task.context,
-                    input_commitment=_input_commitment(task.model_dump(mode="json")),
-                    accepted_route_sha256=metadata_hash(binding.active_attempt.accepted_route.model_dump(mode="json")),
-                    workspace_identity_hash=state.workspace_identity_hash, host_scope_hash=scope,
-                    output_byte_limit=min(task.output_byte_limit, 16_384))
-                _validate_general_eligibility(self._scheduler, self._journal, result,
-                    purpose="request", host_scope_hash=scope, as_of=datetime.now(timezone.utc), events=events)
-            self._scheduler.event_store.append_checked("scheduler", "global", "general-request", request)
-            operation = result
+            if operation is None:
+                if not create:
+                    return GeneralWorkerResult(identity, "", "blocked", "general_worker_not_requested")
+                task = self._inputs._prepare_general_worker_task(**values, task_text=task_text)
+                operation = self._register(identity, task)
             ownership = GeneralWorkerOwnership(self._owner_root, operation.operation_id)
-            if not await asyncio.to_thread(ownership.acquire):
+            acquisition = asyncio.create_task(asyncio.to_thread(ownership.acquire))
+            try:
+                acquired = await asyncio.shield(acquisition)
+            except asyncio.CancelledError:
+                # A cancelled coroutine must not abandon a late acquired flock.
+                await acquisition
+                raise
+            if not acquired:
                 return GeneralWorkerResult(identity, operation.operation_id, "in_progress", "general_worker_in_progress")
-            code = "general_worker_request_blocked"
-            operation, proposal = await self._turn(operation, task, phase="request")
-            if type(proposal) is not GeneralWorkerRequest:
+            operation = self._journal.read(identity)
+            if operation.host_scope_hash != self._authority._scope():
                 raise ValueError()
-            binding = self._authority.resolve_eligibility(operation, purpose="dispatch")
-            request = self._model_request(operation, task, binding)
-            provider, model = validate_gateway_request(request, self._gateway.registry)
-            body = adapter_for(provider.adapter).encode_request(request, model).body_json.encode("utf-8")
-            code = "general_worker_provider_blocked"
-            operation = self._authority.reserve_call(operation, request=request, request_body=body)
-            response = await self._gateway.invoke(request)
-            response = revalidate_model(ModelResponse, response)
-            call = self._journal._provider_success(operation)
-            content = response.output_text.encode("utf-8", errors="strict")
-            raw = _canonical(response.model_dump(mode="json"))
-            if (response.request_id != operation.request_id or response.model_id != call.model_id
-                or response.provider_request_id != call.provider_request_id
-                or response.usage != TokenUsage.model_validate(dict(call.usage))
-                or response.finish_reason != "stop" or response.tool_calls
-                or not 0 < len(content) <= operation.output_byte_limit or not 0 < len(raw) <= 1_048_576):
+            action = recovery_action(operation)
+            # Historical metadata must resolve before any active-only resolver,
+            # fresh verifier or usage source. Its bytes remain separately proven.
+            historical = self._scheduler.read_general_worker_result(identity) if action == "accepted" else None
+            task = self._inputs._restore_general_worker_task(identity=identity, task_text=task_text)
+            if action == "accepted":
+                code = "general_worker_artifact_unavailable"
+                response = self._read_response(operation)
+                self._read_output(operation, historical.artifacts[0], response,
+                    publication_id=operation.acceptance.output_publication_id)
+                return historical
+            if action == "launch_unknown":
+                return GeneralWorkerResult(identity, operation.operation_id, "blocked", "general_worker_launch_unknown")
+            if action == "stop":
+                code = "general_worker_stop_unknown"
+                turn = operation.turns[-1]
+                receipt = await asyncio.to_thread(self._worker.stop_prepared_launch,
+                    turn.prepared, turn.launch_receipt)
+                operation = self._journal.stop_turn(operation, receipt=receipt)
+                action = recovery_action(operation)
+            if action == "call_held":
+                code = "general_worker_provider_held"
+                call = self._journal._provider_call(operation)
+                code = "general_worker_capture_missing" if call.status == "known_success" else "general_worker_provider_held"
+                return GeneralWorkerResult(identity, operation.operation_id, "blocked", code)
+            if action == "held":
+                return GeneralWorkerResult(identity, operation.operation_id, "blocked", "general_worker_held")
+            # Frozen input permits cleanup/replay only. New work always resolves
+            # fresh exact authority with locked standard UTC, including pause,
+            # cancellation, expiry and fencing checks.
+            code = "general_worker_authority_blocked"
+            task = self._inputs._prepare_general_worker_task(**values, task_text=task_text)
+            if _input_commitment(task.model_dump(mode="json")) != operation.input_commitment:
                 raise ValueError()
-            ref = self._publish(operation, raw, kind="response")
-            operation = self._journal.capture_response(operation, response_artifact=ref,
-                output_digest="sha256:" + hashlib.sha256(content).hexdigest(), output_byte_count=len(content))
-            code = "general_worker_completion_blocked"
-            operation, proposal = await self._turn(operation, task, phase="complete", response_text=response.output_text)
-            if type(proposal) is not DecodedWorkerOutput or len(proposal.blobs) != 1:
+            if action == "request":
+                code = "general_worker_request_blocked"
+                operation, proposal = await self._turn(operation, task, phase="request")
+                if type(proposal) is not GeneralWorkerRequest:
+                    raise ValueError()
+                action = "dispatch"
+            if action == "dispatch":
+                code = "general_worker_provider_blocked"
+                operation = await self._dispatch(operation, task)
+                action = "complete"
+            code = "general_worker_artifact_unavailable"
+            response = self._read_response(operation)
+            if action == "complete":
+                code = "general_worker_completion_blocked"
+                operation = await self._complete(operation, task, response)
+            elif action != "accept":
                 raise ValueError()
-            blob, = proposal.blobs
-            if blob.content != content:
+            proposal = self._proposals.read_proposal(identity.run_id, operation.task_sha256)
+            if proposal is None:
                 raise ValueError()
-            output = self._publish(operation, blob.content, kind="output")
-            if output != blob.artifact:
-                raise ValueError()
-            binding = self._authority.resolve_eligibility(operation, purpose="completion")
-            verification_task = VerificationTask(context=task.context, candidate_artifacts=(output,),
-                acceptance_contract=binding.verification_contract, required_check_ids=binding.required_check_ids)
-            evidence = await IsolatedVerifierProcess(max_artifact_bytes=16_384).verify_async(
-                verification_task, self._artifacts, grant_for_digest=lambda digest: self._grants.issue(
-                    digest=digest, run_id=identity.run_id, expires_at=binding.active_attempt.lease_expires_at))
-            proposal = self._proposals.record(verification_task, evidence)
-            operation = self._journal.record_proposal(operation, task_sha256=proposal.task_sha256,
-                evidence_sha256=proposal.evidence_sha256)
+            self._read_output(operation, proposal.task.candidate_artifacts[0], response)
             code = "general_worker_acceptance_blocked"
             return await self._coordinator.accept_general_proposal_async(identity=identity,
-                task_sha256=proposal.task_sha256)
+                task_sha256=operation.task_sha256)
         except Exception:
             pass
         finally:
             if ownership is not None:
                 ownership.close()
         return GeneralWorkerResult(identity, operation.operation_id if operation else "", "blocked", code)
+
+    async def _dispatch(self, operation, task):
+        binding = self._authority.resolve_eligibility(operation, purpose="dispatch")
+        request = self._model_request(operation, task, binding)
+        provider, model = validate_gateway_request(request, self._gateway.registry)
+        body = adapter_for(provider.adapter).encode_request(request, model).body_json.encode("utf-8")
+        operation = self._authority.reserve_call(operation, request=request, request_body=body)
+        response = revalidate_model(ModelResponse, await self._gateway.invoke(request))
+        self._validate_response(operation, response)
+        raw = _canonical(response.model_dump(mode="json"))
+        if not 0 < len(raw) <= 1_048_576:
+            raise ValueError()
+        content = response.output_text.encode("utf-8")
+        ref = self._publish(operation, raw, kind="response")
+        return self._journal.capture_response(operation, response_artifact=ref,
+            output_digest="sha256:" + hashlib.sha256(content).hexdigest(), output_byte_count=len(content))
+
+    def _validate_response(self, operation, response):
+        call = self._journal._provider_success(operation)
+        content = response.output_text.encode("utf-8", errors="strict")
+        if (response.request_id != operation.request_id or response.model_id != call.model_id
+            or response.provider_request_id != call.provider_request_id
+            or response.usage != TokenUsage.model_validate(dict(call.usage))
+            or response.finish_reason != "stop" or response.tool_calls
+            or not 0 < len(content) <= min(operation.output_byte_limit, 16_384)):
+            raise ValueError()
+
+    def _read_publication(self, operation, reference, kind, *, publication_id=None):
+        if self._scheduler.event_store._connection.in_transaction:
+            raise ValueError()
+        _publication_for_operation(self._scheduler.event_store, operation, reference, kind, publication_id)
+        grant = self._grants.issue(digest=reference.digest,
+            run_id=operation.operation_id if kind == "response" else operation.identity.run_id,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1))
+        raw = self._artifacts.read_bytes(reference.digest, grant=grant)
+        if len(raw) != reference.size_bytes or "sha256:" + hashlib.sha256(raw).hexdigest() != reference.digest:
+            raise ValueError()
+        return raw
+
+    def _read_response(self, operation):
+        capture = operation.capture
+        if capture is None or capture.response_artifact.artifact_type != "general-model-response" or (
+            capture.response_artifact.media_type != "application/json"
+            or not 0 < capture.response_artifact.size_bytes <= 1_048_576):
+            raise ValueError()
+        raw = self._read_publication(operation, capture.response_artifact, "response",
+            publication_id=operation.acceptance.response_publication_id if operation.acceptance else None)
+        response = ModelResponse.model_validate(json.loads(raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_pairs, parse_constant=_constant))
+        self._validate_response(operation, response)
+        content = response.output_text.encode("utf-8")
+        if (raw != _canonical(response.model_dump(mode="json")) or len(content) != capture.output_byte_count
+            or "sha256:" + hashlib.sha256(content).hexdigest() != capture.output_digest):
+            raise ValueError()
+        return response
+
+    def _read_output(self, operation, reference, response, *, publication_id=None):
+        if (reference.digest != operation.capture.output_digest
+            or reference.size_bytes != operation.capture.output_byte_count
+            or reference.artifact_type != "text" or reference.media_type != "text/plain; charset=utf-8"
+            or self._read_publication(operation, reference, "output", publication_id=publication_id)
+                != response.output_text.encode("utf-8")):
+            raise ValueError()
+
+    async def _complete(self, operation, task, response):
+        operation, proposal = await self._turn(operation, task, phase="complete", response_text=response.output_text)
+        if type(proposal) is not DecodedWorkerOutput or len(proposal.blobs) != 1:
+            raise ValueError()
+        blob, = proposal.blobs
+        if blob.content != response.output_text.encode("utf-8"):
+            raise ValueError()
+        output = self._publish(operation, blob.content, kind="output")
+        if output != blob.artifact:
+            raise ValueError()
+        binding = self._authority.resolve_eligibility(operation, purpose="completion")
+        verification_task = VerificationTask(context=task.context, candidate_artifacts=(output,),
+            acceptance_contract=binding.verification_contract, required_check_ids=binding.required_check_ids)
+        evidence = await IsolatedVerifierProcess(max_artifact_bytes=16_384).verify_async(
+            verification_task, self._artifacts, grant_for_digest=lambda digest: self._grants.issue(
+                digest=digest, run_id=task.context.run_id, expires_at=binding.active_attempt.lease_expires_at))
+        proposal = self._proposals.record(verification_task, evidence)
+        return self._journal.record_proposal(operation, task_sha256=proposal.task_sha256,
+            evidence_sha256=proposal.evidence_sha256)
 
     async def _turn(self, operation, task, *, phase, response_text=None):
         self._authority.resolve_eligibility(operation, purpose="request" if phase == "request" else "completion")

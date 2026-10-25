@@ -263,7 +263,16 @@ class SystemdReadOnlyLauncher:
                         check=False, timeout=3)
                 result = _read_termination_receipt(unit_name=prepared_launch.unit_name,
                     expected_cgroup=cgroup, client_env=environment, systemctl=self._systemctl)
-                if _observe_prepared_binding(prepared_launch, launch_receipt, self._systemctl, environment) != "stopped":
+                stopped_binding = _observe_prepared_binding(prepared_launch, launch_receipt, self._systemctl, environment)
+                if result is None and stopped_binding == "stopped":
+                    # Collection can pass through loaded/inactive with a blank
+                    # ControlGroup. Keep the shared collector strict; after an
+                    # exact fresh stopped observation, resample its SAME old
+                    # cgroup proof once, then revalidate the binding again.
+                    result = _read_termination_receipt(unit_name=prepared_launch.unit_name,
+                        expected_cgroup=cgroup, client_env=environment, systemctl=self._systemctl)
+                    stopped_binding = _observe_prepared_binding(prepared_launch, launch_receipt, self._systemctl, environment)
+                if stopped_binding != "stopped":
                     result = None
                 if result is not None and session is not None:
                     _discard_staging(session._staging)

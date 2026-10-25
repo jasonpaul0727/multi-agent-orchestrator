@@ -1184,6 +1184,55 @@ def test_reconstructed_live_launch_is_killed_as_whole_unit_before_stop_proof(mon
     assert killed == [prepared.unit_name] and result.cgroup_empty
 
 
+@pytest.mark.parametrize("fault", [None, "mismatched-binding", "unknown-binding", "populated", "final-mismatch"])
+def test_recovered_stop_resamples_strict_receipt_only_after_exact_stopped_binding(monkeypatch, fault):
+    prepared, receipt = _reconstructed_launch()
+    state = dict(killed=False, collectors=0)
+    def systemctl(args, **kwargs):
+        if "kill" in args:
+            assert args[-1] == prepared.unit_name and "--kill-whom=all" in args
+            state["killed"] = True
+            return subprocess.CompletedProcess(args, 0)
+        names = {arg.removeprefix("--property=") for arg in args if arg.startswith("--property=")}
+        if names == {"ActiveState", "LoadState", "ControlGroup"}:
+            state["collectors"] += 1
+            # Real observed transition: inactive but still loaded/blank cgroup
+            # fails the unchanged standard collector. Only its next sample can
+            # witness collected identity plus independently empty old cgroup.
+            values = dict(ActiveState="inactive", LoadState="loaded" if state["collectors"] == 1 else "not-found",
+                ControlGroup="")
+        elif not state["killed"]:
+            values = dict(_observed_worker_profile(), Id=prepared.unit_name, LoadState="loaded",
+                ActiveState="active", ControlGroup=receipt.control_group, InvocationID=receipt.invocation_id)
+        else:
+            values = dict(_observed_worker_profile(), Id=prepared.unit_name, LoadState="not-found",
+                ActiveState="inactive", ControlGroup="", InvocationID="")
+            if fault == "unknown-binding":
+                return subprocess.CompletedProcess(args, 1, stdout=b"")
+            if fault == "mismatched-binding" or fault == "final-mismatch" and state["collectors"] >= 2:
+                values.update(LoadState="loaded", ControlGroup=receipt.control_group, InvocationID="b" * 32)
+        return subprocess.CompletedProcess(args, 0, stdout="".join(f"{key}={values[key]}\n" for key in names).encode())
+    monkeypatch.setattr(launcher_module, "_systemd_client_environment", lambda: {})
+    monkeypatch.setattr(subprocess, "run", systemctl)
+    monkeypatch.setattr(launcher_module, "_cgroup_is_empty", lambda path: fault != "populated")
+    collector_calls = []
+    original_collector = launcher_module._read_termination_receipt
+    def collect(**kwargs):
+        collector_calls.append(kwargs)
+        return original_collector(**kwargs)
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", collect)
+    launcher = SystemdReadOnlyLauncher(systemctl="ctl")
+    if fault is None:
+        stopped = launcher.stop_prepared_launch(prepared, receipt)
+        assert stopped.cgroup_empty and stopped.control_group == receipt.control_group
+        assert len(collector_calls) == 2
+    else:
+        with pytest.raises(launcher_module.IsolationStopUnknown):
+            launcher.stop_prepared_launch(prepared, receipt)
+        assert len(collector_calls) == (1 if fault in {"mismatched-binding", "unknown-binding"} else 2)
+    assert state["killed"]
+
+
 def test_collected_systemd_unit_may_omit_execstart_but_requires_exact_stopped_identity(monkeypatch):
     prepared, receipt = _reconstructed_launch()
     # Captured real systemd shape: no ExecStart at all for a collected unit.

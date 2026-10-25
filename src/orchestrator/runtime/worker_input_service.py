@@ -25,6 +25,20 @@ def _utc_now() -> datetime:
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}", re.ASCII)
 
 
+def _exact_worker_task(*, context, role, task_text):
+    """Pure exact-input/frame validation shared by active and historical reads."""
+    context = revalidate_model(AttemptContext, context)
+    manifest = build_worker_input_manifest(run_id=context.run_id, node_id=context.node_id,
+        role=role, task_text=task_text)
+    if not hmac.compare_digest(manifest.content_hash, context.input_manifest_hash):
+        raise WorkerInputError("worker_input_mismatch")
+    task = WorkerTask(context=context, role=role, task_text=task_text, input_artifacts=(),
+        tool_capabilities=(), output_byte_limit=WORKER_INPUT_OUTPUT_BYTES)
+    if len(task.model_dump_json().encode("utf-8", errors="strict")) > MAX_WORKER_INPUT_FRAME_BYTES:
+        raise WorkerInputError("worker_input_too_large")
+    return task
+
+
 class WorkerInputService:
     """Derive inputs in memory; existing Scheduler authority owns every write."""
 
@@ -103,19 +117,7 @@ class WorkerInputService:
                     or contract.contract_hash != context.planning_contract_hash
                 ):
                     raise WorkerInputError("worker_input_preparation_failed")
-                manifest = build_worker_input_manifest(
-                    run_id=run_id, node_id=node_id, role=node.spec.role, task_text=task_text,
-                )
-                if not hmac.compare_digest(manifest.content_hash, context.input_manifest_hash):
-                    raise WorkerInputError("worker_input_mismatch")
-                result = WorkerTask(
-                    context=context, role=node.spec.role, task_text=task_text,
-                    input_artifacts=(), tool_capabilities=(),
-                    output_byte_limit=WORKER_INPUT_OUTPUT_BYTES,
-                )
-                encoded = result.model_dump_json().encode("utf-8", errors="strict")
-                if len(encoded) > MAX_WORKER_INPUT_FRAME_BYTES:
-                    raise WorkerInputError("worker_input_too_large")
+                result = _exact_worker_task(context=context, role=node.spec.role, task_text=task_text)
                 return None
 
             self._scheduler.event_store.append_checked(
@@ -144,6 +146,41 @@ class WorkerInputService:
             self, run_id=run_id, node_id=node_id, attempt_id=attempt_id,
             fencing_generation=fencing_generation, task_text=task_text, recovery=True, general=True,
         )
+
+    def _restore_general_worker_task(self, *, identity, task_text) -> WorkerTask:
+        """Validate frozen exact input without requiring an active/released lease.
+
+        This supplies data for historical replay and owned orphan cleanup only;
+        every new external phase still requires active preparation/eligibility.
+        """
+        from .general_worker_journal import GeneralWorkerJournal, _identity_value
+        from .general_worker_protocol import _input_commitment
+        result = None
+        try:
+            _identity_value(identity)
+            def restore(_events, _version):
+                nonlocal result
+                operation = GeneralWorkerJournal(self._scheduler.event_store).read(identity)
+                node = self._scheduler.lifecycle.replay(identity.run_id).node(identity.node_id)
+                contract = node.spec.planning_contract
+                if operation is None or contract is None or (
+                    contract.contract_hash != operation.context.planning_contract_hash
+                    or contract.contract_hash != node.spec.planning_contract_hash
+                    or contract.role != node.spec.role or contract.run_id != identity.run_id
+                    or contract.node_id != identity.node_id
+                    or contract.config_hash != operation.context.effective_config_hash
+                    or contract.registry_hash != operation.context.registry_hash
+                    or contract.policy_manifest_hash != operation.context.policy_manifest_hash):
+                    raise ValueError()
+                result = _exact_worker_task(context=operation.context, role=node.spec.role, task_text=task_text)
+                if _input_commitment(result.model_dump(mode="json")) != operation.input_commitment:
+                    raise ValueError()
+            self._scheduler.event_store.append_checked("scheduler", "global", "general-frozen-input", restore)
+            if result is not None:
+                return result
+        except Exception:
+            pass
+        raise WorkerInputError("worker_input_preparation_failed")
 
     def accept_routing_with_input(
         self, request: RoutingRequest, decision: RoutingDecision, *, task_text: str,

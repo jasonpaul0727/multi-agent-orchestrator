@@ -185,6 +185,10 @@ and public runtime exports as needed. The async ownership seam also permits
 narrow shared changes to verifier_process.py, proposal_verification.py,
 Scheduler general-acceptance internals and Coordinator, plus focused tests;
 no duplicated acceptance algorithm or public prevalidated-proof parameter.
+Task3B also permits a narrow launcher.py recovered-stop observation fix and its
+tests: after exact ACK and a fresh stopped binding, bounded reread of the same
+standard termination/cgroup proof plus final stopped-binding recheck. Global
+collector/legacy strictness stays; no synthesized receipt or new-work retry.
 
 **Interfaces:**
 - `GeneralWorkerExecutionService(scheduler, input_service, artifact_store, grant_authority, proposal_journal, acceptance_coordinator, provider_gateway, worker_process, workspace: Path)` requires exact owned dependencies and store/registry binding; unavailable usage remains default.
@@ -207,6 +211,7 @@ no duplicated acceptance algorithm or public prevalidated-proof parameter.
 **Feature B — restart decision table (commit/push B):**
 - [ ] RED `test_captured_success_resumes_without_gateway_or_broker`, `test_dispatching_unknown_and_reserved_gap_block_every_external_boundary`, `test_missing_capture_never_regenerates`, `test_verified_orphan_stopped_before_successor`, `test_unacked_or_stop_unknown_retains_lease`, `test_cross_operation_or_corrupt_capture_blocks`.
 - [ ] Implement single-owner explicit resume with trusted current phase checks. Before ackless launch return launch_unknown; verified orphan gets exact stop/empty proof before new epoch. Captured response resume never invokes; proposed resume accepts only under current authority; accepted replay validates historical result before active-lease lookup.
+- [ ] Exercise a real acknowledged orphan through a NEW launcher with no old backend session. Pin the loaded/blank-cgroup collection transition with focused RED/GREEN; permit only bounded proof resampling after observed exact stopped binding, retaining mismatch/unacknowledged/unresolved/populated failures.
 - [ ] Test pause/cancel/expiry/new generation between phases blocks launch/acceptance and retains unresolved effects; changed host-scope/boot blocks before credentials/Worker/terminal, while new same-boot application process agrees. No automated reconciliation/retry/replan or host migration.
 - [ ] GREEN focused recovery/service tests; commit B, wait for gate.
 
