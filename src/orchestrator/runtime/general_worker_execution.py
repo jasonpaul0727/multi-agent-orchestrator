@@ -7,18 +7,21 @@ dispatch, publication and terminal authority on the SQLite owner thread.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
 
 from orchestrator.artifacts import ArtifactStore, EphemeralArtifactGrantAuthority
+from orchestrator.config import ModelRegistryManifest
 from orchestrator.models import CostSnapshotRefs, ModelMessage, ModelRequest, ModelResponse, ProviderModelGateway, TokenUsage
 from orchestrator.models.adapters import adapter_for
 from orchestrator.models.gateway import validate_gateway_request
 from orchestrator.persistence import SQLiteEventStore
 from orchestrator.scheduler import Scheduler
 from orchestrator.validation import revalidate_model
+from orchestrator.workspace_identity import workspace_identity_hash
 from .acceptance_coordinator import AttemptExecutionCoordinator
 from .contracts import ArtifactRef, VerificationTask
 from .general_worker_authority import (
@@ -42,6 +45,34 @@ from .worker_output import DecodedWorkerOutput
 class GeneralWorkerUnavailable(RuntimeError):
     def __init__(self):
         super().__init__("general_worker_unavailable")
+
+
+@dataclass(frozen=True, slots=True)
+class GeneralWorkerHostConfig:
+    """Trusted constructor-only data; never accepts a foreign bound service."""
+
+    workspace: Path = field(repr=False)
+    registry: ModelRegistryManifest = field(repr=False)
+    secret_broker: object | None = field(default=None, repr=False)
+    transport: object | None = field(default=None, repr=False)
+
+    def __post_init__(self):
+        valid = False
+        try:
+            if not isinstance(self.workspace, Path) or not self.workspace.is_absolute() or (
+                type(self.registry) is not ModelRegistryManifest):
+                raise ValueError()
+            workspace = self.workspace.resolve(strict=True)
+            if not workspace.is_dir():
+                raise ValueError()
+            registry = revalidate_model(ModelRegistryManifest, self.registry)
+            object.__setattr__(self, "workspace", workspace)
+            object.__setattr__(self, "registry", registry)
+            valid = True
+        except Exception:
+            pass
+        if not valid:
+            raise GeneralWorkerUnavailable()
 
 
 class GeneralWorkerExecutionService:
@@ -76,8 +107,10 @@ class GeneralWorkerExecutionService:
             runtime = Path(__file__).resolve().parents[2]
             # /tmp is the launcher's private namespace; ambient executable and
             # config roots remain readable and cannot contain private authority.
-            readable = (root, runtime, *(Path(path).resolve() for path in
-                ("/usr", "/bin", "/lib", "/lib64", "/etc", "/dev")))
+            from orchestrator.isolation._exec import _runtime_grants
+            scratch = Path("/tmp").resolve(strict=True)
+            readable = (root, runtime, *(grant.path.resolve(strict=True) for grant in _runtime_grants()
+                if grant.path.resolve(strict=True) != scratch))
             for private in (database, artifact_store._root.resolve(), owner_root.resolve()):
                 if any(private == public or private.is_relative_to(public) or public.is_relative_to(private)
                     for public in readable):
@@ -118,11 +151,17 @@ class GeneralWorkerExecutionService:
         return result
 
     async def _execute_or_recover(self, *, identity, task_text, create):
+        values = None
+        try:
+            values = _identity_value(identity)
+        except Exception:
+            pass
+        if values is None:
+            raise GeneralWorkerUnavailable()
         operation = None
         ownership = None
         code = "general_worker_preparation_blocked"
         try:
-            values = _identity_value(identity)
             operation = self._journal.read(identity)
             if operation is None:
                 if not create:
@@ -140,7 +179,9 @@ class GeneralWorkerExecutionService:
             if not acquired:
                 return GeneralWorkerResult(identity, operation.operation_id, "in_progress", "general_worker_in_progress")
             operation = self._journal.read(identity)
-            if operation.host_scope_hash != self._authority._scope():
+            if (operation.host_scope_hash != self._authority._scope()
+                or operation.context.registry_hash != self._gateway.registry.content_hash
+                or operation.workspace_identity_hash != workspace_identity_hash(self._workspace)):
                 raise ValueError()
             action = recovery_action(operation)
             # Historical metadata must resolve before any active-only resolver,
@@ -337,4 +378,4 @@ class GeneralWorkerExecutionService:
         return ref
 
 
-__all__ = ["GeneralWorkerExecutionService", "GeneralWorkerUnavailable", "GeneralWorkerOwnership"]
+__all__ = ["GeneralWorkerHostConfig", "GeneralWorkerExecutionService", "GeneralWorkerUnavailable", "GeneralWorkerOwnership"]

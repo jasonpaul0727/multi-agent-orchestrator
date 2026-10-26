@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from orchestrator.artifacts import ArtifactStore, EphemeralArtifactGrantAuthority
-from orchestrator.models import AcceptedModelRoute
+from orchestrator.models import AcceptedModelRoute, ProviderModelGateway
 from orchestrator.models.provider_calls import ProviderCallSnapshot, SQLiteProviderCallJournal
 from orchestrator.persistence import SQLiteEventStore
 from orchestrator.provider_reconciliation import (
@@ -35,6 +35,12 @@ from orchestrator.runtime.recovery_continuation import (
 )
 from orchestrator.runtime.recovery_opportunities import RecoveryOpportunity, RecoveryOpportunityService
 from orchestrator.runtime.worker_input_service import WorkerInputService
+from orchestrator.runtime.general_worker_authority import SchedulerProviderDispatchAuthority
+from orchestrator.runtime.general_worker_execution import (
+    GeneralWorkerExecutionService, GeneralWorkerHostConfig, GeneralWorkerUnavailable,
+)
+from orchestrator.runtime.general_worker_journal import GeneralWorkerIdentity, GeneralWorkerJournal, GeneralWorkerResult
+from orchestrator.runtime.general_worker_process import GeneralWorkerProcess
 from orchestrator.runtime.workspace_execution import (
     WorkspaceExecutionHost, WorkspaceExecutionResult, WorkspaceExecutionService,
 )
@@ -85,11 +91,14 @@ class ControlPlaneApplication:
         termination_verifier: AttemptTerminationVerifier | None = None,
         usage_source: AttemptUsageSource | None = None,
         workspace_execution_host: WorkspaceExecutionHost | None = None,
+        general_worker_config: GeneralWorkerHostConfig | None = None,
     ) -> None:
         self._ready = False
         self._closed = False
         store = None
         try:
+            if general_worker_config is not None and type(general_worker_config) is not GeneralWorkerHostConfig:
+                raise GeneralWorkerUnavailable()
             if usage_source is not None and not isinstance(usage_source, AttemptUsageSource):
                 raise TypeError("usage_source must implement the trusted AttemptUsageSource service")
             limits = revalidate_model(ConcurrencyLimits, limits)
@@ -120,6 +129,18 @@ class ControlPlaneApplication:
                 ) if self._artifact_store is not None else None
             )
             self._journal = SQLiteProviderCallJournal(store)
+            self._general_worker_execution = None
+            if general_worker_config is not None:
+                if self._artifact_store is None:
+                    raise GeneralWorkerUnavailable()
+                general_journal = GeneralWorkerJournal(store)
+                authority = SchedulerProviderDispatchAuthority(self._scheduler, general_journal)
+                gateway = ProviderModelGateway(registry=general_worker_config.registry,
+                    secret_broker=general_worker_config.secret_broker, transport=general_worker_config.transport,
+                    provider_call_journal=authority.provider_journal, dispatch_authority=authority)
+                self._general_worker_execution = GeneralWorkerExecutionService(self._scheduler, self._worker_inputs,
+                    self._artifact_store, self._artifact_grants, VerifierProposalJournal(store),
+                    self._acceptance_coordinator, gateway, GeneralWorkerProcess(), general_worker_config.workspace)
             self._reconciliation = ProviderReconciliationService(
                 journal=self._journal,
                 scheduler=self._scheduler,
@@ -129,11 +150,12 @@ class ControlPlaneApplication:
             # Assign readiness only after append_checked has committed.
             self._report = self._bootstrap()
             self._ready = True
+            return
         except Exception:
             if store is not None:
                 store.close()
             self._closed = True
-            raise StartupRecoveryFailed("control-plane startup recovery failed") from None
+        raise StartupRecoveryFailed("control-plane startup recovery failed") from None
 
     @property
     def startup_report(self) -> StartupRecoveryReport:
@@ -314,6 +336,18 @@ class ControlPlaneApplication:
             approval_grant_id=approval_grant_id,
         )
 
+    async def execute_general_worker_task(self, *, identity: GeneralWorkerIdentity, task_text: str) -> GeneralWorkerResult:
+        self._require_ready()
+        if self._general_worker_execution is None:
+            raise GeneralWorkerUnavailable()
+        return await self._general_worker_execution.execute(identity=identity, task_text=task_text)
+
+    async def recover_general_worker_task(self, *, identity: GeneralWorkerIdentity, task_text: str) -> GeneralWorkerResult:
+        self._require_ready()
+        if self._general_worker_execution is None:
+            raise GeneralWorkerUnavailable()
+        return await self._general_worker_execution.recover(identity=identity, task_text=task_text)
+
     def reconcile_workspace_publication(
         self, *, run_id: str, operation_id: str,
     ) -> WorkspaceExecutionResult:
@@ -370,4 +404,5 @@ class ControlPlaneApplication:
         self.close()
 
 
-__all__ = ["ApplicationNotReady", "ControlPlaneApplication", "StartupRecoveryFailed", "StartupRecoveryReport"]
+__all__ = ["ApplicationNotReady", "ControlPlaneApplication", "StartupRecoveryFailed", "StartupRecoveryReport",
+    "GeneralWorkerHostConfig"]

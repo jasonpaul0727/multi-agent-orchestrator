@@ -92,7 +92,8 @@ def execution_case(tmp_path, *, transport=None, trusted_usage=True):
         app._artifact_grants, VerifierProposalJournal(app._event_store), app._acceptance_coordinator,
         gateway, worker, workspace)
     return SimpleNamespace(app=app, service=service, journal=journal, broker=broker, transport=transport,
-        text=text, contract=contract, identity=GeneralWorkerIdentity("run-1", "node-1", routing.attempt_id, 1))
+        text=text, contract=contract, registry=reg, config=resolved.config, policy=policy,
+        routing=routing, decision=decision, identity=GeneralWorkerIdentity("run-1", "node-1", routing.attempt_id, 1))
 
 
 @pytest.fixture
@@ -187,3 +188,50 @@ def test_requested_registration_rolls_back_if_legacy_provider_intent_already_hol
 
 def vars_identity(identity):
     return {name: getattr(identity, name) for name in ("run_id", "node_id", "attempt_id", "fencing_generation")}
+
+
+@pytest.mark.parametrize("layout", ["workspace-db", "workspace-artifacts", "workspace-owners", "runtime",
+    "ambient", "workspace-symlink", "artifact-symlink", "owner-symlink"])
+def test_private_storage_layout_rejected_if_visible_to_worker(case, monkeypatch, tmp_path, layout):
+    from orchestrator.runtime.general_worker_execution import GeneralWorkerExecutionService, GeneralWorkerUnavailable
+    from orchestrator.runtime import general_worker_execution as module
+    from orchestrator.isolation import _exec
+    from orchestrator.isolation.landlock import PathGrant, READ_EXECUTE
+    from tests.unit.lifecycle.test_scheduler import _resolver_durable_state
+    workspace = case.service._workspace
+    private = case.service._owner_root.parent
+    if layout == "workspace-db":
+        workspace = private
+    elif layout == "workspace-artifacts":
+        workspace = case.app._artifact_store._root
+    elif layout == "workspace-owners":
+        case.service._owner_root.mkdir()
+        workspace = case.service._owner_root
+    elif layout == "runtime":
+        monkeypatch.setattr(module, "__file__", str(private / "orchestrator/runtime/general_worker_execution.py"))
+    elif layout == "ambient":
+        original = _exec._runtime_grants
+        monkeypatch.setattr(_exec, "_runtime_grants", lambda: [*original(), PathGrant(private, READ_EXECUTE)])
+    elif layout == "workspace-symlink":
+        workspace = tmp_path / "workspace-alias"
+        workspace.symlink_to(private, target_is_directory=True)
+    elif layout == "artifact-symlink":
+        alias = tmp_path / "artifact-alias"
+        alias.symlink_to(workspace, target_is_directory=True)
+        monkeypatch.setattr(case.app._artifact_store, "_root", alias)
+    else:
+        case.service._owner_root.symlink_to(workspace, target_is_directory=True)
+    def forbidden(*args, **kwargs):
+        pytest.fail("visible storage crossed an external-work boundary")
+    monkeypatch.setattr(case.service._worker, "prepare_launch", forbidden)
+    monkeypatch.setattr(case.service._worker, "start_turn", forbidden)
+    monkeypatch.setattr(case.service._gateway, "invoke", forbidden)
+    monkeypatch.setattr(case.broker, "acquire_provider_credential", forbidden)
+    monkeypatch.setattr(case.transport, "post_json", forbidden)
+    before = _resolver_durable_state(case.app._event_store)
+    with pytest.raises(GeneralWorkerUnavailable) as caught:
+        GeneralWorkerExecutionService(case.app._scheduler, case.app._worker_inputs, case.app._artifact_store,
+            case.app._artifact_grants, case.service._proposals, case.app._acceptance_coordinator,
+            case.service._gateway, case.service._worker, workspace)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert _resolver_durable_state(case.app._event_store) == before
