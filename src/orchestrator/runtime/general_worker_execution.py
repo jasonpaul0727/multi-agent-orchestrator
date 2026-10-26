@@ -169,13 +169,9 @@ class GeneralWorkerExecutionService:
                 task = self._inputs._prepare_general_worker_task(**values, task_text=task_text)
                 operation = self._register(identity, task)
             ownership = GeneralWorkerOwnership(self._owner_root, operation.operation_id)
-            acquisition = asyncio.create_task(asyncio.to_thread(ownership.acquire))
-            try:
-                acquired = await asyncio.shield(acquisition)
-            except asyncio.CancelledError:
-                # A cancelled coroutine must not abandon a late acquired flock.
-                await acquisition
-                raise
+            # The ownership primitive closes any late FD after finally marks
+            # the claim closed; cleanup never depends on a surviving waiter.
+            acquired = await asyncio.to_thread(ownership.acquire)
             if not acquired:
                 return GeneralWorkerResult(identity, operation.operation_id, "in_progress", "general_worker_in_progress")
             operation = self._journal.read(identity)
