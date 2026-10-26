@@ -254,6 +254,11 @@ that proof, clear a journal or silently re-plan from unknown state.
 
 ### 5. Candidate acceptance and completion
 
+Durable success uses the existing lifecycle event_type `AttemptCompleted`
+with payload.outcome `succeeded`, task_sha256 and evidence_sha256. References
+to a successful Attempt mean that exact event/proof combination; no new
+AttemptSucceeded event or producer schema is introduced.
+
 After completion Worker stop, decode/validate output, publish only attested
 bytes to ArtifactStore, derive VerificationTask from frozen Scheduler binding,
 run the existing isolated verifier, record VerifierProposalJournal evidence,
@@ -293,7 +298,7 @@ must have exact completion-Worker stop, capture and proposal bindings before
 success, even when reached through the existing public acceptance API. Inside
 the SAME SQLite terminal transaction append the journal's accepted checkpoint
 with immutable task/evidence/artifact/usage hashes, settlement key and exact
-completed_at, alongside AttemptSucceeded, reservation commit and slot release.
+completed_at, alongside AttemptCompleted(outcome=succeeded), reservation commit and slot release.
 Use concrete owned journal methods, not injected callbacks under the lock.
 Any exception rolls every terminal write back. Bootstrap validates both sides
 of these references; a general operation's historical success missing the
@@ -328,7 +333,7 @@ committed before acceptance wins. Existing non-general Attempts are unchanged.
 Success-path priority test kills the completion Worker with actual SIGKILL
 after the host has captured a real bounded response, then starts a genuinely
 new application process with the same SQLite/ArtifactStore, re-supplies input
-and proves exact output bytes + independently verified AttemptSucceeded.
+and proves exact output bytes + independently verified AttemptCompleted(outcome=succeeded).
 Provider invocation count across both processes stays ONE. A second scenario
 kills the host after a verified request-Worker launch, recovers the owned unit
 and completes. Unknown-call scenarios use actual journal states and guard
