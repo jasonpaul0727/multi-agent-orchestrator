@@ -174,6 +174,10 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         )
         """,
         """
+        CREATE INDEX IF NOT EXISTS ix_events_stream_attempt_context
+        ON events(stream_type, run_id, node_id, attempt_id)
+        """,
+        """
         CREATE TABLE IF NOT EXISTS idempotency_records (
             stream_id TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
@@ -883,6 +887,26 @@ class SQLiteEventStore:
             ORDER BY stream_id ASC
             """,
             (stream_type,),
+        ).fetchall()
+        return [row["stream_id"] for row in rows]
+
+    def stream_ids_for_context(
+        self, stream_type: str, run_id: str, node_id: str, attempt_id: str
+    ) -> list[str]:
+        """Return streams containing this operation tuple, regardless of fencing generation."""
+
+        stream_type = _validate_identifier(stream_type, "stream_type")
+        run_id = _validate_identifier(run_id, "run_id")
+        node_id = _validate_identifier(node_id, "node_id")
+        attempt_id = _validate_identifier(attempt_id, "attempt_id")
+        rows = self._connection.execute(
+            """
+            SELECT DISTINCT stream_id
+            FROM events
+            WHERE stream_type = ? AND run_id = ? AND node_id = ? AND attempt_id = ?
+            ORDER BY stream_id ASC
+            """,
+            (stream_type, run_id, node_id, attempt_id),
         ).fetchall()
         return [row["stream_id"] for row in rows]
 

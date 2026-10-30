@@ -42,6 +42,13 @@ class GeneralWorkerJournalError(RuntimeError):
         super().__init__("general_worker_journal_invalid")
 
 
+class GeneralWorkerIdentityMismatch(RuntimeError):
+    """A registered attempt exists, but only under a different fencing generation."""
+
+    def __init__(self):
+        super().__init__("general_worker_identity_mismatch")
+
+
 def _guard(function):
     @wraps(function)
     def guarded(*args, **kwargs):
@@ -392,6 +399,49 @@ class GeneralWorkerJournal:
             self._validate_links(operation)
             self._validate_terminal_links(operation)
         return operation
+
+    def read_for_identity(self, identity: GeneralWorkerIdentity) -> GeneralWorkerOperation | None:
+        """Resolve an operation by its stable tuple and reject a generation-only mismatch.
+
+        The caller must not fall back to legacy authority when the same
+        run/node/attempt is registered under a different fencing generation.
+        """
+        try:
+            _identity_value(identity)
+            stream_ids = self.event_store.stream_ids_for_context(
+                STREAM_TYPE, identity.run_id, identity.node_id, identity.attempt_id,
+            )
+            exact = None
+            mismatched_generation = False
+            for stream_id in stream_ids:
+                events, _version = self.event_store.read_stream_with_version(STREAM_TYPE, stream_id)
+                if not events:
+                    raise ValueError()
+                first = events[0]
+                candidate = GeneralWorkerIdentity(
+                    first.run_id, first.node_id, first.attempt_id, first.fencing_generation,
+                )
+                if (candidate.stream_id != stream_id
+                    or candidate.run_id != identity.run_id
+                    or candidate.node_id != identity.node_id
+                    or candidate.attempt_id != identity.attempt_id):
+                    raise ValueError()
+                operation = self.read(candidate)
+                if operation is None:
+                    raise ValueError()
+                if candidate == identity:
+                    exact = operation
+                else:
+                    mismatched_generation = True
+            if exact is not None:
+                return exact
+            if mismatched_generation:
+                raise GeneralWorkerIdentityMismatch()
+            return None
+        except GeneralWorkerIdentityMismatch:
+            raise
+        except Exception:
+            raise GeneralWorkerJournalError() from None
 
     @_guard
     def validate_operations(self) -> None:

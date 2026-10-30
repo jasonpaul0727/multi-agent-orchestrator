@@ -1387,3 +1387,101 @@ def test_openai_compatible_gateway_never_sends_provider_correlation_header(tmp_p
 
     header_names = {name for name, _value in transport.calls[0]["headers"]}
     assert "X-Client-Request-Id" not in header_names
+
+
+@pytest.mark.parametrize(
+    ("register_before_gateway", "expected_code", "expected_verifier_calls", "expected_broker_calls"),
+    [
+        (True, "stale_decision", 0, 0),
+        (False, "provider_journal_unavailable", 1, 1),
+    ],
+)
+def test_registered_operation_other_generation_cannot_fall_through_to_legacy_verifier(
+    tmp_path, register_before_gateway, expected_code, expected_verifier_calls, expected_broker_calls
+):
+    from orchestrator.runtime.contracts import AttemptContext
+    from orchestrator.runtime.general_worker_journal import GeneralWorkerJournal
+    from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
+
+    registry = model_registry()
+    original = model_request(registry)
+    journal_path = tmp_path / "provider-and-general-journal.db"
+    registered_generation = original.fencing_generation + 1
+    changed_generation = original.fencing_generation + 2
+    changed = original.model_copy(update={
+        "fencing_generation": changed_generation,
+        "accepted_route": original.accepted_route.model_copy(update={
+            "fencing_generation": changed_generation,
+        }),
+    })
+    context = AttemptContext(
+        run_id=original.run_id,
+        node_id=original.node_id,
+        attempt_id=original.attempt_id,
+        agent_instance_id="agent-1",
+        fencing_generation=registered_generation,
+        graph_version=1,
+        input_manifest_hash=HASH,
+        effective_config_hash=HASH,
+        registry_hash=HASH,
+        policy_manifest_hash=HASH,
+        routing_decision_hash=HASH,
+        planning_contract_hash=HASH,
+    )
+
+    with SQLiteEventStore(journal_path) as store:
+        journal = SQLiteProviderCallJournal(store)
+
+        def register_other_generation():
+            GeneralWorkerJournal(store).request(
+                context=context,
+                input_commitment=HASH,
+                accepted_route_sha256=HASH,
+                workspace_identity_hash=HASH,
+                host_scope_hash=HASH,
+                output_byte_limit=16_384,
+            )
+
+        if register_before_gateway:
+            register_other_generation()
+
+        class _PermissiveCountingVerifier:
+            calls = 0
+
+            async def is_accepted(self, _request):
+                self.calls += 1
+                return True
+
+        class _RegisteringBroker(_Broker):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            async def acquire_provider_credential(self, **kwargs):
+                self.calls += 1
+                if not register_before_gateway:
+                    register_other_generation()
+                return await super().acquire_provider_credential(**kwargs)
+
+        verifier = _PermissiveCountingVerifier()
+        broker = _RegisteringBroker()
+        transport = _FakeTransport(
+            HTTPTransportResponse(status=200, headers=(), body=b'{"ok":true}')
+        )
+        gateway = ProviderModelGateway(
+            registry=registry,
+            accepted_route_verifier=verifier,
+            secret_broker=broker,
+            transport=transport,
+            provider_call_journal=journal,
+            dispatch_authority=None,
+        )
+
+        with pytest.raises(ModelGatewayError) as failure:
+            asyncio.run(gateway.invoke(changed))
+
+        assert failure.value.failure.code == expected_code
+        assert verifier.calls == expected_verifier_calls
+        assert broker.calls == expected_broker_calls
+        assert len(transport.calls) == 0
+        assert journal.read(changed) is None

@@ -480,15 +480,22 @@ class ProviderModelGateway:
         # Discover registered general work from the concrete durable store
         # before invoking any route-verifier or broker callback.
         from orchestrator.runtime.general_worker_authority import SchedulerProviderDispatchAuthority
-        from orchestrator.runtime.general_worker_journal import GeneralWorkerIdentity, GeneralWorkerJournal
+        from orchestrator.runtime.general_worker_journal import (
+            GeneralWorkerIdentity, GeneralWorkerIdentityMismatch, GeneralWorkerJournal,
+        )
 
         authority = self.dispatch_authority
         registered = False
         if type(self.provider_call_journal) is SQLiteProviderCallJournal and request.fencing_generation > 0:
+            identity = GeneralWorkerIdentity(
+                request.run_id, request.node_id, request.attempt_id, request.fencing_generation,
+            )
             try:
-                registered = GeneralWorkerJournal(self.provider_call_journal.event_store).read(
-                    GeneralWorkerIdentity(request.run_id, request.node_id, request.attempt_id,
-                        request.fencing_generation)) is not None
+                registered = GeneralWorkerJournal(self.provider_call_journal.event_store).read_for_identity(
+                    identity,
+                ) is not None
+            except GeneralWorkerIdentityMismatch:
+                self._fail("stale_decision", "preflight", "not_sent", False)
             except Exception:
                 self._fail("provider_journal_unavailable", "preflight", "not_sent", False)
         if registered or authority is not None:
@@ -610,7 +617,7 @@ class ProviderModelGateway:
                 identity = GeneralWorkerIdentity(request.run_id, request.node_id,
                     request.attempt_id, request.fencing_generation)
                 def record_non_general(_events, _version):
-                    if GeneralWorkerJournal(journal.event_store).read(identity) is not None:
+                    if GeneralWorkerJournal(journal.event_store).read_for_identity(identity) is not None:
                         raise ValueError("general dispatch requires owned authority")
                     SQLiteProviderCallJournal.record_intent(journal, request, **intent_values)
                 journal.event_store.append_checked("general_worker", identity.stream_id,
