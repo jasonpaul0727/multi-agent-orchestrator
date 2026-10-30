@@ -21,3 +21,9 @@ def test_lost_terminal_reply_returns_identical_history_without_new_work(tmp_path
     from tests.support.general_worker_restart_harness import run_restart_scenario
 
     run_restart_scenario(tmp_path, cut="accepted")
+
+
+def test_real_worker_runtime_timeout_then_new_host_completes_without_resend(tmp_path):
+    from tests.support.general_worker_restart_harness import run_restart_scenario
+
+    run_restart_scenario(tmp_path, cut="complete_timeout")

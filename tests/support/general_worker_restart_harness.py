@@ -231,10 +231,10 @@ def _host(root, pipe, *, cut=None, identity=None, options=None):
         app._general_worker_execution._complete = complete
         _install_matrix_hooks(app, root, pipe, identity, cut, options)
 
-        if cut in {"request", "complete"}:
+        if cut in {"request", "complete", "complete_timeout"}:
             original_wait = GeneralWorkerSession.wait
             def wait(self):
-                if self._turn.phase == cut:
+                if self._turn.phase == ("complete" if cut == "complete_timeout" else cut):
                     # _turn calls this only AFTER ack_turn returned/committed,
                     # and BEFORE sandbox.wait writes a single input byte.
                     _rendezvous(pipe, cut, identity=identity, receipt=asdict(self.launch_receipt))
@@ -349,6 +349,44 @@ def _worker_observation(receipt):
     return dict(pid=pid, argv=argv, systemd=values, wchan=Path(f"/proc/{pid}/wchan").read_text())
 
 
+def _wait_real_runtime_timeout(receipt):
+    """Observe systemd's actual timer, independently of the Scheduler lease."""
+    unit = receipt["unit_name"]
+    observed = subprocess.run(["systemctl", "--user", "show", unit,
+        "--property=RuntimeMaxUSec,InvocationID,MainPID"], capture_output=True, text=True,
+        check=True, timeout=3)
+    profile = dict(line.split("=", 1) for line in observed.stdout.splitlines())
+    assert profile["InvocationID"] == receipt["invocation_id"]
+    assert profile["RuntimeMaxUSec"] == "10s"
+    started, deadline = time.monotonic(), time.monotonic()+15
+    observations = []
+    while time.monotonic() < deadline:
+        result = subprocess.run(["systemctl", "--user", "show", unit,
+            "--property=LoadState,ActiveState,MainPID,Result,ExecMainCode,ExecMainStatus"],
+            capture_output=True, text=True, timeout=3)
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if not observations or observations[-1] != values:
+            observations.append(values)
+        if values.get("Result") == "timeout" and values.get("MainPID") == "0":
+            break
+        if values.get("LoadState") == "not-found":
+            break
+        time.sleep(0.02)
+    journal = subprocess.run(["journalctl", "--user", "--no-pager", "--output=json", "-u", unit],
+        capture_output=True, text=True, check=True, timeout=3)
+    records = [json.loads(line) for line in journal.stdout.splitlines() if line]
+    # A collected unit can no longer expose Result. Its actual systemd journal
+    # must still attest the timer firing; absence/elapsed time alone is no proof.
+    timer = [row for row in records if "runtime time limit" in row.get("MESSAGE", "")
+        and row.get("USER_UNIT", row.get("UNIT")) == unit]
+    assert timer, (profile, observations, records)
+    assert any("Failed with result 'timeout'" in row.get("MESSAGE", "") for row in records)
+    assert not Path(f"/proc/{profile['MainPID']}").exists() or Path(
+        f"/proc/{profile['MainPID']}/stat").read_text().split()[2] == "Z"
+    return dict(profile=profile, observations=observations, journal=records,
+        parent_wait_seconds=time.monotonic()-started)
+
+
 def _observe(root, identity):
     # Independent SQLite connection proves both visibility and no host write
     # transaction spanning the test rendezvous, before SIGKILL is issued.
@@ -394,7 +432,7 @@ def _assert_success(root, identity, result, *, previous_operation):
 
 def run_restart_scenario(root, *, cut):
     """Prove one crash cut; every process/unit is owned and cleanup is bounded."""
-    assert cut in {"request", "complete", "accepted"}
+    assert cut in {"request", "complete", "complete_timeout", "accepted"}
     started = time.monotonic()
     context = multiprocessing.get_context("spawn")
     first_pipe, first_child = context.Pipe()
@@ -411,18 +449,22 @@ def run_restart_scenario(root, *, cut):
         evidence.update(first_host_pid=first.pid, identity=asdict(identity), before=asdict(previous))
         if cut != "accepted":
             turn = previous.turns[-1]
-            assert turn.phase == cut and turn.termination_receipt is None
+            assert turn.phase == ("complete" if cut == "complete_timeout" else cut)
+            assert turn.termination_receipt is None
             assert asdict(turn.launch_receipt) == barrier["receipt"]
             cleanup.append(turn)
             worker = _verified_worker(barrier["receipt"])
             evidence["crashed_worker"] = worker
-            if cut == "complete":
+            if cut in {"complete", "complete_timeout"}:
                 assert previous.capture is not None
                 assert [row["kind"] for row in _effects(root)].count("provider") == 1
                 assert not (root / "private/artifacts" / hashlib.sha256(OUTPUT).hexdigest()).exists()
                 # Only this exact MainPID, after all identity/argv predicates.
-                os.kill(worker["pid"], signal.SIGKILL)
-                evidence["worker_sigkill"] = True
+                if cut == "complete":
+                    os.kill(worker["pid"], signal.SIGKILL)
+                    evidence["worker_sigkill"] = True
+                else:
+                    evidence["real_runtime_timeout"] = _wait_real_runtime_timeout(barrier["receipt"])
             else:
                 assert previous.capture is None
                 assert [row["kind"] for row in _effects(root)].count("provider") == 0
