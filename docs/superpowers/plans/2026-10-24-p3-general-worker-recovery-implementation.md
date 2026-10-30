@@ -218,13 +218,14 @@ collector/legacy strictness stays; no synthesized receipt or new-work retry.
 **Feature C — public ready gates/privacy (commit/push C):**
 - [x] RED `test_startup_validates_without_dispatch`, `test_explicit_application_reopen_requires_exact_input`, `test_public_methods_fail_before_ready_or_unconfigured`, `test_same_node_unknown_other_attempt_blocks`, `test_recovered_owner_contention_has_one_winner`, `test_private_storage_layout_rejected_if_visible_to_worker` (workspace/runtime overlap and symlink alias, zero launch/broker/transport), plus real child denial of out-of-tree SQLite/artifact roots.
 - [x] Wire application explicit methods/startup validation; validate all same-store dependencies and immutable commitments on reopen. No caller clock, usage, ModelRequest, success flag or arbitrary continuation cursor.
-- [x] GREEN focused application/recovery tests, one full suite, commit C; independent task review. Daily cap may require Task4 on next LA date.
+- [x] GREEN focused application/recovery tests, one full suite, commit C; independent task review. At Task3 closure, Task4 remained subject to next-LA-day daily-cap accounting.
 
 Task3 closed at `43e51ff` after independent specification/quality review and
 scoped fix-round1 review: cancellation I1 addressed, zero remaining findings.
 A/B/C/fix ordinarily pushed. Full3295/90.76% belongs to pre-review-fix
 `0c4fb64`; current fix has6 focused cases included in520 compatibility passes.
-Task4 must provide the final current-source full and independent-host matrix.
+At Task3 closure, Task4's remaining gates were the final current-source full
+run and independent-host matrix; both are now satisfied as documented below.
 
 ### Task 4: Independent-process SIGKILL matrix and final acceptance
 
@@ -237,20 +238,31 @@ amend touched modules only for demonstrated fixes via TDD.
 **Interfaces:** consumes real application APIs, exact operation history, fixed child, actual systemd receipts and private artifacts. Harness is test-only and records actual PIDs/units/invocations, never runtime test hooks or fake stop receipts. Offline deterministic transport and usage are explicitly labeled; no paid calls.
 
 **Feature A — primary actual crash (commit/push A):**
-- [ ] Add failing real process test `test_sigkill_completion_then_new_process_completes_with_one_call`: capture validated response, wait for ack of real completion Worker blocked on stdin, SIGKILL its actual MainPID, terminate old host, open entirely new Python process/app on same stores, re-supply exact input, obtain actual artifact and independently verified AttemptCompleted(outcome=succeeded), Provider count exactly1. Test-only host instrumentation may pause immediately after durable ack; production source has no crash-hook API.
-- [ ] Also kill host after verified request launch; new owner must stop old exact unit/prove empty then continue. Exercise lost acceptance reply with identical historical task/evidence/artifacts and unchanged counts.
-- [ ] Run required live tests zero skips and exact bounded cleanup; commit A, wait for gate.
+- [x] Add failing real process test `test_sigkill_completion_then_new_process_completes_with_one_call`: capture validated response, wait for ack of real completion Worker blocked on stdin, SIGKILL its actual MainPID, terminate old host, open entirely new Python process/app on same stores, re-supply exact input, obtain actual artifact and independently verified AttemptCompleted(outcome=succeeded), Provider count exactly1. Test-only host instrumentation may pause immediately after durable ack; production source has no crash-hook API.
+- [x] Also kill host after verified request launch; new owner must stop old exact unit/prove empty then continue. Exercise lost acceptance reply with identical historical task/evidence/artifacts and unchanged counts.
+- [x] Run required live tests zero skips and exact bounded cleanup; commit A, wait for gate.
 
 **Feature B — no-resend and competition matrix (commit/push B):**
-- [ ] Add `test_unknown_provider_survives_new_process_without_any_dispatch`, cover dispatching/unknown/reserved/no-capture cuts and changed IDs/attempt/generation attacks; assert broker, transport and Worker counts stayzero on blocked restart.
-- [ ] Two independent recovered hosts, lease expiry/pause/cancel/fence races, capture corruption and terminal rollback; require exactly one accepted result/call/settlement and no released unknown occupancy. Preserve failing logs before fixes.
-- [ ] Run focused real matrix and privacy checks GREEN, commit B, wait for gate.
+- [x] Add `test_unknown_provider_survives_new_process_without_any_dispatch`, cover dispatching/unknown/reserved/no-capture cuts and changed IDs/attempt/generation attacks; assert broker, transport and Worker counts stayzero on blocked restart.
+- [x] Two independent recovered hosts, lease expiry/pause/cancel/fence races, capture corruption and terminal rollback; require exactly one accepted result/call/settlement and no released unknown occupancy. Preserve failing logs before fixes.
+- [x] Run focused real matrix and privacy checks GREEN, commit B, wait for gate.
 
 **Feature C — full evidence and independent whole slice (commit/push C):**
-- [ ] Run one fresh full suite with JUnit and statement coverage>=90%; required live isolation0skips. Run compileall, pip check, private wheel build/inventory without dependency install, and source hashes. Persist exact counts, versions, commands, durations and unresolved limitations; no claiming offline evidence as online delivery/charging proof.
-- [ ] Commit/push acceptance document and tested code. Independent task review, then one broad whole-branch review of base36423cf..HEAD, one fix wave/scoped re-review if needed; all residual load-bearing findings surfaced with rulings.
-- [ ] Mark this slice complete only after gates. Final report once: useful capability, real crash/no-resend proof, test coverage, commit/push state, exhaustive ledger rulings and cost-if-wrong, remaining full-P3 gates. Keep evidence/worktree/branch. No main integration or P5 execution.
+- [x] Run one fresh full suite with JUnit and statement coverage>=90%; required live isolation0skips. Run compileall, pip check, private wheel build/inventory using builder-only tooling isolated from shared/product environments, and source hashes. Persist exact counts, versions, commands, durations and unresolved limitations; no claiming offline evidence as online delivery/charging proof.
+- [x] Commit/push acceptance document and tested code. Independent task review, then one broad whole-branch review of base36423cf..HEAD, one fix wave/scoped re-review if needed; all residual load-bearing findings surfaced with rulings.
+- [x] Mark this slice complete only after gates. Final report once: useful capability, real crash/no-resend proof, test coverage, commit/push state, exhaustive ledger rulings and cost-if-wrong, remaining full-P3 gates. Keep evidence/worktree/branch. No main integration or P5 execution.
 
+**Post-review fixes and final evidence:** The whole-slice review found one
+Important cross-generation authority-fallback issue, resolved by
+280036a42f83d3c0bb54643558c0248ea0a9da70; scoped re-review found no remaining
+findings. The post-fix full run then exposed a legacy SQLite migration-order
+failure, resolved by d41d229bcb222851cb8a5f08d6cc9917b6dbb7be; its scoped
+re-review also found no findings. Final HEAD full suite: 3326 passed,
+0 failures/errors/skips, 90.79% same-run statement coverage. Package tooling
+was installed only in a new private mode-0700 builder venv; the final wheel,
+106 cold imports, frozen hashes and refreshed 23-store privacy scan passed.
+Full review/failure/fix history and the remaining offline/production boundaries
+are recorded in the acceptance document and this plan's ignored progress ledger.
 ## Self-review and authorization
 
 Every design component maps to Tasks1–3; real restart/cross-process evidence

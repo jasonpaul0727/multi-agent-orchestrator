@@ -9,11 +9,15 @@ Provider invocation. Ambiguous effects remain held and block new dispatch.
 
 This is local acceptance evidence with explicitly offline Provider, credential,
 sender-stop and trusted-usage fixtures. It does not establish online delivery,
-actual billing or completion of all P3 work. An independent reviewer completed
-Task4 review for `883c99c..3c96b4b` with no Critical, Important or Minor issues;
-its focused outside-diff check confirmed exact task-text equality. The final
-whole-slice review from `36423cf` remains a controller gate.
-
+actual billing or completion of all P3 work. An independent Task4 review of
+883c99c..3c96b4b found no Critical, Important or Minor issues; its focused outside-diff check confirmed exact task-text equality. The later
+whole-slice review found one Important cross-generation authority-fallback
+issue; commit 280036a added the full-identity rejection and regression, and
+the scoped re-review found no remaining findings. The required full run after
+that fix exposed a legacy SQLite migration-order failure; commit d41d229
+moved the context index after migration on both transaction paths and added a
+migration assertion, and its scoped re-review found no findings. The final
+full suite and review status are recorded below. Reviewers did not rerun tests.
 No PR, main integration, deployment or P5 execution is part of this acceptance.
 
 ## Tested revision and provenance
@@ -25,8 +29,8 @@ No PR, main integration, deployment or P5 execution is part of this acceptance.
 - B/C base: `0f2ea93b58ebfa1ab5a995841f77d0821d1d88cb`, ordinarily pushed;
   170 focused tests, zero failures/errors/skips, 331.92 seconds.
 - C adds one actual Worker RuntimeMax timeout/restart case and this record.
-  No Task4 production source changes were necessary. The current producer
-  includes the ownership cancellation fix `43e51ff`.
+  No production-source change was part of C itself; later review fixes are
+  recorded below. The C-stage producer included the ownership cancellation fix `43e51ff`.
 - Earlier full runs (including 3295 tests/90.76% at `0c4`) precede that producer
   fix and are retained as historical evidence, not current acceptance.
 
@@ -38,7 +42,7 @@ instrumentation/bookkeeping failures are labeled test-harness failures; they
 are not claimed as production RED/GREEN defects. No correct product behavior
 was sabotaged to manufacture a failing acceptance test.
 
-The current full run is frozen at 220 tracked source/test/config files;
+The C-stage pre-review full run froze 220 tracked source/test/config files;
 `task-4-c-full-linux.source-hashes.json` records every SHA-256. The test/harness
 revision is frozen throughout the run. Documentation/proof updates do not
 change the tested product. Original runner/pytest PIDs, start/finish/exit,
@@ -180,7 +184,7 @@ parent829710. Complete actual unit/profile/invocation/cgroup/termination,
 evidence, budget and counter sequencing is retained there. The fresh full run
 also reruns these cases; its own proof inventory is recorded separately below.
 
-## Current full verification and packaging
+## C-stage full verification and packaging (pre-review-fix evidence)
 
 Environment: WSL Ubuntu24.04, Linux6.6.87.2-microsoft-standard-WSL2,
 systemd255.4-1ubuntu8.18, Python3.12.3/GCC13.3.0, SQLite3.45.1,
@@ -191,7 +195,7 @@ The first full-run configuration was invalid: its basetemp was inside the
 Windows-backed `/mnt/c` plan directory. The complete original run is retained:
 3324 cases, 358 failures, 2966 passes, zero errors/skips, 28 warnings,
 1670.97 seconds; pytest exit1, coverage81.123959%, report/JSON exit2. Source
-hashes remained unchanged. This failed trial is not accepted as current evidence.
+hashes remained unchanged. This failed trial is not final acceptance evidence.
 
 The 358 original names/messages/full tracebacks and 40 message groups are in
 `task-4-c-full.failures.json` and `task-4-c-full.failure-groups.json`. DrvFS
@@ -227,7 +231,7 @@ restored (initial child SigIgn0); all220 source hashes exactly match the origina
 trial. No authority stores were moved or copied to correct the configuration;
 the fresh test run creates its own stores directly on Linux. All are retained.
 The coverage data file, report log and JSON are distinct paths, not coverage
-auto-combine sidecars. The corrected run completed with **3324 passed, zero
+auto-combine sidecars. This C-stage corrected run completed with **3324 passed, zero
 failures/errors/skips, 1149.84 seconds (19m09s)**. JUnit time1149.184s;
 pytest process elapsed1153.832s; runner including reports1165.937s. Actual
 pytest/report/coverage-JSON/runner exit codes are all0. Same-run statement
@@ -268,7 +272,7 @@ before new-host recovery. Each fresh success has exactly one accepted,
 successful AttemptCompleted, CostCommitted and slot release. Fresh rollback
 retains two trusted-usage reads but only one durable settlement.
 
-### Compilation, private wheel and byte equality
+### Earlier C package check (pre-review-fix source)
 
 After the full suite exited, these checks ran without another suite:
 
@@ -301,7 +305,7 @@ This is wheel integrity/import evidence, not a production wheel deployment.
 Exact commands/PIDs/paths/hashes/module inventory are retained in
 `task-4-c-package.result.json` and the four named check logs.
 
-### Scoped persistence privacy
+### Earlier C persistence privacy (pre-review-fix source)
 
 `task-4-c-full-linux.privacy.json` records scans of the23 concrete SQLiteEventStore
 fixture database files and every event payload row from the fresh real
@@ -317,6 +321,63 @@ legacy test databases are outside this23-case scan. Required real existing-byte
 private-root read-denial tests and the rest of the privacy compatibility suite
 also passed in the full run. These fixture scans do not establish a claim about
 real credentials or production requests, neither of which was used.
+
+### Final post-review verification at d41d229bcb222851cb8a5f08d6cc9917b6dbb7be
+
+The broad review of 36423cf..e0fa68f found one Important issue in
+src/orchestrator/models/transport.py: a registered operation with matching
+run/node/attempt but a different generation could evade the exact-identity
+lookup and fall back to a permissive legacy verifier. Commit
+280036a42f83d3c0bb54643558c0248ea0a9da70 rejects that cross-generation
+mismatch at lookup and immediately before Provider-intent creation, with a
+regression for the changed generation and absent dispatch authority. The
+reviewer's scoped re-review confirmed the fix and reported no new findings.
+
+The first full suite after that source change retained a separate migration
+failure (3325 passed, one failed, zero errors/skips). Its traceback showed the
+new events index was created before legacy rows gained run_id and related
+columns. Commit d41d229bcb222851cb8a5f08d6cc9917b6dbb7be moves index creation
+after migration in both the savepoint and outer-transaction paths, and asserts
+the migrated index while preserving the old event. The migration test and its
+directly affected five-file group passed (222 tests); the scoped re-review
+confirmed ordering, transactionality, idempotency and row preservation, with
+no findings. Both review-fix commits were ordinarily pushed.
+
+The one final full run at d41d229bcb222851cb8a5f08d6cc9917b6dbb7be completed
+with **3326 passed, zero failures/errors/skips**. Pytest reports 1440.04
+seconds; the runner recorded 1445.97 seconds. Same-run coverage is
+**19670/21666=90.78740884334903% (90.79%)**; report and JSON exits were zero.
+The runner recorded source_unchanged=true for its 220-file frozen source,
+test and configuration map. The complete JUnit, coverage data/report/summary,
+pytest log, source map and runner result are retained as
+task-4-post-migration-full.*. No production source or test file changed after
+this run; subsequent work only generated ignored evidence and updated these
+documents.
+
+Post-run package checks used the product environment for compileall and
+pip check, both exit 0. The existing product venv lacked build backend
+packages; two failed attempts and their logs are retained and are not counted
+as wheel evidence. A fresh mode-0700 builder-only venv at
+/tmp/maestro-t4-worker-build-20261030-0156/venv supplied build 1.4.0,
+setuptools 68.1.2 and wheel 0.48.0 without changing the product venv or any
+shared environment. From exact frozen pyproject.toml and src/ bytes, the
+isolated no-build-isolation command produced
+multi_agent_orchestrator-0.1.0-py3-none-any.whl with SHA-256
+fcadc27fba6946b9ed854a481f850538f17a507064668061fbb4a4fa2128ca8e.
+The 110 wheel members include 106 product Python modules and distribution
+metadata; no tests or evidence directories are included. All 106 modules
+cold-imported with isolated mode from the private extraction, and their bytes
+matched the frozen source. The package result records source_still_unchanged=true.
+This verifies wheel integrity/imports, not deployment.
+
+The refreshed privacy scan covers the 23 SQLite stores and event rows retained
+by this final run. It found **zero hits** for the exact task, response and
+offline-credential sentinels. No WAL/SHM files remained after process close, so
+this is not a live-WAL observation. The scan excludes offline effect-counter
+stores, raw private response artifacts, unrelated hostile legacy fixtures and
+debug logs. See task-4-post-migration-full.privacy.json and
+task-4-post-migration-full.proof-inventory.json; all scan artifacts remain
+in the ignored task evidence directory.
 
 ## Rulings and cost if wrong
 
@@ -375,8 +436,9 @@ The metadata-only SQL boundary applies to new general authority paths. Existing
 legacy/bootstrap artifact recovery retains its prior file checks; this evidence
 does not reclassify those older checks as IO-free.
 
-The independent Task4 spec/quality review on `883c99c..3c96b4b` found no Critical,
-Important or Minor issues and did not rerun tests. One full-slice review from
-`36423cf` to the final reviewed revision remains. If it finds an actionable issue, use
-a bounded fix wave and scoped re-review. This document does not claim that the
-pending full-slice review has already approved the slice.
+The independent Task4 review and the broad whole-slice review are complete.
+The broad review's Important finding and the subsequent migration-order issue
+were addressed in 280036a and d41d229; each received scoped re-review with no
+remaining findings. Reviewers did not rerun tests. Counts and coverage above
+come from the retained final runner/JUnit/coverage artifacts. No PR, main
+integration, deployment or P5 execution is part of this acceptance.
