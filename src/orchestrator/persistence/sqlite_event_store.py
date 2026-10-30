@@ -174,10 +174,6 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         )
         """,
         """
-        CREATE INDEX IF NOT EXISTS ix_events_stream_attempt_context
-        ON events(stream_type, run_id, node_id, attempt_id)
-        """,
-        """
         CREATE TABLE IF NOT EXISTS idempotency_records (
             stream_id TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
@@ -229,6 +225,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
                 connection.execute(statement)
             _migrate_snapshot_metadata(connection)
             _migrate_event_context(connection)
+            _ensure_events_attempt_context_index(connection)
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
@@ -248,6 +245,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             connection.execute(statement)
         _migrate_snapshot_metadata(connection)
         _migrate_event_context(connection)
+        _ensure_events_attempt_context_index(connection)
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
@@ -359,6 +357,17 @@ def _migrate_event_context(connection: sqlite3.Connection) -> None:
     ):
         if name not in columns:
             connection.execute(f"ALTER TABLE events ADD COLUMN {name} {sql_type}")
+
+
+def _ensure_events_attempt_context_index(connection: sqlite3.Connection) -> None:
+    """Create the contextual lookup index after legacy event columns are migrated."""
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_events_stream_attempt_context
+        ON events(stream_type, run_id, node_id, attempt_id)
+        """
+    )
 
 
 def _legacy_snapshot_metadata_hash(

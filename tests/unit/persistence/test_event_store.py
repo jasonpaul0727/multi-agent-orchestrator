@@ -186,6 +186,10 @@ def test_schema_migration_adds_execution_context_without_rewriting_legacy_events
     assert store._connection.execute(
         "SELECT 1 FROM schema_migrations WHERE version = 4"
     ).fetchone() is not None
+    assert store._connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        ("ix_events_stream_attempt_context",),
+    ).fetchone() is not None
 
 
 def test_event_draft_rejects_blank_types_and_non_json_payloads():
