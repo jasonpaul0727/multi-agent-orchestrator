@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -16,6 +18,7 @@ import threading
 import time
 from typing import Literal, Sequence
 import uuid
+import weakref
 
 from .workspace import WorkspaceBoundaryError, snapshot_workspace
 
@@ -41,8 +44,31 @@ class IsolationStartUnknown(IsolationUnavailable):
     """Launch may have started; retain staging and unresolved occupancy."""
 
 
+class IsolationStopUnknown(IsolationUnavailable):
+    """A launched unit lacks exact whole-unit stop proof."""
+
+
 class InvalidSandboxRequest(ValueError, IsolationNotStarted):
     """A sandbox request is malformed or outside the supported profile."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSandboxLaunch:
+    """A host-selected launch epoch, allocated before starting any process."""
+
+    launch_id: str
+    unit_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxLaunchReceipt:
+    """Observed launch binding, without any claim that the unit has stopped."""
+
+    launch_id: str
+    unit_name: str
+    control_group: str
+    invocation_id: str
+    profile_sha256: str
 
 
 @dataclass(frozen=True)
@@ -161,6 +187,101 @@ class SystemdReadOnlyLauncher:
     def __init__(self, *, systemd_run: str | None = None, systemctl: str | None = None) -> None:
         self._systemd_run = systemd_run or shutil.which("systemd-run")
         self._systemctl = systemctl or shutil.which("systemctl")
+        self._prepared: dict[str, PreparedSandboxLaunch] = {}
+        self._consumed: set[str] = set()
+        self._sessions: dict[str, SandboxSession] = {}
+        self._prepare_lock = threading.Lock()
+
+    def prepare_launch(self) -> PreparedSandboxLaunch:
+        """Allocate a unique owned identity without crossing the launch boundary."""
+
+        identity = uuid.uuid4()
+        prepared = PreparedSandboxLaunch(str(identity), f"maestro-attempt-{identity.hex}.service")
+        with self._prepare_lock:
+            self._prepared[prepared.launch_id] = prepared
+        return prepared
+
+    def _consume_prepared(self, prepared: PreparedSandboxLaunch) -> None:
+        valid = False
+        try:
+            _validate_prepared(prepared)
+            with self._prepare_lock:
+                if self._prepared.get(prepared.launch_id) == prepared and prepared.launch_id not in self._consumed:
+                    self._consumed.add(prepared.launch_id)
+                    valid = True
+        except Exception:
+            pass
+        if not valid:
+            raise IsolationNotStarted("prepared_launch_invalid_or_consumed")
+
+    def _retire_session(self, session: SandboxSession) -> None:
+        """Release launcher-owned buffers after the caller proved exact stop."""
+
+        with self._prepare_lock:
+            identity = session._owner_launch_id
+            if self._sessions.get(identity) is session:
+                self._sessions.pop(identity)
+                session._input_bytes = None
+
+    def stop_prepared_launch(
+        self, prepared_launch: PreparedSandboxLaunch, launch_receipt: SandboxLaunchReceipt,
+    ) -> SandboxTerminationReceipt:
+        """Stop an acknowledged binding from the host's validated owned journal.
+
+        A receipt is observational data, not caller authority. The service must
+        retrieve it under operation ownership; reconstruction after restart is
+        supported without a process-local registry.
+        """
+
+        valid = False
+        try:
+            _validate_launch_receipt(prepared_launch, launch_receipt)
+            valid = True
+        except Exception:
+            pass
+        if not valid:
+            raise IsolationStartUnknown("prepared_launch_unacknowledged")
+        result = None
+        try:
+            environment = _systemd_client_environment()
+            cgroup = _CGROUP_ROOT / launch_receipt.control_group.lstrip("/")
+            binding_state = _observe_prepared_binding(prepared_launch, launch_receipt, self._systemctl, environment)
+            if binding_state is not None:
+                with self._prepare_lock:
+                    session = self._sessions.get(prepared_launch.launch_id)
+                if session is not None:
+                    session.cancel()
+                    session.wait()
+                    # A live systemd-run can still submit work. Never witness
+                    # absence until this owning transport operation has ended.
+                    if session._process.poll() is None:
+                        raise ValueError("transport remains unresolved")
+                elif binding_state == "live":
+                    subprocess.run([self._systemctl, "--user", "kill", "--kill-whom=all",
+                        "--signal=SIGKILL", prepared_launch.unit_name], stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment,
+                        check=False, timeout=3)
+                result = _read_termination_receipt(unit_name=prepared_launch.unit_name,
+                    expected_cgroup=cgroup, client_env=environment, systemctl=self._systemctl)
+                stopped_binding = _observe_prepared_binding(prepared_launch, launch_receipt, self._systemctl, environment)
+                if result is None and stopped_binding == "stopped":
+                    # Collection can pass through loaded/inactive with a blank
+                    # ControlGroup. Keep the shared collector strict; after an
+                    # exact fresh stopped observation, resample its SAME old
+                    # cgroup proof once, then revalidate the binding again.
+                    result = _read_termination_receipt(unit_name=prepared_launch.unit_name,
+                        expected_cgroup=cgroup, client_env=environment, systemctl=self._systemctl)
+                    stopped_binding = _observe_prepared_binding(prepared_launch, launch_receipt, self._systemctl, environment)
+                if stopped_binding != "stopped":
+                    result = None
+                if result is not None and session is not None:
+                    _discard_staging(session._staging)
+                    self._retire_session(session)
+        except Exception:
+            result = None
+        if result is None:
+            raise IsolationStopUnknown("prepared_launch_stop_unknown")
+        return result
 
     def launch(
         self,
@@ -170,9 +291,12 @@ class SystemdReadOnlyLauncher:
         limits: SandboxLimits | None = None,
         input_bytes: bytes | None = None,
         expected_workspace_identity_hash: str | None = None,
+        prepared_launch: PreparedSandboxLaunch | None = None,
     ) -> "SandboxSession":
         """Start a command with optional bounded stdin and return a cancellable handle."""
 
+        if prepared_launch is not None:
+            self._consume_prepared(prepared_launch)
         if not platform.system().lower() == "linux":
             raise IsolationNotStarted("the systemd isolation backend is Linux-only")
         if not self._systemd_run or not self._systemctl:
@@ -229,7 +353,7 @@ class SystemdReadOnlyLauncher:
             staging.cleanup()
             raise InvalidSandboxRequest("workspace paths with spaces or systemd separators are unsupported")
 
-        unit_name = f"maestro-attempt-{uuid.uuid4().hex}.service"
+        unit_name = prepared_launch.unit_name if prepared_launch is not None else f"maestro-attempt-{uuid.uuid4().hex}.service"
         scope_cgroup = cgroup_parent / unit_name
         properties = _service_properties(
             root=workspace_snapshot,
@@ -268,6 +392,14 @@ class SystemdReadOnlyLauncher:
             "--",
             *expanded_command,
         ]
+        expected_profile = None
+        if prepared_launch is not None:
+            try:
+                expected_profile = _expected_launch_profile(properties, exec_command)
+            except Exception:
+                staging.cleanup()
+            if expected_profile is None:
+                raise IsolationNotStarted("prepared_launch_profile_unsupported")
         systemd_command = [
             self._systemd_run,
             "--user",
@@ -293,8 +425,12 @@ class SystemdReadOnlyLauncher:
                 close_fds=True,
             )
         except OSError as exc:
-            raise IsolationStartUnknown("systemd transient unit could not be started; staging retained") from exc
-        return SandboxSession(
+            if prepared_launch is None:
+                raise IsolationStartUnknown("systemd transient unit could not be started; staging retained") from exc
+            process = None
+        if process is None:
+            raise IsolationStartUnknown("systemd transient unit could not be started; staging retained")
+        session = SandboxSession(
             process=process,
             unit_name=unit_name,
             systemctl=self._systemctl,
@@ -305,7 +441,20 @@ class SystemdReadOnlyLauncher:
             input_bytes=input_bytes,
             scope_cgroup=scope_cgroup,
             cleanup_on_termination=True,
+            cancel_after_transport_exit=prepared_launch is not None,
         )
+        if prepared_launch is not None:
+            session._owner_ref = weakref.ref(self)
+            session._owner_launch_id = prepared_launch.launch_id
+            with self._prepare_lock:
+                self._sessions[prepared_launch.launch_id] = session
+            receipt = _read_launch_receipt(prepared_launch=prepared_launch,
+                expected_cgroup=scope_cgroup, expected_profile=expected_profile,
+                client_env=client_env, systemctl=self._systemctl)
+            if receipt is None:
+                raise IsolationStartUnknown("prepared_launch_acknowledgement_unknown")
+            session._launch_receipt = receipt
+        return session
 
 
 class SandboxSession:
@@ -354,6 +503,15 @@ class SandboxSession:
         self._cancel_lock = threading.Lock()
         self._wait_lock = threading.Lock()
         self._result: SandboxResult | None = None
+        self._launch_receipt: SandboxLaunchReceipt | None = None
+        self._owner_ref: weakref.ReferenceType[SystemdReadOnlyLauncher] | None = None
+        self._owner_launch_id: str | None = None
+
+    @property
+    def launch_receipt(self) -> SandboxLaunchReceipt | None:
+        """Available only after host observation of this exact launch/profile."""
+
+        return self._launch_receipt
 
     def cancel(self) -> bool:
         """Request SIGKILL for the entire unit; wait() supplies stop confirmation."""
@@ -400,6 +558,11 @@ class SandboxSession:
                         client_env=self._client_env,
                         systemctl=self._systemctl,
                     )
+                    if receipt is not None and self._launch_receipt is not None:
+                        prepared = PreparedSandboxLaunch(self._launch_receipt.launch_id, self.unit_name)
+                        if _observe_prepared_binding(prepared, self._launch_receipt,
+                            self._systemctl, self._client_env) != "stopped":
+                            receipt = None
                     result = replace(result, termination_receipt=receipt)
                 self._result = result
                 return self._result
@@ -414,9 +577,12 @@ class SandboxSession:
                 if self._process.poll() is not None:
                     if self._scope_cgroup is None:
                         self._staging.cleanup()
-                    elif self._cleanup_on_termination and self._result is not None:
-                        if self._result.termination_confirmed:
+                    elif self._result is not None and self._result.termination_confirmed:
+                        if self._cleanup_on_termination:
                             _discard_staging(self._staging)
+                        owner = self._owner_ref() if self._owner_ref is not None else None
+                        if owner is not None:
+                            owner._retire_session(self)
 
     def _collect(self) -> SandboxResult:
         assert self._process.stdout is not None and self._process.stderr is not None
@@ -708,6 +874,231 @@ def _read_termination_receipt(
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
+def _validate_prepared(value: PreparedSandboxLaunch) -> None:
+    if type(value) is not PreparedSandboxLaunch or type(value.launch_id) is not str or type(value.unit_name) is not str:
+        raise ValueError("invalid prepared identity")
+    identity = uuid.UUID(value.launch_id)
+    if (identity.version != 4 or str(identity) != value.launch_id
+        or value.unit_name != f"maestro-attempt-{identity.hex}.service"):
+        raise ValueError("invalid prepared binding")
+
+
+def _validate_launch_receipt(prepared: PreparedSandboxLaunch, receipt: SandboxLaunchReceipt) -> None:
+    _validate_prepared(prepared)
+    if type(receipt) is not SandboxLaunchReceipt:
+        raise ValueError("invalid observed binding")
+    if any(type(value) is not str for value in (receipt.launch_id, receipt.unit_name,
+        receipt.control_group, receipt.invocation_id, receipt.profile_sha256)):
+        raise ValueError("invalid observed binding")
+    if (receipt.launch_id != prepared.launch_id or receipt.unit_name != prepared.unit_name
+        or not re.fullmatch(r"[0-9a-f]{32}", receipt.invocation_id)
+        or receipt.invocation_id == "0" * 32
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt.profile_sha256)):
+        raise ValueError("invalid observed binding")
+    # Apply the same exact path constraints as termination receipts, without
+    # constructing a termination receipt from a launch acknowledgement.
+    path = Path(receipt.control_group)
+    if (not path.is_absolute() or path.as_posix() != receipt.control_group
+        or path.name != prepared.unit_name or path.parent.name != "app.slice"
+        or any(part in {".", ".."} for part in path.parts)):
+        raise ValueError("invalid observed cgroup")
+
+
+_DURATION_PROPERTIES = {"CPUQuotaPerSecUSec", "CPUQuotaPeriodUSec", "RuntimeMaxUSec", "TimeoutStopUSec"}
+_LIMIT_PROPERTIES = {"MemoryMax", "MemorySwapMax", "TasksMax", "LimitNOFILE", "LimitNOFILESoft",
+    "LimitFSIZE", "LimitFSIZESoft", "LimitCORE", "LimitCORESoft"}
+_BOOLEAN_PROPERTIES = {"PrivateNetwork", "PrivateTmp", "PrivateUsers", "PrivateDevices",
+    "ProtectControlGroups", "ProtectKernelTunables", "ProtectKernelModules", "ProtectKernelLogs",
+    "ProtectClock", "ProtectHostname", "NoNewPrivileges", "RestrictRealtime", "RestrictSUIDSGID",
+    "LockPersonality", "MemoryDenyWriteExecute"}
+_TEXT_PROPERTIES = {"ProtectHome", "ProtectSystem", "ProtectProc", "ProcSubset",
+    "CapabilityBoundingSet", "RestrictAddressFamilies", "WorkingDirectory", "KillMode", "Environment", "ExecStart"}
+_PROFILE_PROPERTIES = _DURATION_PROPERTIES | _LIMIT_PROPERTIES | _BOOLEAN_PROPERTIES | _TEXT_PROPERTIES | {
+    "BindReadOnlyPaths", "InaccessiblePaths"}
+
+
+def _duration_usec(value: str) -> str:
+    # systemctl prints normalized human-readable timespans rather than the
+    # numeric microsecond D-Bus value. Convert finite fractions with integer
+    # arithmetic: never round an observed limit into the requested profile.
+    factors = {"us": 1, "ms": 1000, "s": 1_000_000, "min": 60_000_000,
+        "h": 3_600_000_000, "d": 86_400_000_000}
+    if type(value) is not str or len(value) > 128:
+        raise ValueError("invalid duration")
+    chunks = value.split()
+    if not chunks:
+        raise ValueError("missing duration")
+    total = 0
+    for chunk in chunks:
+        match = re.fullmatch(r"([0-9]+)(?:\.([0-9]{1,6}))?(us|ms|s|min|h|d)", chunk)
+        if match is None:
+            raise ValueError("unsupported duration")
+        fraction = match[2] or ""
+        denominator = 10 ** len(fraction)
+        numerator = int(match[1]) * denominator + int(fraction or "0")
+        microseconds, remainder = divmod(numerator * factors[match[3]], denominator)
+        total += microseconds
+        # Every requested profile duration is bounded by SandboxLimits' day
+        # maximum. Infinity/overflow and sub-microsecond values fail closed.
+        if remainder or total > 86_400_000_000:
+            raise ValueError("duration outside profile bounds")
+    return str(total)
+
+
+def _normalise_launch_profile(values: dict[str, str]) -> dict[str, object]:
+    if set(values) != _PROFILE_PROPERTIES:
+        raise ValueError("missing profile properties")
+    result: dict[str, object] = {}
+    for key, value in values.items():
+        if key in _DURATION_PROPERTIES:
+            result[key] = _duration_usec(value)
+        elif key in _LIMIT_PROPERTIES:
+            if not re.fullmatch(r"[0-9]+", value):
+                raise ValueError("unbounded resource")
+            result[key] = str(int(value))
+        elif key in _BOOLEAN_PROPERTIES:
+            if value not in {"yes", "no"}:
+                raise ValueError("unsupported boolean")
+            result[key] = value
+        elif key in {"BindReadOnlyPaths", "InaccessiblePaths", "RestrictAddressFamilies"}:
+            items = []
+            for item in value.split():
+                if key == "BindReadOnlyPaths":
+                    parts = item.split(":")
+                    if len(parts) == 2:
+                        parts.append("rbind")
+                    if len(parts) != 3 or parts[2] != "rbind":
+                        raise ValueError("unsupported bind flags")
+                    if not all(part.startswith("/") for part in parts[:2]):
+                        raise ValueError("invalid bind")
+                    item = ":".join(parts)
+                elif key == "InaccessiblePaths":
+                    item = item.removeprefix("-")
+                    if not item.startswith("/"):
+                        raise ValueError("invalid hidden path")
+                items.append(item)
+            if len(items) != len(set(items)):
+                raise ValueError("duplicate profile member")
+            result[key] = sorted(items)
+        elif key == "ExecStart":
+            match = re.fullmatch(r"\{ path=([^;]+) ; argv\[\]=(.*?) ; ignore_errors=no ; .*\}", value)
+            if match is None:
+                raise ValueError("unsupported exec observation")
+            result[key] = [match[1], match[2]]
+        else:
+            result[key] = value
+    return result
+
+
+def _profile_sha256(profile: dict[str, object]) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(profile, sort_keys=True,
+        separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")).hexdigest()
+
+
+def _expected_launch_profile(properties: tuple[str, ...], command: list[str]) -> dict[str, object]:
+    if any(not token.isascii() or any(c.isspace() or c in ";{}\\\"'" for c in token) for token in command):
+        raise ValueError("ambiguous exec arguments")
+    values = {}
+    repeated = {"BindReadOnlyPaths": [], "InaccessiblePaths": []}
+    renamed = {"RuntimeMaxSec": "RuntimeMaxUSec", "TimeoutStopSec": "TimeoutStopUSec",
+        "CPUQuotaPeriodSec": "CPUQuotaPeriodUSec"}
+    for property_value in properties:
+        key, value = property_value.split("=", 1)
+        if key in repeated:
+            repeated[key].append(value)
+            continue
+        if key == "CPUQuota":
+            key, value = "CPUQuotaPerSecUSec", str(int(value.removesuffix("%")) * 10_000) + "us"
+        key = renamed.get(key, key)
+        if key in values:
+            raise ValueError("duplicate expected property")
+        values[key] = value
+        if key in {"LimitNOFILE", "LimitFSIZE", "LimitCORE"}:
+            values[key + "Soft"] = value
+    values.update({key: " ".join(items) for key, items in repeated.items()})
+    values["Environment"] = ""
+    values["ExecStart"] = "{ path=" + command[0] + " ; argv[]=" + " ".join(command) + " ; ignore_errors=no ; pending=yes }"
+    return _normalise_launch_profile(values)
+
+
+def _query_launch_properties(unit_name: str, systemctl: str, environment: dict[str, str], timeout: float) -> dict | None:
+    identity = {"Id", "LoadState", "ActiveState", "ControlGroup", "InvocationID"}
+    required = _PROFILE_PROPERTIES | identity
+    try:
+        result = subprocess.run([systemctl, "--user", "show", unit_name,
+            *(f"--property={name}" for name in sorted(required))], stdin=subprocess.DEVNULL,
+            capture_output=True, env=environment, check=False, timeout=timeout)
+        if result.returncode == 0:
+            values = {}
+            for line in result.stdout.decode("ascii", errors="strict").splitlines():
+                if "=" not in line:
+                    return None
+                name, value = line.split("=", 1)
+                if name not in required or name in values:
+                    return None
+                values[name] = value
+            # Collected services omit service-only properties such as
+            # ExecStart. Only authoritative identity/state is meaningful then;
+            # loaded units still require the entire effective profile.
+            if identity <= values.keys() and (values["LoadState"] == "not-found" or values.keys() == required):
+                return values
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        pass
+    return None
+
+
+def _read_launch_receipt(*, prepared_launch: PreparedSandboxLaunch, expected_cgroup: Path,
+    expected_profile: dict[str, object], client_env: dict[str, str],
+    timeout_seconds: float = 2.0, systemctl: str = "systemctl") -> SandboxLaunchReceipt | None:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            _validate_prepared(prepared_launch)
+            control_group = "/" + expected_cgroup.relative_to(_CGROUP_ROOT).as_posix()
+            values = _query_launch_properties(prepared_launch.unit_name, systemctl, client_env,
+                min(3, max(0.001, deadline - time.monotonic())))
+            if values is not None and values["LoadState"] == "loaded":
+                if values["Id"] != prepared_launch.unit_name:
+                    return None
+                pending = (values["ActiveState"] in {"inactive", "activating"}
+                    and not values["ControlGroup"] and not values["InvocationID"])
+                if not pending:
+                    if (values["ControlGroup"] != control_group
+                        or values["ActiveState"] not in {"active", "activating"}):
+                        return None
+                    profile = _normalise_launch_profile({key: values[key] for key in _PROFILE_PROPERTIES})
+                    if profile != expected_profile:
+                        return None
+                    receipt = SandboxLaunchReceipt(prepared_launch.launch_id, prepared_launch.unit_name,
+                        control_group, values["InvocationID"], _profile_sha256(profile))
+                    _validate_launch_receipt(prepared_launch, receipt)
+                    return receipt
+        except Exception:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+
+
+def _observe_prepared_binding(prepared: PreparedSandboxLaunch, receipt: SandboxLaunchReceipt,
+    systemctl: str, environment: dict[str, str]) -> str | None:
+    values = _query_launch_properties(prepared.unit_name, systemctl, environment, 3)
+    if values is None or values["Id"] != prepared.unit_name:
+        return None
+    if values["LoadState"] == "not-found":
+        return "stopped" if (values["ActiveState"] in {"inactive", "failed"}
+            and not values["ControlGroup"] and not values["InvocationID"]) else None
+    if (values["LoadState"] != "loaded" or values["ControlGroup"] != receipt.control_group
+        or values["InvocationID"] != receipt.invocation_id):
+        return None
+    profile = _normalise_launch_profile({key: values[key] for key in _PROFILE_PROPERTIES})
+    if _profile_sha256(profile) != receipt.profile_sha256:
+        return None
+    if values["ActiveState"] in {"inactive", "failed"}:
+        return "stopped"
+    return "live" if values["ActiveState"] in {"active", "activating", "deactivating"} else None
+
+
 def _open_cgroup_directory(path: Path) -> int:
     """Open a cgroup directory component-by-component without following links."""
 
@@ -883,6 +1274,9 @@ __all__ = [
     "IsolationUnavailable",
     "IsolationNotStarted",
     "IsolationStartUnknown",
+    "IsolationStopUnknown",
+    "PreparedSandboxLaunch",
+    "SandboxLaunchReceipt",
     "SandboxLimits",
     "SandboxResult",
     "SandboxSession",

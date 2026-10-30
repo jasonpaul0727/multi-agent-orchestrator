@@ -15,7 +15,7 @@ import json
 import math
 import re
 import ssl
-from typing import Protocol
+from typing import Protocol, TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import (
@@ -45,9 +45,13 @@ from orchestrator.models.provider_calls import (
     ProviderCallJournal,
     ProviderCallReplayBlocked,
     ProviderCallSnapshot,
+    SQLiteProviderCallJournal,
 )
 from orchestrator.models.provider_sender import ProviderSenderTerminationReceipt
 from orchestrator.validation import revalidate_model
+
+if TYPE_CHECKING:
+    from orchestrator.runtime.general_worker_authority import SchedulerProviderDispatchAuthority
 
 
 _PROVIDER_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
@@ -438,14 +442,30 @@ class ProviderModelGateway:
         secret_broker: SecretBroker | None = None,
         transport: HTTPTransport | None = None,
         provider_call_journal: ProviderCallJournal | None = None,
+        dispatch_authority: SchedulerProviderDispatchAuthority | None = None,
     ) -> None:
         self.registry = revalidate_model(ModelRegistryManifest, registry)
         self.accepted_route_verifier = accepted_route_verifier
         self.secret_broker = secret_broker or UnavailableSecretBroker()
         self.transport = transport if transport is not None else SystemdProviderHTTPSTransport()
         self.provider_call_journal = provider_call_journal
+        self.dispatch_authority = dispatch_authority
 
     async def invoke(
+        self,
+        request: ModelRequest,
+        *,
+        cancellation: CancellationSignal | None = None,
+    ) -> ModelResponse:
+        from orchestrator.runtime.general_worker_authority import SchedulerProviderDispatchAuthority
+
+        try:
+            return await self._invoke(request, cancellation=cancellation)
+        finally:
+            if type(self.dispatch_authority) is SchedulerProviderDispatchAuthority:
+                self.dispatch_authority._retire_invocation(request)
+
+    async def _invoke(
         self,
         request: ModelRequest,
         *,
@@ -457,14 +477,41 @@ class ProviderModelGateway:
             self._fail("invalid_request", "preflight", "not_sent", False)
         if cancellation is not None and cancellation.cancelled:
             self._fail("cancelled", "preflight", "not_sent", False)
+        # Discover registered general work from the concrete durable store
+        # before invoking any route-verifier or broker callback.
+        from orchestrator.runtime.general_worker_authority import SchedulerProviderDispatchAuthority
+        from orchestrator.runtime.general_worker_journal import (
+            GeneralWorkerIdentity, GeneralWorkerIdentityMismatch, GeneralWorkerJournal,
+        )
+
+        authority = self.dispatch_authority
+        registered = False
+        if type(self.provider_call_journal) is SQLiteProviderCallJournal and request.fencing_generation > 0:
+            identity = GeneralWorkerIdentity(
+                request.run_id, request.node_id, request.attempt_id, request.fencing_generation,
+            )
+            try:
+                registered = GeneralWorkerJournal(self.provider_call_journal.event_store).read_for_identity(
+                    identity,
+                ) is not None
+            except GeneralWorkerIdentityMismatch:
+                self._fail("stale_decision", "preflight", "not_sent", False)
+            except Exception:
+                self._fail("provider_journal_unavailable", "preflight", "not_sent", False)
+        if registered or authority is not None:
+            if (type(authority) is not SchedulerProviderDispatchAuthority
+                or type(self.provider_call_journal) is not SQLiteProviderCallJournal
+                or authority.event_store is not self.provider_call_journal.event_store):
+                self._fail("stale_decision", "preflight", "not_sent", False)
+        verifier = authority if authority is not None else self.accepted_route_verifier
         try:
             provider, model = validate_gateway_request(request, self.registry)
         except (TypeError, ValueError):
             self._fail("stale_decision", "preflight", "not_sent", False)
-        if self.accepted_route_verifier is None:
+        if verifier is None:
             self._fail("stale_decision", "preflight", "not_sent", False)
         try:
-            accepted = await self.accepted_route_verifier.is_accepted(request)
+            accepted = await verifier.is_accepted(request)
         except Exception:
             accepted = False
         if not accepted:
@@ -552,14 +599,31 @@ class ProviderModelGateway:
             header_names[item.name] = item.value
             headers.append((item.name, item.value))
 
+        if cancellation is not None and cancellation.cancelled:
+            self._fail("cancelled", "preflight", "not_sent", False)
         try:
-            self.provider_call_journal.record_intent(
-                request,
+            intent_values = dict(
                 provider_id=provider.id,
                 provider_adapter=provider.adapter,
                 request_body=encoded.body_json.encode("utf-8"),
                 provider_correlation_id=provider_correlation_id,
             )
+            if authority is not None:
+                authority.record_intent(request, **intent_values)
+            elif type(self.provider_call_journal) is SQLiteProviderCallJournal and request.fencing_generation > 0:
+                # Registration may have committed while credential lookup was
+                # awaiting. Serialize its final absence check with this intent.
+                journal = self.provider_call_journal
+                identity = GeneralWorkerIdentity(request.run_id, request.node_id,
+                    request.attempt_id, request.fencing_generation)
+                def record_non_general(_events, _version):
+                    if GeneralWorkerJournal(journal.event_store).read_for_identity(identity) is not None:
+                        raise ValueError("general dispatch requires owned authority")
+                    SQLiteProviderCallJournal.record_intent(journal, request, **intent_values)
+                journal.event_store.append_checked("general_worker", identity.stream_id,
+                    "non-general-provider-intent", record_non_general)
+            else:
+                self.provider_call_journal.record_intent(request, **intent_values)
         except ProviderCallReplayBlocked:
             self._fail("idempotency_conflict", "preflight", "not_sent", False)
         except Exception:

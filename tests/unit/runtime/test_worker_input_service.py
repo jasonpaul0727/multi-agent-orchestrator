@@ -39,6 +39,28 @@ def binding(case):
     return case.app._scheduler.resolve_verification_binding(**case.identity, as_of=case.clock.now)
 
 
+def test_general_input_preparation_uses_control_binding_without_files_or_caller_clock_under_lock(case, monkeypatch):
+    from datetime import datetime
+    from pathlib import Path
+    import orchestrator.runtime.worker_input_service as module
+
+    admit_worker_input_case(case)
+    expected = prepare_worker_input_case(case)
+    class LockedUTC(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert case.app._event_store._connection.in_transaction
+            return case.clock.now
+    def forbidden(*args, **kwargs):
+        pytest.fail("general input consulted files, full recovery or caller clock")
+    monkeypatch.setattr(module, "datetime", LockedUTC)
+    monkeypatch.setattr(case.app._worker_inputs, "_clock", forbidden)
+    monkeypatch.setattr(case.app._scheduler, "resolve_verification_binding", forbidden)
+    monkeypatch.setattr(Path, "open", forbidden)
+    task = case.app._worker_inputs._prepare_general_worker_task(**case.identity, task_text=case.text)
+    assert task == expected
+
+
 def test_admission_derives_canonical_node_input_and_fixed_checks(case):
     admit_worker_input_case(case)
     value = binding(case)

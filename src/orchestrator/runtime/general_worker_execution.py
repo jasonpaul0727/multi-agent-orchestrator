@@ -1,0 +1,377 @@
+"""Explicit host mediation of bounded useful Worker turns.
+
+Children propose data only. The owned journals, Gateway and Scheduler retain
+dispatch, publication and terminal authority on the SQLite owner thread.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+from pathlib import Path
+
+from orchestrator.artifacts import ArtifactStore, EphemeralArtifactGrantAuthority
+from orchestrator.config import ModelRegistryManifest
+from orchestrator.models import CostSnapshotRefs, ModelMessage, ModelRequest, ModelResponse, ProviderModelGateway, TokenUsage
+from orchestrator.models.adapters import adapter_for
+from orchestrator.models.gateway import validate_gateway_request
+from orchestrator.persistence import SQLiteEventStore
+from orchestrator.scheduler import Scheduler
+from orchestrator.validation import revalidate_model
+from orchestrator.workspace_identity import workspace_identity_hash
+from .acceptance_coordinator import AttemptExecutionCoordinator
+from .contracts import ArtifactRef, VerificationTask
+from .general_worker_authority import (
+    SchedulerProviderDispatchAuthority, _validate_general_eligibility, general_worker_host_scope,
+)
+from .general_worker_journal import (
+    GeneralWorkerIdentity, GeneralWorkerJournal, GeneralWorkerResult, _identity_value,
+    _publication_for_operation, metadata_hash,
+)
+from .general_worker_process import GeneralWorkerProcess
+from .general_worker_protocol import (
+    GeneralWorkerRequest, GeneralWorkerTurn, _canonical, _input_commitment, _pairs, _constant,
+)
+from .general_worker_recovery import GeneralWorkerOwnership, recovery_action
+from .verification_journal import VerifierProposalJournal
+from .verifier_process import IsolatedVerifierProcess
+from .worker_input_service import WorkerInputService
+from .worker_output import DecodedWorkerOutput
+
+
+class GeneralWorkerUnavailable(RuntimeError):
+    def __init__(self):
+        super().__init__("general_worker_unavailable")
+
+
+@dataclass(frozen=True, slots=True)
+class GeneralWorkerHostConfig:
+    """Trusted constructor-only data; never accepts a foreign bound service."""
+
+    workspace: Path = field(repr=False)
+    registry: ModelRegistryManifest = field(repr=False)
+    secret_broker: object | None = field(default=None, repr=False)
+    transport: object | None = field(default=None, repr=False)
+
+    def __post_init__(self):
+        valid = False
+        try:
+            if not isinstance(self.workspace, Path) or not self.workspace.is_absolute() or (
+                type(self.registry) is not ModelRegistryManifest):
+                raise ValueError()
+            workspace = self.workspace.resolve(strict=True)
+            if not workspace.is_dir():
+                raise ValueError()
+            registry = revalidate_model(ModelRegistryManifest, self.registry)
+            object.__setattr__(self, "workspace", workspace)
+            object.__setattr__(self, "registry", registry)
+            valid = True
+        except Exception:
+            pass
+        if not valid:
+            raise GeneralWorkerUnavailable()
+
+
+class GeneralWorkerExecutionService:
+    def __init__(self, scheduler, input_service, artifact_store, grant_authority,
+        proposal_journal, acceptance_coordinator, provider_gateway, worker_process, workspace: Path):
+        valid = False
+        try:
+            store = scheduler.event_store
+            authority = provider_gateway.dispatch_authority
+            if (type(scheduler) is not Scheduler or type(store) is not SQLiteEventStore
+                or type(input_service) is not WorkerInputService or input_service._scheduler is not scheduler
+                or type(artifact_store) is not ArtifactStore or artifact_store._event_store is not store
+                or scheduler.recovery.artifact_store is not artifact_store
+                or type(grant_authority) is not EphemeralArtifactGrantAuthority
+                or scheduler._general_artifact_grants is not grant_authority
+                or artifact_store._grant_verifier != grant_authority.verify
+                or type(proposal_journal) is not VerifierProposalJournal or proposal_journal._event_store is not store
+                or type(acceptance_coordinator) is not AttemptExecutionCoordinator
+                or acceptance_coordinator._scheduler is not scheduler
+                or acceptance_coordinator._artifact_store is not artifact_store
+                or acceptance_coordinator._grants is not grant_authority
+                or acceptance_coordinator._journal._event_store is not store
+                or type(provider_gateway) is not ProviderModelGateway
+                or type(authority) is not SchedulerProviderDispatchAuthority or authority.scheduler is not scheduler
+                or authority.event_store is not store or provider_gateway.provider_call_journal is not authority.provider_journal
+                or type(worker_process) is not GeneralWorkerProcess or store._connection.in_transaction):
+                raise ValueError()
+            root = Path(workspace).resolve(strict=True)
+            database = Path(next(row[2] for row in store._connection.execute("PRAGMA database_list")
+                if row[1] == "main")).resolve(strict=True)
+            owner_root = database.parent / ".general-worker-owners"
+            runtime = Path(__file__).resolve().parents[2]
+            # /tmp is the launcher's private namespace; ambient executable and
+            # config roots remain readable and cannot contain private authority.
+            from orchestrator.isolation._exec import _runtime_grants
+            scratch = Path("/tmp").resolve(strict=True)
+            readable = (root, runtime, *(grant.path.resolve(strict=True) for grant in _runtime_grants()
+                if grant.path.resolve(strict=True) != scratch))
+            for private in (database, artifact_store._root.resolve(), owner_root.resolve()):
+                if any(private == public or private.is_relative_to(public) or public.is_relative_to(private)
+                    for public in readable):
+                    raise ValueError()
+            general_worker_host_scope(store)
+            valid = True
+        except Exception:
+            pass
+        if not valid:
+            raise GeneralWorkerUnavailable() from None
+        self._scheduler, self._inputs, self._artifacts = scheduler, input_service, artifact_store
+        self._grants, self._proposals, self._coordinator = grant_authority, proposal_journal, acceptance_coordinator
+        self._gateway, self._worker, self._workspace = provider_gateway, worker_process, root
+        self._authority, self._journal, self._owner_root = authority, authority.journal, owner_root
+
+    async def execute(self, *, identity: GeneralWorkerIdentity, task_text: str) -> GeneralWorkerResult:
+        return await self._execute_or_recover(identity=identity, task_text=task_text, create=True)
+
+    async def recover(self, *, identity: GeneralWorkerIdentity, task_text: str) -> GeneralWorkerResult:
+        return await self._execute_or_recover(identity=identity, task_text=task_text, create=False)
+
+    def _register(self, identity, task):
+        scope = self._authority._scope()
+        result = None
+        def request(events, _version):
+            nonlocal result
+            binding = self._scheduler._resolve_general_verification_binding(**_identity_value(identity),
+                as_of=datetime.now(timezone.utc))
+            state = self._scheduler.lifecycle.replay(identity.run_id)
+            result = self._journal.request(context=task.context,
+                input_commitment=_input_commitment(task.model_dump(mode="json")),
+                accepted_route_sha256=metadata_hash(binding.active_attempt.accepted_route.model_dump(mode="json")),
+                workspace_identity_hash=state.workspace_identity_hash, host_scope_hash=scope,
+                output_byte_limit=min(task.output_byte_limit, 16_384))
+            _validate_general_eligibility(self._scheduler, self._journal, result,
+                purpose="request", host_scope_hash=scope, as_of=datetime.now(timezone.utc), events=events)
+        self._scheduler.event_store.append_checked("scheduler", "global", "general-request", request)
+        return result
+
+    async def _execute_or_recover(self, *, identity, task_text, create):
+        values = None
+        try:
+            values = _identity_value(identity)
+        except Exception:
+            pass
+        if values is None:
+            raise GeneralWorkerUnavailable()
+        operation = None
+        ownership = None
+        code = "general_worker_preparation_blocked"
+        try:
+            operation = self._journal.read(identity)
+            if operation is None:
+                if not create:
+                    return GeneralWorkerResult(identity, "", "blocked", "general_worker_not_requested")
+                task = self._inputs._prepare_general_worker_task(**values, task_text=task_text)
+                operation = self._register(identity, task)
+            ownership = GeneralWorkerOwnership(self._owner_root, operation.operation_id)
+            # The ownership primitive closes any late FD after finally marks
+            # the claim closed; cleanup never depends on a surviving waiter.
+            acquired = await asyncio.to_thread(ownership.acquire)
+            if not acquired:
+                return GeneralWorkerResult(identity, operation.operation_id, "in_progress", "general_worker_in_progress")
+            operation = self._journal.read(identity)
+            if (operation.host_scope_hash != self._authority._scope()
+                or operation.context.registry_hash != self._gateway.registry.content_hash
+                or operation.workspace_identity_hash != workspace_identity_hash(self._workspace)):
+                raise ValueError()
+            action = recovery_action(operation)
+            # Historical metadata must resolve before any active-only resolver,
+            # fresh verifier or usage source. Its bytes remain separately proven.
+            historical = self._scheduler.read_general_worker_result(identity) if action == "accepted" else None
+            task = self._inputs._restore_general_worker_task(identity=identity, task_text=task_text)
+            if action == "accepted":
+                code = "general_worker_artifact_unavailable"
+                response = self._read_response(operation)
+                self._read_output(operation, historical.artifacts[0], response,
+                    publication_id=operation.acceptance.output_publication_id)
+                return historical
+            if action == "launch_unknown":
+                return GeneralWorkerResult(identity, operation.operation_id, "blocked", "general_worker_launch_unknown")
+            if action == "stop":
+                code = "general_worker_stop_unknown"
+                turn = operation.turns[-1]
+                receipt = await asyncio.to_thread(self._worker.stop_prepared_launch,
+                    turn.prepared, turn.launch_receipt)
+                operation = self._journal.stop_turn(operation, receipt=receipt)
+                action = recovery_action(operation)
+            if action == "call_held":
+                code = "general_worker_provider_held"
+                call = self._journal._provider_call(operation)
+                code = "general_worker_capture_missing" if call.status == "known_success" else "general_worker_provider_held"
+                return GeneralWorkerResult(identity, operation.operation_id, "blocked", code)
+            if action == "held":
+                return GeneralWorkerResult(identity, operation.operation_id, "blocked", "general_worker_held")
+            # Frozen input permits cleanup/replay only. New work always resolves
+            # fresh exact authority with locked standard UTC, including pause,
+            # cancellation, expiry and fencing checks.
+            code = "general_worker_authority_blocked"
+            task = self._inputs._prepare_general_worker_task(**values, task_text=task_text)
+            if _input_commitment(task.model_dump(mode="json")) != operation.input_commitment:
+                raise ValueError()
+            if action == "request":
+                code = "general_worker_request_blocked"
+                operation, proposal = await self._turn(operation, task, phase="request")
+                if type(proposal) is not GeneralWorkerRequest:
+                    raise ValueError()
+                action = "dispatch"
+            if action == "dispatch":
+                code = "general_worker_provider_blocked"
+                operation = await self._dispatch(operation, task)
+                action = "complete"
+            code = "general_worker_artifact_unavailable"
+            response = self._read_response(operation)
+            if action == "complete":
+                code = "general_worker_completion_blocked"
+                operation = await self._complete(operation, task, response)
+            elif action != "accept":
+                raise ValueError()
+            proposal = self._proposals.read_proposal(identity.run_id, operation.task_sha256)
+            if proposal is None:
+                raise ValueError()
+            self._read_output(operation, proposal.task.candidate_artifacts[0], response)
+            code = "general_worker_acceptance_blocked"
+            return await self._coordinator.accept_general_proposal_async(identity=identity,
+                task_sha256=operation.task_sha256)
+        except Exception:
+            pass
+        finally:
+            if ownership is not None:
+                ownership.close()
+        return GeneralWorkerResult(identity, operation.operation_id if operation else "", "blocked", code)
+
+    async def _dispatch(self, operation, task):
+        binding = self._authority.resolve_eligibility(operation, purpose="dispatch")
+        request = self._model_request(operation, task, binding)
+        provider, model = validate_gateway_request(request, self._gateway.registry)
+        body = adapter_for(provider.adapter).encode_request(request, model).body_json.encode("utf-8")
+        operation = self._authority.reserve_call(operation, request=request, request_body=body)
+        response = revalidate_model(ModelResponse, await self._gateway.invoke(request))
+        self._validate_response(operation, response)
+        raw = _canonical(response.model_dump(mode="json"))
+        if not 0 < len(raw) <= 1_048_576:
+            raise ValueError()
+        content = response.output_text.encode("utf-8")
+        ref = self._publish(operation, raw, kind="response")
+        return self._journal.capture_response(operation, response_artifact=ref,
+            output_digest="sha256:" + hashlib.sha256(content).hexdigest(), output_byte_count=len(content))
+
+    def _validate_response(self, operation, response):
+        call = self._journal._provider_success(operation)
+        content = response.output_text.encode("utf-8", errors="strict")
+        if (response.request_id != operation.request_id or response.model_id != call.model_id
+            or response.provider_request_id != call.provider_request_id
+            or response.usage != TokenUsage.model_validate(dict(call.usage))
+            or response.finish_reason != "stop" or response.tool_calls
+            or not 0 < len(content) <= min(operation.output_byte_limit, 16_384)):
+            raise ValueError()
+
+    def _read_publication(self, operation, reference, kind, *, publication_id=None):
+        if self._scheduler.event_store._connection.in_transaction:
+            raise ValueError()
+        _publication_for_operation(self._scheduler.event_store, operation, reference, kind, publication_id)
+        grant = self._grants.issue(digest=reference.digest,
+            run_id=operation.operation_id if kind == "response" else operation.identity.run_id,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1))
+        raw = self._artifacts.read_bytes(reference.digest, grant=grant)
+        if len(raw) != reference.size_bytes or "sha256:" + hashlib.sha256(raw).hexdigest() != reference.digest:
+            raise ValueError()
+        return raw
+
+    def _read_response(self, operation):
+        capture = operation.capture
+        if capture is None or capture.response_artifact.artifact_type != "general-model-response" or (
+            capture.response_artifact.media_type != "application/json"
+            or not 0 < capture.response_artifact.size_bytes <= 1_048_576):
+            raise ValueError()
+        raw = self._read_publication(operation, capture.response_artifact, "response",
+            publication_id=operation.acceptance.response_publication_id if operation.acceptance else None)
+        response = ModelResponse.model_validate(json.loads(raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_pairs, parse_constant=_constant))
+        self._validate_response(operation, response)
+        content = response.output_text.encode("utf-8")
+        if (raw != _canonical(response.model_dump(mode="json")) or len(content) != capture.output_byte_count
+            or "sha256:" + hashlib.sha256(content).hexdigest() != capture.output_digest):
+            raise ValueError()
+        return response
+
+    def _read_output(self, operation, reference, response, *, publication_id=None):
+        if (reference.digest != operation.capture.output_digest
+            or reference.size_bytes != operation.capture.output_byte_count
+            or reference.artifact_type != "text" or reference.media_type != "text/plain; charset=utf-8"
+            or self._read_publication(operation, reference, "output", publication_id=publication_id)
+                != response.output_text.encode("utf-8")):
+            raise ValueError()
+
+    async def _complete(self, operation, task, response):
+        operation, proposal = await self._turn(operation, task, phase="complete", response_text=response.output_text)
+        if type(proposal) is not DecodedWorkerOutput or len(proposal.blobs) != 1:
+            raise ValueError()
+        blob, = proposal.blobs
+        if blob.content != response.output_text.encode("utf-8"):
+            raise ValueError()
+        output = self._publish(operation, blob.content, kind="output")
+        if output != blob.artifact:
+            raise ValueError()
+        binding = self._authority.resolve_eligibility(operation, purpose="completion")
+        verification_task = VerificationTask(context=task.context, candidate_artifacts=(output,),
+            acceptance_contract=binding.verification_contract, required_check_ids=binding.required_check_ids)
+        evidence = await IsolatedVerifierProcess(max_artifact_bytes=16_384).verify_async(
+            verification_task, self._artifacts, grant_for_digest=lambda digest: self._grants.issue(
+                digest=digest, run_id=task.context.run_id, expires_at=binding.active_attempt.lease_expires_at))
+        proposal = self._proposals.record(verification_task, evidence)
+        return self._journal.record_proposal(operation, task_sha256=proposal.task_sha256,
+            evidence_sha256=proposal.evidence_sha256)
+
+    async def _turn(self, operation, task, *, phase, response_text=None):
+        self._authority.resolve_eligibility(operation, purpose="request" if phase == "request" else "completion")
+        prepared = await asyncio.to_thread(self._worker.prepare_launch)
+        # Recheck after the await, before recording any new launch intent.
+        self._authority.resolve_eligibility(operation, purpose="request" if phase == "request" else "completion")
+        operation = self._journal.prepare_turn(operation, phase=phase, prepared=prepared)
+        turn = GeneralWorkerTurn(phase, prepared.launch_id, task, response_text)
+        session = await asyncio.to_thread(self._worker.start_turn, self._workspace, turn,
+            prepared_launch=prepared, expected_workspace_identity_hash=operation.workspace_identity_hash)
+        operation = self._journal.ack_turn(operation, receipt=session.launch_receipt)
+        result = await asyncio.to_thread(session.wait)
+        operation = self._journal.stop_turn(operation, receipt=result.termination_receipt,
+            request_proposal=result.proposal if type(result.proposal) is GeneralWorkerRequest else None)
+        return operation, result.proposal
+
+    def _model_request(self, operation, task, binding):
+        snapshot = self._scheduler.lifecycle.config_snapshot(operation.identity.run_id)
+        if snapshot.registry_manifest.content_hash != self._gateway.registry.content_hash:
+            raise ValueError()
+        state = self._scheduler.lifecycle.replay(operation.identity.run_id)
+        contract = state.node(operation.identity.node_id).spec.planning_contract
+        active = binding.active_attempt
+        reservation = active.reservation
+        return ModelRequest(request_id=operation.request_id, idempotency_key=operation.idempotency_key,
+            **_identity_value(operation.identity), model_id=active.accepted_route.model_id,
+            accepted_route=active.accepted_route, budget_reservation_id=reservation.reservation_id,
+            messages=(ModelMessage(role="user", content=task.task_text),), tools=(),
+            max_output_tokens=contract.max_output_tokens, reasoning_effort=active.accepted_route.reasoning_effort,
+            timeout_ms=30_000, cost_snapshots=CostSnapshotRefs(registry_manifest_hash=operation.context.registry_hash,
+                **{name: getattr(reservation, name) for name in ("tokenizer_snapshot_id", "fx_snapshot_id",
+                    "price_snapshot_id", "estimator_snapshot_id")}))
+
+    def _publish(self, operation, content, *, kind):
+        source = {**{key: str(value) for key, value in _identity_value(operation.identity).items()},
+            "agent_instance_id": operation.context.agent_instance_id,
+            "general_worker_operation_id": operation.operation_id, "general_worker_kind": kind}
+        response = kind == "response"
+        record = self._artifacts.publish_bytes(content, source=source,
+            artifact_type="general-model-response" if response else "text",
+            media_type="application/json" if response else "text/plain; charset=utf-8",
+            readable_scope=(operation.operation_id if response else operation.identity.run_id,))
+        ref = ArtifactRef(digest=record.digest, size_bytes=record.size,
+            artifact_type=record.artifact_type, media_type=record.media_type)
+        _publication_for_operation(self._scheduler.event_store, operation, ref, kind, record.publication_id)
+        return ref
+
+
+__all__ = ["GeneralWorkerHostConfig", "GeneralWorkerExecutionService", "GeneralWorkerUnavailable", "GeneralWorkerOwnership"]

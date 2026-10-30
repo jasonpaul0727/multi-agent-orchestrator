@@ -68,6 +68,11 @@ __all__ = [
     "WorkspaceExecutionHost",
     "WorkspaceExecutionResult",
     "WorkspaceExecutionService",
+    "GeneralWorkerHostConfig",
+    "GeneralWorkerExecutionService",
+    "GeneralWorkerIdentity",
+    "GeneralWorkerResult",
+    "GeneralWorkerUnavailable",
 ]
 
 
@@ -80,4 +85,10 @@ def __getattr__(name):
     if name in {"WorkspaceExecutionHost", "WorkspaceExecutionResult", "WorkspaceExecutionService"}:
         from . import workspace_execution
         return getattr(workspace_execution, name)
+    if name in {"GeneralWorkerHostConfig", "GeneralWorkerExecutionService", "GeneralWorkerUnavailable"}:
+        from . import general_worker_execution
+        return getattr(general_worker_execution, name)
+    if name in {"GeneralWorkerIdentity", "GeneralWorkerResult"}:
+        from . import general_worker_journal
+        return getattr(general_worker_journal, name)
     raise AttributeError(name)

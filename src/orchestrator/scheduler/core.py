@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
@@ -11,7 +11,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from orchestrator.agents import AgentRegistry
-from orchestrator.artifacts import ArtifactStore
+from orchestrator.artifacts import ArtifactStore, EphemeralArtifactGrantAuthority
 from orchestrator.budget import BudgetLedger, BudgetReservation, RunLimit, UsageRecord
 from orchestrator.config.runtime import RunConfigSnapshot
 from orchestrator.models import AcceptedModelRoute, ModelGatewayFailure
@@ -29,9 +29,15 @@ from orchestrator.recovery.run import RunRecoveryCoordinator, RunRecoveryError
 from orchestrator.validation import revalidate_model
 from orchestrator.runtime.contracts import AttemptContext
 from orchestrator.runtime.verifier_process import (
-    BUILTIN_VERIFICATION_CONTRACT_ID, SUPPORTED_VERIFICATION_CHECK_IDS,
+    BUILTIN_VERIFICATION_CONTRACT_ID, SUPPORTED_VERIFICATION_CHECK_IDS, IsolatedVerifierProcess,
 )
+from orchestrator.runtime.proposal_verification import verify_proposal
 from orchestrator.runtime.verification_journal import VerifierProposalJournal
+from orchestrator.runtime.attempt_usage import AttemptUsageSource, UnavailableAttemptUsageSource
+from orchestrator.runtime.general_worker_journal import (
+    GeneralWorkerJournal, GeneralWorkerIdentity, GeneralWorkerAcceptance, GeneralWorkerResult,
+    _identity_value, _safe, _require_worker_stopped, _publication_for_operation, metadata_hash,
+)
 
 from orchestrator.lifecycle.controller import (
     LifecycleConflict,
@@ -126,14 +132,42 @@ class Scheduler:
         *,
         limits: ConcurrencyLimits,
         artifact_store: ArtifactStore | None = None,
+        usage_source: AttemptUsageSource | None = None,
+        artifact_grants: EphemeralArtifactGrantAuthority | None = None,
     ) -> None:
         self.event_store = event_store
         self.limits = limits
         self.lifecycle = LifecycleController(event_store)
         self.agents = AgentRegistry(event_store)
         self.recovery = RunRecoveryCoordinator(event_store, artifact_store=artifact_store)
+        self._general_usage_source = usage_source if usage_source is not None else UnavailableAttemptUsageSource()
+        self._general_recovery_scope = None
+        self._general_artifact_grants = artifact_grants
 
     def resolve_active_attempt(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, as_of: datetime,
+    ) -> ActiveAttemptSnapshot:
+        """Resolve ordinary authority, preserving full artifact recovery."""
+        return self._resolve_active_attempt(run_id=run_id, node_id=node_id,
+            attempt_id=attempt_id, fencing_generation=fencing_generation,
+            as_of=as_of, control_only=False)
+
+    def _resolve_general_active_attempt(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, as_of: datetime,
+    ) -> ActiveAttemptSnapshot:
+        """Owned general authority; this projection makes no artifact-byte claim."""
+        return self._resolve_active_attempt(run_id=run_id, node_id=node_id,
+            attempt_id=attempt_id, fencing_generation=fencing_generation,
+            as_of=as_of, control_only=True)
+
+    def _resolve_general_release_snapshot(self, *, run_id, node_id, attempt_id, fencing_generation, as_of):
+        """Owned known-failure/cancellation snapshot; never authorizes execution."""
+        return self._resolve_active_attempt(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+            fencing_generation=fencing_generation, as_of=as_of, control_only=True, allow_cancelling=True)
+
+    def _resolve_active_attempt(
         self,
         *,
         run_id: str,
@@ -141,6 +175,8 @@ class Scheduler:
         attempt_id: str,
         fencing_generation: int,
         as_of: datetime,
+        control_only: bool,
+        allow_cancelling: bool = False,
     ) -> ActiveAttemptSnapshot:
         """Resolve exact accepted authority without changing durable state.
 
@@ -199,7 +235,8 @@ class Scheduler:
             )
             if not accepted_at <= as_of < lease_expires_at:
                 raise SchedulerError("Attempt is not accepted and unexpired at the trusted time")
-            recovered = self.recovery.recover(run_id)
+            recovered = (self.recovery.recover_control_state(run_id) if control_only
+                         else self.recovery.recover(run_id))
             lease = next(
                 (item for item in recovered.active_attempts
                  if item.attempt_ref == attempt_ref
@@ -212,7 +249,8 @@ class Scheduler:
             node = recovered.lifecycle.node(node_id)
             attempt = next(item for item in node.attempts if item.attempt_id == attempt_id)
             if (
-                recovered.lifecycle.status in {"cancelling", "cancelled"}
+                (recovered.lifecycle.status == "cancelled"
+                 or recovered.lifecycle.status == "cancelling" and not allow_cancelling)
                 or lease is None
                 or datetime.fromisoformat(lease.lease_expires_at) != lease_expires_at
                 or datetime.fromisoformat(attempt.lease_expires_at) != lease_expires_at
@@ -754,15 +792,31 @@ class Scheduler:
         self, *, run_id: str, node_id: str, attempt_id: str,
         fencing_generation: int, as_of: datetime,
     ) -> VerificationBinding:
+        return self._resolve_verification_binding(run_id=run_id, node_id=node_id,
+            attempt_id=attempt_id, fencing_generation=fencing_generation,
+            as_of=as_of, control_only=False)
+
+    def _resolve_general_verification_binding(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, as_of: datetime,
+    ) -> VerificationBinding:
+        return self._resolve_verification_binding(run_id=run_id, node_id=node_id,
+            attempt_id=attempt_id, fencing_generation=fencing_generation,
+            as_of=as_of, control_only=True)
+
+    def _resolve_verification_binding(
+        self, *, run_id: str, node_id: str, attempt_id: str,
+        fencing_generation: int, as_of: datetime, control_only: bool,
+    ) -> VerificationBinding:
         """Reload independent admission authority; missing/changed bindings fail closed."""
         result = None
         attempt_ref = _attempt_ref(run_id, node_id, attempt_id)
 
         def resolve(events, _version):
             nonlocal result
-            active = self.resolve_active_attempt(
+            active = self._resolve_active_attempt(
                 run_id=run_id, node_id=node_id, attempt_id=attempt_id,
-                fencing_generation=fencing_generation, as_of=as_of,
+                fencing_generation=fencing_generation, as_of=as_of, control_only=control_only,
             )
             accepted = _active_acceptance(events, attempt_ref)
             if accepted is None:
@@ -955,6 +1009,224 @@ class Scheduler:
                 or terminal.idempotency_key != f"attemptcompleted:{attempt_id}"):
                 raise SchedulerError("success proof terminal execution bindings disagree")
 
+        GeneralWorkerJournal(self.event_store).validate_operations()
+
+    def read_general_worker_result(self, identity: GeneralWorkerIdentity) -> GeneralWorkerResult | None:
+        """Read original accepted metadata without lease, usage, or file sampling."""
+        result = None
+        def read(_events, _version):
+            nonlocal result
+            self.validate_success_proofs()
+            operation = GeneralWorkerJournal(self.event_store).read(identity)
+            if operation is not None:
+                self.recovery.recover_control_state(identity.run_id)
+            result = None if operation is None else operation.accepted_result
+        self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, "general-result", read)
+        return result
+
+    def _general_operation(self, run_id, node_id, attempt_id, fencing_generation):
+        return GeneralWorkerJournal(self.event_store).read(
+            GeneralWorkerIdentity(run_id, node_id, attempt_id, fencing_generation))
+
+    def _prepare_general_recovery_scope(self):
+        from orchestrator.runtime.general_worker_authority import general_worker_host_scope
+        self._general_recovery_scope = (general_worker_host_scope(self.event_store)
+            if self.event_store.stream_ids("general_worker") else None)
+
+    def _general_release_scope(self, run_id, node_id, attempt_id, fencing_generation):
+        operation = self._general_operation(run_id, node_id, attempt_id, fencing_generation)
+        if operation is None:
+            return None
+        if self.event_store._connection.in_transaction:
+            if self._general_recovery_scope is None:
+                raise SchedulerError("general release requires owned recovery authority")
+            return self._general_recovery_scope
+        from orchestrator.runtime.general_worker_authority import general_worker_host_scope
+        return general_worker_host_scope(self.event_store)
+
+    def _check_general_release(self, run_id, node_id, attempt_id, fencing_generation, scope):
+        operation = self._general_operation(run_id, node_id, attempt_id, fencing_generation)
+        if operation is not None:
+            if operation.host_scope_hash != scope:
+                raise SchedulerError("general release host authority changed")
+            try:
+                _require_worker_stopped(operation)
+            except ValueError:
+                raise SchedulerError("general release requires exact Worker stop proof") from None
+        return operation
+
+    def _prepare_general_release(self, *, run_id, node_id, attempt_id, fencing_generation,
+        entry, usage, known_no_effect, at):
+        """Derive known-cost usage outside SQL; reconciliation stays metadata-only."""
+        try:
+            scope = self._general_release_scope(run_id, node_id, attempt_id, fencing_generation)
+            if scope is None:
+                return None, None
+            if self.event_store._connection.in_transaction and entry != "reconcile":
+                raise ValueError()
+            from orchestrator.runtime.general_worker_authority import _validate_general_release_authority
+            snapshot = None
+            def preflight(events, _version):
+                nonlocal snapshot
+                operation = self._check_general_release(run_id, node_id, attempt_id, fencing_generation, scope)
+                if self._has_general_release(events, operation.identity):
+                    return
+                needs_usage = _validate_general_release_authority(self, GeneralWorkerJournal(self.event_store), operation,
+                    events=events, entry=entry, usage=usage, known_no_effect=known_no_effect, at=at)
+                if needs_usage:
+                    snapshot = self._resolve_general_release_snapshot(run_id=run_id, node_id=node_id,
+                        attempt_id=attempt_id, fencing_generation=fencing_generation, as_of=datetime.now(timezone.utc))
+            self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, "general-release-preflight", preflight)
+            if snapshot is None:
+                return scope, None
+            if self.event_store._connection.in_transaction:
+                raise ValueError()
+            trusted = revalidate_model(UsageRecord, self._general_usage_source.usage_for(snapshot))
+            _validate_usage(trusted, run_id=run_id, reservation_id=snapshot.reservation.reservation_id)
+            if trusted != usage:
+                raise ValueError()
+            return self._general_release_scope(run_id, node_id, attempt_id, fencing_generation), trusted
+        except Exception:
+            pass
+        raise SchedulerError("general release requires authoritative Provider settlement")
+
+    @staticmethod
+    def _has_general_release(events, identity):
+        return any(event.event_type == "AttemptSlotReleased" and all(getattr(event, name) == value
+            for name, value in _identity_value(identity).items()) for event in events)
+
+    def _check_general_release_claim(self, *, run_id, node_id, attempt_id, fencing_generation,
+        scope, trusted_usage, events, entry, usage, known_no_effect, at):
+        operation = self._check_general_release(run_id, node_id, attempt_id, fencing_generation, scope)
+        if operation is None or self._has_general_release(events, operation.identity):
+            return
+        # Loaded before the checked transaction by _prepare_general_release.
+        from orchestrator.runtime.general_worker_authority import _validate_general_release_authority
+        needs_usage = _validate_general_release_authority(self, GeneralWorkerJournal(self.event_store), operation,
+            events=events, entry=entry, usage=usage, known_no_effect=known_no_effect, at=at)
+        if needs_usage and (trusted_usage is None or trusted_usage != usage):
+            raise SchedulerError("general release lost trusted usage authority")
+
+    def _finish_general_verified_attempt(self, *, identity: GeneralWorkerIdentity,
+        task_sha256: str) -> GeneralWorkerResult:
+        """Identity-only entry for the host Coordinator; derive every prerequisite."""
+        return self._accept_general_proposal(identity=identity, task_sha256=task_sha256)
+
+    def _accept_general_proposal(self, *, identity: GeneralWorkerIdentity, task_sha256: str,
+        expected_usage: UsageRecord | None = None):
+        steps = self._general_acceptance_steps(identity=identity, task_sha256=task_sha256,
+            expected_usage=expected_usage)
+        try:
+            proposal, binding = next(steps)
+            verify_proposal(proposal, binding, verifier=IsolatedVerifierProcess(max_artifact_bytes=16_384),
+                artifact_store=self.recovery.artifact_store, grants=self._general_artifact_grants)
+            next(steps)
+        except StopIteration as completed:
+            return completed.value
+        except Exception:
+            pass
+        finally:
+            steps.close()
+        raise SchedulerError("general verified completion prerequisites failed")
+
+    async def _finish_general_verified_attempt_async(self, *, identity: GeneralWorkerIdentity,
+        task_sha256: str) -> GeneralWorkerResult:
+        from orchestrator.runtime.proposal_verification import verify_proposal_async
+        steps = self._general_acceptance_steps(identity=identity, task_sha256=task_sha256)
+        try:
+            proposal, binding = next(steps)
+            await verify_proposal_async(proposal, binding,
+                verifier=IsolatedVerifierProcess(max_artifact_bytes=16_384),
+                artifact_store=self.recovery.artifact_store, grants=self._general_artifact_grants)
+            next(steps)
+        except StopIteration as completed:
+            return completed.value
+        except Exception:
+            pass
+        finally:
+            steps.close()
+        raise SchedulerError("general verified completion prerequisites failed")
+
+    def _general_acceptance_steps(self, *, identity: GeneralWorkerIdentity, task_sha256: str,
+        expected_usage: UsageRecord | None = None):
+        """Owned preflight and atomic acceptance. No caller preflight capability."""
+        if self.event_store._connection.in_transaction:
+            raise SchedulerError("general completion must own its transaction")
+        from orchestrator.runtime.general_worker_authority import (
+            SchedulerProviderDispatchAuthority, _validate_general_eligibility,
+            _preflight_general_bytes, _validate_general_usage,
+        )
+        try:
+            journal = GeneralWorkerJournal(self.event_store)
+            operation = journal.read(identity)
+            if operation is None or operation.task_sha256 != task_sha256:
+                raise ValueError()
+            if operation.accepted_result is not None:
+                result = self.read_general_worker_result(identity)
+                if expected_usage is not None and metadata_hash(
+                    revalidate_model(UsageRecord, expected_usage).model_dump(mode="json")) != operation.acceptance.usage_sha256:
+                    raise ValueError()
+                return result
+            authority = SchedulerProviderDispatchAuthority(self, journal)
+            binding = authority.resolve_eligibility(operation, purpose="acceptance")
+            proposal = VerifierProposalJournal(self.event_store).read_proposal(identity.run_id, task_sha256)
+            if (proposal is None or proposal.evidence.outcome != "accepted"
+                or proposal.task.context != binding.context
+                or proposal.task.acceptance_contract != binding.verification_contract
+                or tuple(sorted(proposal.task.required_check_ids)) != binding.required_check_ids):
+                raise ValueError()
+            response_id, output_id = _preflight_general_bytes(self, journal, operation, proposal)
+            if type(self._general_artifact_grants) is not EphemeralArtifactGrantAuthority:
+                raise ValueError()
+            # Only owned sync/async drivers advance this private continuation,
+            # after a fresh concrete verifier and shared evidence validation.
+            yield proposal, binding
+            usage = revalidate_model(UsageRecord, self._general_usage_source.usage_for(binding.active_attempt))
+            _validate_usage(usage, run_id=identity.run_id,
+                reservation_id=binding.active_attempt.reservation.reservation_id)
+            _validate_general_usage(journal, operation, usage)
+            if expected_usage is not None and revalidate_model(UsageRecord, expected_usage) != usage:
+                raise ValueError()
+            # Re-sample filesystem/boot ownership outside the final transaction.
+            scope = authority._scope()
+            attempt_ref = _attempt_ref(identity.run_id, identity.node_id, identity.attempt_id)
+            result = None
+            def decide(events, _version):
+                nonlocal result
+                completed_at = datetime.now(timezone.utc)
+                current_binding = _validate_general_eligibility(self, journal, operation, purpose="acceptance",
+                    host_scope_hash=scope, as_of=completed_at, events=events)
+                current_proposal = VerifierProposalJournal(self.event_store).read_proposal(identity.run_id, task_sha256)
+                if current_binding != binding or current_proposal != proposal:
+                    raise ValueError()
+                _publication_for_operation(self.event_store, operation, operation.capture.response_artifact,
+                    "response", response_id)
+                _publication_for_operation(self.event_store, operation, proposal.task.candidate_artifacts[0],
+                    "output", output_id)
+                _validate_general_usage(journal, operation, usage)
+                acceptance = GeneralWorkerAcceptance(task_sha256, proposal.evidence_sha256,
+                    proposal.task.candidate_artifacts, metadata_hash(usage.model_dump(mode="json")), usage.settlement_key,
+                    completed_at.isoformat(), metadata_hash(_safe(operation.capture)), metadata_hash(_safe(operation.turns)),
+                    response_id, output_id)
+                self._ledger_for_run(identity.run_id).commit_usage(usage.reservation_id, usage,
+                    settlement_key=usage.settlement_key, run_id=identity.run_id)
+                result = journal._record_accepted(operation, acceptance=acceptance).accepted_result
+                self.lifecycle._record_verified_attempt_completed(identity.run_id, node_id=identity.node_id,
+                    attempt_id=identity.attempt_id, fencing_generation=identity.fencing_generation,
+                    task_sha256=task_sha256, evidence_sha256=proposal.evidence_sha256)
+                self.agents.complete_attempt(**_identity_value(identity), agent_instance_id=binding.context.agent_instance_id,
+                    causation_id=binding.context.routing_decision_hash, outcome="succeeded")
+                payload = dict(attempt_ref=attempt_ref, **_identity_value(identity),
+                    completed_at=acceptance.completed_at, outcome="succeeded", usage_hash=acceptance.usage_sha256,
+                    known_no_effect=False, task_sha256=task_sha256, evidence_sha256=proposal.evidence_sha256)
+                return [EventDraft("AttemptSlotReleased", payload, **_identity_value(identity),
+                    correlation_id=identity.run_id, causation_id=binding.context.routing_decision_hash)]
+            self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, f"finish:{attempt_ref}", decide)
+            return result
+        except Exception:
+            pass
+        raise SchedulerError("general verified completion prerequisites failed")
+
     def finish_verified_attempt(
         self, *, run_id: str, node_id: str, attempt_id: str,
         fencing_generation: int, task_sha256: str, completed_at: datetime, usage: UsageRecord,
@@ -962,12 +1234,20 @@ class Scheduler:
         """Atomically accept durable verifier proof and settle the exact Attempt."""
         if type(fencing_generation) is not int or fencing_generation <= 0:
             raise SchedulerError("verified completion has invalid fencing generation")
+        if self._general_operation(run_id, node_id, attempt_id, fencing_generation) is not None:
+            if usage is None:
+                raise SchedulerError("general completion requires matching trusted usage")
+            self._accept_general_proposal(identity=GeneralWorkerIdentity(run_id, node_id, attempt_id,
+                fencing_generation), task_sha256=task_sha256, expected_usage=usage)
+            return
         completed_at = _aware(completed_at, "completed_at")
         usage = revalidate_model(UsageRecord, usage)
         attempt_ref = _attempt_ref(run_id, node_id, attempt_id)
         key = f"finish:{attempt_ref}"
 
         def decide(events, _version):
+            if self._general_operation(run_id, node_id, attempt_id, fencing_generation) is not None:
+                raise SchedulerError("general registration requires owned terminal preflight")
             proposal = VerifierProposalJournal(self.event_store).read_proposal(run_id, task_sha256)
             if proposal is None or proposal.evidence.outcome != "accepted":
                 raise SchedulerError("completion requires an accepted durable verifier proof")
@@ -1048,6 +1328,10 @@ class Scheduler:
         key = f"finish:{attempt_ref}"
 
         def decide(events: list[StoredEvent], version: int):
+            if outcome != "outcome_unknown":
+                self._check_general_release_claim(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                    fencing_generation=fencing_generation, scope=general_scope, trusted_usage=general_usage,
+                    events=events, entry="finish", usage=usage, known_no_effect=known_no_effect, at=completed_at)
             prior = next((item for item in events if item.idempotency_key == key), None)
             if prior is not None:
                 if prior.event_type not in {"AttemptSlotReleased", "AttemptOutcomeUnknown"} or any(
@@ -1064,6 +1348,9 @@ class Scheduler:
             if completed_at < accepted_at:
                 raise LifecycleConflict("attempt completion precedes route acceptance")
             expires_at = datetime.fromisoformat(accepted.payload["lease_expires_at"])
+            if general_scope is not None and outcome != "outcome_unknown":
+                self._resolve_general_release_snapshot(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                    fencing_generation=fencing_generation, as_of=datetime.now(timezone.utc))
             if outcome != "outcome_unknown" and completed_at >= expires_at:
                 raise LifecycleConflict("late attempt result must be reconciled, not accepted")
             decision_hash = accepted.payload["decision_hash"]
@@ -1145,6 +1432,9 @@ class Scheduler:
                 )
             ]
 
+        general_scope, general_usage = (self._prepare_general_release(run_id=run_id, node_id=node_id,
+            attempt_id=attempt_id, fencing_generation=fencing_generation, entry="finish", usage=usage,
+            known_no_effect=known_no_effect, at=completed_at) if outcome != "outcome_unknown" else (None, None))
         self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
 
     def acknowledge_cancellation(
@@ -1196,6 +1486,9 @@ class Scheduler:
         key = f"cancel-ack:{attempt_ref}"
 
         def decide(events: list[StoredEvent], version: int):
+            self._check_general_release_claim(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                fencing_generation=fencing_generation, scope=general_scope, trusted_usage=general_usage,
+                events=events, entry="cancel", usage=usage, known_no_effect=no_effect_receipt_hash is not None, at=stopped_at)
             prior = next((item for item in events if item.idempotency_key == key), None)
             if prior is not None:
                 if prior.event_type != "AttemptSlotReleased" or dict(prior.payload) != op_payload:
@@ -1210,6 +1503,9 @@ class Scheduler:
                 raise LifecycleConflict("cancellation receipt precedes attempt acceptance")
             if stopped_at >= datetime.fromisoformat(accepted.payload["lease_expires_at"]):
                 raise LifecycleConflict("expired attempt must be reconciled, not cancelled")
+            if general_scope is not None:
+                self._resolve_general_release_snapshot(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                    fencing_generation=fencing_generation, as_of=datetime.now(timezone.utc))
             state = self.lifecycle.replay(run_id)
             if state.status != "cancelling":
                 raise SchedulerError("cancellation acknowledgement requires a cancelling Run")
@@ -1254,6 +1550,9 @@ class Scheduler:
                 )
             ]
 
+        general_scope, general_usage = self._prepare_general_release(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+            fencing_generation=fencing_generation, entry="cancel", usage=usage,
+            known_no_effect=no_effect_receipt_hash is not None, at=stopped_at)
         self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
 
     def mark_expired_attempts_unknown(self, *, as_of: datetime) -> tuple[str, ...]:
@@ -1328,6 +1627,9 @@ class Scheduler:
         key = f"reconcile:{attempt_ref}"
 
         def decide(events: list[StoredEvent], version: int):
+            self._check_general_release_claim(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                fencing_generation=fencing_generation, scope=general_scope, trusted_usage=general_usage,
+                events=events, entry="reconcile", usage=usage, known_no_effect=known_no_effect, at=reconciled_at)
             prior = next((item for item in events if item.idempotency_key == key), None)
             if prior is not None:
                 if prior.event_type != "AttemptSlotReleased" or any(
@@ -1409,6 +1711,9 @@ class Scheduler:
                 )
             ]
 
+        general_scope, general_usage = self._prepare_general_release(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+            fencing_generation=fencing_generation, entry="reconcile", usage=usage,
+            known_no_effect=known_no_effect, at=reconciled_at)
         self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
 
     def _ledger_for_run(self, run_id: str) -> BudgetLedger:

@@ -916,3 +916,478 @@ def test_scoped_session_detaches_temporary_directory_finalizer_until_verified_st
     assert not result.termination_confirmed
     assert (staging_path / "marker").read_text(encoding="utf-8") == "must remain"
     temporary.cleanup()
+
+
+def test_prepared_identity_precedes_launch(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("preparation must not start or inspect any process")
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    launcher = SystemdReadOnlyLauncher()
+    first, second = launcher.prepare_launch(), launcher.prepare_launch()
+    import uuid
+    assert uuid.UUID(first.launch_id).version == 4
+    assert first.unit_name == "maestro-attempt-" + uuid.UUID(first.launch_id).hex + ".service"
+    assert first != second
+
+
+def _observed_worker_profile():
+    return dict(PrivateNetwork="yes", PrivateTmp="yes", PrivateUsers="yes", PrivateDevices="yes",
+        ProtectHome="tmpfs", ProtectSystem="strict", ProtectProc="invisible", ProcSubset="pid",
+        ProtectControlGroups="yes", ProtectKernelTunables="yes", ProtectKernelModules="yes",
+        ProtectKernelLogs="yes", ProtectClock="yes", ProtectHostname="yes", NoNewPrivileges="yes",
+        CapabilityBoundingSet="", RestrictAddressFamilies="AF_UNIX", RestrictRealtime="yes",
+        RestrictSUIDSGID="yes", LockPersonality="yes", MemoryDenyWriteExecute="yes",
+        WorkingDirectory="/tmp/staging/workspace", KillMode="control-group", Environment="",
+        ExecStart="{ path=/usr/bin/env ; argv[]=/usr/bin/env -i /usr/bin/python3 -I -S /tmp/worker.py --child ; ignore_errors=no ; pending=yes }",
+        MemoryMax="536870912", MemorySwapMax="0", TasksMax="64", CPUQuotaPerSecUSec="1s",
+        CPUQuotaPeriodUSec="100ms", RuntimeMaxUSec="10s", TimeoutStopUSec="1s",
+        LimitNOFILE="256", LimitNOFILESoft="256", LimitFSIZE="67108864", LimitFSIZESoft="67108864",
+        LimitCORE="0", LimitCORESoft="0", InaccessiblePaths="-/run/user -/etc/shadow",
+        BindReadOnlyPaths="/tmp/source:/tmp/staging/workspace:rbind /tmp/runtime:/tmp/staging/runtime:rbind")
+
+
+@pytest.mark.parametrize("change", [dict(Id="wrong.service"), dict(LoadState="not-found"),
+    dict(ControlGroup="/user.slice/app.slice/wrong.service"), dict(PrivateNetwork="no"),
+    dict(ProtectSystem="full"), dict(NoNewPrivileges="no"), dict(MemoryMax="infinity")])
+def test_ack_requires_observed_identity(monkeypatch, change):
+    launch = launcher_module.PreparedSandboxLaunch(
+        "4dc48974-60de-476b-8828-e6d979729813",
+        "maestro-attempt-4dc4897460de476b8828e6d979729813.service")
+    cgroup = Path("/sys/fs/cgroup/user.slice/app.slice") / launch.unit_name
+    profile = _observed_worker_profile()
+    properties = dict(Id=launch.unit_name, LoadState="loaded", ActiveState="active",
+        ControlGroup="/user.slice/app.slice/" + launch.unit_name, InvocationID="a" * 32, **profile)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **_kwargs: subprocess.CompletedProcess(
+        args, 0, stdout="".join(f"{k}={v}\n" for k, v in (properties | change).items()).encode()))
+    assert launcher_module._read_launch_receipt(prepared_launch=launch, expected_cgroup=cgroup,
+        expected_profile=launcher_module._normalise_launch_profile(profile), client_env={}, timeout_seconds=0.01) is None
+
+
+def test_exact_observed_identity_issues_launch_receipt_before_wait(monkeypatch):
+    launch = launcher_module.PreparedSandboxLaunch(
+        "4dc48974-60de-476b-8828-e6d979729813",
+        "maestro-attempt-4dc4897460de476b8828e6d979729813.service")
+    control_group = "/user.slice/app.slice/" + launch.unit_name
+    profile = _observed_worker_profile()
+    properties = dict(Id=launch.unit_name, LoadState="loaded", ActiveState="active",
+        ControlGroup=control_group, InvocationID="a" * 32, **profile)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **_kwargs: subprocess.CompletedProcess(
+        args, 0, stdout="".join(f"{k}={v}\n" for k, v in properties.items()).encode()))
+    receipt = launcher_module._read_launch_receipt(prepared_launch=launch,
+        expected_cgroup=Path("/sys/fs/cgroup") / control_group.lstrip("/"),
+        expected_profile=launcher_module._normalise_launch_profile(profile), client_env={}, timeout_seconds=0.01)
+    assert receipt.launch_id == launch.launch_id and receipt.unit_name == launch.unit_name
+    assert receipt.control_group == control_group and receipt.invocation_id == "a" * 32
+    assert receipt.profile_sha256.startswith("sha256:")
+    assert not hasattr(receipt, "cgroup_empty")
+
+
+def test_epoch_cannot_be_reused_or_substituted(monkeypatch, tmp_path):
+    from dataclasses import replace
+    launcher = SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl")
+    prepared = launcher.prepare_launch()
+    # Consume an epoch even when validation proves no start, preventing retries
+    # from accidentally reusing a journalled prepared identity.
+    with pytest.raises(launcher_module.IsolationNotStarted):
+        launcher.launch(tmp_path, [], prepared_launch=prepared)
+    for other in (prepared, replace(prepared, unit_name="maestro-attempt-" + "a" * 32 + ".service")):
+        with pytest.raises(launcher_module.IsolationNotStarted):
+            launcher.launch(tmp_path, ["/bin/true"], prepared_launch=other)
+
+
+def test_unacknowledged_prepared_launch_cannot_claim_stop():
+    launcher = SystemdReadOnlyLauncher()
+    prepared = launcher.prepare_launch()
+    with pytest.raises(launcher_module.IsolationStartUnknown) as caught:
+        launcher.stop_prepared_launch(prepared, None)
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+
+
+def _reconstructed_launch():
+    prepared = launcher_module.PreparedSandboxLaunch("4dc48974-60de-476b-8828-e6d979729813",
+        "maestro-attempt-4dc4897460de476b8828e6d979729813.service")
+    group = "/user.slice/app.slice/" + prepared.unit_name
+    digest = launcher_module._profile_sha256(launcher_module._normalise_launch_profile(_observed_worker_profile()))
+    receipt = launcher_module.SandboxLaunchReceipt(prepared.launch_id, prepared.unit_name, group, "a" * 32, digest)
+    return prepared, receipt
+
+
+@pytest.mark.parametrize("collected", [False, True])
+def test_reconstructed_acknowledged_launch_can_stop_after_restart(monkeypatch, collected):
+    prepared, receipt = _reconstructed_launch()
+    properties = dict(_observed_worker_profile(), Id=prepared.unit_name, ActiveState="inactive",
+        LoadState="not-found" if collected else "loaded", ControlGroup="" if collected else receipt.control_group,
+        InvocationID="" if collected else receipt.invocation_id)
+    kills = []
+    def systemctl(args, **_kwargs):
+        if "kill" in args:
+            kills.append(args)
+            return subprocess.CompletedProcess(args, 0)
+        selected = {arg.removeprefix("--property=") for arg in args if arg.startswith("--property=")}
+        return subprocess.CompletedProcess(args, 0, stdout="".join(
+            f"{key}={properties[key]}\n" for key in selected).encode())
+    monkeypatch.setattr(launcher_module, "_systemd_client_environment", lambda: {})
+    monkeypatch.setattr(subprocess, "run", systemctl)
+    monkeypatch.setattr(launcher_module, "_cgroup_is_empty", lambda _path: True)
+    # A newly created launcher owns no in-memory session/prepare state.
+    stopped = SystemdReadOnlyLauncher(systemctl="ctl").stop_prepared_launch(prepared, receipt)
+    assert stopped.unit_name == prepared.unit_name and stopped.control_group == receipt.control_group
+    assert stopped.cgroup_empty
+
+
+@pytest.mark.parametrize("change", [dict(InvocationID="b" * 32), dict(Id="wrong.service"),
+    dict(ControlGroup="/user.slice/app.slice/other.service"), dict(PrivateNetwork="no"),
+    dict(Environment="SECRET=private-secret")])
+def test_recovered_stop_rejects_replaced_invocation_or_profile_before_signal(monkeypatch, change):
+    prepared, receipt = _reconstructed_launch()
+    properties = dict(_observed_worker_profile(), Id=prepared.unit_name, ActiveState="active",
+        LoadState="loaded", ControlGroup=receipt.control_group, InvocationID=receipt.invocation_id) | change
+    def systemctl(args, **_kwargs):
+        assert "kill" not in args, "a substituted binding must not be signalled"
+        return subprocess.CompletedProcess(args, 0, stdout="".join(f"{k}={v}\n" for k, v in properties.items()).encode())
+    monkeypatch.setattr(launcher_module, "_systemd_client_environment", lambda: {})
+    monkeypatch.setattr(subprocess, "run", systemctl)
+    with pytest.raises(launcher_module.IsolationStopUnknown):
+        SystemdReadOnlyLauncher(systemctl="ctl").stop_prepared_launch(prepared, receipt)
+
+
+def test_normal_wait_rejects_replaced_invocation_even_with_empty_cgroup(monkeypatch):
+    prepared, receipt = _reconstructed_launch()
+    properties = dict(_observed_worker_profile(), Id=prepared.unit_name, ActiveState="inactive",
+        LoadState="loaded", ControlGroup=receipt.control_group, InvocationID="b" * 32)
+    monkeypatch.setattr(subprocess, "run", lambda args, **_kw: subprocess.CompletedProcess(args, 0,
+        stdout="".join(f"{k}={v}\n" for k, v in properties.items()).encode()))
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", lambda **_kw:
+        launcher_module.SandboxTerminationReceipt(prepared.unit_name, receipt.control_group, "inactive", True))
+    session = SandboxSession(process=_completed_process(), unit_name=prepared.unit_name,
+        systemctl="ctl", client_env={}, output_limit=1024, timeout_seconds=10,
+        staging=_TrackingStaging(), scope_cgroup=Path("/sys/fs/cgroup") / receipt.control_group.lstrip("/"))
+    session._launch_receipt = receipt
+    assert not session.wait().termination_confirmed
+
+
+@pytest.mark.parametrize("property_name", sorted(_observed_worker_profile()))
+def test_observer_rejects_every_missing_profile_property(monkeypatch, property_name):
+    prepared, receipt = _reconstructed_launch()
+    profile = _observed_worker_profile()
+    properties = dict(profile, Id=prepared.unit_name, ActiveState="active", LoadState="loaded",
+        ControlGroup=receipt.control_group, InvocationID=receipt.invocation_id)
+    del properties[property_name]
+    monkeypatch.setattr(subprocess, "run", lambda args, **_kw: subprocess.CompletedProcess(args, 0,
+        stdout="".join(f"{k}={v}\n" for k, v in properties.items()).encode()))
+    assert launcher_module._read_launch_receipt(prepared_launch=prepared,
+        expected_cgroup=Path("/sys/fs/cgroup") / receipt.control_group.lstrip("/"),
+        expected_profile=launcher_module._normalise_launch_profile(profile), client_env={}, timeout_seconds=0.001) is None
+
+
+def _mock_prepared_launch(monkeypatch):
+    import io
+    from types import SimpleNamespace
+    monkeypatch.setattr(launcher_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher_module, "_systemd_client_environment", lambda: {})
+    monkeypatch.setattr(launcher_module, "_systemd_cgroup_parent",
+        lambda *_args: Path("/sys/fs/cgroup/user.slice/app.slice"))
+    monkeypatch.setattr(subprocess, "run", lambda args, **_kw: subprocess.CompletedProcess(args, 0))
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: SimpleNamespace(
+        stdin=None, stdout=io.BytesIO(), stderr=io.BytesIO(), returncode=0, poll=lambda: 0))
+
+
+def test_prepared_launch_returns_observed_ack_without_collecting(monkeypatch, tmp_path):
+    _mock_prepared_launch(monkeypatch)
+    launcher = SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl")
+    prepared = launcher.prepare_launch()
+    def observe(**kwargs):
+        assert kwargs["prepared_launch"] == prepared
+        expected = kwargs["expected_profile"]
+        assert expected["PrivateNetwork"] == "yes" and expected["ProtectSystem"] == "strict"
+        assert expected["CPUQuotaPerSecUSec"] == "1000000"
+        assert expected["MemoryMax"] == "536870912"
+        assert expected["ExecStart"][1].startswith("/usr/bin/env -i PATH=/usr/bin:/bin ")
+        assert "BindReadOnlyPaths" in expected and "InaccessiblePaths" in expected
+        group = "/" + kwargs["expected_cgroup"].relative_to(Path("/sys/fs/cgroup")).as_posix()
+        return launcher_module.SandboxLaunchReceipt(prepared.launch_id, prepared.unit_name,
+            group, "a" * 32, launcher_module._profile_sha256(expected))
+    monkeypatch.setattr(launcher_module, "_read_launch_receipt", observe)
+    monkeypatch.setattr(SandboxSession, "wait", lambda _self: pytest.fail("launch must return before wait"))
+    session = launcher.launch(tmp_path, ["/bin/true"], prepared_launch=prepared)
+    assert session.launch_receipt.launch_id == prepared.launch_id
+    assert session._result is None
+    # The test transport ran no untrusted command and already exited.
+    session._process.stdout.close()
+    session._process.stderr.close()
+    launcher_module._discard_staging(session._staging)
+
+
+def test_prepared_unacknowledged_launch_retains_staging_and_consumes_epoch(monkeypatch, tmp_path):
+    _mock_prepared_launch(monkeypatch)
+    monkeypatch.setattr(launcher_module, "_read_launch_receipt", lambda **_kwargs: None)
+    launcher = SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl")
+    prepared = launcher.prepare_launch()
+    with pytest.raises(launcher_module.IsolationStartUnknown) as caught:
+        launcher.launch(tmp_path, ["/bin/true"], prepared_launch=prepared)
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    session = launcher._sessions[prepared.launch_id]
+    assert session.launch_receipt is None and session._staging.path.exists()
+    with pytest.raises(launcher_module.IsolationNotStarted):
+        launcher.launch(tmp_path, ["/bin/true"], prepared_launch=prepared)
+    # Only this test's already-completed fake transport can be discarded here.
+    session._process.stdout.close()
+    session._process.stderr.close()
+    launcher_module._discard_staging(session._staging)
+
+
+@pytest.mark.parametrize("token", ["has space", "semi;colon", "brace{", "quote\"", "back\\slash"])
+def test_only_prepared_launch_rejects_ambiguous_exec_tokens_before_spawn(monkeypatch, tmp_path, token):
+    _mock_prepared_launch(monkeypatch)
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: pytest.fail("ambiguous argv must not start"))
+    launcher = SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl")
+    with pytest.raises(launcher_module.IsolationNotStarted):
+        launcher.launch(tmp_path, ["/bin/echo", token], prepared_launch=launcher.prepare_launch())
+
+
+@pytest.mark.parametrize("change", [dict(InaccessiblePaths="-/run/user"),
+    dict(BindReadOnlyPaths="/tmp/source:/tmp/staging/workspace:rbind"),
+    dict(RestrictAddressFamilies="AF_UNIX AF_INET"), dict(LimitNOFILESoft="1024"),
+    dict(ExecStart="{ path=/bin/echo ; argv[]=/bin/echo bypass ; ignore_errors=no ; pending=yes }")])
+def test_weakened_path_exec_and_resource_profiles_never_ack(monkeypatch, change):
+    prepared, receipt = _reconstructed_launch()
+    profile = _observed_worker_profile()
+    properties = dict(profile, Id=prepared.unit_name, ActiveState="active", LoadState="loaded",
+        ControlGroup=receipt.control_group, InvocationID=receipt.invocation_id) | change
+    monkeypatch.setattr(subprocess, "run", lambda args, **_kw: subprocess.CompletedProcess(args, 0,
+        stdout="".join(f"{k}={v}\n" for k, v in properties.items()).encode()))
+    assert launcher_module._read_launch_receipt(prepared_launch=prepared,
+        expected_cgroup=Path("/sys/fs/cgroup") / receipt.control_group.lstrip("/"),
+        expected_profile=launcher_module._normalise_launch_profile(profile), client_env={}, timeout_seconds=0.01) is None
+
+
+def test_reconstructed_live_launch_is_killed_as_whole_unit_before_stop_proof(monkeypatch):
+    prepared, receipt = _reconstructed_launch()
+    properties = dict(_observed_worker_profile(), Id=prepared.unit_name, ActiveState="active",
+        LoadState="loaded", ControlGroup=receipt.control_group, InvocationID=receipt.invocation_id)
+    killed = []
+    def systemctl(args, **_kwargs):
+        if "kill" in args:
+            assert args[-1] == prepared.unit_name
+            assert "--kill-whom=all" in args and "--signal=SIGKILL" in args
+            killed.append(prepared.unit_name)
+            properties["ActiveState"] = "inactive"
+            return subprocess.CompletedProcess(args, 0)
+        names = {arg.removeprefix("--property=") for arg in args if arg.startswith("--property=")}
+        return subprocess.CompletedProcess(args, 0, stdout="".join(
+            f"{key}={properties[key]}\n" for key in names).encode())
+    monkeypatch.setattr(launcher_module, "_systemd_client_environment", lambda: {})
+    monkeypatch.setattr(subprocess, "run", systemctl)
+    monkeypatch.setattr(launcher_module, "_cgroup_is_empty", lambda _path: True)
+    result = SystemdReadOnlyLauncher(systemctl="ctl").stop_prepared_launch(prepared, receipt)
+    assert killed == [prepared.unit_name] and result.cgroup_empty
+
+
+@pytest.mark.parametrize("fault", [None, "mismatched-binding", "unknown-binding", "populated", "final-mismatch"])
+def test_recovered_stop_resamples_strict_receipt_only_after_exact_stopped_binding(monkeypatch, fault):
+    prepared, receipt = _reconstructed_launch()
+    state = dict(killed=False, collectors=0)
+    def systemctl(args, **kwargs):
+        if "kill" in args:
+            assert args[-1] == prepared.unit_name and "--kill-whom=all" in args
+            state["killed"] = True
+            return subprocess.CompletedProcess(args, 0)
+        names = {arg.removeprefix("--property=") for arg in args if arg.startswith("--property=")}
+        if names == {"ActiveState", "LoadState", "ControlGroup"}:
+            state["collectors"] += 1
+            # Real observed transition: inactive but still loaded/blank cgroup
+            # fails the unchanged standard collector. Only its next sample can
+            # witness collected identity plus independently empty old cgroup.
+            values = dict(ActiveState="inactive", LoadState="loaded" if state["collectors"] == 1 else "not-found",
+                ControlGroup="")
+        elif not state["killed"]:
+            values = dict(_observed_worker_profile(), Id=prepared.unit_name, LoadState="loaded",
+                ActiveState="active", ControlGroup=receipt.control_group, InvocationID=receipt.invocation_id)
+        else:
+            values = dict(_observed_worker_profile(), Id=prepared.unit_name, LoadState="not-found",
+                ActiveState="inactive", ControlGroup="", InvocationID="")
+            if fault == "unknown-binding":
+                return subprocess.CompletedProcess(args, 1, stdout=b"")
+            if fault == "mismatched-binding" or fault == "final-mismatch" and state["collectors"] >= 2:
+                values.update(LoadState="loaded", ControlGroup=receipt.control_group, InvocationID="b" * 32)
+        return subprocess.CompletedProcess(args, 0, stdout="".join(f"{key}={values[key]}\n" for key in names).encode())
+    monkeypatch.setattr(launcher_module, "_systemd_client_environment", lambda: {})
+    monkeypatch.setattr(subprocess, "run", systemctl)
+    monkeypatch.setattr(launcher_module, "_cgroup_is_empty", lambda path: fault != "populated")
+    collector_calls = []
+    original_collector = launcher_module._read_termination_receipt
+    def collect(**kwargs):
+        collector_calls.append(kwargs)
+        return original_collector(**kwargs)
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", collect)
+    launcher = SystemdReadOnlyLauncher(systemctl="ctl")
+    if fault is None:
+        stopped = launcher.stop_prepared_launch(prepared, receipt)
+        assert stopped.cgroup_empty and stopped.control_group == receipt.control_group
+        assert len(collector_calls) == 2
+    else:
+        with pytest.raises(launcher_module.IsolationStopUnknown):
+            launcher.stop_prepared_launch(prepared, receipt)
+        assert len(collector_calls) == (1 if fault in {"mismatched-binding", "unknown-binding"} else 2)
+    assert state["killed"]
+
+
+def test_collected_systemd_unit_may_omit_execstart_but_requires_exact_stopped_identity(monkeypatch):
+    prepared, receipt = _reconstructed_launch()
+    # Captured real systemd shape: no ExecStart at all for a collected unit.
+    properties = dict(Id=prepared.unit_name, LoadState="not-found", ActiveState="inactive",
+        ControlGroup="", InvocationID="", PrivateNetwork="no")
+    monkeypatch.setattr(subprocess, "run", lambda args, **_kw: subprocess.CompletedProcess(args, 0,
+        stdout="".join(f"{k}={v}\n" for k, v in properties.items()).encode()))
+    assert launcher_module._observe_prepared_binding(prepared, receipt, "ctl", {}) == "stopped"
+    properties["InvocationID"] = "b" * 32
+    assert launcher_module._observe_prepared_binding(prepared, receipt, "ctl", {}) is None
+
+
+def test_loaded_inactive_without_invocation_is_polled_until_actual_launch_observation(monkeypatch):
+    prepared, receipt = _reconstructed_launch()
+    profile = _observed_worker_profile()
+    pending = dict(profile, Id=prepared.unit_name, LoadState="loaded", ActiveState="inactive",
+        ControlGroup="", InvocationID="")
+    running = pending | dict(ActiveState="active", ControlGroup=receipt.control_group, InvocationID=receipt.invocation_id)
+    calls = []
+    def systemctl(args, **_kw):
+        calls.append(args)
+        value = pending if len(calls) == 1 else running
+        return subprocess.CompletedProcess(args, 0, stdout="".join(f"{k}={v}\n" for k, v in value.items()).encode())
+    monkeypatch.setattr(subprocess, "run", systemctl)
+    observed = launcher_module._read_launch_receipt(prepared_launch=prepared,
+        expected_cgroup=Path("/sys/fs/cgroup") / receipt.control_group.lstrip("/"),
+        expected_profile=launcher_module._normalise_launch_profile(profile), client_env={}, timeout_seconds=0.1)
+    assert observed == receipt and len(calls) == 2
+
+
+@pytest.mark.parametrize(("value", "microseconds"), [("1.250000s", "1250000"),
+    ("0.001ms", "1"), ("1.5ms", "1500"), ("1min 0.5s", "60500000"),
+    ("0.000001s", "1"), ("24h", "86400000000"), ("0.000000s", "0")])
+def test_effective_resource_timespans_normalize_finite_fractions_exactly(value, microseconds):
+    assert launcher_module._duration_usec(value) == microseconds
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "inf", "1e999s", "-1s", "+1s",
+    "0.1us", "1.0000001s", "1.0000000s", "24h 1us", "999999999d",
+    "18446744073709551615us", "1.2.3s", "9" * 200 + "s"])
+def test_resource_timespans_reject_nonfinite_negative_submicrosecond_and_overflow(value):
+    with pytest.raises(ValueError):
+        launcher_module._duration_usec(value)
+
+
+@pytest.mark.parametrize("field", ["launch_id", "unit_name", "control_group", "invocation_id", "profile_sha256"])
+def test_constructed_launch_receipt_fields_rejected_before_any_callback(monkeypatch, field):
+    from dataclasses import replace
+    calls = []
+    class Hostile:
+        def __ne__(self, other):
+            calls.append("ne")
+            return False
+        def __eq__(self, other):
+            calls.append("eq")
+            return True
+        def __str__(self):
+            calls.append("str")
+            return "private-receipt-sentinel"
+        def __fspath__(self):
+            calls.append("fspath")
+            return "/private-receipt-sentinel"
+    prepared, receipt = _reconstructed_launch()
+    unsafe = replace(receipt, **{field: Hostile()})
+    with pytest.raises(ValueError):
+        launcher_module._validate_launch_receipt(prepared, unsafe)
+    assert calls == []
+    monkeypatch.setattr(launcher_module, "_systemd_client_environment",
+        lambda: pytest.fail("invalid receipt must fail before consulting the host"))
+    with pytest.raises(launcher_module.IsolationStartUnknown) as caught:
+        SystemdReadOnlyLauncher().stop_prepared_launch(prepared, unsafe)
+    assert calls == []
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "private-" not in str(caught.value) + repr(caught.value)
+
+
+def _local_prepared_lifecycle(monkeypatch):
+    # Use actual bounded pipe collection; replace only systemd observations
+    # and the systemd transport with a controlled local echo interpreter.
+    popen = subprocess.Popen
+    _mock_prepared_launch(monkeypatch)
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kw: popen(
+        ["/usr/bin/python3", "-c", "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0))
+    def acknowledge(**kw):
+        prepared = kw["prepared_launch"]
+        group = "/" + kw["expected_cgroup"].relative_to(Path("/sys/fs/cgroup")).as_posix()
+        return launcher_module.SandboxLaunchReceipt(prepared.launch_id, prepared.unit_name,
+            group, "a" * 32, launcher_module._profile_sha256(kw["expected_profile"]))
+    def stopped(**kw):
+        return launcher_module.SandboxTerminationReceipt(kw["unit_name"],
+            "/" + kw["expected_cgroup"].relative_to(Path("/sys/fs/cgroup")).as_posix(), "inactive", True)
+    monkeypatch.setattr(launcher_module, "_read_launch_receipt", acknowledge)
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", stopped)
+    monkeypatch.setattr(launcher_module, "_observe_prepared_binding", lambda *_args: "stopped")
+    return stopped
+
+
+def test_confirmed_stopped_sessions_do_not_accumulate_or_retain_input(monkeypatch, tmp_path):
+    import weakref
+    _local_prepared_lifecycle(monkeypatch)
+    launcher = SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl")
+    for _ in range(8):
+        prepared = launcher.prepare_launch()
+        payload = b"private-input-sentinel" * 1024
+        session = launcher.launch(tmp_path, ["/usr/bin/cat"], prepared_launch=prepared, input_bytes=payload)
+        result = session.wait()
+        try:
+            assert result.stdout == payload and result.termination_confirmed
+            assert session.wait() is result
+            assert prepared.launch_id not in launcher._sessions
+            assert session._input_bytes is None
+            assert prepared.launch_id in launcher._consumed
+            reference = weakref.ref(session)
+        finally:
+            # Every test transport is controlled and has already exited.
+            launcher_module._discard_staging(session._staging)
+        del session, result
+        assert reference() is None
+    assert not launcher._sessions
+
+
+def test_unknown_sessions_remain_strongly_retained_with_no_retry(monkeypatch, tmp_path):
+    import weakref
+    _local_prepared_lifecycle(monkeypatch)
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", lambda **_kw: None)
+    launcher = SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl")
+    prepared = launcher.prepare_launch()
+    payload = b"private-unknown-input"
+    session = launcher.launch(tmp_path, ["/usr/bin/cat"], prepared_launch=prepared, input_bytes=payload)
+    result = session.wait()
+    assert not result.termination_confirmed and session.wait() is result
+    reference = weakref.ref(session)
+    del session
+    assert reference() is launcher._sessions[prepared.launch_id]
+    assert reference()._input_bytes == payload
+    with pytest.raises(launcher_module.IsolationNotStarted):
+        launcher.launch(tmp_path, ["/usr/bin/cat"], prepared_launch=prepared)
+    launcher_module._discard_staging(reference()._staging)  # Controlled local test transport only.
+
+
+def test_fresh_recovered_stop_retires_prior_cached_unknown_and_replays_wait(monkeypatch, tmp_path):
+    stopped = _local_prepared_lifecycle(monkeypatch)
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", lambda **_kw: None)
+    launcher = SystemdReadOnlyLauncher(systemd_run="run", systemctl="ctl")
+    prepared = launcher.prepare_launch()
+    session = launcher.launch(tmp_path, ["/usr/bin/cat"], prepared_launch=prepared, input_bytes=b"private-recovery-input")
+    cached = session.wait()
+    assert not cached.termination_confirmed and prepared.launch_id in launcher._sessions
+    receipt = session.launch_receipt
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", stopped)
+    fresh = launcher.stop_prepared_launch(prepared, receipt)
+    assert fresh.cgroup_empty and prepared.launch_id not in launcher._sessions
+    assert session._input_bytes is None
+    assert session.wait() is cached
+    assert launcher.stop_prepared_launch(prepared, receipt) == fresh
+    with pytest.raises(launcher_module.IsolationNotStarted):
+        launcher.launch(tmp_path, ["/usr/bin/cat"], prepared_launch=prepared)

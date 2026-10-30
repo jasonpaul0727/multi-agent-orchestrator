@@ -83,6 +83,17 @@ class RecoveredPendingArtifact:
 
 
 @dataclass(frozen=True)
+class RecoveredControlState:
+    """Consistent durable control metadata, without an artifact-byte claim."""
+
+    lifecycle: RunLifecycleState
+    agents: AgentRegistryState
+    budget: BudgetBalance
+    active_attempts: tuple[RecoveredAttemptLease, ...]
+    effects: tuple[RecoveredEffect, ...]
+
+
+@dataclass(frozen=True)
 class RecoveredRun:
     """Consistent lifecycle, Agent, budget, effect, artifact, and scheduler views."""
 
@@ -122,6 +133,26 @@ class RunRecoveryCoordinator:
             raise RunRecoveryError("Run recovery failed a durable-state invariant") from exc
 
     def _recover(self, run_id: str) -> RecoveredRun:
+        control = self._recover_control_state(run_id)
+        attempts = {(node.spec.node_id, attempt.attempt_id): attempt
+            for node in control.lifecycle.nodes for attempt in node.attempts}
+        return RecoveredRun(
+            lifecycle=control.lifecycle, agents=control.agents, budget=control.budget,
+            active_attempts=control.active_attempts, effects=control.effects,
+            artifacts=self._recover_artifacts(run_id, attempts),
+            pending_artifacts=self._recover_pending_artifacts(run_id, attempts),
+        )
+
+    def recover_control_state(self, run_id: str) -> RecoveredControlState:
+        """Replay the shared control invariants; never inspect artifact files."""
+        try:
+            return self._recover_control_state(run_id)
+        except RunRecoveryError:
+            raise
+        except Exception as exc:
+            raise RunRecoveryError("Run recovery failed a durable-state invariant") from exc
+
+    def _recover_control_state(self, run_id: str) -> RecoveredControlState:
         lifecycle_controller = LifecycleController(self.event_store)
         lifecycle = lifecycle_controller.replay(run_id)
         if lifecycle.run_id != run_id:
@@ -157,9 +188,6 @@ class RunRecoveryCoordinator:
                 "succeeded", "failed", "cancelled"
             }:
                 raise RunRecoveryError("terminal Attempt has an unresolved external effect")
-        artifacts = self._recover_artifacts(run_id, attempts)
-        pending_artifacts = self._recover_pending_artifacts(run_id, attempts)
-
         active_attempts: list[RecoveredAttemptLease] = []
         expected_agent_status = {
             "accepted": "active",
@@ -244,14 +272,12 @@ class RunRecoveryCoordinator:
             raise RunRecoveryError("Agent Registry and scheduler active counts disagree")
         if balance.reserved_minor < 0 or balance.unknown_minor < 0:
             raise RunRecoveryError("budget replay produced a negative held balance")
-        return RecoveredRun(
+        return RecoveredControlState(
             lifecycle=lifecycle,
             agents=agents,
             budget=balance,
             active_attempts=tuple(sorted(active_attempts, key=lambda item: item.attempt_ref)),
             effects=effects,
-            artifacts=artifacts,
-            pending_artifacts=pending_artifacts,
         )
 
     def _recover_effects(
@@ -737,6 +763,7 @@ def _parse_aware_timestamp(value: object) -> datetime:
 __all__ = [
     "RecoveredArtifact",
     "RecoveredAttemptLease",
+    "RecoveredControlState",
     "RecoveredEffect",
     "RecoveredRun",
     "RunRecoveryCoordinator",
