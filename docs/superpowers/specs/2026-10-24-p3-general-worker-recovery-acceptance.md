@@ -9,8 +9,11 @@ Provider invocation. Ambiguous effects remain held and block new dispatch.
 
 This is local acceptance evidence with explicitly offline Provider, credential,
 sender-stop and trusted-usage fixtures. It does not establish online delivery,
-actual billing or completion of all P3 work. Task4's independent task review and
-the final whole-slice review are **pending controller gates after the C commit**.
+actual billing or completion of all P3 work. An independent reviewer completed
+Task4 review for `883c99c..3c96b4b` with no Critical, Important or Minor issues;
+its focused outside-diff check confirmed exact task-text equality. The final
+whole-slice review from `36423cf` remains a controller gate.
+
 No PR, main integration, deployment or P5 execution is part of this acceptance.
 
 ## Tested revision and provenance
@@ -372,7 +375,8 @@ The metadata-only SQL boundary applies to new general authority paths. Existing
 legacy/bootstrap artifact recovery retains its prior file checks; this evidence
 does not reclassify those older checks as IO-free.
 
-After C's ordinary push/quota gate, the controller still owns independent
-Task4 spec/quality review and ONE whole-branch review from `36423cf`, with a
-bounded fix wave/scoped re-review if needed. This document does not claim those
-pending reviews have already approved the slice.
+The independent Task4 spec/quality review on `883c99c..3c96b4b` found no Critical,
+Important or Minor issues and did not rerun tests. One full-slice review from
+`36423cf` to the final reviewed revision remains. If it finds an actionable issue, use
+a bounded fix wave and scoped re-review. This document does not claim that the
+pending full-slice review has already approved the slice.
