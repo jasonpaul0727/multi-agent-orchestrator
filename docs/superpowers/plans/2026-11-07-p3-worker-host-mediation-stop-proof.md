@@ -1,0 +1,92 @@
+# Worker Host Mediation and Operation Stop Proof Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox ( - [ ] ) syntax for tracking.
+
+**Goal:** Add an opt-in single read-only Worker-to-host action with an operation-wide, recoverable stop proof and fail-closed handling of unknown effects.
+**Architecture:** Preserve v1 behavior and introduce a disabled-by-default v2 path. A single-store write-lock gate serializes both versions, every actor receives a durable prelaunch permit and exact ACK/stop/transport evidence, and host-owned policy, private capture and canonical output authorize acceptance only with a matching closed census.
+**Tech Stack:** Python, SQLiteEventStore, pytest, Linux systemd user units, isolated workspace snapshots.
+**Spec:** docs/superpowers/specs/2026-11-07-p3-worker-host-mediation-stop-proof-design.md
+
+## Global Constraints
+
+- Work only in the designated isolated P3 worktree and feature branch. Preserve unrelated changes and all ledgers/worktrees.
+- The v2 feature is disabled by default until every gate and real-system acceptance passes. Never weaken v1 behavior.
+- No paid Provider calls, real credentials, shared dependency installation, PR, deployment, force push, or main merge. Local loopback TLS fixture is permitted.
+- Unknown Provider outcome is never resent. An unACKed launch permit, missing capture after possible success, unknown settlement, or unverifiable stop/transport evidence remains held.
+- Use one owning SQLite connection/thread and BEGIN IMMEDIATE for each cross-stream decision; no I/O or untrusted callbacks inside the write transaction.
+- Host policy authority must be restart-readable, monotonic, authenticated, same-store and serialized with permit creation; external independently changing state cannot grant permission. Only allow is executable.
+- Tool is fixed workspace.list_root mapped to system.readonly-command, fixed /usr/bin/ls -1b --sort=name -- ., C.UTF-8, isolated snapshot cwd; complete listing at most 4096 bytes. No additional model call.
+- Composite JSON, file authorization, redaction, stop evidence and state/release matrix follow the spec exactly.
+- TDD: demonstrate intended failing test before production code; run focused and required full verification; independent task and whole-slice review.
+- At most 5 completed tasks per Los Angeles calendar day. Check usage immediately before each dispatch and after each push; stop at used >=50% or unavailable.
+- Each task has at least three meaningful normal pushes to the feature branch, no empty commits. A red test push may be transient on the feature branch; never merge incomplete work to main.
+- No plan workspace, branch, recovery ledger or worktree deletion even when a skill suggests cleanup.
+
+## Review Focus
+
+- Delayed launcher resumes after close or host crash: test pre-Popen and post-Popen/pre-ACK barriers, transport quiescence, and held state.
+- v1/v2 or old/new attempts race Scheduler release: test two independent connections and both orderings; no actor starts after release.
+- Policy revocation races launch, private capture authorization or acceptance: test each ordering with concurrent connections and no output disclosure.
+- Host dies with tool output only in pipe versus after durable capture and stop: first stays held, second recovers once without replay.
+- Composite swaps or corrupts private publications, uses oversized/invalid Unicode, or logs sensitive content: exact byte comparison, limits, scoped access and sentinel tests.
+
+## File and interface map
+
+Existing files: src/orchestrator/runtime/general_worker_{authority,execution,journal,process,protocol}.py; src/orchestrator/scheduler/core.py; src/orchestrator/persistence/sqlite_event_store.py; src/orchestrator/isolation/{launcher,workspace,_exec}.py; src/orchestrator/models/provider_sender.py; src/orchestrator/runtime/verifier_process.py; src/orchestrator/security/policy.py; src/orchestrator/tools/gateway.py; src/orchestrator/artifacts/{store,grants}.py.
+
+Create focused modules under src/orchestrator/runtime for the v2 journal/gate, actor protocol, policy authority, private capture and composite. Names and contracts are fixed per task below. Modify the existing implementations only where required to route their real public calls through those interfaces. Test paths are exact below; retain existing helpers rather than duplicating a whole application.
+
+No task may advertise v2 as available before Task 5 is complete. Any interface whose exact production dependencies require an adjustment must be recorded as a ruling with reason, effect on downstream signatures and review evidence; never invent successful stop, policy or usage evidence.
+
+---
+
+### Task 1: Characterize and close v1 launch versus release gap
+
+**Files:** Modify src/orchestrator/runtime/general_worker_journal.py, general_worker_execution.py, general_worker_authority.py, src/orchestrator/scheduler/core.py and src/orchestrator/persistence/sqlite_event_store.py as required; create tests/unit/runtime/test_general_worker_atomic_gate.py and extend tests/unit/runtime/test_general_worker_authority.py.
+
+**Interfaces:** Preserve public v1 calls. Introduce in src/orchestrator/runtime/general_worker_gate.py an owned-transaction gate GeneralWorkerGate that is constructed with the actual SQLiteEventStore, and expose check_v1_prepare(operation, phase, prepared) plus check_release(run_id, node_id) only while the store's owning write transaction is held. Match existing concrete types in signatures and enforce owned-lock precondition; return no external authority objects. The owned gate samples real UTC exactly once after acquiring its own write lock, passes that value only to private pure checks, and never trusts a caller-supplied or pre-lock timestamp. SQLiteEventStore must maintain a private connection-and-thread-bound owned-write transaction marker created only after its own BEGIN IMMEDIATE succeeds, cleared on commit/rollback/finally, and correctly propagated to legitimate same-connection nested savepoints. Unknown ambient or read-only transactions fail closed; in_transaction by itself is not proof. Later v2 census extends this gate in Task 2.
+
+- [ ] **A: Write characterization tests.** Reuse dispatch_case(tmp_path, register=False), an actual durable SQLite database and journal.request(**case.registration); use a fresh connection per thread. In test_release_wins_after_eligibility_before_prepare, connection A resolves request eligibility and waits; connection B finishes the same attempt failed with known_no_effect=True and commits; resume A's public journal.prepare_turn. Assert prepare is rejected, no prepared event exists and no launcher can run. In test_prepare_wins_before_release, commit a prepared turn before attempting release; assert release rejected and no AttemptSlotReleased. Use real barriers and no timing sleeps. Record observed RED or already-safe result honestly; if the setup cannot reach finish, fix test assumptions rather than claiming a race. The primary characterization must exercise public service execute using execution_case from tests/unit/runtime/test_general_worker_execution.py: intercept its real journal.prepare_turn after the second eligibility check, let an independently connected Scheduler release, then resume the original method; start_turn is only a call-recording sentinel and must have zero calls after release. Use bounded waits and propagate thread errors. The direct journal test is additional, not a replacement.
+- [ ] Run python -m pytest tests/unit/runtime/test_general_worker_atomic_gate.py -v. Record exact failure and prove it exercises the real public path. Commit and push the substantive characterization.
+- [ ] **B: Close the reachable gap and establish a shared v1 gate.** Under one owned write lock atomically re-read Scheduler fence, current operation and preconditions before appending prepare; route all actual public v1 prepare/registration and release/terminal/cancel/reconcile entry points through the gate without stale pre-lock decisions, cross-thread connection sharing or callbacks. Keep v1 receipt semantics and existing signatures. Add inverse/race tests as needed. Run the focused file, tests/unit/runtime/test_general_worker_journal.py, test_general_worker_authority.py and test_general_worker_execution.py; commit and push implementation.
+- [ ] **C: Regression and independent review package.** Add direct-entry, stale lease, unknown/read-only ambient transaction, forged ownership, legitimate nested append_checked, nested rollback and competing-connection tests; run the four focused files and the appropriate v1 integration slice. Commit and push the substantive regression coverage. Request independent spec/quality review and fix all load-bearing findings before marking complete.
+
+### Task 2: Durable actor registry, permit and operation seal
+
+**Files:** Create src/orchestrator/runtime/mediation_journal.py and mediation_actors.py; extend general_worker_gate.py and Scheduler/v1 public gates; tests/unit/runtime/test_mediation_journal.py, test_mediation_actor_gate.py and test_mediation_cross_version_races.py.
+
+**Interfaces:** Provide MediationJournal.register(operation), permit(operation_id, actor_intent), record_ack(operation_id, actor_id, ack), record_stop(operation_id, actor_id, stop, transport_proof), close(operation_id), seal(operation_id) and load(operation_id); define immutable typed records in mediation_actors.py with explicit operation/fence/actor sequence, prepared identity, ACK, exact unit stop and independently bound transport quiescence evidence. Return immutable replayed state. The concrete verifier of evidence must be host-owned, not supplied by API callers. Extend GeneralWorkerGate to enumerate bounded indexed v1/v2 operations by run/node across attempts/generations and reject incompatible work under the same lock.
+
+- [ ] **A:** Test and implement versioned event replay and strict identity/digest validation; reject duplicates, mismatched ACK/stop, unknown ambient transactions, capacity overflow and permit after close. Verify unACKed permit remains launch_unknown even when no unit is observed. Push meaningful tests and initial registry.
+- [ ] **B:** TDD the single atomic v1/v2 and cross-generation census and all Scheduler release/accept/cancel/reconcile/successor entry points, both commit orders using independent connections. Implement shared gate with same-connection nested writes only. Test no public v1 journal entry bypasses it. Push meaningful gate changes.
+- [ ] **C:** TDD close and canonical seal: no new permit after close, late authenticated ACK/stop allowed, each actor and transport evidence hash bound, all unknown/conflicting or unresolved Provider states held, stale seal rejected. Include barriers before Popen and between Popen/ACK, with a permitted delayed transport retained in the census. Push meaningful seal/tests, run relevant v1/v2 unit suites, get independent task review.
+
+### Task 3: Concrete actor supervisors and transport proof
+
+**Files:** Modify src/orchestrator/isolation/launcher.py, runtime/general_worker_process.py, models/provider_sender.py, runtime/verifier_process.py; extend mediation_actors.py; tests/unit/runtime/test_mediation_supervision.py, tests/integration/test_mediation_systemd_actors.py.
+
+**Interfaces:** For each Worker, tool, Provider sender and Verifier, supply host-owned prepare → durable permit → start → authentic ACK → exact unit stop plus transport quiescence evidence to MediationJournal. Preserve legacy callers. A restart verifier must validate persisted boot/unit/invocation/cgroup and exact transport identity; if transport ending cannot be proved, return held. Test-only launchers are not production authority.
+
+- [ ] **A:** Write failing tests for prepare-before-Popen, exact ACK binding, unknown prior to ACK and mismatched/reused identity; implement the shared owned protocol and Worker adapter. Push real code/tests.
+- [ ] **B:** TDD Provider sender and Verifier adapters, including to_thread cancellation and persisted transport proof, preserving existing v1 paths. A stopped sender does not settle Provider outcome. Push real code/tests.
+- [ ] **C:** TDD actual systemd Worker/tool/sender/Verifier lifecycle including local loopback TLS genuine sender, unit/cgroup plus transport death, cancellation, timeout, delayed launch and SIGKILL retaining a transport. Unknown exact transport remains held. Push substantive integration work, run focused suites and review independently. Never use fake receipts to assert real stop.
+
+### Task 4: Same-store policy, fixed tool and private capture
+
+**Files:** Create runtime/mediation_policy.py and mediation_capture.py; modify security/policy.py, tools/gateway.py, artifacts/store.py and grants.py only as required; tests/unit/runtime/test_mediation_policy.py, test_mediation_capture.py, tests/integration/test_mediation_tool.py.
+
+**Interfaces:** MediationPolicyAuthority.install_trusted_snapshot(snapshot), revoke(change), decide_locked(operation, action, now) must authenticate bootstrap, enforce monotonic version/scope and run under owned store lock; it returns allow/deny/needs_approval, never uses a runtime callback as authority. MediationCapture.publish_private(operation, actor, bytes), authorize_locked(publication, policy_version, fence, now), read_authorized(operation, publication) separate file I/O from transactional authorization and bind immutable scope, ID, digest and length. A staging file is private and unreadable through normal artifact APIs until authorization. Existing publish_bytes immediately emits ArtifactPublished and existing reads authorize any same-digest publication in scope; therefore do not call it for staging. Introduce an exact-publication-ID v2 authorization check on every v2 read, with current policy/revocation verification, or an equivalent inaccessible staging namespace and an atomic authorized publication transition. Existing digest/scope grants must not derive new read or metadata rights from this. Existing read_bytes, get_record and list_publications paths must not disclose v2 publication/operation association or derive authority from an unauthorized or revoked v2 publication. An independently authorized legacy publication of identical bytes remains readable under its own authority, including empty bytes; the oracle is no new rights or association leakage, not revocation of pre-existing legitimate access. Failed authorization leaves a nonreusable orphan.
+
+- [ ] **A:** TDD durable bootstrap, identity, replay, rollback/revocation and absence cases with two connections; integrate pure existing policy/manifest and grant rules without weakening ToolGateway. Allow only explicit allow; needs_approval consumes nothing and blocks launch. Push implementation and tests.
+- [ ] **B:** TDD fixed action mapping and real snapshot tool argv/locale/cwd; invalid UTF-8 and >4096 bytes hold without truncation. The supervisor from Task 3 is mandatory. Prove ongoing cancellation/revocation supervision. Push implementation and tests.
+- [ ] **C:** TDD private capture with outside-lock fsync/publication and locked authorization, empty value distinct from missing, stale policy/fence, authorization/acceptance revocation races, orphan invisibility through the real artifact read APIs, same-digest multiple publication and empty listing, pre-existing scope grants, revoked grants, and exact receipt binding. Real launcher tests cover hidden, control/non-UTF8, empty, oversized and snapshot failure. Push substantive changes, run focused and integration suites, independent review.
+
+### Task 5: Worker protocol, composite acceptance and real recovery
+
+**Files:** Modify runtime/general_worker_protocol.py, general_worker_process.py, general_worker_execution.py, general_worker_authority.py and application wiring with version-specific v2 handlers; create runtime/mediation_composite.py; tests/unit/runtime/test_mediation_composite.py and test_mediation_execution.py, tests/integration/test_mediation_restart_process.py.
+
+**Interfaces:** build_composite(provider_text: str, listing: str) -> bytes emits exactly spec canonical JSON and validates the operation output limit <=16384; host privately rereads exact scoped captures, compares completion bytes and rechecks immutable publication bindings in locked acceptance. v1 equality rules remain unchanged. V2 Worker emits one validated fixed action after one known Provider response; no Worker-supplied command or authority.
+
+- [ ] **A:** TDD canonical composite, empty/special Unicode listing, escaping expansion, >limit, malformed/duplicate/extra fields, forged/swapped/truncated source publications and sentinel redaction. Implement fixed completion protocol and host comparison; push substantial changes.
+- [ ] **B:** TDD v2 application wiring, policy/permit/ACK/stop/capture/Verifier/seal/acceptance fence, known failure matrix, current authority rechecks, disabled-by-default behavior and no second Provider call or unknown resend. Push substantive integration.
+- [ ] **C:** Run genuine independent-process SIGKILL scenarios: after tool ACK but before durable capture => exact stop if provable, result_missing held, zero retry; after both exact stop/transport evidence and authorized capture => recover exact artifact and finish with one tool and one Provider call. Cover in-flight transport, permission revocation, and same-boot/store limitations. Push substantive test/fixes. Run whole feature slice, full suite plus statement coverage and independent whole-slice review; record actual commands/results and remaining platform/Provider boundaries. Do not merge to main without separate authorization.

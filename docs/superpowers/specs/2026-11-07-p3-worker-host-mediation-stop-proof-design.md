@@ -249,7 +249,18 @@ but may not invent either. Unknown or ambiguous evidence fails closed.
 The tool executes at most once for a given committed intent. Its private
 output is captured, size/UTF-8 validated and durably published with immutable
 identity, digest and length before a checkpoint claims it exists. A recorded
-start or hash alone is not recoverable output. Crash after tool ACK while
+start or hash alone is not recoverable output. Existing publish_bytes emits
+ArtifactPublished immediately and existing reads can authorize any same-digest
+publication in scope; neither is sufficient to hide an unauthorized orphan.
+Use a truly inaccessible staging namespace plus an authorized publication
+transition, or exact-publication-ID v2 read checks with current policy and
+revocation. Existing digest/scope grants must never acquire new read or metadata rights
+from unauthorized v2 publications; read_bytes, get_record and list_publications
+must not disclose v2 publication/operation association. Independently
+previously authorized identical bytes (including empty bytes) remain readable
+under their own legacy authority; no rule revokes that existing access. Test
+that v2 orphan or revocation adds no rights or association leakage through real
+artifact APIs, including same-digest multiple publications. Crash after tool ACK while
 output remains only in a host pipe can lose it: recover the exact stop if
 possible, then persist result_missing/unknown, prohibit automatic re-execution,
 do not send the listing elsewhere, and keep the operation and resource release
