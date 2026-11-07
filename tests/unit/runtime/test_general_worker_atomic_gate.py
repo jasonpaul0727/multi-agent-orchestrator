@@ -102,5 +102,3 @@ def test_prepare_wins_before_release(tmp_path):
         assert not any(e.event_type == "AttemptSlotReleased" for e in scheduler_events(case.store))
     finally:
         case.store.close()
-
-
