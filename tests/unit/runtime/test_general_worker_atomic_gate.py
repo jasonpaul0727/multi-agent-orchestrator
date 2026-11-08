@@ -773,3 +773,179 @@ def test_execute_lease_expires_after_recheck_before_prepare(tmp_path, monkeypatc
         assert case.journal.read(case.identity).turns == ()
     finally:
         case.app.close()
+
+
+@pytest.mark.parametrize("entry", ["finish", "reconcile", "unknown"])
+def test_old_exact_receipt_replays_while_new_attempt_worker_is_live(tmp_path, entry):
+    from datetime import timedelta
+    from orchestrator.runtime.general_worker_authority import general_worker_host_scope
+    from orchestrator.runtime.general_worker_journal import metadata_hash
+    from tests.support.attempt_acceptance import ADMISSION
+    from tests.unit.lifecycle.test_scheduler import routed_pair
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        first = dict(case.identity)
+        case.journal.request(**case.registration)
+        at = datetime.now(timezone.utc)
+        if entry == "finish":
+            case.scheduler.finish_attempt(**first, completed_at=at, outcome="failed", known_no_effect=True)
+            receipt = dict(completed_at=at, outcome="failed", known_no_effect=True)
+        else:
+            case.scheduler.finish_attempt(**first, completed_at=at, outcome="outcome_unknown")
+            case.scheduler.reconcile_attempt(**first, reconciled_at=at, outcome="failed", known_no_effect=True)
+            receipt = (dict(completed_at=at, outcome="outcome_unknown", known_no_effect=False)
+                if entry == "unknown" else dict(reconciled_at=at, outcome="failed", known_no_effect=True))
+        routing, decision = routed_pair(case.registry, case.config, case.policy, attempt=2,
+            contract_hash=case.contract.contract_hash)
+        now = datetime.now(timezone.utc)
+        case.scheduler.accept_routing(routing, decision, accepted_at=now,
+            lease_expires_at=now + timedelta(minutes=5), **ADMISSION)
+        second = dict(run_id="run-1", node_id="node-1", attempt_id=routing.attempt_id, fencing_generation=2)
+        binding = case.scheduler._resolve_general_verification_binding(**second, as_of=now)
+        operation = case.journal.request(context=binding.context, input_commitment="sha256:" + "a" * 64,
+            accepted_route_sha256=metadata_hash(binding.active_attempt.accepted_route.model_dump(mode="json")),
+            workspace_identity_hash=case.lifecycle.replay("run-1").workspace_identity_hash,
+            host_scope_hash=general_worker_host_scope(case.store), output_byte_limit=16384)
+        prepared = epoch()[0]
+        active = case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+        before = scheduler_events(case.store)
+        with SQLiteEventStore(tmp_path / "events.db") as independent:
+            scheduler = Scheduler(independent, limits=_application_limits())
+            method = scheduler.reconcile_attempt if entry == "reconcile" else scheduler.finish_attempt
+            method(**first, **receipt)
+            assert scheduler_events(independent) == before
+            changed = dict(receipt)
+            time_field = "reconciled_at" if entry == "reconcile" else "completed_at"
+            changed[time_field] += timedelta(microseconds=1)
+            with pytest.raises(SchedulerError, match="idempotency key was reused"):
+                method(**first, **changed)
+            with pytest.raises(SchedulerError, match="idempotency key was reused"):
+                method(**{**first, "fencing_generation": 99}, **receipt)
+            with pytest.raises(SchedulerError):
+                method(**first, **{**receipt, "known_no_effect": 1})
+            with pytest.raises(SchedulerError):
+                scheduler.finish_attempt(**second, completed_at=now, outcome="failed", known_no_effect=True)
+            assert scheduler_events(independent) == before
+            assert scheduler._resolve_general_active_attempt(**second, as_of=now).accepted_route.attempt_id == second["attempt_id"]
+        assert case.journal.read(active.identity) == active
+        assert active.turns[-1].launch_receipt is None
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("sql", ["ROLLBACK /* TO */", "rollback TRANSACTION /* TO */", "rollback -- TO\n"])
+def test_rollback_comments_cannot_preserve_ownership(tmp_path, sql):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        def replace_transaction(_events, _version):
+            case.store._connection.execute(sql)
+            case.store._connection.execute("SAVEPOINT foreign_transaction")
+            with pytest.raises(GeneralWorkerJournalError):
+                case.journal.request(**case.registration)
+        case.store.append_checked("scheduler", "global", "commented-rollback", replace_transaction)
+        assert case.journal.read(case.operation.identity) is None
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("sql", [
+    'ROLLBACK TO nested_test',
+    'rollback /* comment */ TRANSACTION /* comment */ to SAVEPOINT nested_test',
+    'ROLLBACK TRANSACTION TO SAVEPOINT "TO"',
+])
+def test_savepoint_rollback_preserves_real_outer_ownership(tmp_path, sql):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        def outer(_events, _version):
+            name = '"TO"' if '"TO"' in sql else 'nested_test'
+            case.store._connection.execute(f"SAVEPOINT {name}")
+            case.store._connection.execute(sql)
+            case.store._connection.execute(f"RELEASE SAVEPOINT {name}")
+            case.journal.request(**case.registration)
+        case.store.append_checked("scheduler", "global", "real-savepoint", outer)
+        assert case.journal.read(case.operation.identity) is not None
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("statement", ["ROLLBACK nonsense TO name", "ROLLBACK TO", "ROLLBACK /* TO", "ROLLBACK TO SAVEPOINT"])
+def test_unknown_rollback_trace_fails_closed(tmp_path, statement):
+    from weakref import ref
+    from orchestrator.persistence.sqlite_event_store import _watch_transaction
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        def outer(_events, _version):
+            assert case.store._has_owned_write()
+            _watch_transaction(ref(case.store), statement)
+            assert not case.store._has_owned_write()
+            with pytest.raises(GeneralWorkerJournalError):
+                case.journal.request(**case.registration)
+        case.store.append_checked("scheduler", "global", "unknown-trace", outer)
+        assert case.journal.read(case.operation.identity) is None
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("entry", ["finish", "reconcile"])
+def test_matching_event_without_durable_terminal_state_is_not_receipt(tmp_path, entry):
+    from orchestrator.persistence import EventDraft
+    from orchestrator.scheduler.core import _attempt_ref
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        at = datetime.now(timezone.utc)
+        if entry == "reconcile":
+            case.scheduler.finish_attempt(**case.identity, completed_at=at, outcome="outcome_unknown")
+        attempt_ref = _attempt_ref(case.identity["run_id"], case.identity["node_id"], case.identity["attempt_id"])
+        time_field = "reconciled_at" if entry == "reconcile" else "completed_at"
+        payload = dict(attempt_ref=attempt_ref, **case.identity, **{time_field: at.isoformat()},
+            outcome="failed", usage_hash=None, known_no_effect=True)
+        key = ("finish:" if entry == "finish" else "reconcile:") + attempt_ref
+        version = case.store.current_version("scheduler", "global")
+        case.store.append("scheduler", "global", version, [EventDraft("AttemptSlotReleased", payload,
+            **case.identity, correlation_id="run-1", causation_id=case.decision.decision_hash)], key)
+        before = scheduler_events(case.store)
+        method = case.scheduler.finish_attempt if entry == "finish" else case.scheduler.reconcile_attempt
+        with pytest.raises(SchedulerError):
+            method(**case.identity, **{time_field: at}, outcome="failed", known_no_effect=True)
+        assert scheduler_events(case.store) == before
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("name", ['"name -- TO"', '"/* TO */"', "'quoted name'", '`TO`', '[TO]', '"雪"'])
+def test_rollback_to_quoted_savepoint_retains_owned_transaction(tmp_path, name):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        def outer(_events, _version):
+            case.store._connection.execute(f"SAVEPOINT {name}")
+            case.store._connection.execute(f"rollback /* comment */ TRANSACTION TO SAVEPOINT {name}")
+            assert case.store._has_owned_write()
+            case.store._connection.execute(f"RELEASE SAVEPOINT {name}")
+            case.journal.request(**case.registration)
+        case.store.append_checked("scheduler", "global", "quoted-savepoint", outer)
+        assert case.journal.read(case.operation.identity) is not None
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("mutation", ["missing-null-field", "extra-field"])
+def test_historical_receipt_requires_exact_persisted_payload(tmp_path, mutation):
+    from orchestrator.persistence.sqlite_event_store import _sha256_json, canonical_json
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        at = datetime.now(timezone.utc)
+        case.scheduler.finish_attempt(**case.identity, completed_at=at, outcome="failed", known_no_effect=True)
+        event = next(e for e in scheduler_events(case.store) if e.event_type == "AttemptSlotReleased")
+        payload = dict(event.payload)
+        if mutation == "missing-null-field":
+            del payload["usage_hash"]
+        else:
+            payload["unexpected"] = True
+        # Simulate an internally consistent payload edit outside the immutable API.
+        case.store._connection.execute("DROP TRIGGER events_immutable_update")
+        case.store._connection.execute("UPDATE events SET payload_json=?, payload_hash=? WHERE event_id=?",
+            (canonical_json(payload), _sha256_json(payload), event.event_id))
+        with pytest.raises(SchedulerError, match="idempotency key was reused"):
+            case.scheduler.finish_attempt(**case.identity, completed_at=at, outcome="failed", known_no_effect=True)
+    finally:
+        case.store.close()

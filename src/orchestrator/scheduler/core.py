@@ -1095,6 +1095,18 @@ class Scheduler:
         return any(event.event_type == "AttemptSlotReleased" and all(getattr(event, name) == value
             for name, value in _identity_value(identity).items()) for event in events)
 
+    @staticmethod
+    def _matches_terminal_receipt(event, event_type, payload):
+        return (event.event_type == event_type and _hash(dict(event.payload)) == _hash(payload)
+            and event.run_id == payload["run_id"] and event.node_id == payload["node_id"]
+            and event.attempt_id == payload["attempt_id"]
+            and event.fencing_generation == payload["fencing_generation"]
+            and event.correlation_id == payload["run_id"])
+    def _validate_historical_terminal(self, run_id):
+        try:
+            self.recovery.recover_control_state(run_id)
+        except RunRecoveryError:
+            raise SchedulerError("historical terminal receipt lacks consistent durable state") from None
     def _check_general_release_claim(self, *, run_id, node_id, attempt_id, fencing_generation,
         scope, trusted_usage, events, entry, usage, known_no_effect, at):
         from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
@@ -1315,6 +1327,8 @@ class Scheduler:
         usage: UsageRecord | None = None,
         known_no_effect: bool = False,
     ) -> None:
+        if type(fencing_generation) is not int or fencing_generation <= 0 or type(known_no_effect) is not bool:
+            raise SchedulerError("attempt completion has invalid receipt identity or proof")
         if outcome == "succeeded":
             raise SchedulerError("attempt success requires durable verifier proof")
         completed_at = _aware(completed_at, "completed_at")
@@ -1339,17 +1353,17 @@ class Scheduler:
         key = f"finish:{attempt_ref}"
 
         def decide(events: list[StoredEvent], version: int):
+            prior = [item for item in events if item.idempotency_key == key]
+            if prior:
+                expected_type = "AttemptOutcomeUnknown" if outcome == "outcome_unknown" else "AttemptSlotReleased"
+                if len(prior) != 1 or not self._matches_terminal_receipt(prior[0], expected_type, op_payload):
+                    raise SchedulerError("attempt completion idempotency key was reused")
+                self._validate_historical_terminal(run_id)
+                return None
             if outcome != "outcome_unknown":
                 self._check_general_release_claim(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
                     fencing_generation=fencing_generation, scope=general_scope, trusted_usage=general_usage,
                     events=events, entry="finish", usage=usage, known_no_effect=known_no_effect, at=completed_at)
-            prior = next((item for item in events if item.idempotency_key == key), None)
-            if prior is not None:
-                if prior.event_type not in {"AttemptSlotReleased", "AttemptOutcomeUnknown"} or any(
-                    prior.payload.get(name) != value for name, value in op_payload.items()
-                ):
-                    raise SchedulerError("attempt completion idempotency key was reused")
-                return None
             accepted = _active_acceptance(events, attempt_ref)
             if accepted is None or accepted.payload.get("run_id") != run_id:
                 raise LifecycleConflict("attempt is not holding an active scheduler lease")
@@ -1610,6 +1624,8 @@ class Scheduler:
         usage: UsageRecord | None = None,
         known_no_effect: bool = False,
     ) -> None:
+        if type(fencing_generation) is not int or fencing_generation <= 0 or type(known_no_effect) is not bool:
+            raise SchedulerError("attempt reconciliation has invalid receipt identity or proof")
         if outcome == "succeeded":
             raise SchedulerError("attempt success requires durable verifier proof")
         reconciled_at = _aware(reconciled_at, "reconciled_at")
@@ -1632,16 +1648,15 @@ class Scheduler:
         key = f"reconcile:{attempt_ref}"
 
         def decide(events: list[StoredEvent], version: int):
+            prior = [item for item in events if item.idempotency_key == key]
+            if prior:
+                if len(prior) != 1 or not self._matches_terminal_receipt(prior[0], "AttemptSlotReleased", op_payload):
+                    raise SchedulerError("attempt reconciliation idempotency key was reused")
+                self._validate_historical_terminal(run_id)
+                return None
             self._check_general_release_claim(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
                 fencing_generation=fencing_generation, scope=general_scope, trusted_usage=general_usage,
                 events=events, entry="reconcile", usage=usage, known_no_effect=known_no_effect, at=reconciled_at)
-            prior = next((item for item in events if item.idempotency_key == key), None)
-            if prior is not None:
-                if prior.event_type != "AttemptSlotReleased" or any(
-                    prior.payload.get(name) != value for name, value in op_payload.items()
-                ):
-                    raise SchedulerError("attempt reconciliation idempotency key was reused")
-                return None
             unknown = next(
                 (item for item in events if item.event_type == "AttemptOutcomeUnknown"
                  and item.payload.get("attempt_ref") == attempt_ref),

@@ -514,11 +514,25 @@ _OWNED_WRITES = WeakKeyDictionary()
 
 
 def _watch_transaction(store_ref, statement):
-    """Invalidate ownership when a connection changes its outer transaction."""
-    statement = re.sub(r"\A(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", statement, flags=re.S)
-    words = re.findall(r"[A-Z_]+", statement.upper())
-    if words and (words[0] in {"BEGIN", "COMMIT", "END"}
-        or (words[0] == "ROLLBACK" and "TO" not in words)):
+    """Invalidate on transaction replacement, retaining only actual ROLLBACK TO."""
+    # Most traced statements are ordinary reads/writes. Avoid tokenizing their
+    # potentially large bound payloads; only ROLLBACK needs detailed parsing.
+    prefix = re.sub(r"\A(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", statement, flags=re.S)
+    command = re.match(r"([A-Za-z_]+)", prefix)
+    if command is None:
+        return
+    command = command.group(1).upper()
+    rollback_to = False
+    if command == "ROLLBACK":
+        # Preserve quoted identifiers while removing comments everywhere.
+        token = re.compile(r"(?P<quoted>'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\])|(?P<comment>--[^\n]*|/\*.*?\*/)", re.S)
+        clean = token.sub(lambda match: match.group("quoted") or " ", prefix)
+        identifier = r"(?:\"(?:\"\"|[^\"])*\"|'(?:''|[^'])*'|`(?:``|[^`])*`|\[[^\]]*\]|(?!SAVEPOINT\b)[A-Za-z_\u0080-\uffff][\w$\u0080-\uffff]*)"
+        rollback_to = re.fullmatch(
+            r"\s*ROLLBACK(?:\s+TRANSACTION)?\s+TO\s+(?:SAVEPOINT\s+)?" + identifier + r"\s*;?\s*",
+            clean, flags=re.I | re.S,
+        ) is not None
+    if command in {"BEGIN", "COMMIT", "END"} or (command == "ROLLBACK" and not rollback_to):
         store = store_ref()
         if store is not None:
             _OWNED_WRITES.pop(store, None)
