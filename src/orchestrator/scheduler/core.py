@@ -1097,6 +1097,8 @@ class Scheduler:
 
     def _check_general_release_claim(self, *, run_id, node_id, attempt_id, fencing_generation,
         scope, trusted_usage, events, entry, usage, known_no_effect, at):
+        from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+        GeneralWorkerGate(self.event_store).check_release(run_id, node_id)
         operation = self._check_general_release(run_id, node_id, attempt_id, fencing_generation, scope)
         if operation is None or self._has_general_release(events, operation.identity):
             return
@@ -1193,6 +1195,8 @@ class Scheduler:
             result = None
             def decide(events, _version):
                 nonlocal result
+                from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+                GeneralWorkerGate(self.event_store).check_release(identity.run_id, identity.node_id)
                 completed_at = datetime.now(timezone.utc)
                 current_binding = _validate_general_eligibility(self, journal, operation, purpose="acceptance",
                     host_scope_hash=scope, as_of=completed_at, events=events)
@@ -1246,6 +1250,8 @@ class Scheduler:
         key = f"finish:{attempt_ref}"
 
         def decide(events, _version):
+            from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+            GeneralWorkerGate(self.event_store).check_release(run_id, node_id)
             if self._general_operation(run_id, node_id, attempt_id, fencing_generation) is not None:
                 raise SchedulerError("general registration requires owned terminal preflight")
             proposal = VerifierProposalJournal(self.event_store).read_proposal(run_id, task_sha256)

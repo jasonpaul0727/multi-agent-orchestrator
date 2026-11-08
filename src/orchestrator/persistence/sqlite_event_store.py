@@ -7,11 +7,14 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import re
 from pathlib import Path
 import sqlite3
 import time
+import threading
 from typing import Any, Callable
 from urllib.parse import quote
+from weakref import WeakKeyDictionary, ref
 
 from orchestrator.identifiers import new_id
 
@@ -81,12 +84,23 @@ def _validate_version(value: Any, field_name: str) -> int:
     return value
 
 
+class _OwnedConnection(sqlite3.Connection):
+    """Keep the store's transaction observer installed for its lifetime."""
+
+    def set_trace_callback(self, callback):
+        if getattr(self, "_ownership_trace_installed", False):
+            raise RuntimeError("the store transaction observer cannot be replaced")
+        super().set_trace_callback(callback)
+        self._ownership_trace_installed = True
+
+
 def _open_connection(path: str | Path) -> sqlite3.Connection:
     connection = sqlite3.connect(
         str(path),
         timeout=5.0,
         isolation_level=None,
         check_same_thread=True,
+        factory=_OwnedConnection,
     )
     try:
         connection.row_factory = sqlite3.Row
@@ -438,6 +452,20 @@ def _draft_request_hash(stream_type: str, stream_id: str, drafts: list[EventDraf
     )
 
 
+_OWNED_WRITES = WeakKeyDictionary()
+
+
+def _watch_transaction(store_ref, statement):
+    """Invalidate ownership when a connection changes its outer transaction."""
+    statement = re.sub(r"\A(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", statement, flags=re.S)
+    words = re.findall(r"[A-Z_]+", statement.upper())
+    if words and (words[0] in {"BEGIN", "COMMIT", "END"}
+        or (words[0] == "ROLLBACK" and "TO" not in words)):
+        store = store_ref()
+        if store is not None:
+            _OWNED_WRITES.pop(store, None)
+
+
 class SQLiteEventStore:
     """Append-only event storage with stream-version CAS and idempotency.
 
@@ -449,6 +477,8 @@ class SQLiteEventStore:
     def __init__(self, path: str | Path) -> None:
         self._connection = _open_connection(path)
         initialize_schema(self._connection)
+        store_ref = ref(self)
+        self._connection.set_trace_callback(lambda sql: _watch_transaction(store_ref, sql))
 
     @classmethod
     def open_read_only(cls, path: str | Path) -> "SQLiteEventStore":
@@ -465,16 +495,23 @@ class SQLiteEventStore:
         uri = "file:" + quote(str(database), safe="/") + "?mode=ro"
         connection = sqlite3.connect(
             uri, uri=True, timeout=5.0, isolation_level=None, check_same_thread=True,
+            factory=_OwnedConnection,
         )
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout = 5000")
             instance = cls.__new__(cls)
             instance._connection = connection
+            store_ref = ref(instance)
+            connection.set_trace_callback(lambda sql: _watch_transaction(store_ref, sql))
             return instance
         except BaseException:
             connection.close()
             raise
+
+    def _has_owned_write(self):
+        return (self._connection.in_transaction and _OWNED_WRITES.get(self) ==
+            (self._connection, threading.get_ident()))
 
     def append(
         self,
@@ -504,6 +541,7 @@ class SQLiteEventStore:
         savepoint: str | None = None
         if started_transaction:
             connection.execute("BEGIN IMMEDIATE")
+            _OWNED_WRITES[self] = (connection, threading.get_ident())
         else:
             savepoint = "orchestrator_append"
             connection.execute(f"SAVEPOINT {savepoint}")
@@ -666,6 +704,9 @@ class SQLiteEventStore:
                 finally:
                     connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
+        finally:
+            if started_transaction:
+                _OWNED_WRITES.pop(self, None)
 
     def append_checked(
         self,
@@ -696,6 +737,7 @@ class SQLiteEventStore:
         savepoint: str | None = None
         if started_transaction:
             connection.execute("BEGIN IMMEDIATE")
+            _OWNED_WRITES[self] = (connection, threading.get_ident())
         else:
             savepoint = "orchestrator_append_checked"
             connection.execute(f"SAVEPOINT {savepoint}")
@@ -738,6 +780,9 @@ class SQLiteEventStore:
                 finally:
                     connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
+        finally:
+            if started_transaction:
+                _OWNED_WRITES.pop(self, None)
 
     def read_stream(
         self,

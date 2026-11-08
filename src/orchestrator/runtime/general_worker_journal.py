@@ -389,6 +389,21 @@ class GeneralWorkerJournal:
         if type(event_store) is not SQLiteEventStore:
             raise GeneralWorkerJournalError()
         self.event_store = event_store
+        self._gate = None
+        if not event_store._connection.in_transaction:
+            try:
+                from .general_worker_gate import GeneralWorkerGate
+                self._gate = GeneralWorkerGate(event_store)
+            except Exception:
+                pass
+
+    def _v1_gate(self):
+        if not self.event_store._connection.in_transaction:
+            from .general_worker_gate import GeneralWorkerGate
+            self._gate = GeneralWorkerGate(self.event_store)
+        if self._gate is None:
+            raise ValueError("gate requires preflight outside the transaction")
+        return self._gate
 
     @_guard
     def read(self, identity: GeneralWorkerIdentity) -> GeneralWorkerOperation | None:
@@ -467,14 +482,28 @@ class GeneralWorkerJournal:
             accepted_route_sha256=accepted_route_sha256, workspace_identity_hash=workspace_identity_hash,
             host_scope_hash=host_scope_hash, output_byte_limit=output_byte_limit))
         operation = _request_operation(data)
-        return self._append(operation, "Requested", data)
+        gate = self._v1_gate()
+        result = None
+        def register(_events, _version):
+            nonlocal result
+            result = self._append(operation, "Requested", data)
+            gate.check_v1_prepare(result, "registration", None)
+        self.event_store.append_checked("scheduler", "global", "general-registration-gate", register)
+        return result
 
     @_guard
     def prepare_turn(self, operation: GeneralWorkerOperation, *, phase: Literal["request", "complete"],
         prepared: PreparedSandboxLaunch) -> GeneralWorkerOperation:
         if type(prepared) is not PreparedSandboxLaunch:
             raise ValueError()
-        return self._append(operation, "TurnPrepared", _safe(dict(phase=phase, prepared=prepared)))
+        gate = self._v1_gate()
+        result = None
+        def prepare(_events, _version):
+            nonlocal result
+            gate.check_v1_prepare(operation, phase, prepared)
+            result = self._append(operation, "TurnPrepared", _safe(dict(phase=phase, prepared=prepared)))
+        self.event_store.append_checked("scheduler", "global", "general-prepare-gate", prepare)
+        return result
 
     @_guard
     def ack_turn(self, operation: GeneralWorkerOperation, *, receipt: SandboxLaunchReceipt) -> GeneralWorkerOperation:

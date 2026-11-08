@@ -90,17 +90,17 @@ def test_host_scope_rejects_ambient_transaction_before_file_read(tmp_path, monke
 def test_operation_binding_uses_exact_frozen_route_and_context(prepared):
     from dataclasses import replace
     from orchestrator.runtime.general_worker_authority import validate_operation_binding
-    from orchestrator.runtime.general_worker_journal import GeneralWorkerJournal, metadata_hash
+    from orchestrator.runtime.general_worker_journal import _request_operation, _safe, metadata_hash
     app = prepared.app
     binding = app._scheduler._resolve_general_verification_binding(**prepared.identity, as_of=prepared.clock.now)
     scope = general_worker_host_scope(app._event_store)
     # This legacy acceptance fixture has no workspace admission; this unit
     # exercises comparison with an independently supplied host commitment.
     workspace = "sha256:" + "c" * 64
-    operation = GeneralWorkerJournal(app._event_store).request(context=binding.context,
+    operation = _request_operation(_safe(dict(context=binding.context,
         input_commitment="sha256:" + "a" * 64,
         accepted_route_sha256=metadata_hash(binding.active_attempt.accepted_route.model_dump(mode="json")),
-        workspace_identity_hash=workspace, host_scope_hash=scope, output_byte_limit=16_384)
+        workspace_identity_hash=workspace, host_scope_hash=scope, output_byte_limit=16_384)))
     validate_operation_binding(operation, binding, workspace_identity_hash=workspace, host_scope_hash=scope)
     for field in ("accepted_route_sha256", "workspace_identity_hash", "host_scope_hash"):
         with pytest.raises(GeneralWorkerJournalError):

@@ -102,3 +102,68 @@ def test_prepare_wins_before_release(tmp_path):
         assert not any(e.event_type == "AttemptSlotReleased" for e in scheduler_events(case.store))
     finally:
         case.store.close()
+
+
+def test_registration_after_release_is_rejected(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+            outcome="failed", known_no_effect=True)
+        with pytest.raises(GeneralWorkerJournalError):
+            case.journal.request(**case.registration)
+        assert case.journal.read(case.operation.identity) is None
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("statements", [False, True])
+def test_replaced_ambient_transaction_cannot_inherit_owned_write(tmp_path, statements):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        def replace_transaction(_events, _version):
+            if statements:
+                case.store._connection.execute("COMMIT;")
+                case.store._connection.execute("BEGIN;")
+            else:
+                case.store._connection.commit()
+                case.store._connection.execute("BEGIN IMMEDIATE")
+            with pytest.raises(GeneralWorkerJournalError):
+                case.journal.request(**case.registration)
+        case.store.append_checked("scheduler", "global", "replace-transaction-test", replace_transaction)
+        assert case.journal.read(case.operation.identity) is None
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("base_method", [False, pytest.param(True, marks=pytest.mark.xfail(
+    reason="same-process code can bypass the private connection subclass", strict=True))])
+def test_owned_transaction_monitor_cannot_be_disabled(tmp_path, base_method):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        def replace_transaction(_events, _version):
+            with pytest.raises((RuntimeError, GeneralWorkerJournalError)):
+                if base_method:
+                    import sqlite3
+                    sqlite3.Connection.set_trace_callback(case.store._connection, None)
+                else:
+                    case.store._connection.set_trace_callback(None)
+                case.store._connection.commit()
+                case.store._connection.execute("BEGIN IMMEDIATE")
+                case.journal.request(**case.registration)
+        case.store.append_checked("scheduler", "global", "disable-monitor-test", replace_transaction)
+        assert case.journal.read(case.operation.identity) is None
+    finally:
+        case.store.close()
+
+
+def test_owned_nested_registration_and_prepare_share_outer_commit(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        def nested(_events, _version):
+            operation = case.journal.request(**case.registration)
+            case.journal.prepare_turn(operation, phase="request", prepared=epoch()[0])
+        case.store.append_checked("scheduler", "global", "nested-gate-test", nested)
+        assert len(case.journal.read(case.operation.identity).turns) == 1
+        assert not case.store._has_owned_write()
+    finally:
+        case.store.close()
