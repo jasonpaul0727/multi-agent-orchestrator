@@ -8,7 +8,9 @@ import pytest
 
 from orchestrator.budget import BudgetLedger, CostEstimate, RunLimit, UsageRecord
 from orchestrator.persistence import EventDraft, SQLiteEventStore
-from tests.support.process_crash import block_at_crash_point, kill_at_crash_point
+from tests.support.process_crash import (
+    block_at_crash_point, block_before_store_commit, kill_at_crash_point,
+)
 
 
 def _context(*, causation_id="event-parent"):
@@ -68,13 +70,6 @@ def _provider_call_child(database, dispatched_marker, registry, request):
         store.close()
 
 
-def _trace_before_commit(pipe, point):
-    def trace(statement):
-        if statement.strip().upper() == "COMMIT":
-            block_at_crash_point(pipe, point)
-    return trace
-
-
 def _budget_reservation_child(database, pipe, boundary):
     with SQLiteEventStore(database) as store:
         ledger = BudgetLedger(
@@ -83,7 +78,12 @@ def _budget_reservation_child(database, pipe, boundary):
         )
         point = f"budget_reservation_{boundary}"
         if boundary == "before_commit":
-            store._connection.set_trace_callback(_trace_before_commit(pipe, point))
+            with block_before_store_commit(
+                store, pipe, point, stream_type="budget", stream_id="run-1",
+                event_types=("BudgetReserved",),
+            ):
+                _reserve_budget(ledger)
+            raise AssertionError("reservation returned without pre-commit barrier")
         _reserve_budget(ledger)
         block_at_crash_point(pipe, point)
 
@@ -93,7 +93,16 @@ def _budget_settlement_child(database, pipe, boundary, reservation_id):
         ledger = BudgetLedger(store)
         point = f"budget_settlement_{boundary}"
         if boundary == "before_commit":
-            store._connection.set_trace_callback(_trace_before_commit(pipe, point))
+            with block_before_store_commit(
+                store, pipe, point, stream_type="budget", stream_id="run-1",
+                event_types=("BudgetReserved", "UsageObserved", "CostCommitted", "BudgetReleased"),
+            ):
+                ledger.commit_usage(
+                    reservation_id,
+                    {"input_tokens": 4, "cost_minor": 3},
+                    settlement_key="settlement-1",
+                )
+            raise AssertionError("settlement returned without pre-commit barrier")
         ledger.commit_usage(
             reservation_id,
             {"input_tokens": 4, "cost_minor": 3},
