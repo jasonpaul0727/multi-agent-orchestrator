@@ -3,7 +3,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from threading import Event
+from threading import Event, get_ident
 
 import pytest
 
@@ -654,3 +654,122 @@ def test_nested_prepare_publishes_after_outer_append_commit(tmp_path):
         assert case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
     finally:
         case.store.close()
+
+
+@pytest.mark.parametrize("entry", ["registration", "prepare"])
+def test_direct_entry_rejects_lease_expiring_before_owned_gate(tmp_path, monkeypatch, entry):
+    from datetime import timedelta
+    import orchestrator.runtime.general_worker_gate as gate_module
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration) if entry == "prepare" else None
+        class AfterExpiry(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.now(timezone.utc) + timedelta(hours=1)
+        monkeypatch.setattr(gate_module, "datetime", AfterExpiry)
+        with pytest.raises(GeneralWorkerJournalError):
+            if entry == "registration":
+                case.journal.request(**case.registration)
+            else:
+                case.journal.prepare_turn(operation, phase="request", prepared=epoch()[0])
+        events = case.store.read_stream("general_worker", case.operation.identity.stream_id)
+        assert [event.event_type for event in events] == ([] if entry == "registration" else ["GeneralWorkerRequested"])
+        assert case.journal._fresh_prepare is None
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("ambient", ["unknown", "readonly"])
+def test_direct_registration_rejects_unowned_ambient_transaction(tmp_path, ambient):
+    from orchestrator.runtime.general_worker_journal import GeneralWorkerJournal
+    case = dispatch_case(tmp_path, register=False)
+    other = None
+    try:
+        store = case.store
+        journal = case.journal
+        if ambient == "readonly":
+            other = SQLiteEventStore.open_read_only((tmp_path / "events.db").resolve())
+            store = other
+            journal = GeneralWorkerJournal(store)
+        store._connection.execute("BEGIN")
+        store._connection.execute("SELECT count(*) FROM events").fetchone()
+        assert not store._has_owned_write()
+        with pytest.raises(GeneralWorkerJournalError):
+            journal.request(**case.registration)
+        store._connection.rollback()
+        assert case.journal.read(case.operation.identity) is None
+    finally:
+        if other is not None:
+            other.close()
+        case.store.close()
+
+
+def test_forged_store_attribute_does_not_establish_owned_transaction(tmp_path):
+    from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        gate = GeneralWorkerGate(case.store)
+        case.store._connection.execute("BEGIN IMMEDIATE")
+        case.store._owned_write = (case.store._connection, get_ident())
+        with pytest.raises(ValueError, match="owned write transaction required"):
+            gate.check_release("run-1", "node-1")
+        case.store._connection.rollback()
+        assert case.journal.read(case.operation.identity) is None
+    finally:
+        case.store.close()
+
+
+def test_post_commit_publication_error_leaves_durable_prepare_without_launch_permit(tmp_path, monkeypatch):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        prepared = epoch()[0]
+        attempts = []
+        def fail_publication(*args):
+            assert not case.store._connection.in_transaction
+            attempts.append(True)
+            raise RuntimeError("synthetic post-commit publication failure")
+        monkeypatch.setattr(case.journal, "_publish_fresh_prepare", fail_publication)
+        def outer(_events, _version):
+            case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+        case.store.append_checked("scheduler", "global", "publication-failure", outer)
+        assert attempts == [True]
+        current = case.journal.read(operation.identity)
+        assert len(current.turns) == 1 and current.turns[0].prepared == prepared
+        assert case.journal._fresh_prepare is None
+        assert not case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
+        with pytest.raises(SchedulerError):
+            case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+                outcome="failed", known_no_effect=True)
+    finally:
+        case.store.close()
+
+
+def test_execute_lease_expires_after_recheck_before_prepare(tmp_path, monkeypatch):
+    from datetime import timedelta
+    import orchestrator.runtime.general_worker_gate as gate_module
+    case = execution_case(tmp_path)
+    entered, starts = [], []
+    original = case.service._journal.prepare_turn
+    class AfterExpiry(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(timezone.utc) + timedelta(hours=1)
+    def expire_before_prepare(*args, **kwargs):
+        entered.append(True)
+        monkeypatch.setattr(gate_module, "datetime", AfterExpiry)
+        return original(*args, **kwargs)
+    def record_start(*args, **kwargs):
+        starts.append(True)
+        raise RuntimeError("record-only sentinel")
+    monkeypatch.setattr(case.service._journal, "prepare_turn", expire_before_prepare)
+    monkeypatch.setattr(case.service._worker, "prepare_launch", lambda: epoch()[0])
+    monkeypatch.setattr(case.service._worker, "start_turn", record_start)
+    try:
+        result = asyncio.run(case.service.execute(identity=case.identity, task_text=case.text))
+        assert entered == [True]
+        assert result.status == "blocked" and starts == []
+        assert case.journal.read(case.identity).turns == ()
+    finally:
+        case.app.close()
