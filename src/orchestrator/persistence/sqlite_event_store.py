@@ -240,6 +240,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             _migrate_snapshot_metadata(connection)
             _migrate_event_context(connection)
             _ensure_events_attempt_context_index(connection)
+            _migrate_general_worker_scope(connection)
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
@@ -260,6 +261,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         _migrate_snapshot_metadata(connection)
         _migrate_event_context(connection)
         _ensure_events_attempt_context_index(connection)
+        _migrate_general_worker_scope(connection)
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
@@ -269,6 +271,62 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         connection.rollback()
         raise
 
+
+def _migrate_general_worker_scope(connection: sqlite3.Connection) -> None:
+    """Build one immutable scope row per Worker stream in the migration transaction."""
+    migrated = connection.execute("SELECT 1 FROM schema_migrations WHERE version = 5").fetchone() is not None
+    exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='general_worker_scope'").fetchone() is not None
+    if migrated and not exists:
+        raise ValueError("general worker scope index is missing")
+    connection.execute("""CREATE TABLE IF NOT EXISTS general_worker_scope (
+        stream_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, node_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL, fencing_generation INTEGER NOT NULL CHECK (fencing_generation > 0))""")
+    if not migrated:
+        invalid = connection.execute("""
+            SELECT 1 FROM stream_versions s
+            LEFT JOIN events e ON e.stream_type=s.stream_type AND e.stream_id=s.stream_id AND e.stream_version=1
+            WHERE s.stream_type='general_worker' AND
+              (e.stream_id IS NULL OR typeof(e.run_id) != 'text' OR length(trim(e.run_id, char(9)||char(10)||char(13)||' '))=0
+               OR typeof(e.node_id) != 'text' OR length(trim(e.node_id, char(9)||char(10)||char(13)||' '))=0
+               OR typeof(e.attempt_id) != 'text' OR length(trim(e.attempt_id, char(9)||char(10)||char(13)||' '))=0
+               OR typeof(e.fencing_generation) != 'integer' OR e.fencing_generation <= 0)
+            LIMIT 1
+        """).fetchone()
+        inconsistent = connection.execute("""
+            SELECT 1 FROM events e JOIN events f ON f.stream_type=e.stream_type AND f.stream_id=e.stream_id
+                AND f.stream_version=1
+            WHERE e.stream_type='general_worker' AND (e.run_id IS NOT f.run_id OR e.node_id IS NOT f.node_id
+                OR e.attempt_id IS NOT f.attempt_id OR e.fencing_generation IS NOT f.fencing_generation)
+            LIMIT 1
+        """).fetchone()
+        if invalid or inconsistent:
+            raise ValueError("general worker scope contains unattributable history")
+        connection.execute("""INSERT INTO general_worker_scope
+            SELECT stream_id, run_id, node_id, attempt_id, fencing_generation FROM events
+            WHERE stream_type='general_worker' AND stream_version=1""")
+        connection.execute("INSERT INTO schema_migrations (version) VALUES (5)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_general_worker_scope_node ON general_worker_scope(run_id, node_id, stream_id)")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS gw_scope_check BEFORE INSERT ON events
+        WHEN NEW.stream_type='general_worker' BEGIN
+        SELECT CASE WHEN typeof(NEW.run_id) != 'text' OR length(trim(NEW.run_id, char(9)||char(10)||char(13)||' '))=0
+            OR typeof(NEW.node_id) != 'text' OR length(trim(NEW.node_id, char(9)||char(10)||char(13)||' '))=0
+            OR typeof(NEW.attempt_id) != 'text' OR length(trim(NEW.attempt_id, char(9)||char(10)||char(13)||' '))=0
+            OR typeof(NEW.fencing_generation) != 'integer' OR NEW.fencing_generation <= 0
+            THEN RAISE(ABORT, 'general worker scope requires identity') END;
+        SELECT CASE WHEN NEW.stream_version > 1 AND NOT EXISTS (
+            SELECT 1 FROM general_worker_scope s WHERE s.stream_id=NEW.stream_id
+            AND s.run_id=NEW.run_id AND s.node_id=NEW.node_id AND s.attempt_id=NEW.attempt_id
+            AND s.fencing_generation=NEW.fencing_generation)
+            THEN RAISE(ABORT, 'general worker scope mismatch') END;
+        END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS gw_scope_insert AFTER INSERT ON events
+        WHEN NEW.stream_type='general_worker' AND NEW.stream_version=1 BEGIN
+        INSERT INTO general_worker_scope VALUES (NEW.stream_id, NEW.run_id, NEW.node_id,
+            NEW.attempt_id, NEW.fencing_generation); END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS gw_scope_immutable_update BEFORE UPDATE ON general_worker_scope
+        BEGIN SELECT RAISE(ABORT, 'general worker scope is immutable'); END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS gw_scope_immutable_delete BEFORE DELETE ON general_worker_scope
+        BEGIN SELECT RAISE(ABORT, 'general worker scope is immutable'); END""")
 
 def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
     """Add authenticated snapshot metadata to databases from Task 3."""
@@ -510,8 +568,12 @@ class SQLiteEventStore:
             raise
 
     def _has_owned_write(self):
-        return (self._connection.in_transaction and _OWNED_WRITES.get(self) ==
-            (self._connection, threading.get_ident()))
+        marker = _OWNED_WRITES.get(self)
+        return (self._connection.in_transaction and marker is not None
+            and marker[0] is self._connection and marker[1] == threading.get_ident())
+
+    def _owned_write_token(self):
+        return _OWNED_WRITES[self][2] if self._has_owned_write() else None
 
     def append(
         self,
@@ -541,7 +603,7 @@ class SQLiteEventStore:
         savepoint: str | None = None
         if started_transaction:
             connection.execute("BEGIN IMMEDIATE")
-            _OWNED_WRITES[self] = (connection, threading.get_ident())
+            _OWNED_WRITES[self] = (connection, threading.get_ident(), object())
         else:
             savepoint = "orchestrator_append"
             connection.execute(f"SAVEPOINT {savepoint}")
@@ -737,7 +799,7 @@ class SQLiteEventStore:
         savepoint: str | None = None
         if started_transaction:
             connection.execute("BEGIN IMMEDIATE")
-            _OWNED_WRITES[self] = (connection, threading.get_ident())
+            _OWNED_WRITES[self] = (connection, threading.get_ident(), object())
         else:
             savepoint = "orchestrator_append_checked"
             connection.execute(f"SAVEPOINT {savepoint}")
@@ -856,6 +918,7 @@ class SQLiteEventStore:
         stream_type: str,
         stream_id: str,
         after_version: int = 0,
+        *, max_events: int | None = None,
     ) -> tuple[list[StoredEvent], int]:
         """Read a stream and its version from one SQLite read transaction.
 
@@ -866,6 +929,8 @@ class SQLiteEventStore:
         stream_type = _validate_identifier(stream_type, "stream_type")
         stream_id = _validate_identifier(stream_id, "stream_id")
         after_version = _validate_version(after_version, "after_version")
+        if max_events is not None and (type(max_events) is not int or max_events < 1):
+            raise ValueError("max_events must be positive")
         connection = self._connection
         savepoint: str | None = None
         started_transaction = not connection.in_transaction
@@ -883,10 +948,12 @@ class SQLiteEventStore:
                        fencing_generation, correlation_id, causation_id
                 FROM events
                 WHERE stream_type = ? AND stream_id = ? AND stream_version > ?
-                ORDER BY stream_version ASC
+                ORDER BY stream_version ASC LIMIT ?
                 """,
-                (stream_type, stream_id, after_version),
+                (stream_type, stream_id, after_version, -1 if max_events is None else max_events + 1),
             ).fetchall()
+            if max_events is not None and len(rows) > max_events:
+                raise ValueError("stream exceeds event bound")
             version_row = connection.execute(
                 """
                 SELECT current_version
@@ -944,6 +1011,15 @@ class SQLiteEventStore:
         ).fetchall()
         return [row["stream_id"] for row in rows]
 
+    def stream_ids_for_worker_node(self, run_id: str, node_id: str, *, limit: int) -> list[str]:
+        run_id = _validate_identifier(run_id, "run_id")
+        node_id = _validate_identifier(node_id, "node_id")
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be positive")
+        rows = self._connection.execute(
+            "SELECT stream_id FROM general_worker_scope WHERE run_id=? AND node_id=? ORDER BY stream_id LIMIT ?",
+            (run_id, node_id, limit)).fetchall()
+        return [row["stream_id"] for row in rows]
     def stream_ids_for_context(
         self, stream_type: str, run_id: str, node_id: str, attempt_id: str
     ) -> list[str]:

@@ -390,6 +390,7 @@ class GeneralWorkerJournal:
             raise GeneralWorkerJournalError()
         self.event_store = event_store
         self._gate = None
+        self._fresh_prepare = None
         if not event_store._connection.in_transaction:
             try:
                 from .general_worker_gate import GeneralWorkerGate
@@ -408,7 +409,7 @@ class GeneralWorkerJournal:
     @_guard
     def read(self, identity: GeneralWorkerIdentity) -> GeneralWorkerOperation | None:
         _identity_value(identity)
-        events, version = self.event_store.read_stream_with_version(STREAM_TYPE, identity.stream_id)
+        events, version = self.event_store.read_stream_with_version(STREAM_TYPE, identity.stream_id, max_events=MAX_EVENTS)
         operation = _replay(identity, events, version)
         if operation is not None:
             self._validate_links(operation)
@@ -429,7 +430,7 @@ class GeneralWorkerJournal:
             exact = None
             mismatched_generation = False
             for stream_id in stream_ids:
-                events, _version = self.event_store.read_stream_with_version(STREAM_TYPE, stream_id)
+                events, _version = self.event_store.read_stream_with_version(STREAM_TYPE, stream_id, max_events=MAX_EVENTS)
                 if not events:
                     raise ValueError()
                 first = events[0]
@@ -461,7 +462,7 @@ class GeneralWorkerJournal:
     @_guard
     def validate_operations(self) -> None:
         for stream_id in self.event_store.stream_ids(STREAM_TYPE):
-            events, version = self.event_store.read_stream_with_version(STREAM_TYPE, stream_id)
+            events, version = self.event_store.read_stream_with_version(STREAM_TYPE, stream_id, max_events=MAX_EVENTS)
             if not events:
                 raise ValueError()
             first = events[0]
@@ -486,8 +487,10 @@ class GeneralWorkerJournal:
         result = None
         def register(_events, _version):
             nonlocal result
-            result = self._append(operation, "Requested", data)
-            gate.check_v1_prepare(result, "registration", None)
+            result = self._exact_replay(operation, "Requested", data)
+            if result is None:
+                result = self._append(operation, "Requested", data)
+                gate.check_v1_prepare(result, "registration", None)
         self.event_store.append_checked("scheduler", "global", "general-registration-gate", register)
         return result
 
@@ -496,14 +499,51 @@ class GeneralWorkerJournal:
         prepared: PreparedSandboxLaunch) -> GeneralWorkerOperation:
         if type(prepared) is not PreparedSandboxLaunch:
             raise ValueError()
+        self._fresh_prepare = None
         gate = self._v1_gate()
         result = None
+        is_new = False
+        data = _safe(dict(phase=phase, prepared=prepared))
         def prepare(_events, _version):
-            nonlocal result
-            gate.check_v1_prepare(operation, phase, prepared)
-            result = self._append(operation, "TurnPrepared", _safe(dict(phase=phase, prepared=prepared)))
+            nonlocal result, is_new
+            result = self._exact_replay(operation, "TurnPrepared", data)
+            if result is None:
+                gate.check_v1_prepare(operation, phase, prepared)
+                result = self._append(operation, "TurnPrepared", data)
+                is_new = True
         self.event_store.append_checked("scheduler", "global", "general-prepare-gate", prepare)
+        if is_new:
+            self._fresh_prepare = (operation.identity, phase, prepared)
         return result
+
+    def _consume_fresh_prepare(self, identity, phase, prepared):
+        fresh = (not self.event_store._connection.in_transaction
+            and self._fresh_prepare == (identity, phase, prepared))
+        self._fresh_prepare = None
+        return fresh
+
+    def _exact_replay(self, operation, action, data):
+        if not self.event_store._has_owned_write():
+            raise ValueError("owned write transaction required")
+        self._validate_operation(operation)
+        identity = operation.identity
+        events, version = self.event_store.read_stream_with_version(STREAM_TYPE, identity.stream_id, max_events=MAX_EVENTS)
+        key = _event_key(operation.operation_id, action, data)
+        existing = [event for event in events if event.idempotency_key == key]
+        if not existing:
+            return None
+        payload = dict(schema_version=SCHEMA_VERSION, operation_id=operation.operation_id, action=action, data=data)
+        if len(existing) != 1 or existing[0].payload != payload:
+            raise ValueError()
+        current = _replay(identity, events, version)
+        fields = ("identity", "operation_id", "context", "input_commitment", "accepted_route_sha256",
+            "workspace_identity_hash", "host_scope_hash", "output_byte_limit", "request_id", "idempotency_key")
+        supplied, persisted = _safe(operation), _safe(current)
+        if any(_canonical(supplied[name]) != _canonical(persisted[name]) for name in fields):
+            raise ValueError("replay has changed immutable commitments")
+        self._validate_links(current)
+        self._validate_terminal_links(current)
+        return current
 
     @_guard
     def ack_turn(self, operation: GeneralWorkerOperation, *, receipt: SandboxLaunchReceipt) -> GeneralWorkerOperation:

@@ -12,12 +12,17 @@ if TYPE_CHECKING:
     from .general_worker_journal import GeneralWorkerOperation
 
 
+MAX_RELEASE_STREAMS = 64
+
+
 class GeneralWorkerGate:
     def __init__(self, event_store: SQLiteEventStore):
         if type(event_store) is not SQLiteEventStore:
             raise ValueError()
         self._store = event_store
         self._scope = None
+        self._now = None
+        self._write_token = None
         if not event_store._connection.in_transaction:
             from .general_worker_authority import general_worker_host_scope
             self._scope = general_worker_host_scope(event_store)
@@ -53,19 +58,49 @@ class GeneralWorkerGate:
         self._owned()
         # Sample under ownership even though stop-proof classification itself
         # has no time-dependent branch.
-        now = datetime.now(timezone.utc)
-        if now.utcoffset() != timezone.utc.utcoffset(now):
+        self._write_token = self._store._owned_write_token()
+        self._now = datetime.now(timezone.utc)
+        if self._now.utcoffset() != timezone.utc.utcoffset(self._now):
             raise ValueError()
-        from .general_worker_journal import GeneralWorkerIdentity, GeneralWorkerJournal, _require_worker_stopped
+        from orchestrator.lifecycle import LifecycleController
+        from .general_worker_journal import (
+            GeneralWorkerIdentity, GeneralWorkerJournal, MAX_EVENTS, _require_worker_stopped,
+        )
+        streams = self._store.stream_ids_for_worker_node(run_id, node_id, limit=MAX_RELEASE_STREAMS + 1)
+        if len(streams) > MAX_RELEASE_STREAMS:
+            raise ValueError("general worker scope exceeds release bound")
+        # Known admitted identities also have deterministic stream IDs. Probe
+        # them independently so corrupted scope metadata cannot hide them.
+        attempts = LifecycleController(self._store).replay(run_id).node(node_id).attempts
+        if len(attempts) > MAX_RELEASE_STREAMS:
+            raise ValueError("attempt history exceeds release bound")
+        indexed = set(streams)
+        for attempt in attempts:
+            identity = GeneralWorkerIdentity(run_id, node_id, attempt.attempt_id, attempt.fencing_generation)
+            if self._store.current_version("general_worker", identity.stream_id) and identity.stream_id not in indexed:
+                raise ValueError("general worker scope hides an admitted stream")
         journal = GeneralWorkerJournal(self._store)
-        for stream_id in self._store.stream_ids("general_worker"):
-            events = self._store.read_stream("general_worker", stream_id)
+        for stream_id in streams:
+            version = self._store.current_version("general_worker", stream_id)
+            if not 0 < version <= MAX_EVENTS:
+                raise ValueError("invalid general worker stream length")
+            events, _ = self._store.read_stream_with_version("general_worker", stream_id, max_events=MAX_EVENTS)
             if not events:
                 raise ValueError()
             first = events[0]
-            if first.run_id == run_id and first.node_id == node_id:
-                identity = GeneralWorkerIdentity(first.run_id, first.node_id, first.attempt_id, first.fencing_generation)
-                operation = journal.read(identity)
-                if operation is None:
-                    raise ValueError()
-                _require_worker_stopped(operation)
+            identity = GeneralWorkerIdentity(first.run_id, first.node_id, first.attempt_id, first.fencing_generation)
+            if first.run_id != run_id or first.node_id != node_id or identity.stream_id != stream_id:
+                raise ValueError("general worker scope disagrees with identity")
+            operation = journal.read(identity)
+            if operation is None:
+                raise ValueError()
+            _require_worker_stopped(operation)
+
+    def _check_release_snapshot(self, scheduler, *, run_id, node_id, attempt_id, fencing_generation):
+        from orchestrator.scheduler.core import Scheduler
+        self._owned()
+        if (type(scheduler) is not Scheduler or scheduler.event_store is not self._store
+            or self._write_token is not self._store._owned_write_token() or self._now is None):
+            raise ValueError("release gate belongs to another transaction")
+        scheduler._resolve_general_release_snapshot(run_id=run_id, node_id=node_id,
+            attempt_id=attempt_id, fencing_generation=fencing_generation, as_of=self._now)

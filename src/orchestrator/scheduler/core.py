@@ -1098,7 +1098,8 @@ class Scheduler:
     def _check_general_release_claim(self, *, run_id, node_id, attempt_id, fencing_generation,
         scope, trusted_usage, events, entry, usage, known_no_effect, at):
         from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
-        GeneralWorkerGate(self.event_store).check_release(run_id, node_id)
+        gate = GeneralWorkerGate(self.event_store)
+        gate.check_release(run_id, node_id)
         operation = self._check_general_release(run_id, node_id, attempt_id, fencing_generation, scope)
         if operation is None or self._has_general_release(events, operation.identity):
             return
@@ -1108,6 +1109,9 @@ class Scheduler:
             events=events, entry=entry, usage=usage, known_no_effect=known_no_effect, at=at)
         if needs_usage and (trusted_usage is None or trusted_usage != usage):
             raise SchedulerError("general release lost trusted usage authority")
+        if entry in {"finish", "cancel"}:
+            gate._check_release_snapshot(self, run_id=run_id, node_id=node_id,
+                attempt_id=attempt_id, fencing_generation=fencing_generation)
 
     def _finish_general_verified_attempt(self, *, identity: GeneralWorkerIdentity,
         task_sha256: str) -> GeneralWorkerResult:
@@ -1196,8 +1200,9 @@ class Scheduler:
             def decide(events, _version):
                 nonlocal result
                 from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
-                GeneralWorkerGate(self.event_store).check_release(identity.run_id, identity.node_id)
-                completed_at = datetime.now(timezone.utc)
+                gate = GeneralWorkerGate(self.event_store)
+                gate.check_release(identity.run_id, identity.node_id)
+                completed_at = gate._now
                 current_binding = _validate_general_eligibility(self, journal, operation, purpose="acceptance",
                     host_scope_hash=scope, as_of=completed_at, events=events)
                 current_proposal = VerifierProposalJournal(self.event_store).read_proposal(identity.run_id, task_sha256)
@@ -1354,9 +1359,6 @@ class Scheduler:
             if completed_at < accepted_at:
                 raise LifecycleConflict("attempt completion precedes route acceptance")
             expires_at = datetime.fromisoformat(accepted.payload["lease_expires_at"])
-            if general_scope is not None and outcome != "outcome_unknown":
-                self._resolve_general_release_snapshot(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
-                    fencing_generation=fencing_generation, as_of=datetime.now(timezone.utc))
             if outcome != "outcome_unknown" and completed_at >= expires_at:
                 raise LifecycleConflict("late attempt result must be reconciled, not accepted")
             decision_hash = accepted.payload["decision_hash"]
@@ -1509,9 +1511,6 @@ class Scheduler:
                 raise LifecycleConflict("cancellation receipt precedes attempt acceptance")
             if stopped_at >= datetime.fromisoformat(accepted.payload["lease_expires_at"]):
                 raise LifecycleConflict("expired attempt must be reconciled, not cancelled")
-            if general_scope is not None:
-                self._resolve_general_release_snapshot(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
-                    fencing_generation=fencing_generation, as_of=datetime.now(timezone.utc))
             state = self.lifecycle.replay(run_id)
             if state.status != "cancelling":
                 raise SchedulerError("cancellation acknowledgement requires a cancelling Run")

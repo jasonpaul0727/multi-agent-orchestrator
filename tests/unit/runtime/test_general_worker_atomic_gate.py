@@ -167,3 +167,250 @@ def test_owned_nested_registration_and_prepare_share_outer_commit(tmp_path):
         assert not case.store._has_owned_write()
     finally:
         case.store.close()
+
+
+def test_public_registration_and_prepare_replay_after_progress(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        prepared, ack, stop = epoch()
+        ready = case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+        assert case.journal.prepare_turn(operation, phase="request", prepared=prepared) == ready
+        acknowledged = case.journal.ack_turn(ready, receipt=ack)
+        stopped = case.journal.stop_turn(acknowledged, receipt=stop)
+        assert case.journal.request(**case.registration) == stopped
+        assert case.journal.prepare_turn(operation, phase="request", prepared=prepared) == stopped
+        with pytest.raises(GeneralWorkerJournalError):
+            case.journal.prepare_turn(operation, phase="request",
+                prepared=epoch("9c483536-3c61-41e7-977b-6559b2732937")[0])
+        case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+            outcome="failed", known_no_effect=True)
+        assert case.journal.request(**case.registration) == stopped
+        assert case.journal.prepare_turn(operation, phase="request", prepared=prepared) == stopped
+        with pytest.raises(GeneralWorkerJournalError):
+            case.journal.prepare_turn(stopped, phase="request",
+                prepared=epoch("9c483536-3c61-41e7-977b-6559b2732937")[0])
+    finally:
+        case.store.close()
+
+
+def test_release_ignores_corrupt_unrelated_worker_streams(tmp_path, monkeypatch):
+    from orchestrator.persistence import EventDraft
+    case = dispatch_case(tmp_path, register=False)
+    unrelated = []
+    try:
+        for number in range(24):
+            stream = f"foreign-{number}"
+            unrelated.append(stream)
+            case.store.append("general_worker", stream, 0, [EventDraft("GeneralWorkerRequested", {},
+                run_id=f"other-{number}", node_id="node-1", attempt_id="attempt-1", fencing_generation=1,
+                correlation_id=f"other-{number}", causation_id="decision-foreign")], f"foreign-{number}")
+        touched = []
+        original = case.store.read_stream
+        def record(stream_type, stream_id, *args, **kwargs):
+            if stream_type == "general_worker" and stream_id in unrelated:
+                touched.append(stream_id)
+            return original(stream_type, stream_id, *args, **kwargs)
+        monkeypatch.setattr(case.store, "read_stream", record)
+        case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+            outcome="failed", known_no_effect=True)
+        assert touched == []
+        assert any(e.event_type == "AttemptSlotReleased" for e in scheduler_events(case.store))
+    finally:
+        case.store.close()
+
+
+def test_release_rejects_corrupt_target_worker_stream(tmp_path):
+    from orchestrator.persistence import EventDraft
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        case.store.append("general_worker", "corrupt-target", 0, [EventDraft("GeneralWorkerRequested", {},
+            run_id="run-1", node_id="node-1", attempt_id="another-attempt", fencing_generation=1,
+            correlation_id="run-1", causation_id="decision-foreign")], "bad-target")
+        with pytest.raises(ValueError):
+            case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+                outcome="failed", known_no_effect=True)
+        assert not any(e.event_type == "AttemptSlotReleased" for e in scheduler_events(case.store))
+    finally:
+        case.store.close()
+
+
+def test_release_rejects_target_stream_count_above_bound(tmp_path, monkeypatch):
+    import orchestrator.runtime.general_worker_gate as gate_module
+    from orchestrator.runtime.general_worker_journal import _request_operation, _safe
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        monkeypatch.setattr(gate_module, "MAX_RELEASE_STREAMS", 2, raising=False)
+        for number in range(3):
+            registration = dict(case.registration)
+            registration["context"] = registration["context"].model_copy(
+                update={"attempt_id": f"historical-{number}"})
+            data = _safe(registration)
+            case.journal._append(_request_operation(data), "Requested", data)
+        with pytest.raises((GeneralWorkerJournalError, SchedulerError, ValueError)):
+            case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+                outcome="failed", known_no_effect=True)
+        assert not any(e.event_type == "AttemptSlotReleased" for e in scheduler_events(case.store))
+    finally:
+        case.store.close()
+
+
+def test_execute_exact_prepare_replay_does_not_launch_again(tmp_path, monkeypatch):
+    case = execution_case(tmp_path)
+    starts, returned = [], []
+    try:
+        task = case.app._worker_inputs._prepare_general_worker_task(**vars_identity(case.identity), task_text=case.text)
+        operation = case.service._register(case.identity, task)
+        prepared, ack, stop = epoch()
+        operation = case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+        operation = case.journal.ack_turn(operation, receipt=ack)
+        operation = case.journal.stop_turn(operation, receipt=stop)
+        original = case.service._journal.prepare_turn
+        def record_prepare(*args, **kwargs):
+            result = original(*args, **kwargs)
+            returned.append(result)
+            return result
+        monkeypatch.setattr(case.service._journal, "prepare_turn", record_prepare)
+        monkeypatch.setattr(case.service._worker, "prepare_launch", lambda: prepared)
+        def record_start(*args, **kwargs):
+            starts.append(True)
+            raise RuntimeError("record-only sentinel")
+        monkeypatch.setattr(case.service._worker, "start_turn", record_start)
+        result = asyncio.run(case.service.execute(identity=case.identity, task_text=case.text))
+        assert returned == [operation]
+        assert starts == []
+        assert result.status == "blocked"
+    finally:
+        case.app.close()
+
+
+def test_legacy_worker_scope_migrates_atomically(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    operation = case.journal.request(**case.registration)
+    connection = case.store._connection
+    for name in ("gw_scope_insert", "gw_scope_check", "gw_scope_immutable_update", "gw_scope_immutable_delete"):
+        connection.execute(f"DROP TRIGGER IF EXISTS {name}")
+    connection.execute("DROP TABLE IF EXISTS general_worker_scope")
+    connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+    case.store.close()
+    with SQLiteEventStore(tmp_path / "events.db") as reopened:
+        assert reopened.stream_ids_for_worker_node("run-1", "node-1", limit=10) == [operation.identity.stream_id]
+
+
+@pytest.mark.parametrize("bad_sql", [
+    "run_id = NULL", "run_id = ''", "fencing_generation = 'bad'",
+])
+def test_legacy_worker_scope_rejects_unattributable_history(tmp_path, bad_sql):
+    from orchestrator.persistence import EventDraft
+    path = tmp_path / "legacy.db"
+    with SQLiteEventStore(path) as store:
+        for name in ("gw_scope_insert", "gw_scope_check", "gw_scope_immutable_update", "gw_scope_immutable_delete"):
+            store._connection.execute(f"DROP TRIGGER IF EXISTS {name}")
+        store._connection.execute("DROP TABLE IF EXISTS general_worker_scope")
+        store._connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+        store.append("general_worker", "missing-context", 0, [EventDraft("GeneralWorkerRequested", {},
+            run_id="run-1", node_id="node-1", attempt_id="attempt-1", fencing_generation=1,
+            correlation_id="run-1", causation_id="decision-foreign")], "bad-legacy")
+        # Simulate an old database damaged outside the append-only API.
+        store._connection.execute("DROP TRIGGER events_immutable_update")
+        store._connection.execute(f"UPDATE events SET {bad_sql} WHERE stream_id = 'missing-context'")
+    with pytest.raises(ValueError, match="general worker scope"):
+        SQLiteEventStore(path)
+    import sqlite3
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT 1 FROM sqlite_master WHERE name = ?", ("general_worker_scope",)).fetchone() is None
+        assert connection.execute("SELECT 1 FROM schema_migrations WHERE version = 5").fetchone() is None
+
+
+def test_release_rejects_scope_hiding_known_admitted_stream(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        # Model external damage that also bypassed the immutable-scope trigger.
+        case.store._connection.execute("DROP TRIGGER gw_scope_immutable_update")
+        case.store._connection.execute("UPDATE general_worker_scope SET run_id='other-run' WHERE stream_id=?",
+            (operation.identity.stream_id,))
+        with pytest.raises(ValueError, match="scope hides"):
+            case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+                outcome="failed", known_no_effect=True)
+        assert not any(e.event_type == "AttemptSlotReleased" for e in scheduler_events(case.store))
+    finally:
+        case.store.close()
+
+
+def test_release_uses_one_locked_utc_sample_for_all_checks(tmp_path, monkeypatch):
+    import orchestrator.runtime.general_worker_gate as gate_module
+    import orchestrator.scheduler.core as scheduler_module
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        case.journal.request(**case.registration)
+        completed_at = datetime.now(timezone.utc)
+        locked_samples = []
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = super().now(tz)
+                if case.store._has_owned_write():
+                    locked_samples.append(value)
+                return value
+        monkeypatch.setattr(gate_module, "datetime", Clock)
+        monkeypatch.setattr(scheduler_module, "datetime", Clock)
+        case.scheduler.finish_attempt(**case.identity, completed_at=completed_at,
+            outcome="failed", known_no_effect=True)
+        assert len(locked_samples) == 1
+    finally:
+        case.store.close()
+
+
+def test_prepare_replay_rejects_forged_operation_commitments(tmp_path):
+    from dataclasses import replace
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        prepared = epoch()[0]
+        case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+        forged = replace(operation, input_commitment="sha256:" + "b" * 64)
+        with pytest.raises(GeneralWorkerJournalError):
+            case.journal.prepare_turn(forged, phase="request", prepared=prepared)
+    finally:
+        case.store.close()
+
+
+def test_scope_index_rolls_back_with_worker_registration(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        def abort(_events, _version):
+            case.journal.request(**case.registration)
+            assert case.store.stream_ids_for_worker_node("run-1", "node-1", limit=10)
+            raise RuntimeError("roll back outer transaction")
+        with pytest.raises(RuntimeError, match="roll back outer transaction"):
+            case.store.append_checked("scheduler", "global", "rollback-scope-test", abort)
+        assert case.store.stream_ids_for_worker_node("run-1", "node-1", limit=10) == []
+        assert case.journal.read(case.operation.identity) is None
+    finally:
+        case.store.close()
+
+
+def test_corrupt_worker_history_is_bounded_before_decoding(tmp_path, monkeypatch):
+    from orchestrator.persistence import EventDraft
+    from orchestrator.runtime.general_worker_journal import MAX_EVENTS
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        event = EventDraft("GeneralWorkerTurnPrepared", {}, **case.identity,
+            correlation_id="run-1", causation_id="decision-foreign")
+        case.store.append("general_worker", operation.identity.stream_id, 1,
+            [event] * MAX_EVENTS, "oversized-history")
+        case.store._connection.execute("UPDATE stream_versions SET current_version=1 WHERE stream_type=? AND stream_id=?",
+            ("general_worker", operation.identity.stream_id))
+        decoded = []
+        original = case.store._row_to_event
+        def counted(row):
+            decoded.append(1)
+            return original(row)
+        monkeypatch.setattr(case.store, "_row_to_event", counted)
+        with pytest.raises(GeneralWorkerJournalError):
+            case.journal.read(operation.identity)
+        assert len(decoded) <= MAX_EVENTS
+    finally:
+        case.store.close()

@@ -326,6 +326,8 @@ class GeneralWorkerExecutionService:
         # Recheck after the await, before recording any new launch intent.
         self._authority.resolve_eligibility(operation, purpose="request" if phase == "request" else "completion")
         operation = self._journal.prepare_turn(operation, phase=phase, prepared=prepared)
+        if not self._journal._consume_fresh_prepare(operation.identity, phase, prepared):
+            raise ValueError("replayed preparation is not a new launch permit")
         turn = GeneralWorkerTurn(phase, prepared.launch_id, task, response_text)
         session = await asyncio.to_thread(self._worker.start_turn, self._workspace, turn,
             prepared_launch=prepared, expected_workspace_identity_hash=operation.workspace_identity_hash)
