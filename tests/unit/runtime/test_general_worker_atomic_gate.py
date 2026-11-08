@@ -414,3 +414,243 @@ def test_corrupt_worker_history_is_bounded_before_decoding(tmp_path, monkeypatch
         assert len(decoded) <= MAX_EVENTS
     finally:
         case.store.close()
+
+
+def test_nested_prepare_rollback_never_grants_fresh_launch(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        prepared = epoch()[0]
+        def outer(_events, _version):
+            case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+            raise RuntimeError("abort")
+        with pytest.raises(RuntimeError, match="abort"):
+            case.store.append_checked("scheduler", "global", "rollback-prepare", outer)
+        assert case.journal.read(operation.identity) == operation
+        assert case.journal._fresh_prepare is None
+        assert not case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
+    finally:
+        case.store.close()
+
+
+def test_nested_prepare_savepoint_rollback_never_grants_fresh_launch(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        prepared = epoch()[0]
+        def outer(_events, _version):
+            def nested(_nested_events, _nested_version):
+                case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+                raise RuntimeError("abort savepoint")
+            with pytest.raises(RuntimeError, match="abort savepoint"):
+                case.store.append_checked("scheduler", "global", "nested-rollback", nested)
+        case.store.append_checked("scheduler", "global", "commit-outer", outer)
+        assert case.journal.read(operation.identity) == operation
+        assert case.journal._fresh_prepare is None
+        assert not case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
+    finally:
+        case.store.close()
+
+
+def test_nested_prepare_commit_grants_one_fresh_launch(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        prepared = epoch()[0]
+        def outer(_events, _version):
+            case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+            assert case.journal._fresh_prepare is None
+        case.store.append_checked("scheduler", "global", "commit-prepare", outer)
+        assert case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
+        assert not case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
+    finally:
+        case.store.close()
+
+
+def test_real_attempt_boundaries_and_live_worker_census(tmp_path):
+    from datetime import timedelta
+    from pydantic import ValidationError
+    from orchestrator.lifecycle import NodeSpec
+    from orchestrator.models import ModelGatewayFailure
+    from orchestrator.runtime.general_worker_authority import general_worker_host_scope
+    from orchestrator.runtime.general_worker_journal import metadata_hash
+    from tests.support.attempt_acceptance import ADMISSION
+    from tests.unit.lifecycle.test_scheduler import routed_pair
+
+    case = dispatch_case(tmp_path, register=False, max_attempts=100, retries=100, max_agents=100)
+    routing, decision = case.routing, case.decision
+    failure = ModelGatewayFailure(code="rate_limited", phase="provider", outcome="known_failure",
+        retryable=True, http_status=429)
+
+    def verify_other_terminal_paths(identity, number):
+        import sqlite3
+        from orchestrator.lifecycle import LifecycleController
+        for entry in ("cancel", "reconcile"):
+            clone = tmp_path / f"boundary-{number}-{entry}.db"
+            with sqlite3.connect(clone) as destination:
+                case.store._connection.backup(destination)
+            with SQLiteEventStore(clone) as store:
+                scheduler = Scheduler(store, limits=_application_limits())
+                now = datetime.now(timezone.utc)
+                if entry == "cancel":
+                    LifecycleController(store).request_cancel("run-1", reason_code="user_request")
+                    scheduler.acknowledge_cancellation(**identity, stopped_at=now,
+                        stop_receipt_hash="sha256:" + "a" * 64, no_effect_receipt_hash="sha256:" + "b" * 64)
+                else:
+                    scheduler.finish_attempt(**identity, completed_at=now, outcome="outcome_unknown")
+                    scheduler.reconcile_attempt(**identity, reconciled_at=now, outcome="failed", known_no_effect=True)
+                assert any(e.event_type == "AttemptSlotReleased" and e.attempt_id == identity["attempt_id"]
+                    for e in scheduler_events(store))
+
+    try:
+
+        with pytest.raises(ValidationError):
+            NodeSpec(node_id="node-1", role="coder", planning_contract=case.contract,
+                planning_contract_hash=case.contract.contract_hash, max_attempts=101)
+        for number in range(1, 101):
+            identity = dict(run_id="run-1", node_id="node-1", attempt_id=routing.attempt_id,
+                fencing_generation=number)
+            if number in (64, 65, 100):
+                verify_other_terminal_paths(identity, number)
+                binding = case.scheduler._resolve_general_verification_binding(**identity, as_of=datetime.now(timezone.utc))
+                operation = case.journal.request(context=binding.context, input_commitment="sha256:" + "a" * 64,
+                    accepted_route_sha256=metadata_hash(binding.active_attempt.accepted_route.model_dump(mode="json")),
+                    workspace_identity_hash=case.lifecycle.replay("run-1").workspace_identity_hash,
+                    host_scope_hash=general_worker_host_scope(case.store), output_byte_limit=16384)
+                prepared, ack, stop = epoch()
+                operation = case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+                with pytest.raises(SchedulerError):
+                    case.scheduler.finish_attempt(**identity, completed_at=datetime.now(timezone.utc),
+                        outcome="failed", known_no_effect=True)
+                operation = case.journal.ack_turn(operation, receipt=ack)
+                case.journal.stop_turn(operation, receipt=stop)
+            case.scheduler.finish_attempt(**identity, completed_at=datetime.now(timezone.utc),
+                outcome="failed", known_no_effect=True)
+            if number == 100:
+                break
+            plan = case.scheduler.plan_attempt_recovery(**identity, source_decision=decision,
+                contract=case.contract, failure=failure)
+            assert plan.outcome == "authorized", (number, plan)
+            routing, next_decision = routed_pair(case.registry, case.config, case.policy,
+                attempt=number + 1, contract_hash=case.contract.contract_hash,
+                recovery_action=plan.action, recovery_authorization=plan.authorization,
+                prior_decision_hash=decision.decision_hash, previous_model_id="model-1",
+                failure_category="transient", retry_level=number,
+                exhausted_model_ids=() if number == 1 else ("model-1",))
+            now = datetime.now(timezone.utc)
+            case.scheduler.accept_routing(routing, next_decision, accepted_at=now,
+                lease_expires_at=now + timedelta(hours=6), **ADMISSION)
+            decision = next_decision
+        assert len(case.lifecycle.replay("run-1").node("node-1").attempts) == 100
+        assert sum(e.event_type == "AttemptSlotReleased" for e in scheduler_events(case.store)) == 100
+    finally:
+        case.store.close()
+
+
+def test_rolled_back_prepare_cannot_claim_another_journals_reinsert(tmp_path):
+    from orchestrator.runtime.general_worker_journal import GeneralWorkerJournal
+    case = dispatch_case(tmp_path, register=False)
+    other = GeneralWorkerJournal(case.store)
+    try:
+        operation = case.journal.request(**case.registration)
+        prepared = epoch()[0]
+        def outer(_events, _version):
+            def nested(_nested_events, _nested_version):
+                case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+                raise RuntimeError("abort savepoint")
+            with pytest.raises(RuntimeError, match="abort savepoint"):
+                case.store.append_checked("scheduler", "global", "undo-first", nested)
+            other.prepare_turn(operation, phase="request", prepared=prepared)
+        case.store.append_checked("scheduler", "global", "commit-second", outer)
+        assert not case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
+        assert other._consume_fresh_prepare(operation.identity, "request", prepared)
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("count", [100, 101])
+def test_worker_census_at_supported_limit_and_above(tmp_path, monkeypatch, count):
+    from orchestrator.runtime.general_worker_journal import _request_operation, _safe
+    from orchestrator.runtime import general_worker_journal as journal_module
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operations = []
+        for number in range(count):
+            registration = dict(case.registration)
+            registration["context"] = registration["context"].model_copy(
+                update={"attempt_id": f"census-{number}"})
+            data = _safe(registration)
+            operation = case.journal._append(_request_operation(data), "Requested", data)
+            operations.append(operation)
+        # The last indexed identity is deliberately left unstopped.
+        operation = max(operations, key=lambda item: item.identity.stream_id)
+        prepared, ack, stop = epoch()
+        operation = case.journal._append(operation, "TurnPrepared", _safe(dict(phase="request", prepared=prepared)))
+        checked = []
+        original = journal_module._require_worker_stopped
+        def record(candidate):
+            checked.append(candidate.identity.stream_id)
+            original(candidate)
+        monkeypatch.setattr(journal_module, "_require_worker_stopped", record)
+        if count == 101:
+            with pytest.raises(ValueError, match="scope exceeds release bound"):
+                case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+                    outcome="failed", known_no_effect=True)
+        else:
+            with pytest.raises(ValueError):
+                case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+                    outcome="failed", known_no_effect=True)
+            assert set(checked) == {item.identity.stream_id for item in operations}
+            operation = case.journal.ack_turn(operation, receipt=ack)
+            case.journal.stop_turn(operation, receipt=stop)
+            case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+                outcome="failed", known_no_effect=True)
+        released = any(e.event_type == "AttemptSlotReleased" for e in scheduler_events(case.store))
+        assert released == (count == 100)
+    finally:
+        case.store.close()
+
+
+def test_fresh_prepare_cannot_be_consumed_before_outer_commit(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        prepared = epoch()[0]
+        def outer(_events, _version):
+            case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+            assert not case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
+        case.store.append_checked("scheduler", "global", "early-consume", outer)
+        assert not case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
+    finally:
+        case.store.close()
+
+
+def test_nested_exact_replay_does_not_publish_fresh_permission(tmp_path):
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        prepared = epoch()[0]
+        def outer(_events, _version):
+            ready = case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+            assert case.journal.prepare_turn(operation, phase="request", prepared=prepared) == ready
+        case.store.append_checked("scheduler", "global", "nested-replay", outer)
+        assert case.journal._fresh_prepare is None
+        assert not case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
+    finally:
+        case.store.close()
+
+
+def test_nested_prepare_publishes_after_outer_append_commit(tmp_path):
+    from orchestrator.persistence import EventDraft
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        operation = case.journal.request(**case.registration)
+        prepared = epoch()[0]
+        def outer(_events, _version):
+            case.journal.prepare_turn(operation, phase="request", prepared=prepared)
+            assert case.journal._fresh_prepare is None
+            return [EventDraft("NestedCommitObserved", {}, correlation_id="run-1")]
+        case.store.append_checked("scheduler", "global", "nested-with-draft", outer)
+        assert case.journal._consume_fresh_prepare(operation.identity, "request", prepared)
+    finally:
+        case.store.close()

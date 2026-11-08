@@ -535,6 +535,7 @@ class SQLiteEventStore:
     def __init__(self, path: str | Path) -> None:
         self._connection = _open_connection(path)
         initialize_schema(self._connection)
+        self._post_commit_actions = []
         store_ref = ref(self)
         self._connection.set_trace_callback(lambda sql: _watch_transaction(store_ref, sql))
 
@@ -560,6 +561,7 @@ class SQLiteEventStore:
             connection.execute("PRAGMA busy_timeout = 5000")
             instance = cls.__new__(cls)
             instance._connection = connection
+            instance._post_commit_actions = []
             store_ref = ref(instance)
             connection.set_trace_callback(lambda sql: _watch_transaction(store_ref, sql))
             return instance
@@ -567,6 +569,19 @@ class SQLiteEventStore:
             connection.close()
             raise
 
+    def _defer_until_commit(self, action):
+        if not self._has_owned_write() or not callable(action):
+            raise ValueError("deferred action requires an owned write transaction")
+        self._post_commit_actions.append(action)
+
+    def _publish_post_commit(self):
+        actions, self._post_commit_actions = self._post_commit_actions, []
+        for action in actions:
+            try:
+                action()
+            except Exception:
+                # A failed publication never changes the durable commit.
+                pass
     def _has_owned_write(self):
         marker = _OWNED_WRITES.get(self)
         return (self._connection.in_transaction and marker is not None
@@ -604,6 +619,7 @@ class SQLiteEventStore:
         if started_transaction:
             connection.execute("BEGIN IMMEDIATE")
             _OWNED_WRITES[self] = (connection, threading.get_ident(), object())
+            self._post_commit_actions = []
         else:
             savepoint = "orchestrator_append"
             connection.execute(f"SAVEPOINT {savepoint}")
@@ -636,6 +652,7 @@ class SQLiteEventStore:
                     raise RuntimeError("idempotency record points to missing events")
                 if started_transaction:
                     connection.commit()
+                    self._publish_post_commit()
                 else:
                     connection.execute(f"RELEASE SAVEPOINT {savepoint}")
                 return original_events
@@ -754,6 +771,7 @@ class SQLiteEventStore:
             )
             if started_transaction:
                 connection.commit()
+                self._publish_post_commit()
             else:
                 connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             return stored_events
@@ -769,6 +787,7 @@ class SQLiteEventStore:
         finally:
             if started_transaction:
                 _OWNED_WRITES.pop(self, None)
+                self._post_commit_actions = []
 
     def append_checked(
         self,
@@ -800,6 +819,7 @@ class SQLiteEventStore:
         if started_transaction:
             connection.execute("BEGIN IMMEDIATE")
             _OWNED_WRITES[self] = (connection, threading.get_ident(), object())
+            self._post_commit_actions = []
         else:
             savepoint = "orchestrator_append_checked"
             connection.execute(f"SAVEPOINT {savepoint}")
@@ -818,6 +838,7 @@ class SQLiteEventStore:
                 ]
                 if started_transaction:
                     connection.commit()
+                    self._publish_post_commit()
                 else:
                     connection.execute(f"RELEASE SAVEPOINT {savepoint}")
                 return existing
@@ -830,6 +851,7 @@ class SQLiteEventStore:
             )
             if started_transaction:
                 connection.commit()
+                self._publish_post_commit()
             else:
                 connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             return appended
@@ -845,6 +867,7 @@ class SQLiteEventStore:
         finally:
             if started_transaction:
                 _OWNED_WRITES.pop(self, None)
+                self._post_commit_actions = []
 
     def read_stream(
         self,

@@ -109,7 +109,7 @@ def test_operation_binding_uses_exact_frozen_route_and_context(prepared):
 
 
 def dispatch_case(tmp_path, *, register=True, request_observed=True, required_check_ids=("artifact-integrity",),
-    previous_status=None):
+    previous_status=None, max_attempts=3, retries=None, max_agents=8):
     """Offline model and broker, with actual frozen admission and durable store."""
     from orchestrator.config import ConfigCandidate, ConfigManager
     from orchestrator.lifecycle import LifecycleController, NodeSpec
@@ -127,7 +127,13 @@ def dispatch_case(tmp_path, *, register=True, request_observed=True, required_ch
 
     store = SQLiteEventStore(tmp_path / "events.db")
     reg = registry()
-    resolved = effective_config(reg)
+    resolved = effective_config(reg, max_agents=max_agents)
+    if retries is not None:
+        from orchestrator.config import EffectiveConfig, resolve_effective_config
+        config_data = resolved.config.model_dump(mode="json")
+        for preset in config_data["presets"].values():
+            preset["roles"]["coder"]["retries"] = retries
+        resolved = resolve_effective_config(EffectiveConfig.model_validate(config_data), registry=reg)
     policy = PolicyManifest(authorities=(PolicyAuthority(source="system", max_permission="read-only",
         allowed_actions=("model_invoke",), allowed_tools=("model:model-1",)),))
     contract = compile_node_contract(run_id="run-1", node_id="node-1", role="coder", task_text="private-task",
@@ -139,7 +145,7 @@ def dispatch_case(tmp_path, *, register=True, request_observed=True, required_ch
     lifecycle = LifecycleController(store)
     lifecycle.initialize_run("run-1")
     lifecycle.append_nodes("run-1", (NodeSpec(node_id="node-1", role="coder", planning_contract=contract,
-        planning_contract_hash=contract.contract_hash, max_attempts=3),), expected_graph_version=0,
+        planning_contract_hash=contract.contract_hash, max_attempts=max_attempts),), expected_graph_version=0,
         idempotency_key="graph", policy_manifest=policy)
     lifecycle.start_run("run-1")
     scheduler = Scheduler(store, limits=_application_limits())
@@ -191,7 +197,8 @@ def dispatch_case(tmp_path, *, register=True, request_observed=True, required_ch
     body = adapter_for(provider.adapter).encode_request(request, model).body_json.encode()
     return SimpleNamespace(store=store, scheduler=scheduler, lifecycle=lifecycle, authority=authority,
         journal=journal, operation=operation, request=request, body=body, registry=reg,
-        provider_journal=SQLiteProviderCallJournal(store), identity=identity, registration=registration, previous=previous)
+        provider_journal=SQLiteProviderCallJournal(store), identity=identity, registration=registration, previous=previous,
+        contract=contract, policy=policy, config=resolved.config, routing=routing, decision=decision)
 
 
 @pytest.fixture

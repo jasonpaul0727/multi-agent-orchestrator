@@ -6,13 +6,15 @@ from datetime import datetime, timezone
 from typing import Literal, TYPE_CHECKING
 
 from orchestrator.persistence import SQLiteEventStore
+from orchestrator.lifecycle.models import MAX_NODE_ATTEMPTS
 
 if TYPE_CHECKING:
     from orchestrator.isolation import PreparedSandboxLaunch
     from .general_worker_journal import GeneralWorkerOperation
 
 
-MAX_RELEASE_STREAMS = 64
+MAX_RELEASE_STREAMS = MAX_NODE_ATTEMPTS
+MAX_RELEASE_ATTEMPTS = MAX_NODE_ATTEMPTS
 
 
 class GeneralWorkerGate:
@@ -72,7 +74,7 @@ class GeneralWorkerGate:
         # Known admitted identities also have deterministic stream IDs. Probe
         # them independently so corrupted scope metadata cannot hide them.
         attempts = LifecycleController(self._store).replay(run_id).node(node_id).attempts
-        if len(attempts) > MAX_RELEASE_STREAMS:
+        if len(attempts) > MAX_RELEASE_ATTEMPTS:
             raise ValueError("attempt history exceeds release bound")
         indexed = set(streams)
         for attempt in attempts:

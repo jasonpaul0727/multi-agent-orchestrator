@@ -21,6 +21,8 @@ from orchestrator.config.models import ReasoningEffort
 from orchestrator.routing.planning import PlanningNodeContract
 
 
+MAX_NODE_ATTEMPTS = 100
+
 _HASH = r"^sha256:[0-9a-f]{64}$"
 _IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$"
 
@@ -39,7 +41,7 @@ class NodeSpec(_LifecycleModel):
     depends_on: tuple[StrictStr, ...] = ()
     parent_agent_instance_id: StrictStr | None = None
     tool_ids: tuple[StrictStr, ...] = ()
-    max_attempts: StrictInt = Field(default=1, ge=1, le=100)
+    max_attempts: StrictInt = Field(default=1, ge=1, le=MAX_NODE_ATTEMPTS)
 
     @model_validator(mode="after")
     def validate_frozen_contract_binding(self) -> "NodeSpec":

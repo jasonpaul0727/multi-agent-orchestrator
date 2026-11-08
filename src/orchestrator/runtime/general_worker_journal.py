@@ -391,6 +391,7 @@ class GeneralWorkerJournal:
         self.event_store = event_store
         self._gate = None
         self._fresh_prepare = None
+        self._prepare_generation = 0
         if not event_store._connection.in_transaction:
             try:
                 from .general_worker_gate import GeneralWorkerGate
@@ -500,27 +501,60 @@ class GeneralWorkerJournal:
         if type(prepared) is not PreparedSandboxLaunch:
             raise ValueError()
         self._fresh_prepare = None
+        self._prepare_generation += 1
+        generation = self._prepare_generation
         gate = self._v1_gate()
         result = None
-        is_new = False
+        event_id = None
         data = _safe(dict(phase=phase, prepared=prepared))
         def prepare(_events, _version):
-            nonlocal result, is_new
+            nonlocal result, event_id
             result = self._exact_replay(operation, "TurnPrepared", data)
             if result is None:
                 gate.check_v1_prepare(operation, phase, prepared)
                 result = self._append(operation, "TurnPrepared", data)
-                is_new = True
+                events, _ = self.event_store.read_stream_with_version(
+                    STREAM_TYPE, operation.identity.stream_id, max_events=MAX_EVENTS)
+                key = _event_key(operation.operation_id, "TurnPrepared", data)
+                matches = [event for event in events if event.idempotency_key == key]
+                if len(matches) != 1:
+                    raise ValueError("fresh preparation has no exact event")
+                event_id = matches[0].event_id
         self.event_store.append_checked("scheduler", "global", "general-prepare-gate", prepare)
-        if is_new:
-            self._fresh_prepare = (operation.identity, phase, prepared)
+        if event_id is not None:
+            marker = (operation.identity, phase, prepared, event_id)
+            if self.event_store._has_owned_write():
+                self.event_store._defer_until_commit(lambda: self._publish_fresh_prepare(marker, generation))
+            else:
+                self._fresh_prepare = marker
         return result
 
+    def _publish_fresh_prepare(self, marker, generation):
+        if self._prepare_generation != generation or self.event_store._connection.in_transaction:
+            return
+        events, _ = self.event_store.read_stream_with_version(
+            STREAM_TYPE, marker[0].stream_id, max_events=MAX_EVENTS)
+        if any(event.event_id == marker[3] and event.event_type == "GeneralWorkerTurnPrepared" for event in events):
+            self._fresh_prepare = marker
+
     def _consume_fresh_prepare(self, identity, phase, prepared):
-        fresh = (not self.event_store._connection.in_transaction
-            and self._fresh_prepare == (identity, phase, prepared))
-        self._fresh_prepare = None
-        return fresh
+        self._prepare_generation += 1
+        marker, self._fresh_prepare = self._fresh_prepare, None
+        if (self.event_store._connection.in_transaction or marker is None
+            or marker[:3] != (identity, phase, prepared)):
+            return False
+        try:
+            events, _ = self.event_store.read_stream_with_version(
+                STREAM_TYPE, identity.stream_id, max_events=MAX_EVENTS)
+            operation = self.read(identity)
+            return (sum(event.event_id == marker[3] and event.event_type == "GeneralWorkerTurnPrepared"
+                        for event in events) == 1
+                and operation is not None and bool(operation.turns)
+                and operation.turns[-1].phase == phase and operation.turns[-1].prepared == prepared
+                and operation.turns[-1].launch_receipt is None
+                and operation.turns[-1].termination_receipt is None)
+        except Exception:
+            return False
 
     def _exact_replay(self, operation, action, data):
         if not self.event_store._has_owned_write():
