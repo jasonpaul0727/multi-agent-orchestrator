@@ -57,18 +57,30 @@ def _operation(value):
     for item in (value.operation_id, value.run_id, value.node_id, value.attempt_id):
         _identifier(item)
     _positive(value.fencing_generation)
+    for item in (value.task_input_sha256, value.workspace_sha256, value.capability_sha256,
+                 value.manifest_sha256, value.policy_authority_sha256):
+        _digest(item)
     _digest(value.commitment_sha256)
+    data = asdict(value)
+    del data["commitment_sha256"]
+    if _hash(data) != value.commitment_sha256:
+        raise ValueError()
     return value
 
 
 def _intent(value, operation):
     if type(value) is not ActorIntent:
         raise ValueError()
-    for item in (value.operation_id, value.actor_id, value.kind, value.unit_name):
+    for item in (value.operation_id, value.actor_id, value.kind, value.host_id, value.boot_id, value.unit_name, value.launch_id):
         _identifier(item)
     _positive(value.fencing_generation)
     _positive(value.sequence)
+    _digest(value.parameters_sha256)
     _digest(value.intent_sha256)
+    data = asdict(value)
+    del data["intent_sha256"]
+    if _hash(data) != value.intent_sha256:
+        raise ValueError()
     if value.operation_id != operation.operation_id or value.fencing_generation != operation.fencing_generation:
         raise ValueError()
     return value
@@ -91,7 +103,9 @@ def _apply(state, action, data):
         actor = _intent(_decode(ActorIntent, data), state.operation)
         if state.closed or len(state.actors) >= MAX_ACTORS:
             raise ValueError()
-        if any(a.intent.actor_id == actor.actor_id or a.intent.sequence == actor.sequence for a in state.actors):
+        if any(a.intent.actor_id == actor.actor_id or a.intent.sequence == actor.sequence
+               or (a.intent.host_id, a.intent.boot_id, a.intent.unit_name) ==
+                  (actor.host_id, actor.boot_id, actor.unit_name) for a in state.actors):
             raise ValueError()
         return replace(state, actors=state.actors + (MediationActor(actor),), version=state.version + 1)
     if action == "Closed" and data == {} and not state.closed:
@@ -111,7 +125,8 @@ def _replay(operation_id, events, version):
             raise ValueError()
         if type(payload["schema_version"]) is not int or payload["schema_version"] != SCHEMA_VERSION:
             raise ValueError()
-        if payload["operation_id"] != operation_id or event.stream_version != index:
+        if (event.schema_version != 1 or payload["operation_id"] != operation_id
+                or event.stream_version != index):
             raise ValueError()
         action = payload["action"]
         if type(action) is not str or event.event_type != "Mediation" + action:
@@ -143,7 +158,8 @@ class MediationJournal:
             _identifier(operation_id)
             if self.event_store._connection.in_transaction and not self.event_store._has_owned_write():
                 raise ValueError()
-            events, version = self.event_store.read_stream_with_version(STREAM, operation_id, max_events=MAX_EVENTS)
+            events, version = self.event_store.read_stream_with_version(STREAM, operation_id, max_events=MAX_EVENTS,
+                stream_bounds=(MAX_EVENTS, MAX_RECORD_BYTES, MAX_HISTORY_BYTES))
             return _replay(operation_id, events, version)
         except Exception:
             raise MediationJournalError() from None
@@ -208,5 +224,6 @@ class MediationJournal:
                 node_id=op.node_id, attempt_id=op.attempt_id, fencing_generation=op.fencing_generation,
                 correlation_id=op.run_id, causation_id=(_hash(events[-1].payload) if events else op.commitment_sha256))]
 
-        store.append_checked(STREAM, operation_id, key, decide)
+        store.append_checked(STREAM, operation_id, key, decide,
+            stream_bounds=(MAX_EVENTS, MAX_RECORD_BYTES, MAX_HISTORY_BYTES))
         return result

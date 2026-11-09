@@ -13,12 +13,8 @@ def journal(tmp_path):
         yield MediationJournal(store)
 
 
-def operation():
-    return MediationOperation("op", "run", "node", "attempt", 1, H)
-
-
-def intent(actor_id="actor", sequence=1):
-    return ActorIntent("op", 1, actor_id, sequence, "worker", "unit.service", H)
+from tests.unit.runtime.test_mediation_review_fixes import operation, intent
+from dataclasses import replace
 
 
 def test_replay_is_idempotent_and_unacked_permit_remains_unknown_after_close(journal):
@@ -79,7 +75,7 @@ def test_capacity_and_bad_digest_fail_closed(journal, monkeypatch):
     monkeypatch.setattr(module, "MAX_ACTORS", 1)
     journal.register(operation())
     with pytest.raises(MediationJournalError):
-        journal.permit("op", ActorIntent("op", 1, "bad", 1, "worker", "unit.service", "bad"))
+        journal.permit("op", replace(intent("bad"), intent_sha256="bad"))
     journal.permit("op", intent())
     with pytest.raises(MediationJournalError):
         journal.permit("op", intent("other", 2))
@@ -104,3 +100,32 @@ def test_load_rejects_unknown_ambient_transaction(journal):
             journal.load("op")
     finally:
         journal.event_store._connection.rollback()
+
+
+def test_unknown_envelope_version_rejected(journal):
+    journal.register(operation())
+    conn = journal.event_store._connection
+    conn.execute("DROP TRIGGER events_immutable_update")
+    conn.execute("UPDATE events SET schema_version=99 WHERE stream_type='mediation_v2'")
+    with pytest.raises(MediationJournalError):
+        journal.load("op")
+
+
+def test_reusing_unit_with_other_actor_rejected(journal):
+    journal.register(operation())
+    journal.permit("op", intent())
+    with pytest.raises(MediationJournalError):
+        journal.permit("op", intent("other", 2))
+
+
+def test_version_lag_with_tail_rejected(journal):
+    import uuid
+    journal.register(operation())
+    conn = journal.event_store._connection
+    conn.execute("""INSERT INTO events
+        SELECT ?, stream_type, stream_id, 2, event_type, schema_version, occurred_at,
+        payload_json, payload_hash, ?, run_id, node_id, attempt_id, fencing_generation,
+        correlation_id, causation_id FROM events WHERE stream_type='mediation_v2'""",
+        (str(uuid.uuid4()), str(uuid.uuid4())))
+    with pytest.raises(MediationJournalError):
+        journal.close("op")

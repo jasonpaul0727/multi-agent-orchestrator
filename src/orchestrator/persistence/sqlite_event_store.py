@@ -809,6 +809,7 @@ class SQLiteEventStore:
         stream_id: str,
         idempotency_key: str,
         decide: Callable[[list[StoredEvent], int], Iterable[EventDraft] | None],
+        *, stream_bounds: tuple[int, int, int] | None = None,
     ) -> list[StoredEvent]:
         """Run a locked read-modify-append operation atomically.
 
@@ -838,6 +839,8 @@ class SQLiteEventStore:
             savepoint = "orchestrator_append_checked"
             connection.execute(f"SAVEPOINT {savepoint}")
         try:
+            if stream_bounds is not None:
+                self._validate_stream_bounds(stream_type, stream_id, stream_bounds)
             events = self._read_rows(
                 stream_type,
                 stream_id,
@@ -956,6 +959,7 @@ class SQLiteEventStore:
         stream_id: str,
         after_version: int = 0,
         *, max_events: int | None = None,
+        stream_bounds: tuple[int, int, int] | None = None,
     ) -> tuple[list[StoredEvent], int]:
         """Read a stream and its version from one SQLite read transaction.
 
@@ -977,6 +981,8 @@ class SQLiteEventStore:
             savepoint = "orchestrator_stream_read"
             connection.execute(f"SAVEPOINT {savepoint}")
         try:
+            if stream_bounds is not None:
+                self._validate_stream_bounds(stream_type, stream_id, stream_bounds)
             rows = connection.execute(
                 """
                 SELECT event_id, stream_type, stream_id, stream_version,
@@ -1076,6 +1082,26 @@ class SQLiteEventStore:
             (stream_type, run_id, node_id, attempt_id),
         ).fetchall()
         return [row["stream_id"] for row in rows]
+
+    def _validate_stream_bounds(self, stream_type, stream_id, bounds):
+        """Check physical rows under the caller's transaction before materialization."""
+        if (type(bounds) is not tuple or len(bounds) != 3
+                or any(type(value) is not int or value < 1 for value in bounds)
+                or not self._connection.in_transaction):
+            raise ValueError("invalid stream bounds")
+        row = self._connection.execute(
+            """SELECT COUNT(*) AS n, COALESCE(MIN(stream_version), 0) AS low,
+                      COALESCE(MAX(stream_version), 0) AS high,
+                      COALESCE(MAX(length(CAST(payload_json AS BLOB))), 0) AS largest,
+                      COALESCE(SUM(length(CAST(payload_json AS BLOB))), 0) AS total
+                 FROM events WHERE stream_type = ? AND stream_id = ?""",
+            (stream_type, stream_id),
+        ).fetchone()
+        version = self.current_version(stream_type, stream_id)
+        count, low, high, largest, total = row
+        if (count > bounds[0] or largest > bounds[1] or total > bounds[2]
+                or count != version or high != version or low != (1 if count else 0)):
+            raise ValueError("invalid bounded stream")
 
     def _read_rows(
         self,
