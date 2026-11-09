@@ -169,3 +169,127 @@ def test_unknown_payload_version_rejected(journal, action):
         else:
             journal.load("op")
     assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == before
+
+
+@pytest.mark.parametrize("kind", ["worker", "tool", "provider_sender", "verifier"])
+def test_supported_actor_kinds_are_accepted(journal, kind):
+    journal.register(operation())
+    item = intent(kind=kind)
+    assert journal.permit("op", item).actors[0].intent == item
+    assert journal.permit("op", item) == journal.load("op")
+
+
+def test_unknown_actor_kind_is_rejected_even_with_valid_digest(journal):
+    journal.register(operation())
+    with pytest.raises(MediationJournalError):
+        journal.permit("op", intent(kind="untrusted_runner"))
+    assert journal.load("op").actors == ()
+
+
+@pytest.mark.parametrize("action", ["register", "permit", "close", "load"])
+def test_unknown_actor_kind_in_history_is_rejected(journal, action):
+    journal.register(operation())
+    journal.permit("op", intent())
+    conn = journal.event_store._connection
+    conn.execute("DROP TRIGGER events_immutable_update")
+    raw = conn.execute("SELECT payload_json FROM events WHERE stream_type='mediation_v2' AND stream_version=2").fetchone()[0]
+    payload = json.loads(raw)
+    fields = payload["data"]
+    fields["kind"] = "untrusted_runner"
+    fields["intent_sha256"] = digest({k: v for k, v in fields.items() if k != "intent_sha256"})
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    value = hashlib.sha256(encoded.encode()).hexdigest()
+    conn.execute("UPDATE events SET payload_json=?, payload_hash=?, idempotency_key=? WHERE stream_type='mediation_v2' AND stream_version=2",
+                 (encoded, value, "sha256:" + value))
+    before = conn.execute("SELECT count(*) FROM events").fetchone()[0]
+    with pytest.raises(MediationJournalError):
+        if action == "register":
+            journal.register(operation())
+        elif action == "permit":
+            journal.permit("op", intent())
+        elif action == "close":
+            journal.close("op")
+        else:
+            journal.load("op")
+    assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == before
+
+
+@pytest.mark.parametrize("conflict", ["actor_id", "sequence"])
+def test_actor_id_and_sequence_conflicts_are_independent_of_unit(journal, conflict):
+    journal.register(operation())
+    original = intent()
+    state = journal.permit("op", original)
+    assert journal.permit("op", original) == state
+    other = (intent("actor", 2, unit_name="different.service", launch_id="different")
+             if conflict == "actor_id" else
+             intent("other", 1, unit_name="different.service", launch_id="different"))
+    with pytest.raises(MediationJournalError):
+        journal.permit("op", other)
+    assert journal.load("op") == state
+
+
+@pytest.mark.parametrize("action", ["register", "permit", "close", "load"])
+def test_remote_tail_version_100_rejected_before_decode(journal, action, monkeypatch):
+    journal.register(operation())
+    conn = journal.event_store._connection
+    conn.execute("""INSERT INTO events
+        SELECT ?, stream_type, stream_id, 100, event_type, schema_version, occurred_at,
+        payload_json, payload_hash, ?, run_id, node_id, attempt_id, fencing_generation,
+        correlation_id, causation_id FROM events WHERE stream_type='mediation_v2' AND stream_version=1""",
+        (str(uuid.uuid4()), str(uuid.uuid4())))
+    decoded = []
+    original = SQLiteEventStore._row_to_event
+    def observe(row):
+        decoded.append(True)
+        return original(row)
+    monkeypatch.setattr(SQLiteEventStore, "_row_to_event", staticmethod(observe))
+    before = conn.execute("SELECT count(*) FROM events").fetchone()[0]
+    with pytest.raises(MediationJournalError):
+        if action == "register":
+            journal.register(operation())
+        elif action == "permit":
+            journal.permit("op", intent())
+        elif action == "close":
+            journal.close("op")
+        else:
+            journal.load("op")
+    assert not decoded
+    assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == before
+
+
+@pytest.mark.parametrize("action", ["permit", "close", "replay"])
+def test_sensitive_sentinel_is_not_exposed_by_public_exceptions(journal, action):
+    import traceback
+    secret = "task-listing-secret"
+    journal.register(operation())
+    if action == "replay":
+        conn = journal.event_store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        raw = conn.execute("SELECT payload_json FROM events WHERE stream_type='mediation_v2'").fetchone()[0]
+        payload = json.loads(raw)
+        payload["data"]["run_id"] = secret
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        value = hashlib.sha256(encoded.encode()).hexdigest()
+        conn.execute("UPDATE events SET payload_json=?, payload_hash=?, idempotency_key=? WHERE stream_type='mediation_v2'",
+                     (encoded, value, "sha256:" + value))
+    with pytest.raises(MediationJournalError) as error:
+        if action == "permit":
+            journal.permit("op", replace(intent(), actor_id=secret))
+        elif action == "close":
+            journal.close(secret + "!")
+        else:
+            journal.load("op")
+    assert secret not in "".join(traceback.format_exception(error.value))
+    assert error.value.__cause__ is None
+
+
+def test_exact_registration_and_permit_replay_remain_idempotent_after_close(journal):
+    op = operation()
+    actor = intent()
+    journal.register(op)
+    journal.permit("op", actor)
+    closed = journal.close("op")
+    assert journal.register(op) == closed
+    assert journal.permit("op", actor) == closed
+    assert journal.close("op") == closed
+    assert journal.load("op") == closed

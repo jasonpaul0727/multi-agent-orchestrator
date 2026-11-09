@@ -2,6 +2,9 @@
 
 Only registration, intent persistence and closure are implemented. ACK, stop
 and seal remain unavailable until an independently owned verifier is wired.
+Metadata does not establish a real unit, its systemd name validity, or its
+uniqueness across operations. A shared bounded, atomic host-owned census
+must enforce cross-operation unit uniqueness before launch is enabled.
 """
 
 from dataclasses import asdict, replace
@@ -18,6 +21,7 @@ MAX_ACTORS = 128
 MAX_EVENTS = MAX_ACTORS + 2
 MAX_RECORD_BYTES = 16384
 MAX_HISTORY_BYTES = 262144
+ACTOR_KINDS = frozenset({"worker", "tool", "provider_sender", "verifier"})
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -75,6 +79,8 @@ def _intent(value, operation):
         _identifier(item)
     _positive(value.fencing_generation)
     _positive(value.sequence)
+    if value.kind not in ACTOR_KINDS:
+        raise ValueError()
     _digest(value.parameters_sha256)
     _digest(value.intent_sha256)
     data = asdict(value)
