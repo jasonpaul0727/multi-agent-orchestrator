@@ -1137,3 +1137,29 @@ def test_cancel_reconcile_rejects_committed_fee_mismatch(tmp_path):
         assert case.lifecycle.complete_cancellation_if_idle("run-1").outcome == "held"
     finally:
         case.store.close()
+
+
+def test_cancel_reconcile_rejects_matching_usage_and_commit_with_wrong_currency(tmp_path):
+    import json
+    from datetime import datetime, timedelta, timezone
+    from orchestrator.persistence.sqlite_event_store import _sha256_json
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        now = datetime.now(timezone.utc)
+        case.scheduler.finish_attempt(**case.identity, completed_at=now, outcome="outcome_unknown")
+        case.scheduler.reconcile_attempt(**case.identity, reconciled_at=now+timedelta(seconds=1), outcome="failed", known_no_effect=True)
+        append_cancel_request(case)
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        for kind in ("UsageObserved", "CostCommitted"):
+            row = conn.execute("SELECT payload_json FROM events WHERE stream_type='budget' AND event_type=?", (kind,)).fetchone()
+            payload = json.loads(row[0]); payload["currency"] = "EUR"
+            conn.execute("UPDATE events SET payload_json=?, payload_hash=? WHERE stream_type='budget' AND event_type=?", (json.dumps(payload), _sha256_json(payload), kind))
+        result = case.lifecycle.complete_cancellation_if_idle("run-1")
+        assert result.outcome == "held"
+        events = case.store.read_stream("run_lifecycle", "run-1")
+        assert any(event.event_type == "RunCancellationRequested" for event in events)
+        assert not any(event.event_type == "RunCancelled" for event in events)
+    finally:
+        case.store.close()

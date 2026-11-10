@@ -1171,3 +1171,35 @@ def test_expiry_continues_to_healthy_node_when_first_reservation_missing(tmp_pat
         assert not any(e.event_type == "AttemptSlotReleased" for e in events)
     finally:
         case.store.close()
+
+
+@pytest.mark.parametrize("entry", ["load", "register", "close"])
+def test_public_v2_rejects_gap_and_tail_before_decode(tmp_path, monkeypatch, entry):
+    import uuid
+    case = dispatch_case(tmp_path, register=False)
+    decoded = []
+    original = case.store._row_to_event
+    def observed(row):
+        if row["stream_type"] == "mediation_v2":
+            decoded.append(True)
+        return original(row)
+    try:
+        candidate = v2_operation(case)
+        journal = MediationJournal(case.store)
+        journal.register(candidate)
+        conn = case.store._connection
+        conn.execute("""INSERT INTO events SELECT ?, stream_type, stream_id, 3, event_type, schema_version,
+            occurred_at, payload_json, payload_hash, ?, run_id, node_id, attempt_id, fencing_generation,
+            correlation_id, causation_id FROM events WHERE stream_type='mediation_v2' AND stream_id=? AND stream_version=1""",
+            (str(uuid.uuid4()), str(uuid.uuid4()), candidate.operation_id))
+        conn.execute("UPDATE stream_versions SET current_version=2 WHERE stream_type='mediation_v2' AND stream_id=?", (candidate.operation_id,))
+        before = conn.execute("SELECT count(*) FROM events").fetchone()[0]
+        monkeypatch.setattr(case.store, "_row_to_event", observed)
+        with pytest.raises(MediationJournalError):
+            if entry == "load": journal.load(candidate.operation_id)
+            elif entry == "register": journal.register(candidate)
+            else: journal.close(candidate.operation_id)
+        assert not decoded
+        assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == before
+    finally:
+        case.store.close()

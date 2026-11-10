@@ -22,6 +22,11 @@ class CancellationHeld(ValueError):
 
 @dataclass(slots=True)
 class CancellationBudget:
+    """One proof only; never reuse this budget after a savepoint rollback.
+
+    SQLite total_changes does not track rollbacks. This is a caller contract,
+    not a runtime check; public completion creates a fresh budget per call.
+    """
     max_rows: int
     max_bytes: int
     max_row_bytes: int
@@ -458,7 +463,9 @@ def prove_basic_cancellation(store, run_id, budget):
                 usage = reservation_state.usage
                 committed = next(e for e in related if e.event_type == "CostCommitted").payload
                 observed = next(e for e in related if e.event_type == "UsageObserved").payload
-                if (usage is None or reservation_state.cost_minor != usage.cost_minor
+                if (usage is None or usage.status != "committed"
+                        or usage.currency != reservation.currency
+                        or reservation_state.cost_minor != usage.cost_minor
                         or reservation_state.used_tokens != usage.total_tokens
                         or metadata_hash(dict(committed)) != metadata_hash(BudgetLedger._committed_payload(usage))
                         or metadata_hash(dict(observed)) != metadata_hash(BudgetLedger._usage_payload(usage))):
