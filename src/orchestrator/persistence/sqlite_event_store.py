@@ -845,6 +845,10 @@ class SQLiteEventStore:
             if current_version != expected_version:
                 raise StaleStream(expected_version, current_version)
 
+            if stream_type == "artifact":
+                from orchestrator.artifacts.evidence_checkpoint import verify_before_append
+                verify_before_append(self, stream_id)
+
             existing_events = self._read_rows(
                 stream_type,
                 stream_id,
@@ -928,6 +932,12 @@ class SQLiteEventStore:
                         stored_event.causation_id,
                     ),
                 )
+
+            if stream_type == "artifact":
+                # Experimental checkpoint maintenance shares this transaction;
+                # it supplies no artifact-access or cancellation authority.
+                from orchestrator.artifacts.evidence_checkpoint import refresh_after_append
+                refresh_after_append(self, stream_id)
 
             connection.execute(
                 """
