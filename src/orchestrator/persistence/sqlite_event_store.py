@@ -626,9 +626,15 @@ def _watch_transaction(store_ref, statement):
     """Invalidate on transaction replacement, retaining only actual ROLLBACK TO."""
     # Most traced statements are ordinary reads/writes. Avoid tokenizing their
     # potentially large bound payloads; only ROLLBACK needs detailed parsing.
-    prefix = re.sub(r"\A(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", statement, flags=re.S)
+    # SQLite accepts empty statements and BOM tokens before the command.
+    # Consume them together with SQL whitespace/comments, in any order.
+    prefix = re.sub(r"\A(?:[\x09-\x0d \ufeff;]|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", statement, flags=re.S)
     command = re.match(r"([A-Za-z_]+)", prefix)
     if command is None:
+        # Never retain proof ownership when the traced command is unknown.
+        store = store_ref()
+        if store is not None:
+            _OWNED_WRITES.pop(store, None)
         return
     command = command.group(1).upper()
     rollback_to = False

@@ -1239,3 +1239,101 @@ def test_budget_fails_closed_after_nested_store_scope_rolls_back(tmp_path):
             assert (budget.rows, budget.bytes, budget.streams) == counters
     finally:
         case.store.close()
+
+
+_SQLITE_CONTROL_PREFIXES = [
+    pytest.param(";", id="semicolon"),
+    pytest.param(";;;", id="multiple-semicolons"),
+    pytest.param("\ufeff", id="bom"),
+    pytest.param(" \t/* before */; -- between\n;\ufeff /* after */ ", id="mixed-prefix"),
+]
+_SQLITE_SAVEPOINT_NAMES = [
+    "nested", '"nested -- quoted"', "'nested /* quoted */'", "`nested ; quoted`", "[nested quoted]",
+]
+
+
+def _observe_real_transaction_trace(monkeypatch):
+    from orchestrator.persistence import sqlite_event_store
+    observed = []
+    original = sqlite_event_store._watch_transaction
+
+    def record(store_ref, statement):
+        observed.append(statement)
+        original(store_ref, statement)
+
+    monkeypatch.setattr(sqlite_event_store, "_watch_transaction", record)
+    return observed
+
+
+@pytest.mark.parametrize("prefix", _SQLITE_CONTROL_PREFIXES)
+@pytest.mark.parametrize("name", _SQLITE_SAVEPOINT_NAMES)
+def test_prefixed_rollback_rejects_stale_budget_and_restores_real_data(tmp_path, monkeypatch, prefix, name):
+    from datetime import datetime, timezone
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget, read_event_window
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    observed = _observe_real_transaction_trace(monkeypatch)
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc), outcome="failed", known_no_effect=True)
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        with case.store._cancellation_proof_write():
+            conn.execute("SAVEPOINT " + name)
+            conn.execute("UPDATE events SET event_type='ExperimentOnly' WHERE stream_type='budget' AND event_type='BudgetReleased'")
+            budget = CancellationBudget(1000, 2000000, 65536, 50, 20)
+            changed, _ = read_event_window(case.store, "budget", "run-1", budget)
+            assert any(event.event_type == "ExperimentOnly" for event in changed)
+            counters = (budget.rows, budget.bytes, budget.streams)
+            statement = prefix + "ROLLBACK TO SAVEPOINT " + name
+            conn.execute(statement)
+            assert statement in observed  # Actual SQLite trace, not a direct observer call.
+            assert conn.execute("SELECT count(*) FROM events WHERE event_type='ExperimentOnly'").fetchone()[0] == 0
+            conn.execute("RELEASE SAVEPOINT " + name)
+            with pytest.raises(ValueError, match="rollback"):
+                read_event_window(case.store, "budget", "run-1", budget)
+            assert (budget.rows, budget.bytes, budget.streams) == counters
+            fresh = CancellationBudget(1000, 2000000, 65536, 50, 20)
+            restored, _ = read_event_window(case.store, "budget", "run-1", fresh)
+            assert any(event.event_type == "BudgetReleased" for event in restored)
+            assert not any(event.event_type == "ExperimentOnly" for event in restored)
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("prefix", _SQLITE_CONTROL_PREFIXES)
+@pytest.mark.parametrize("name", _SQLITE_SAVEPOINT_NAMES)
+def test_prefixed_nested_release_preserves_budget(tmp_path, monkeypatch, prefix, name):
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget, read_event_window
+    observed = _observe_real_transaction_trace(monkeypatch)
+    with SQLiteEventStore(tmp_path / "events.db") as store:
+        with store._cancellation_proof_write():
+            budget = CancellationBudget(20, 100000, 10000, 20, 20)
+            cached = read_event_window(store, "run_lifecycle", "none", budget)
+            counters = (budget.rows, budget.bytes, budget.streams)
+            store._connection.execute("SAVEPOINT " + name)
+            statement = prefix + "RELEASE SAVEPOINT " + name
+            store._connection.execute(statement)
+            assert statement in observed
+            assert read_event_window(store, "run_lifecycle", "none", budget) is cached
+            assert (budget.rows, budget.bytes, budget.streams) == counters
+
+
+@pytest.mark.parametrize("prefix", _SQLITE_CONTROL_PREFIXES)
+def test_prefixed_outer_rollback_discards_owned_token(tmp_path, monkeypatch, prefix):
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget, read_event_window
+    from orchestrator.persistence.sqlite_event_store import _OWNED_WRITES
+    observed = _observe_real_transaction_trace(monkeypatch)
+    with SQLiteEventStore(tmp_path / "events.db") as store:
+        budget = CancellationBudget(20, 100000, 10000, 20, 20)
+        with pytest.raises(ValueError, match="lost write ownership"):
+            with store._cancellation_proof_write():
+                read_event_window(store, "run_lifecycle", "none", budget)
+                counters = (budget.rows, budget.bytes, budget.streams)
+                statement = prefix + "ROLLBACK"
+                store._connection.execute(statement)
+                assert statement in observed
+                assert not store._connection.in_transaction
+                assert store not in _OWNED_WRITES
+                with pytest.raises(ValueError, match="owned write required"):
+                    read_event_window(store, "run_lifecycle", "none", budget)
+                assert (budget.rows, budget.bytes, budget.streams) == counters
