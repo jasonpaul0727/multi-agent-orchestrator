@@ -232,6 +232,10 @@ proposal and completion Worker turn; the tool; the Provider sender; and the
 Verifier. Model service activity after a request is delivered is not a local
 actor and is not represented as stopped by a sender receipt.
 
+The supervised-systemd addendum defines the current transport and trusted-host boundary and supersedes the systemd-run-specific mechanism below for v2. Same-UID host processes are trusted operationally, while Workers and tools remain untrusted regardless of UID. One-shot dispatch, manager queue continuity and cgroup evidence remain mandatory.
+
+The addendum also requires stable single-namespace broker lock identity and crash-durable SQLite semantics, serialized in-broker one-shot dispatch, close-on-exec control capabilities, and uninterrupted producer/event continuity from cgroup observation through proof commit and release. Repeated observation or a database lock alone cannot establish that continuity. Real pre-policy starts are limited to controlled test fixtures; production admission requires the same-lock trusted policy and revocation authority.
+
 Each concrete launcher is refactored to the same staged protocol:
   1. Prepare an unguessable unique actor identity and exact operation/fence,
      actor kind, unit name, launch parameters and intent digest.
@@ -245,7 +249,7 @@ Each concrete launcher is refactored to the same staged protocol:
      unit/invocation identity, cgroup membership and empty/inactive state.
      In addition, prove the exact launcher transport is terminated or
      irreversibly fenced so it cannot submit the unit again. A live local
-     systemd-run transport must be observed exited; recovered ACK alone,
+     systemd-run transport must be observed exited; v2 instead requires the addendum's owned broker one-shot and resolved manager queue. Recovered ACK alone,
      empty cgroup, unit absence or loss of the in-memory session does not
      prove transport quiescence after host crash. If the exact transport
      cannot be identified and proved ended/fenced, hold. Reused or
