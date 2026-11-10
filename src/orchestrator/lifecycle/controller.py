@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Literal
+import sqlite3
+from typing import Literal, TYPE_CHECKING
 
 from orchestrator.config.runtime import RunConfigSnapshot
 from orchestrator.persistence import EventDraft, SQLiteEventStore, SnapshotStore, StoredEvent
@@ -14,7 +15,11 @@ from orchestrator.security import PolicyManifest
 from .graph import GraphError, validate_graph_append
 from .models import AttemptState, NodeSpec, NodeState, RunLifecycleState
 
+if TYPE_CHECKING:
+    from .cancel_completion import CancellationResult
 
+
+MAX_CANCEL_CENSUS_WORK = 100
 _LIFECYCLE_STREAM = "run_lifecycle"
 _RUN_STREAM = "run"
 _HASH = r"^sha256:[0-9a-f]{64}$"
@@ -44,6 +49,7 @@ class LifecycleController:
     def __init__(self, event_store: SQLiteEventStore) -> None:
         self.event_store = event_store
         self.snapshots = SnapshotStore(event_store)
+        self.last_cancellation_completion = None
 
     def initialize_run(self, run_id: str) -> RunLifecycleState:
         snapshot = self.config_snapshot(run_id)
@@ -291,7 +297,9 @@ class LifecycleController:
         self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
         return self.checkpoint(run_id)
 
-    def request_cancel(self, run_id: str, *, reason_code: str) -> RunLifecycleState:
+    def request_cancel(self, run_id: str, *, reason_code: str) -> RunLifecycleState | CancellationResult:
+        if self.event_store._connection.in_transaction and not self.event_store._has_owned_write():
+            raise ValueError("unknown ambient transaction")
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason_code):
             raise ValueError("reason_code must be a stable lowercase code")
         payload = {"run_id": run_id, "reason_code": reason_code}
@@ -312,41 +320,79 @@ class LifecycleController:
             ]
 
         self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
-        self.complete_cancellation_if_idle(run_id)
-        return self.checkpoint(run_id)
+        result = self.complete_cancellation_if_idle(run_id)
+        return result.state if result.state is not None else result
 
-    def complete_cancellation_if_idle(self, run_id: str) -> RunLifecycleState:
-        state = self.replay(run_id)
-        if state.status != "cancelling" or any(
-            node.status in {"running", "awaiting_reconciliation"} for node in state.nodes
-        ):
-            return state
-        request_event = next(
-            event for event in reversed(self.event_store.read_stream(_LIFECYCLE_STREAM, run_id))
-            if event.event_type == "RunCancellationRequested"
-        )
-        payload = {"run_id": run_id, "cancellation_request_id": request_event.event_id}
-        key = f"run-cancel-complete:{run_id}"
+    def complete_cancellation_if_idle(self, run_id: str) -> CancellationResult:
+        """Attempt a bounded completion; the cancellation intent is independent."""
+        from .cancel_completion import CancellationBudget, CancellationHeld, CancellationResult, prove_basic_cancellation
 
-        def decide(events: list[StoredEvent], version: int):
-            if any(event.idempotency_key == key for event in events):
-                _check_idempotent(events, key, "RunCancelled", payload)
-                return None
-            current = reduce_lifecycle(run_id, events)
-            if current.status != "cancelling" or any(
-                node.status in {"running", "awaiting_reconciliation"} for node in current.nodes
-            ):
-                raise LifecycleConflict("Run still has attempts requiring termination or reconciliation")
-            return [
-                EventDraft(
-                    "RunCancelled", payload, run_id=run_id,
-                    correlation_id=run_id, causation_id=request_event.event_id,
-                )
-            ]
-
-        self.event_store.append_checked(_LIFECYCLE_STREAM, run_id, key, decide)
-        return self.checkpoint(run_id)
-
+        budget = CancellationBudget(max_rows=4000, max_bytes=4 * 1024 * 1024,
+            max_row_bytes=65536, max_streams=300, max_nodes=MAX_CANCEL_CENSUS_WORK)
+        def publish(result):
+            self.last_cancellation_completion = result
+            return result
+        try:
+            with self.event_store._cancellation_proof_write() as owns_commit:
+                try:
+                    result, events, version = prove_basic_cancellation(self.event_store, run_id, budget)
+                    if result.outcome != "ready":
+                        return publish(result)
+                    request = next((event for event in reversed(events)
+                                    if event.event_type == "RunCancellationRequested"), None)
+                    if request is None:
+                        raise CancellationHeld("integrity")
+                    payload = {"run_id": run_id, "cancellation_request_id": request.event_id}
+                    key = f"run-cancel-complete:{run_id}"
+                    prior = [event for event in events if event.idempotency_key == key]
+                    if prior:
+                        if len(prior) != 1:
+                            raise CancellationHeld("integrity")
+                        try:
+                            _check_idempotent(events, key, "RunCancelled", payload)
+                        except (LifecycleError, ValueError, TypeError, KeyError):
+                            raise CancellationHeld("integrity") from None
+                        return publish(CancellationResult("not_needed", state=result.state))
+                    budget.bind(self.event_store)
+                    if self.event_store._connection.execute(
+                            "SELECT 1 FROM idempotency_records WHERE stream_id=? AND idempotency_key=?",
+                            (run_id, key)).fetchone() is not None:
+                        raise CancellationHeld("integrity")
+                    count, size = budget._windows[(_LIFECYCLE_STREAM, run_id)]
+                    # append() re-reads the already checked lifecycle window;
+                    # reserve that materialization and the single output row.
+                    event_cost = (1024 + 3 * len(run_id.encode("utf-8")) + len(key.encode("utf-8"))
+                                  + len(request.event_id.encode("utf-8"))
+                                  + len(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                                   separators=(",", ":")).encode("utf-8")))
+                    if (event_cost > budget.max_row_bytes or budget.rows + count + 2 > budget.max_rows
+                            or budget.bytes + size + event_cost > budget.max_bytes):
+                        raise CancellationHeld("budget")
+                    budget.rows += count + 2
+                    budget.bytes += size + event_cost
+                    draft = EventDraft("RunCancelled", payload, run_id=run_id,
+                                       correlation_id=run_id, causation_id=request.event_id)
+                    appended = self.event_store.append(_LIFECYCLE_STREAM, run_id, version, [draft], key)
+                    budget.bind(self.event_store)
+                    if len(appended) != 1:
+                        raise CancellationHeld("integrity")
+                    state = apply_lifecycle_event(run_id, result.state, appended[0])
+                    return publish(CancellationResult("completed" if owns_commit else "pending_commit", state=state))
+                except CancellationHeld as held:
+                    return publish(CancellationResult("held", held.reason, budget._state))
+        except sqlite3.OperationalError as error:
+            missing_indexes = {
+                "no such index: ix_cancel_events_run",
+                "no such index: ix_cancel_v1_scope_run",
+                "no such index: ix_cancel_v2_scope_run",
+                "no such index: ix_scheduler_release_context",
+            }
+            reason = "integrity" if str(error) in missing_indexes else "internal"
+            return publish(CancellationResult("held", reason, budget._state))
+        except Exception:
+            # Stable, non-sensitive diagnostics; unexpected failures remain
+            # distinct from budget, integrity and unsupported-history holds.
+            return publish(CancellationResult("held", "internal", budget._state))
     def _run_transition(
         self, run_id: str, event_type: str, operation: str, *, reason_code: str | None
     ) -> RunLifecycleState:
@@ -387,6 +433,8 @@ class LifecycleController:
             if any(event.idempotency_key == key for event in events):
                 _check_idempotent(events, key, "AttemptAccepted", payload)
                 return None
+            from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+            GeneralWorkerGate(self.event_store).check_release(run_id, node_id)
             state = reduce_lifecycle(run_id, events)
             node = state.node(node_id)
             if state.status != "running" or node.status != "ready":

@@ -13,6 +13,7 @@ import json
 import re
 
 from orchestrator.persistence import EventDraft, SQLiteEventStore
+from orchestrator.persistence.mediation_identity import mediation_stream_id
 from .mediation_actors import ActorIntent, MediationActor, MediationOperation, MediationState
 
 STREAM = "mediation_v2"
@@ -61,6 +62,8 @@ def _operation(value):
     for item in (value.operation_id, value.run_id, value.node_id, value.attempt_id):
         _identifier(item)
     _positive(value.fencing_generation)
+    if value.operation_id != mediation_stream_id(value.run_id, value.node_id, value.attempt_id, value.fencing_generation):
+        raise ValueError()
     for item in (value.task_input_sha256, value.workspace_sha256, value.capability_sha256,
                  value.manifest_sha256, value.policy_authority_sha256):
         _digest(item)
@@ -178,12 +181,8 @@ class MediationJournal:
             raise MediationJournalError() from None
 
     def permit(self, operation_id, actor_intent):
-        try:
-            if type(actor_intent) is not ActorIntent:
-                raise ValueError()
-            return self._append(operation_id, "Permitted", asdict(actor_intent))
-        except Exception:
-            raise MediationJournalError() from None
+        """No public execution permit exists until host authority is integrated."""
+        raise MediationJournalError()
 
     def close(self, operation_id):
         try:
@@ -222,6 +221,11 @@ class MediationJournal:
                 return None
             result = _apply(state, action, data)
             op = result.operation
+            if action in ("Registered", "Permitted"):
+                from .general_worker_gate import GeneralWorkerGate
+                gate = GeneralWorkerGate(store)
+                gate.check_v2_admission(op)
+                gate.check_v2_against_v1(op.run_id, op.node_id)
             raw = _canonical(payload)
             if (op.operation_id != operation_id or len(events) >= MAX_EVENTS or len(raw) > MAX_RECORD_BYTES
                     or sum(len(_canonical(e.payload)) for e in events) + len(raw) > MAX_HISTORY_BYTES):

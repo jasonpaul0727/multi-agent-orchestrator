@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -241,6 +242,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             _migrate_event_context(connection)
             _ensure_events_attempt_context_index(connection)
             _migrate_general_worker_scope(connection)
+            _migrate_mediation_scope(connection)
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
@@ -262,6 +264,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         _migrate_event_context(connection)
         _ensure_events_attempt_context_index(connection)
         _migrate_general_worker_scope(connection)
+        _migrate_mediation_scope(connection)
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
@@ -327,6 +330,105 @@ def _migrate_general_worker_scope(connection: sqlite3.Connection) -> None:
         BEGIN SELECT RAISE(ABORT, 'general worker scope is immutable'); END""")
     connection.execute("""CREATE TRIGGER IF NOT EXISTS gw_scope_immutable_delete BEFORE DELETE ON general_worker_scope
         BEGIN SELECT RAISE(ABORT, 'general worker scope is immutable'); END""")
+
+def _migrate_mediation_scope(connection: sqlite3.Connection) -> None:
+    """Index v2 event metadata; the index alone is not a launch authority."""
+    migrated = connection.execute("SELECT 1 FROM schema_migrations WHERE version=6").fetchone() is not None
+    exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mediation_scope'").fetchone() is not None
+    if migrated and not exists:
+        raise ValueError("mediation scope index is missing")
+    connection.execute("""CREATE TABLE IF NOT EXISTS mediation_scope (
+        stream_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, node_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL, fencing_generation INTEGER NOT NULL CHECK (fencing_generation > 0))""")
+    if not migrated:
+        invalid = connection.execute("""
+            SELECT 1 FROM stream_versions s
+            LEFT JOIN events e ON e.stream_type=s.stream_type AND e.stream_id=s.stream_id AND e.stream_version=1
+            WHERE s.stream_type='mediation_v2' AND
+              (e.stream_id IS NULL OR typeof(e.run_id) != 'text' OR length(trim(e.run_id))=0
+               OR typeof(e.node_id) != 'text' OR length(trim(e.node_id))=0
+               OR typeof(e.attempt_id) != 'text' OR length(trim(e.attempt_id))=0
+               OR typeof(e.fencing_generation) != 'integer' OR e.fencing_generation <= 0)
+            LIMIT 1
+        """).fetchone()
+        inconsistent = connection.execute("""
+            SELECT 1 FROM events e LEFT JOIN events f ON f.stream_type=e.stream_type AND f.stream_id=e.stream_id
+                AND f.stream_version=1
+            WHERE e.stream_type='mediation_v2' AND (f.stream_id IS NULL OR e.run_id IS NOT f.run_id
+                OR e.node_id IS NOT f.node_id OR e.attempt_id IS NOT f.attempt_id
+                OR e.fencing_generation IS NOT f.fencing_generation)
+            LIMIT 1
+        """).fetchone()
+        bad_header = connection.execute("""
+            SELECT 1 FROM events e
+            WHERE e.stream_type='mediation_v2' AND e.stream_version=1 AND
+              CASE WHEN length(CAST(e.payload_json AS BLOB)) > 16384 OR NOT json_valid(e.payload_json)
+                THEN 1 ELSE (
+                    e.schema_version != 1 OR e.event_type != 'MediationRegistered'
+                    OR json_extract(e.payload_json, '$.schema_version') IS NOT 2
+                    OR json_extract(e.payload_json, '$.operation_id') IS NOT e.stream_id
+                    OR json_extract(e.payload_json, '$.action') IS NOT 'Registered'
+                    OR json_extract(e.payload_json, '$.data.operation_id') IS NOT e.stream_id
+                    OR json_extract(e.payload_json, '$.data.run_id') IS NOT e.run_id
+                    OR json_extract(e.payload_json, '$.data.node_id') IS NOT e.node_id
+                    OR json_extract(e.payload_json, '$.data.attempt_id') IS NOT e.attempt_id
+                    OR json_extract(e.payload_json, '$.data.fencing_generation') IS NOT e.fencing_generation)
+              END LIMIT 1
+        """).fetchone()
+        bad_versions = connection.execute("""
+            SELECT 1 FROM stream_versions s LEFT JOIN events e
+              ON e.stream_type=s.stream_type AND e.stream_id=s.stream_id
+            WHERE s.stream_type='mediation_v2' GROUP BY s.stream_id, s.current_version
+            HAVING count(e.stream_id) != s.current_version OR min(e.stream_version) != 1
+                OR max(e.stream_version) != s.current_version OR count(e.stream_id) > 130
+                OR max(length(CAST(e.payload_json AS BLOB))) > 16384
+                OR sum(length(CAST(e.payload_json AS BLOB))) > 262144 LIMIT 1
+        """).fetchone()
+        orphan = connection.execute("""
+            SELECT 1 FROM events e LEFT JOIN stream_versions s
+              ON e.stream_type=s.stream_type AND e.stream_id=s.stream_id
+            WHERE e.stream_type='mediation_v2' AND s.stream_id IS NULL LIMIT 1
+        """).fetchone()
+        from .mediation_identity import mediation_stream_id
+        identities = connection.execute("""
+            SELECT stream_id, run_id, node_id, attempt_id, fencing_generation
+            FROM events WHERE stream_type='mediation_v2' AND stream_version=1
+        """)
+        for stream_id, run_id, node_id, attempt_id, generation in identities:
+            if stream_id != mediation_stream_id(run_id, node_id, attempt_id, generation):
+                raise ValueError("legacy mediation stream identity is incompatible")
+        if invalid or inconsistent or bad_header or bad_versions or orphan:
+            raise ValueError("mediation scope contains unattributable history")
+        connection.execute("""INSERT INTO mediation_scope
+            SELECT stream_id, run_id, node_id, attempt_id, fencing_generation FROM events
+            WHERE stream_type='mediation_v2' AND stream_version=1""")
+        connection.execute("INSERT INTO schema_migrations (version) VALUES (6)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_mediation_scope_node ON mediation_scope(run_id, node_id, stream_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_mediation_event_node ON events(stream_type, run_id, node_id, stream_version, stream_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_cancel_events_run ON events(stream_type, run_id, stream_id, stream_version)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_cancel_v1_scope_run ON general_worker_scope(run_id, stream_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_cancel_v2_scope_run ON mediation_scope(run_id, stream_id)")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS mediation_scope_check BEFORE INSERT ON events
+        WHEN NEW.stream_type='mediation_v2' BEGIN
+        SELECT CASE WHEN typeof(NEW.run_id) != 'text' OR length(trim(NEW.run_id))=0
+            OR typeof(NEW.node_id) != 'text' OR length(trim(NEW.node_id))=0
+            OR typeof(NEW.attempt_id) != 'text' OR length(trim(NEW.attempt_id))=0
+            OR typeof(NEW.fencing_generation) != 'integer' OR NEW.fencing_generation <= 0
+            THEN RAISE(ABORT, 'mediation scope requires identity') END;
+        SELECT CASE WHEN NEW.stream_version > 1 AND NOT EXISTS (
+            SELECT 1 FROM mediation_scope s WHERE s.stream_id=NEW.stream_id
+            AND s.run_id=NEW.run_id AND s.node_id=NEW.node_id AND s.attempt_id=NEW.attempt_id
+            AND s.fencing_generation=NEW.fencing_generation)
+            THEN RAISE(ABORT, 'mediation scope mismatch') END;
+        END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS mediation_scope_insert AFTER INSERT ON events
+        WHEN NEW.stream_type='mediation_v2' AND NEW.stream_version=1 BEGIN
+        INSERT INTO mediation_scope VALUES (NEW.stream_id, NEW.run_id, NEW.node_id,
+            NEW.attempt_id, NEW.fencing_generation); END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS mediation_scope_immutable_update BEFORE UPDATE ON mediation_scope
+        BEGIN SELECT RAISE(ABORT, 'mediation scope is immutable'); END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS mediation_scope_immutable_delete BEFORE DELETE ON mediation_scope
+        BEGIN SELECT RAISE(ABORT, 'mediation scope is immutable'); END""")
 
 def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
     """Add authenticated snapshot metadata to databases from Task 3."""
@@ -438,6 +540,13 @@ def _ensure_events_attempt_context_index(connection: sqlite3.Connection) -> None
         """
         CREATE INDEX IF NOT EXISTS ix_events_stream_attempt_context
         ON events(stream_type, run_id, node_id, attempt_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_scheduler_release_context
+        ON events(stream_type, run_id, node_id, attempt_id, fencing_generation,
+                  event_type, stream_id, stream_version)
         """
     )
 
@@ -604,6 +713,42 @@ class SQLiteEventStore:
     def _owned_write_token(self):
         return _OWNED_WRITES[self][2] if self._has_owned_write() else None
 
+    @contextmanager
+    def _cancellation_proof_write(self):
+        """Enter a same-thread owned write scope before bounded proof reads."""
+        connection = self._connection
+        started = not connection.in_transaction
+        if not started and not self._has_owned_write():
+            raise ValueError("unknown ambient transaction")
+        if started:
+            connection.execute("BEGIN IMMEDIATE")
+            _OWNED_WRITES[self] = (connection, threading.get_ident(), object())
+            self._post_commit_actions = []
+        else:
+            connection.execute("SAVEPOINT cancellation_proof")
+        token = self._owned_write_token()
+        try:
+            yield started
+            if not self._has_owned_write() or self._owned_write_token() is not token:
+                raise ValueError("cancellation proof lost write ownership")
+            if started:
+                connection.commit()
+                self._publish_post_commit()
+            else:
+                connection.execute("RELEASE SAVEPOINT cancellation_proof")
+        except BaseException:
+            if started:
+                connection.rollback()
+            else:
+                try:
+                    connection.execute("ROLLBACK TO SAVEPOINT cancellation_proof")
+                finally:
+                    connection.execute("RELEASE SAVEPOINT cancellation_proof")
+            raise
+        finally:
+            if started:
+                _OWNED_WRITES.pop(self, None)
+                self._post_commit_actions = []
     def append(
         self,
         stream_type: str,
@@ -1054,6 +1199,25 @@ class SQLiteEventStore:
         ).fetchall()
         return [row["stream_id"] for row in rows]
 
+    def _read_scheduler_releases(self, run_id, node_id, attempt_id, fencing_generation):
+        """Read at most one bounded release using the attempt context index."""
+        for value, name in ((run_id, "run_id"), (node_id, "node_id"), (attempt_id, "attempt_id")):
+            _validate_identifier(value, name)
+        if type(fencing_generation) is not int or fencing_generation < 1:
+            raise ValueError("invalid fencing generation")
+        rows = self._connection.execute("""
+            SELECT event_id, stream_type, stream_id, stream_version, event_type, schema_version,
+                   occurred_at, CASE WHEN length(CAST(payload_json AS BLOB)) <= 16384
+                       THEN payload_json ELSE NULL END AS payload_json,
+                   payload_hash, idempotency_key, run_id, node_id, attempt_id,
+                   fencing_generation, correlation_id, causation_id
+            FROM events WHERE stream_type='scheduler' AND stream_id='global'
+              AND event_type='AttemptSlotReleased' AND run_id=? AND node_id=? AND attempt_id=?
+              AND fencing_generation=? ORDER BY stream_version LIMIT 2
+        """, (run_id, node_id, attempt_id, fencing_generation)).fetchall()
+        if len(rows) > 1:
+            raise ValueError("duplicate attempt releases")
+        return [self._row_to_event(row) for row in rows]
     def stream_ids_for_worker_node(self, run_id: str, node_id: str, *, limit: int) -> list[str]:
         run_id = _validate_identifier(run_id, "run_id")
         node_id = _validate_identifier(node_id, "node_id")
@@ -1063,6 +1227,28 @@ class SQLiteEventStore:
             "SELECT stream_id FROM general_worker_scope WHERE run_id=? AND node_id=? ORDER BY stream_id LIMIT ?",
             (run_id, node_id, limit)).fetchall()
         return [row["stream_id"] for row in rows]
+    def stream_ids_for_mediation_node(self, run_id: str, node_id: str, *, limit: int) -> list[str]:
+        """Return bounded v2 scope candidates, not an authorization decision."""
+        run_id = _validate_identifier(run_id, "run_id")
+        node_id = _validate_identifier(node_id, "node_id")
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be positive")
+        rows = self._connection.execute("""
+            WITH scope AS (
+                SELECT stream_id, run_id, node_id, attempt_id, fencing_generation
+                  FROM mediation_scope WHERE run_id=? AND node_id=? ORDER BY stream_id LIMIT ?
+            ), headers AS (
+                SELECT stream_id, run_id, node_id, attempt_id, fencing_generation
+                  FROM events WHERE stream_type='mediation_v2' AND run_id=? AND node_id=?
+                  AND stream_version=1 ORDER BY stream_id LIMIT ?
+            )
+            SELECT 0 AS source, * FROM scope UNION ALL SELECT 1 AS source, * FROM headers
+        """, (run_id, node_id, limit, run_id, node_id, limit)).fetchall()
+        scope = [tuple(row)[1:] for row in rows if row["source"] == 0]
+        headers = [tuple(row)[1:] for row in rows if row["source"] == 1]
+        if scope != headers:
+            raise ValueError("mediation scope disagrees with event headers")
+        return [row[0] for row in scope]
     def stream_ids_for_context(
         self, stream_type: str, run_id: str, node_id: str, attempt_id: str
     ) -> list[str]:

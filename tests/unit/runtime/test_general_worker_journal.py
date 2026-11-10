@@ -70,7 +70,11 @@ def request_proposal(operation):
 
 
 @pytest.fixture
-def store(tmp_path):
+def store(tmp_path, monkeypatch):
+    # This file uses a synthetic reducer without Scheduler admission.
+    # Real cross-version gate coverage uses actual admission and connections.
+    from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+    monkeypatch.setattr(GeneralWorkerGate, "_check_no_v2", lambda _gate, _run, _node, _budget=None: None)
     with SQLiteEventStore(tmp_path / "events.db") as value:
         yield value
 

@@ -569,44 +569,54 @@ def test_rolled_back_prepare_cannot_claim_another_journals_reinsert(tmp_path):
 
 
 @pytest.mark.parametrize("count", [100, 101])
-def test_worker_census_at_supported_limit_and_above(tmp_path, monkeypatch, count):
+def test_synthetic_worker_projection_limit_and_final_unstopped(tmp_path, monkeypatch, count):
+    # Pure projections deliberately bypass admission; they do not prove real census coverage.
     from orchestrator.runtime.general_worker_journal import _request_operation, _safe
+    from orchestrator.runtime.general_worker_gate import _check_scope_limit, _require_stopped_operations
     from orchestrator.runtime import general_worker_journal as journal_module
     case = dispatch_case(tmp_path, register=False)
     try:
         operations = []
         for number in range(count):
             registration = dict(case.registration)
-            registration["context"] = registration["context"].model_copy(
-                update={"attempt_id": f"census-{number}"})
+            registration["context"] = registration["context"].model_copy(update={"attempt_id": f"census-{number}"})
             data = _safe(registration)
-            operation = case.journal._append(_request_operation(data), "Requested", data)
-            operations.append(operation)
-        # The last indexed identity is deliberately left unstopped.
+            operations.append(case.journal._append(_request_operation(data), "Requested", data))
+        if count == 101:
+            with pytest.raises(ValueError, match="scope exceeds release bound"):
+                _check_scope_limit(operations)
+            return
+        _check_scope_limit(operations)
         operation = max(operations, key=lambda item: item.identity.stream_id)
-        prepared, ack, stop = epoch()
+        prepared, _, _ = epoch()
         operation = case.journal._append(operation, "TurnPrepared", _safe(dict(phase="request", prepared=prepared)))
+        ordered = sorted((item for item in operations if item.identity != operation.identity),
+                         key=lambda item: item.identity.stream_id) + [operation]
         checked = []
         original = journal_module._require_worker_stopped
         def record(candidate):
             checked.append(candidate.identity.stream_id)
             original(candidate)
         monkeypatch.setattr(journal_module, "_require_worker_stopped", record)
-        if count == 101:
-            with pytest.raises(ValueError, match="scope exceeds release bound"):
-                case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
-                    outcome="failed", known_no_effect=True)
-        else:
-            with pytest.raises(ValueError):
-                case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
-                    outcome="failed", known_no_effect=True)
-            assert set(checked) == {item.identity.stream_id for item in operations}
-            operation = case.journal.ack_turn(operation, receipt=ack)
-            case.journal.stop_turn(operation, receipt=stop)
+        with pytest.raises(ValueError):
+            _require_stopped_operations(ordered)
+        assert checked == [item.identity.stream_id for item in ordered]
+    finally:
+        case.store.close()
+
+
+def test_worker_census_rejects_unknown_admission(tmp_path):
+    from orchestrator.runtime.general_worker_journal import _request_operation, _safe
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        registration = dict(case.registration)
+        registration["context"] = registration["context"].model_copy(update={"attempt_id": "unadmitted"})
+        data = _safe(registration)
+        case.journal._append(_request_operation(data), "Requested", data)
+        with pytest.raises(ValueError):
             case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
-                outcome="failed", known_no_effect=True)
-        released = any(e.event_type == "AttemptSlotReleased" for e in scheduler_events(case.store))
-        assert released == (count == 100)
+                                          outcome="failed", known_no_effect=True)
+        assert not any(e.event_type == "AttemptSlotReleased" for e in scheduler_events(case.store))
     finally:
         case.store.close()
 

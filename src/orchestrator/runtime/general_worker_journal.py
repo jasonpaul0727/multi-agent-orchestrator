@@ -532,10 +532,16 @@ class GeneralWorkerJournal:
     def _publish_fresh_prepare(self, marker, generation):
         if self._prepare_generation != generation or self.event_store._connection.in_transaction:
             return
-        events, _ = self.event_store.read_stream_with_version(
-            STREAM_TYPE, marker[0].stream_id, max_events=MAX_EVENTS)
-        if any(event.event_id == marker[3] and event.event_type == "GeneralWorkerTurnPrepared" for event in events):
-            self._fresh_prepare = marker
+        try:
+            with self.event_store._cancellation_proof_write():
+                budget = self._history_budget()
+                events, _ = self._bounded_owned_history(marker[0], budget)
+                found = any(event.event_id == marker[3] and event.event_type == "GeneralWorkerTurnPrepared"
+                            for event in events)
+            if found and self._prepare_generation == generation:
+                self._fresh_prepare = marker
+        except Exception:
+            return
 
     def _consume_fresh_prepare(self, identity, phase, prepared):
         self._prepare_generation += 1
@@ -544,15 +550,18 @@ class GeneralWorkerJournal:
             or marker[:3] != (identity, phase, prepared)):
             return False
         try:
-            events, _ = self.event_store.read_stream_with_version(
-                STREAM_TYPE, identity.stream_id, max_events=MAX_EVENTS)
-            operation = self.read(identity)
-            return (sum(event.event_id == marker[3] and event.event_type == "GeneralWorkerTurnPrepared"
-                        for event in events) == 1
-                and operation is not None and bool(operation.turns)
-                and operation.turns[-1].phase == phase and operation.turns[-1].prepared == prepared
-                and operation.turns[-1].launch_receipt is None
-                and operation.turns[-1].termination_receipt is None)
+            with self.event_store._cancellation_proof_write():
+                budget = self._history_budget()
+                events, version = self._bounded_owned_history(identity, budget)
+                operation = _replay(identity, events, version)
+                if operation is not None:
+                    self._validate_bounded_links(operation, budget, terminal=True)
+                return (sum(event.event_id == marker[3] and event.event_type == "GeneralWorkerTurnPrepared"
+                            for event in events) == 1
+                    and operation is not None and bool(operation.turns)
+                    and operation.turns[-1].phase == phase and operation.turns[-1].prepared == prepared
+                    and operation.turns[-1].launch_receipt is None
+                    and operation.turns[-1].termination_receipt is None)
         except Exception:
             return False
 
@@ -561,7 +570,8 @@ class GeneralWorkerJournal:
             raise ValueError("owned write transaction required")
         self._validate_operation(operation)
         identity = operation.identity
-        events, version = self.event_store.read_stream_with_version(STREAM_TYPE, identity.stream_id, max_events=MAX_EVENTS)
+        budget = self._history_budget()
+        events, version = self._bounded_owned_history(identity, budget)
         key = _event_key(operation.operation_id, action, data)
         existing = [event for event in events if event.idempotency_key == key]
         if not existing:
@@ -575,8 +585,7 @@ class GeneralWorkerJournal:
         supplied, persisted = _safe(operation), _safe(current)
         if any(_canonical(supplied[name]) != _canonical(persisted[name]) for name in fields):
             raise ValueError("replay has changed immutable commitments")
-        self._validate_links(current)
-        self._validate_terminal_links(current)
+        self._validate_bounded_links(current, budget, terminal=True)
         return current
 
     @_guard
@@ -631,13 +640,15 @@ class GeneralWorkerJournal:
     def capture_response(self, operation: GeneralWorkerOperation, *, response_artifact: ArtifactRef,
         output_digest: str, output_byte_count: int) -> GeneralWorkerOperation:
         self._validate_operation(operation)
-        call = self._provider_success(operation)
-        if type(response_artifact) is not ArtifactRef:
-            raise ValueError()
-        return self._append(operation, "ResponseCaptured", _safe(dict(response_artifact=response_artifact,
-            output_digest=output_digest, output_byte_count=output_byte_count,
-            request_body_sha256=call.request_hash, usage_sha256=metadata_hash(dict(call.usage)),
-            sender_receipt_sha256=call.termination_receipt.receipt_hash)))
+        budget = self._history_budget()
+        with self.event_store._cancellation_proof_write():
+            call = self._bounded_provider_success(operation, budget)
+            if type(response_artifact) is not ArtifactRef:
+                raise ValueError()
+            return self._append(operation, "ResponseCaptured", _safe(dict(response_artifact=response_artifact,
+                output_digest=output_digest, output_byte_count=output_byte_count,
+                request_body_sha256=call.request_hash, usage_sha256=metadata_hash(dict(call.usage)),
+                sender_receipt_sha256=call.termination_receipt.receipt_hash)), budget=budget)
 
     @_guard
     def record_proposal(self, operation: GeneralWorkerOperation, *, task_sha256: str,
@@ -659,13 +670,50 @@ class GeneralWorkerJournal:
         _context(_safe(operation.context))
         _integer(operation.output_byte_limit, 1, 16_384)
 
-    def _append(self, operation, action, data):
+    @staticmethod
+    def _history_budget():
+        from orchestrator.lifecycle.cancel_completion import CancellationBudget
+        return CancellationBudget(max_rows=4000, max_bytes=4 * 1024 * 1024,
+                                  max_row_bytes=65536, max_streams=300, max_nodes=100)
+
+    def _bounded_owned_history(self, identity, budget):
+        # This preflight is on the same owned connection as any subsequent read.
+        from orchestrator.lifecycle.cancel_completion import CancellationHeld, read_event_window
+        events, version = read_event_window(self.event_store, STREAM_TYPE, identity.stream_id, budget)
+        # Reserve for the checked append pre-read and append CAS/idempotent reread.
+        count, size = budget._windows[(STREAM_TYPE, identity.stream_id)]
+        if (version > MAX_EVENTS or budget.rows + count * 2 > budget.max_rows
+                or budget.bytes + size * 2 > budget.max_bytes):
+            raise CancellationHeld("budget")
+        budget.rows += count * 2
+        budget.bytes += size * 2
+        return events, version
+
+    def _validate_bounded_links(self, operation, budget, *, terminal=False):
+        from orchestrator.lifecycle.cancel_completion import (validate_v1_links,
+            validate_v1_terminal, read_scheduler_release)
+        validate_v1_links(self.event_store, operation, budget, allow_uncaptured_call=True)
+        if not terminal:
+            return
+        identity = operation.identity
+        releases = read_scheduler_release(self.event_store, identity.run_id, identity.node_id,
+                                          identity.attempt_id, identity.fencing_generation, budget)
+        if operation.phase == "accepted":
+            validate_v1_terminal(self.event_store, operation, budget)
+        elif releases:
+            if any(event.payload.get("outcome") == "succeeded" for event in releases):
+                raise ValueError()
+            _require_worker_stopped(operation)
+
+    def _append(self, operation, action, data, *, budget=None):
         self._validate_operation(operation)
         _plain(data)
         identity = operation.identity
         key = _event_key(operation.operation_id, action, data)
         payload = dict(schema_version=SCHEMA_VERSION, operation_id=operation.operation_id, action=action, data=data)
         result = None
+        if budget is None:
+            budget = self._history_budget()
 
         def decide(events, version):
             nonlocal result
@@ -674,17 +722,20 @@ class GeneralWorkerJournal:
             if existing:
                 if len(existing) != 1 or existing[0].payload != payload:
                     raise ValueError()
-                self._validate_links(current)
+                self._validate_bounded_links(current, budget)
                 result = current
                 return [EventDraft("GeneralWorker" + action, payload, **_identity_value(identity),
                     correlation_id=identity.run_id, causation_id=existing[0].causation_id)]
+            if action in {"CallReserved", "ResponseCaptured", "Proposed", "Accepted"}:
+                from .general_worker_gate import GeneralWorkerGate
+                GeneralWorkerGate(self.event_store)._check_no_v2(identity.run_id, identity.node_id, budget)
             # Canonical comparison also rejects bool/int and int/float equality
             # tricks in constructed immutable projections.
             expected = None if action == "Requested" else operation
             if _canonical(_safe(current)) != _canonical(_safe(expected)):
                 raise ValueError()
             result = _apply(current, action, data)
-            self._validate_links(result)
+            self._validate_bounded_links(result, budget)
             if (len(events) >= MAX_EVENTS or len(_canonical(payload)) > MAX_RECORD_BYTES
                 or sum(len(_canonical(event.payload)) for event in events) + len(_canonical(payload)) > MAX_HISTORY_BYTES):
                 raise ValueError()
@@ -692,8 +743,28 @@ class GeneralWorkerJournal:
                 correlation_id=identity.run_id, causation_id=(metadata_hash(events[-1].payload)
                     if events else operation.context.routing_decision_hash))]
 
-        self.event_store.append_checked(STREAM_TYPE, identity.stream_id, key, decide)
+        with self.event_store._cancellation_proof_write():
+            self._bounded_owned_history(identity, budget)
+            self.event_store.append_checked(STREAM_TYPE, identity.stream_id, key, decide)
         return result
+
+    def _bounded_provider_success(self, operation, budget):
+        from orchestrator.lifecycle.cancel_completion import read_event_window
+        if operation.call is None:
+            raise ValueError()
+        events, _ = read_event_window(self.event_store, "provider_call",
+                                      operation.call.provider_call_stream_id, budget)
+        call = SQLiteProviderCallJournal(self.event_store)._project_call(events)
+        if (call is None or any(getattr(call, name) != value
+                for name, value in _identity_value(operation.identity).items())
+            or call.request_id != operation.request_id or call.registry_manifest_hash != operation.context.registry_hash
+            or call.request_hash != operation.call.request_body_sha256
+            or any(getattr(call, name) != getattr(operation.call, name) for name in (
+                "accepted_route_id", "budget_reservation_id", "provider_id", "model_id", "idempotency_key_hash"))
+            or call.status != "known_success" or call.usage is None
+            or call.usage.get("status") not in {"reported", "estimated"} or call.termination_receipt is None):
+            raise ValueError()
+        return call
 
     def _provider_success(self, operation):
         call = self._provider_call(operation)
@@ -734,9 +805,7 @@ class GeneralWorkerJournal:
 
     def _validate_terminal_links(self, operation):
         """Reciprocal immutable success/usage links, without fresh time or files."""
-        matches = [event for event in self.event_store.read_stream("scheduler", "global")
-            if event.event_type == "AttemptSlotReleased" and
-            all(getattr(event, key) == value for key, value in _identity_value(operation.identity).items())]
+        matches = self.event_store._read_scheduler_releases(**_identity_value(operation.identity))
         successes = [event for event in matches if event.payload.get("outcome") == "succeeded"]
         if operation.phase != "accepted":
             if successes:

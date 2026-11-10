@@ -6,6 +6,9 @@ import uuid
 
 import pytest
 
+from orchestrator.persistence.mediation_identity import mediation_stream_id
+OP = mediation_stream_id("run-1", "node-1", "attempt-node-1-1", 1)
+
 from orchestrator.persistence import SQLiteEventStore
 from orchestrator.runtime.mediation_actors import ActorIntent, MediationOperation
 from orchestrator.runtime.mediation_journal import MediationJournal, MediationJournalError
@@ -19,24 +22,35 @@ def digest(fields):
 
 
 def operation():
-    fields = dict(operation_id="op", run_id="run", node_id="node", attempt_id="attempt",
+    fields = dict(operation_id=OP, run_id="run-1", node_id="node-1", attempt_id="attempt-node-1-1",
                   fencing_generation=1, task_input_sha256=H, workspace_sha256=H,
                   capability_sha256=H, manifest_sha256=H, policy_authority_sha256=H)
     return MediationOperation(**fields, commitment_sha256=digest(fields))
 
 
 def intent(actor_id="actor", sequence=1, **changes):
-    fields = dict(operation_id="op", fencing_generation=1, actor_id=actor_id,
+    fields = dict(operation_id=OP, fencing_generation=1, actor_id=actor_id,
                   sequence=sequence, kind="worker", host_id="host", boot_id="boot",
                   unit_name="unit.service", launch_id="launch", parameters_sha256=H)
     fields.update(changes)
     return ActorIntent(**fields, intent_sha256=digest(fields))
 
 
+def record_inert(journal, operation_id, actor):
+    """Reducer/census fixture only: never a launch grant or host proof."""
+    try:
+        return journal._append(operation_id, "Permitted", asdict(actor))
+    except Exception:
+        raise MediationJournalError() from None
+
 @pytest.fixture
 def journal(tmp_path):
-    with SQLiteEventStore(tmp_path / "events.db") as store:
-        yield MediationJournal(store)
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        yield MediationJournal(case.store)
+    finally:
+        case.store.close()
 
 
 @pytest.mark.parametrize("field", ["operation_id", "run_id", "node_id", "attempt_id",
@@ -56,15 +70,15 @@ def test_actor_preimage_tamper_rejected(journal, field):
     item = intent()
     value = 2 if field in ("sequence", "fencing_generation") else (J if field.endswith("sha256") else "changed")
     with pytest.raises(MediationJournalError):
-        journal.permit("op", replace(item, **{field: value}))
+        record_inert(journal, OP, replace(item, **{field: value}))
 
 
 def test_duplicate_unit_rejected_even_when_other_actor_and_parameters_change(journal):
     journal.register(operation())
-    journal.permit("op", intent())
-    journal.permit("op", intent())
+    record_inert(journal, OP, intent())
+    record_inert(journal, OP, intent())
     with pytest.raises(MediationJournalError):
-        journal.permit("op", intent("other", 2, kind="tool", launch_id="other", parameters_sha256=J))
+        record_inert(journal, OP, intent("other", 2, kind="tool", launch_id="other", parameters_sha256=J))
 
 
 @pytest.mark.parametrize("action", ["register", "permit", "close", "load"])
@@ -80,11 +94,11 @@ def test_physical_corruption_rejected_before_mutation_or_load(journal, action, d
                 SELECT ?, stream_type, stream_id, ?, event_type, schema_version, occurred_at,
                        ?, payload_hash, ?, run_id, node_id, attempt_id, fencing_generation,
                        correlation_id, causation_id FROM events
-                 WHERE stream_type='mediation_v2' AND stream_id='op' AND stream_version=1""",
+                 WHERE stream_type='mediation_v2' AND stream_version=1""",
                 (str(uuid.uuid4()), version, "x" * 16000 if damage == "large_history" else "{}",
                  str(uuid.uuid4())))
         if damage != "extra_tail":
-            connection.execute("UPDATE stream_versions SET current_version=? WHERE stream_type='mediation_v2' AND stream_id='op'", (count + 1,))
+            connection.execute("UPDATE stream_versions SET current_version=? WHERE stream_type='mediation_v2'", (count + 1,))
     elif damage == "large_row":
         connection.execute("UPDATE events SET payload_json=? WHERE stream_type='mediation_v2'", ("x" * 20000,))
     else:
@@ -100,11 +114,11 @@ def test_physical_corruption_rejected_before_mutation_or_load(journal, action, d
         if action == "register":
             journal.register(operation())
         elif action == "permit":
-            journal.permit("op", intent())
+            record_inert(journal, OP, intent())
         elif action == "close":
-            journal.close("op")
+            journal.close(OP)
         else:
-            journal.load("op")
+            journal.load(OP)
     assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == before
     if damage != "envelope":
         assert not decoded
@@ -130,7 +144,7 @@ def test_public_error_does_not_leak_sensitive_metadata(journal):
 def test_replay_rejects_changed_preimage_with_unchanged_commitment(journal, target, field):
     journal.register(operation())
     if target == "actor":
-        journal.permit("op", intent())
+        record_inert(journal, OP, intent())
     version = 1 if target == "operation" else 2
     conn = journal.event_store._connection
     conn.execute("DROP TRIGGER events_immutable_update")
@@ -144,7 +158,7 @@ def test_replay_rejects_changed_preimage_with_unchanged_commitment(journal, targ
                     WHERE stream_type='mediation_v2' AND stream_version=?""",
                  (encoded, value, "sha256:" + value, version))
     with pytest.raises(MediationJournalError):
-        journal.load("op")
+        journal.load(OP)
 
 
 @pytest.mark.parametrize("action", ["register", "permit", "close", "load"])
@@ -163,11 +177,11 @@ def test_unknown_payload_version_rejected(journal, action):
         if action == "register":
             journal.register(operation())
         elif action == "permit":
-            journal.permit("op", intent())
+            record_inert(journal, OP, intent())
         elif action == "close":
-            journal.close("op")
+            journal.close(OP)
         else:
-            journal.load("op")
+            journal.load(OP)
     assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == before
 
 
@@ -175,21 +189,21 @@ def test_unknown_payload_version_rejected(journal, action):
 def test_supported_actor_kinds_are_accepted(journal, kind):
     journal.register(operation())
     item = intent(kind=kind)
-    assert journal.permit("op", item).actors[0].intent == item
-    assert journal.permit("op", item) == journal.load("op")
+    assert record_inert(journal, OP, item).actors[0].intent == item
+    assert record_inert(journal, OP, item) == journal.load(OP)
 
 
 def test_unknown_actor_kind_is_rejected_even_with_valid_digest(journal):
     journal.register(operation())
     with pytest.raises(MediationJournalError):
-        journal.permit("op", intent(kind="untrusted_runner"))
-    assert journal.load("op").actors == ()
+        record_inert(journal, OP, intent(kind="untrusted_runner"))
+    assert journal.load(OP).actors == ()
 
 
 @pytest.mark.parametrize("action", ["register", "permit", "close", "load"])
 def test_unknown_actor_kind_in_history_is_rejected(journal, action):
     journal.register(operation())
-    journal.permit("op", intent())
+    record_inert(journal, OP, intent())
     conn = journal.event_store._connection
     conn.execute("DROP TRIGGER events_immutable_update")
     raw = conn.execute("SELECT payload_json FROM events WHERE stream_type='mediation_v2' AND stream_version=2").fetchone()[0]
@@ -206,11 +220,11 @@ def test_unknown_actor_kind_in_history_is_rejected(journal, action):
         if action == "register":
             journal.register(operation())
         elif action == "permit":
-            journal.permit("op", intent())
+            record_inert(journal, OP, intent())
         elif action == "close":
-            journal.close("op")
+            journal.close(OP)
         else:
-            journal.load("op")
+            journal.load(OP)
     assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == before
 
 
@@ -218,14 +232,14 @@ def test_unknown_actor_kind_in_history_is_rejected(journal, action):
 def test_actor_id_and_sequence_conflicts_are_independent_of_unit(journal, conflict):
     journal.register(operation())
     original = intent()
-    state = journal.permit("op", original)
-    assert journal.permit("op", original) == state
+    state = record_inert(journal, OP, original)
+    assert record_inert(journal, OP, original) == state
     other = (intent("actor", 2, unit_name="different.service", launch_id="different")
              if conflict == "actor_id" else
              intent("other", 1, unit_name="different.service", launch_id="different"))
     with pytest.raises(MediationJournalError):
-        journal.permit("op", other)
-    assert journal.load("op") == state
+        record_inert(journal, OP, other)
+    assert journal.load(OP) == state
 
 
 @pytest.mark.parametrize("action", ["register", "permit", "close", "load"])
@@ -248,11 +262,11 @@ def test_remote_tail_version_100_rejected_before_decode(journal, action, monkeyp
         if action == "register":
             journal.register(operation())
         elif action == "permit":
-            journal.permit("op", intent())
+            record_inert(journal, OP, intent())
         elif action == "close":
-            journal.close("op")
+            journal.close(OP)
         else:
-            journal.load("op")
+            journal.load(OP)
     assert not decoded
     assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == before
 
@@ -274,11 +288,11 @@ def test_sensitive_sentinel_is_not_exposed_by_public_exceptions(journal, action)
                      (encoded, value, "sha256:" + value))
     with pytest.raises(MediationJournalError) as error:
         if action == "permit":
-            journal.permit("op", replace(intent(), actor_id=secret))
+            record_inert(journal, OP, replace(intent(), actor_id=secret))
         elif action == "close":
             journal.close(secret + "!")
         else:
-            journal.load("op")
+            journal.load(OP)
     assert secret not in "".join(traceback.format_exception(error.value))
     assert error.value.__cause__ is None
 
@@ -287,9 +301,16 @@ def test_exact_registration_and_permit_replay_remain_idempotent_after_close(jour
     op = operation()
     actor = intent()
     journal.register(op)
-    journal.permit("op", actor)
-    closed = journal.close("op")
+    record_inert(journal, OP, actor)
+    closed = journal.close(OP)
     assert journal.register(op) == closed
-    assert journal.permit("op", actor) == closed
-    assert journal.close("op") == closed
-    assert journal.load("op") == closed
+    assert record_inert(journal, OP, actor) == closed
+    assert journal.close(OP) == closed
+    assert journal.load(OP) == closed
+
+
+def test_public_permit_is_disabled_without_host_authority(journal):
+    journal.register(operation())
+    with pytest.raises(MediationJournalError):
+        journal.permit(OP, intent())
+    assert journal.load(OP).actors == ()
