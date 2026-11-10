@@ -106,6 +106,9 @@ def _head(conn, digest, expected_version):
 
 def before_append(store, digest, version):
     conn = store._connection
+    from .transactional_dirty import tracking_present
+    if tracking_present(conn):
+        return
     if not _structure(conn):
         return
     if not store._has_owned_write():
@@ -119,6 +122,9 @@ def before_append(store, digest, version):
 
 def after_append(store, digest, events):
     conn = store._connection
+    from .transactional_dirty import tracking_present
+    if tracking_present(conn):
+        return
     if not _structure(conn):
         return
     row = conn.execute('SELECT version, chain FROM artifact_incremental_checkpoint WHERE digest=?', (digest,)).fetchone()
@@ -142,6 +148,8 @@ def snapshot_incremental(store, digest, publication_id, budget):
     """Diagnostic only: validate head and exact row, not arbitrary old damage."""
     budget.bind(store)
     conn = store._connection
+    from .transactional_dirty import require_clean_marker
+    require_clean_marker(conn, digest, budget)
     # Conservative fixed accounting for schema, singleton and boundary probes.
     _charge(budget, 12, 16384)
     if not _structure(conn, budget):

@@ -272,3 +272,275 @@ def test_install_allows_extra_nonunique_index(tmp_path):
             store._connection.execute('CREATE INDEX extra_nonunique ON events(event_type)')
             install_dirty_tracking(store)
         assert store._connection.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_dirty_schema'").fetchone()
+
+
+def diagnostic(store, record):
+    from orchestrator.artifacts.incremental_checkpoint import snapshot_incremental
+    with store._cancellation_proof_write():
+        return snapshot_incremental(store, record.digest, record.publication_id, budget())
+
+
+@pytest.mark.parametrize('damage', ['dirty', 'missing_marker', 'missing_trigger', 'bad_version'])
+def test_opted_in_diagnostic_holds_for_dirty_or_incomplete_tracking(tmp_path, damage):
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, b, _ = setup(store, tmp_path)
+        assert diagnostic(store, a).payload['publication_id'] == a.publication_id
+        conn = store._connection
+        if damage == 'dirty':
+            conn.execute('UPDATE artifact_dirty_marker SET dirty=1 WHERE digest=?', (a.digest,))
+        elif damage == 'missing_marker':
+            conn.execute('DELETE FROM artifact_dirty_marker WHERE digest=?', (a.digest,))
+        elif damage == 'missing_trigger':
+            conn.execute('DROP TRIGGER artifact_dirty_events_insert')
+        else:
+            conn.execute('DELETE FROM artifact_dirty_schema')
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+        if damage in ('dirty', 'missing_marker'):
+            assert diagnostic(store, b).payload['publication_id'] == b.publication_id
+
+
+def test_independent_old_writer_same_value_marks_and_blocks_only_its_diagnostic(tmp_path):
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    db = tmp_path / 'events.db'
+    with SQLiteEventStore(db) as store:
+        a, b, _ = setup(store, tmp_path)
+        script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('UPDATE artifact_incremental_publication SET version=version WHERE digest=?',(sys.argv[2],)); c.commit()"
+        proc = subprocess.run([sys.executable, '-c', script, str(db), a.digest], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+        assert diagnostic(store, b).payload['publication_id'] == b.publication_id
+
+
+@pytest.mark.parametrize('ambient', [False, True])
+def test_append_does_not_erase_or_advance_opted_in_dirty_checkpoint(tmp_path, ambient):
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        original = tuple(conn.execute('SELECT * FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone())
+        conn.execute('UPDATE artifact_dirty_marker SET dirty=1 WHERE digest=?', (a.digest,))
+        if ambient:
+            conn.execute('BEGIN')
+        ArtifactStore(tmp_path / 'artifacts', event_store=store).publish_bytes(
+            b'a', source={'run_id': 'new'}, readable_scope=('new',))
+        if ambient:
+            conn.commit()
+        assert marker(conn, a.digest) == 1
+        assert tuple(conn.execute('SELECT * FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone()) == original
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+
+
+def test_clean_marker_turns_dirty_on_append_and_rollback_restores_diagnostic(tmp_path):
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        with pytest.raises(RuntimeError, match='abort'):
+            with store._cancellation_proof_write():
+                ArtifactStore(tmp_path / 'artifacts', event_store=store).publish_bytes(
+                    b'a', source={'run_id': 'new'}, readable_scope=('new',))
+                assert marker(store._connection, a.digest) == 1
+                with pytest.raises(CancellationHeld):
+                    diagnostic(store, a)
+                raise RuntimeError('abort')
+        assert marker(store._connection, a.digest) == 0
+        assert diagnostic(store, a).payload['publication_id'] == a.publication_id
+
+
+def test_idempotent_replay_cannot_clear_dirty(tmp_path):
+    from orchestrator.persistence import EventDraft
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        draft = EventDraft('ArtifactPublished', dict(payload, publication_id='replay'))
+        store.append('artifact', a.digest, 2, [draft], 'test-replay')
+        assert marker(store._connection, a.digest) == 1
+        store.append('artifact', a.digest, 2, [draft], 'test-replay')
+        assert marker(store._connection, a.digest) == 1
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+
+
+@pytest.mark.parametrize('damage', ['changed_trigger', 'extra_unique', 'duplicate_schema'])
+def test_diagnostic_holds_for_changed_tracking_structure(tmp_path, damage):
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        if damage == 'changed_trigger':
+            conn.execute('DROP TRIGGER artifact_dirty_events_insert')
+            conn.execute('CREATE TRIGGER artifact_dirty_events_insert BEFORE INSERT ON events BEGIN SELECT 1; END')
+        elif damage == 'extra_unique':
+            conn.execute('CREATE UNIQUE INDEX extra_unique ON events(idempotency_key)')
+        else:
+            conn.execute('INSERT INTO artifact_dirty_schema VALUES (1)')
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+
+
+def test_malformed_marker_fails_closed_without_loading_its_blob(tmp_path):
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        conn.execute('PRAGMA ignore_check_constraints=ON')
+        conn.execute('UPDATE artifact_dirty_marker SET dirty=? WHERE digest=?', (sqlite3.Binary(b'x' * 1000000), a.digest))
+        conn.execute('PRAGMA ignore_check_constraints=OFF')
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+
+
+@pytest.mark.parametrize('target', ['index_install', 'index_read', 'dirty_object_read'])
+def test_long_schema_names_are_rejected_before_python_materialization(tmp_path, target):
+    from orchestrator.artifacts.transactional_dirty import install_dirty_tracking
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        if target == 'index_install':
+            record = ArtifactStore(tmp_path / 'artifacts', event_store=store).publish_bytes(b'a', source={'run_id': 'a'}, readable_scope=('a',))
+            with store._cancellation_proof_write():
+                initialize_incremental(store, record.digest, budget())
+        else:
+            record, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        long_name = ('artifact_dirty_' if target == 'dirty_object_read' else 'long_index_') + 'x' * 70000
+        conn.execute(f'CREATE INDEX "{long_name}" ON events(event_type)')
+        def guard(cursor, values):
+            if any(isinstance(value, str) and len(value) > 60000 for value in values):
+                raise AssertionError('oversized schema name materialized')
+            return sqlite3.Row(cursor, values)
+        conn.row_factory = guard
+        try:
+            if target == 'index_install':
+                with store._cancellation_proof_write():
+                    with pytest.raises(RuntimeError):
+                        install_dirty_tracking(store)
+            else:
+                with pytest.raises(CancellationHeld):
+                    diagnostic(store, record)
+        finally:
+            conn.row_factory = sqlite3.Row
+
+
+@pytest.mark.parametrize('temporary', [False, True])
+def test_install_rejects_unreviewed_marker_reset_trigger(tmp_path, temporary):
+    from orchestrator.artifacts.transactional_dirty import install_dirty_tracking
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        record = ArtifactStore(tmp_path / 'artifacts', event_store=store).publish_bytes(b'a', source={'run_id': 'a'}, readable_scope=('a',))
+        with store._cancellation_proof_write():
+            initialize_incremental(store, record.digest, budget())
+            prefix = 'TEMP ' if temporary else ''
+            store._connection.execute(f'CREATE {prefix}TRIGGER unexpected AFTER UPDATE ON stream_versions BEGIN SELECT 1; END')
+            with pytest.raises(RuntimeError):
+                install_dirty_tracking(store)
+        assert store._connection.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_dirty_schema'").fetchone() is None
+
+
+@pytest.mark.parametrize('temporary', [False, True])
+def test_reset_trigger_and_old_writer_cannot_make_diagnostic_clean(tmp_path, temporary):
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    db = tmp_path / 'events.db'
+    with SQLiteEventStore(db) as store:
+        a, _, _ = setup(store, tmp_path)
+        prefix = 'TEMP ' if temporary else ''
+        store._connection.execute(f'CREATE {prefix}TRIGGER evil_reset AFTER UPDATE ON artifact_dirty_marker WHEN NEW.dirty=1 BEGIN UPDATE artifact_dirty_marker SET dirty=0 WHERE digest=NEW.digest; END')
+        if not temporary:
+            script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('UPDATE artifact_incremental_publication SET version=version WHERE digest=?',(sys.argv[2],)); c.commit()"
+            proc = subprocess.run([sys.executable, '-c', script, str(db), a.digest], capture_output=True, text=True)
+            assert proc.returncode == 0, proc.stderr
+            assert marker(store._connection, a.digest) == 0
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+
+
+def test_two_process_proof_lock_blocks_old_writer_then_dirty_holds(tmp_path):
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    db = tmp_path / 'events.db'
+    with SQLiteEventStore(db) as store:
+        a, _, _ = setup(store, tmp_path)
+        script = """import sqlite3,sys
+c=sqlite3.connect(sys.argv[1], timeout=10)
+print('attempting', flush=True)
+c.execute('BEGIN IMMEDIATE')
+c.execute('UPDATE artifact_incremental_publication SET version=version WHERE digest=?',(sys.argv[2],))
+c.commit()
+print('committed', flush=True)
+"""
+        proc = None
+        try:
+            with store._cancellation_proof_write():
+                assert diagnostic(store, a).payload['publication_id'] == a.publication_id
+                proc = subprocess.Popen([sys.executable, '-u', '-c', script, str(db), a.digest], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                assert proc.stdout.readline().strip() == 'attempting'
+                with pytest.raises(subprocess.TimeoutExpired):
+                    proc.wait(timeout=0.3)
+                assert marker(store._connection, a.digest) == 0
+            stdout, stderr = proc.communicate(timeout=10)
+            assert proc.returncode == 0, stderr
+            assert 'committed' in stdout
+            assert marker(store._connection, a.digest) == 1
+            with pytest.raises(CancellationHeld):
+                diagnostic(store, a)
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+
+def test_diagnostic_holds_when_expected_event_trigger_is_missing(tmp_path):
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        store._connection.execute('DROP TRIGGER gw_scope_check')
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+
+
+@pytest.mark.parametrize('target', ['install', 'read'])
+@pytest.mark.parametrize('kind', ['column', 'collation'])
+def test_long_table_column_or_collation_rejected_before_materialization(tmp_path, target, kind):
+    from orchestrator.artifacts.transactional_dirty import install_dirty_tracking
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        if target == 'install':
+            record = ArtifactStore(tmp_path / 'artifacts', event_store=store).publish_bytes(b'a', source={'run_id': 'a'}, readable_scope=('a',))
+            with store._cancellation_proof_write():
+                initialize_incremental(store, record.digest, budget())
+        else:
+            record, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        long_name = 'z' * 70000
+        if kind == 'column':
+            conn.execute(f'ALTER TABLE events ADD COLUMN "{long_name}" TEXT')
+            conn.execute(f'CREATE UNIQUE INDEX novel_idx ON events("{long_name}")')
+        else:
+            conn.create_collation(long_name, lambda a, b: (a > b) - (a < b))
+            conn.execute(f'CREATE UNIQUE INDEX novel_idx ON events(event_id COLLATE "{long_name}")')
+        def guard(cursor, values):
+            if any(isinstance(value, str) and len(value) > 60000 for value in values):
+                raise AssertionError('oversized column or collation materialized')
+            return sqlite3.Row(cursor, values)
+        conn.row_factory = guard
+        try:
+            if target == 'install':
+                with store._cancellation_proof_write():
+                    with pytest.raises(RuntimeError):
+                        install_dirty_tracking(store)
+            else:
+                with pytest.raises(CancellationHeld):
+                    diagnostic(store, record)
+        finally:
+            conn.row_factory = sqlite3.Row
+
+
+def test_unopted_v1_append_ignores_long_extra_column(tmp_path):
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        name = 'v' * 70000
+        store._connection.execute(f'ALTER TABLE events ADD COLUMN "{name}" TEXT')
+        record = ArtifactStore(tmp_path / 'artifacts', event_store=store).publish_bytes(
+            b'legacy', source={'run_id': 'legacy'}, readable_scope=('legacy',))
+        assert store.current_version('artifact', record.digest) == 2
+        assert store._connection.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_dirty_schema'").fetchone() is None
