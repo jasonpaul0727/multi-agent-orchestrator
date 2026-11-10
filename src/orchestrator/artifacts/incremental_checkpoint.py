@@ -182,6 +182,3 @@ def snapshot_incremental(store, digest, publication_id, budget):
         raise
     except Exception:
         raise CancellationHeld('integrity') from None
-
-
-

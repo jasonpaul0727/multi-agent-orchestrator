@@ -282,6 +282,3 @@ def test_unicode_publication_index_bytes_are_charged_before_initialization(tmp_p
                 initialize_incremental(store, record.digest, limited)
             assert error.value.reason == 'budget'
             assert store._connection.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_incremental_checkpoint'").fetchone() is None
-
-
-
