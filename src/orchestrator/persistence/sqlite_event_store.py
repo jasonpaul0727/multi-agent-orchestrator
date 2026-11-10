@@ -243,6 +243,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             _ensure_events_attempt_context_index(connection)
             _migrate_general_worker_scope(connection)
             _migrate_mediation_scope(connection)
+            _migrate_mediation_capacity_contract(connection)
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
@@ -265,6 +266,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         _ensure_events_attempt_context_index(connection)
         _migrate_general_worker_scope(connection)
         _migrate_mediation_scope(connection)
+        _migrate_mediation_capacity_contract(connection)
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
@@ -330,6 +332,25 @@ def _migrate_general_worker_scope(connection: sqlite3.Connection) -> None:
         BEGIN SELECT RAISE(ABORT, 'general worker scope is immutable'); END""")
     connection.execute("""CREATE TRIGGER IF NOT EXISTS gw_scope_immutable_delete BEFORE DELETE ON general_worker_scope
         BEGIN SELECT RAISE(ABORT, 'general worker scope is immutable'); END""")
+
+def _migrate_mediation_capacity_contract(connection: sqlite3.Connection) -> None:
+    """Persist prospective limits only; no live evidence is enabled by this row."""
+    from .mediation_capacity import MAX_ACTORS, MAX_EVENTS, MAX_RECORD_BYTES, MAX_HISTORY_BYTES
+    migrated = connection.execute("SELECT 1 FROM schema_migrations WHERE version=7").fetchone()
+    if not migrated:
+        connection.execute("""CREATE TABLE mediation_capacity_contract (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            max_actors INTEGER NOT NULL CHECK (max_actors = 128),
+            max_events INTEGER NOT NULL CHECK (max_events = 387),
+            max_record_bytes INTEGER NOT NULL CHECK (max_record_bytes = 16384),
+            max_history_bytes INTEGER NOT NULL CHECK (max_history_bytes = max_events * max_record_bytes)
+        )""")
+        connection.execute("INSERT INTO mediation_capacity_contract VALUES (1, 128, 387, 16384, 6340608)")
+        connection.execute("INSERT INTO schema_migrations (version) VALUES (7)")
+    row = connection.execute("SELECT singleton, max_actors, max_events, max_record_bytes, max_history_bytes FROM mediation_capacity_contract LIMIT 2").fetchall()
+    if [tuple(item) for item in row] != [(1, MAX_ACTORS, MAX_EVENTS, MAX_RECORD_BYTES, MAX_HISTORY_BYTES)]:
+        raise ValueError("mediation capacity contract is incompatible")
+
 
 def _migrate_mediation_scope(connection: sqlite3.Connection) -> None:
     """Index v2 event metadata; the index alone is not a launch authority."""
