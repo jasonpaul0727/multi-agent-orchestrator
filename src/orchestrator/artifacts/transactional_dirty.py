@@ -169,12 +169,12 @@ def _trigger_sql():
 
 
 def register_digest(store, digest):
-    """Register a diagnostic marker, not a validated checkpoint or grant."""
+    """Register DIRTY; only a fresh full rebuild may establish diagnostic clean."""
     _require_owned(store)
     conn = store._connection
     if not conn.execute('SELECT 1 FROM artifact_incremental_checkpoint WHERE digest=?', (digest,)).fetchone():
         raise ValueError('incremental checkpoint is absent')
-    conn.execute('INSERT INTO artifact_dirty_marker VALUES (?, 0)', (digest,))
+    conn.execute('INSERT INTO artifact_dirty_marker VALUES (?, 1)', (digest,))
 
 
 def tracking_present(conn):

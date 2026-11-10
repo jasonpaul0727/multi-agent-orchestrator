@@ -20,6 +20,7 @@ def marker(conn, digest):
 
 def setup(store, tmp_path):
     from orchestrator.artifacts.transactional_dirty import install_dirty_tracking, register_digest
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
     artifacts = ArtifactStore(tmp_path / 'artifacts', event_store=store)
     records = [artifacts.publish_bytes(x, source={'run_id': 'a'}, readable_scope=('a',)) for x in (b'a', b'b', b'c')]
     with store._cancellation_proof_write():
@@ -28,6 +29,7 @@ def setup(store, tmp_path):
         install_dirty_tracking(store)
         for record in records:
             register_digest(store, record.digest)
+            rebuild_incremental(store, record.digest, budget())
     return records
 
 
@@ -999,3 +1001,107 @@ def test_rebuild_replaces_corrupt_index_with_exact_historical_publications(tmp_p
         assert rows == [(a.publication_id, published.event_id, published.stream_version)]
         assert diagnostic(store, a).payload['publication_id'] == a.publication_id
         assert diagnostic(store, b).payload['publication_id'] == b.publication_id
+
+
+def test_registration_after_old_writer_gap_stays_dirty_until_full_rebuild(tmp_path):
+    from orchestrator.artifacts.transactional_dirty import install_dirty_tracking, register_digest
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    db = tmp_path / 'registration-gap.db'
+    with SQLiteEventStore(db) as store:
+        artifacts = ArtifactStore(tmp_path / 'artifacts', event_store=store)
+        a = artifacts.publish_bytes(b'a', source={'run_id': 'a'}, readable_scope=('a',))
+        b = artifacts.publish_bytes(b'b', source={'run_id': 'b'}, readable_scope=('b',))
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        from orchestrator.persistence import EventDraft
+        store.append('artifact', a.digest, 2, [EventDraft('ArtifactPublished', dict(payload, publication_id='other-publication'))], 'other-publication')
+        with store._cancellation_proof_write():
+            initialize_incremental(store, a.digest, budget())
+            initialize_incremental(store, b.digest, budget())
+            install_dirty_tracking(store)
+            register_digest(store, b.digest)
+            rebuild_incremental(store, b.digest, budget())
+        script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('DELETE FROM artifact_incremental_publication WHERE digest=? AND publication_id=?',(sys.argv[2],sys.argv[3])); c.commit()"
+        proc = subprocess.run([sys.executable, '-c', script, str(db), a.digest, 'other-publication'], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        with store._cancellation_proof_write():
+            register_digest(store, a.digest)
+        assert marker(store._connection, a.digest) == 1
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+        with store._cancellation_proof_write():
+            rebuild_incremental(store, a.digest, budget())
+        assert marker(store._connection, a.digest) == 0
+        assert store._connection.execute('SELECT COUNT(*) FROM artifact_incremental_publication WHERE digest=?', (a.digest,)).fetchone()[0] == 2
+        assert diagnostic(store, a).payload['publication_id'] == a.publication_id
+        assert diagnostic(store, b).payload['publication_id'] == b.publication_id
+
+
+def test_same_transaction_gap_and_failed_rebuild_leave_new_registration_dirty(tmp_path):
+    from orchestrator.artifacts.transactional_dirty import install_dirty_tracking, register_digest
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'same-tx-gap.db') as store:
+        artifacts = ArtifactStore(tmp_path / 'artifacts', event_store=store)
+        a = artifacts.publish_bytes(b'a', source={'run_id': 'a'}, readable_scope=('a',))
+        b = artifacts.publish_bytes(b'b', source={'run_id': 'b'}, readable_scope=('b',))
+        conn = store._connection
+        with store._cancellation_proof_write():
+            initialize_incremental(store, a.digest, budget())
+            initialize_incremental(store, b.digest, budget())
+            install_dirty_tracking(store)
+            conn.execute('DELETE FROM artifact_incremental_publication WHERE digest=?', (a.digest,))
+            register_digest(store, a.digest)
+            register_digest(store, b.digest)
+            rebuild_incremental(store, b.digest, budget())
+            assert marker(conn, a.digest) == 1
+            assert marker(conn, b.digest) == 0
+            with pytest.raises(CancellationHeld):
+                rebuild_incremental(store, a.digest, CancellationBudget(10, 4096, 1024, 3, 3))
+            assert marker(conn, a.digest) == 1
+            with pytest.raises(sqlite3.IntegrityError):
+                register_digest(store, a.digest)
+            assert marker(conn, a.digest) == 1
+            rebuild_incremental(store, a.digest, budget())
+            assert marker(conn, a.digest) == 0
+        assert diagnostic(store, a).payload['publication_id'] == a.publication_id
+        assert diagnostic(store, b).payload['publication_id'] == b.publication_id
+
+
+def test_registration_and_failed_semantic_rebuild_cannot_create_clean_marker(tmp_path):
+    from orchestrator.artifacts.transactional_dirty import install_dirty_tracking, register_digest
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    from orchestrator.persistence import EventDraft
+    with SQLiteEventStore(tmp_path / 'bad-history.db') as store:
+        a = ArtifactStore(tmp_path / 'artifacts', event_store=store).publish_bytes(b'a', source={'run_id': 'a'}, readable_scope=('a',))
+        with store._cancellation_proof_write():
+            initialize_incremental(store, a.digest, budget())
+            install_dirty_tracking(store)
+        store.append('artifact', a.digest, 2, [EventDraft('UnknownEvent', {})], 'unknown-before-register')
+        with store._cancellation_proof_write():
+            register_digest(store, a.digest)
+            with pytest.raises(CancellationHeld):
+                rebuild_incremental(store, a.digest, budget())
+            assert marker(store._connection, a.digest) == 1
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+
+
+def test_registration_rebuild_ignores_preexisting_event_window_cache(tmp_path):
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    from orchestrator.lifecycle.cancel_completion import read_event_window
+    with SQLiteEventStore(tmp_path / 'stale-cache.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        conn.execute('DELETE FROM artifact_incremental_publication WHERE digest=?', (a.digest,))
+        with store._cancellation_proof_write():
+            shared_budget = budget()
+            events, version = read_event_window(store, 'artifact', a.digest, shared_budget)
+            assert len(events) == version == 2
+            # Simulate a stale cached window with an apparently matching
+            # change counter; rebuild must perform a fresh physical scan.
+            shared_budget._cache[('artifact', a.digest)] = (([], 0), conn.total_changes)
+            rebuild_incremental(store, a.digest, shared_budget)
+            assert marker(conn, a.digest) == 0
+        assert diagnostic(store, a).payload['publication_id'] == a.publication_id
