@@ -334,7 +334,7 @@ def test_append_does_not_erase_or_advance_opted_in_dirty_checkpoint(tmp_path, am
             diagnostic(store, a)
 
 
-def test_clean_marker_turns_dirty_on_append_and_rollback_restores_diagnostic(tmp_path):
+def test_clean_controlled_append_and_rollback_restores_diagnostic(tmp_path):
     from orchestrator.lifecycle.cancel_completion import CancellationHeld
     with SQLiteEventStore(tmp_path / 'events.db') as store:
         a, _, _ = setup(store, tmp_path)
@@ -342,9 +342,8 @@ def test_clean_marker_turns_dirty_on_append_and_rollback_restores_diagnostic(tmp
             with store._cancellation_proof_write():
                 ArtifactStore(tmp_path / 'artifacts', event_store=store).publish_bytes(
                     b'a', source={'run_id': 'new'}, readable_scope=('new',))
-                assert marker(store._connection, a.digest) == 1
-                with pytest.raises(CancellationHeld):
-                    diagnostic(store, a)
+                assert marker(store._connection, a.digest) == 0
+                assert diagnostic(store, a).payload['publication_id'] == a.publication_id
                 raise RuntimeError('abort')
         assert marker(store._connection, a.digest) == 0
         assert diagnostic(store, a).payload['publication_id'] == a.publication_id
@@ -358,7 +357,7 @@ def test_idempotent_replay_cannot_clear_dirty(tmp_path):
         payload = store.read_stream('artifact', a.digest)[-1].payload
         draft = EventDraft('ArtifactPublished', dict(payload, publication_id='replay'))
         store.append('artifact', a.digest, 2, [draft], 'test-replay')
-        assert marker(store._connection, a.digest) == 1
+        store._connection.execute('UPDATE artifact_dirty_marker SET dirty=1 WHERE digest=?', (a.digest,))
         store.append('artifact', a.digest, 2, [draft], 'test-replay')
         assert marker(store._connection, a.digest) == 1
         with pytest.raises(CancellationHeld):
@@ -544,3 +543,233 @@ def test_unopted_v1_append_ignores_long_extra_column(tmp_path):
             b'legacy', source={'run_id': 'legacy'}, readable_scope=('legacy',))
         assert store.current_version('artifact', record.digest) == 2
         assert store._connection.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_dirty_schema'").fetchone() is None
+
+
+def test_owned_valid_append_advances_clean_diagnostic_then_later_sql_marks_dirty(tmp_path):
+    from orchestrator.persistence import EventDraft
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        draft = EventDraft('ArtifactPublished', dict(payload, publication_id='controlled'))
+        with store._cancellation_proof_write():
+            events = store.append('artifact', a.digest, 2, [draft], 'controlled')
+            assert marker(store._connection, a.digest) == 0
+            assert diagnostic(store, a).payload['publication_id'] == a.publication_id
+            from orchestrator.artifacts.incremental_checkpoint import snapshot_incremental
+            assert snapshot_incremental(store, a.digest, 'controlled', budget()).event_id == events[0].event_id
+            store._connection.execute('UPDATE artifact_incremental_publication SET version=version WHERE digest=?', (a.digest,))
+            assert marker(store._connection, a.digest) == 1
+            with pytest.raises(CancellationHeld):
+                diagnostic(store, a)
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+
+
+@pytest.mark.parametrize('kind', ['unknown', 'duplicate_index'])
+def test_unverified_new_event_never_restores_clean(tmp_path, kind):
+    from orchestrator.persistence import EventDraft
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        if kind == 'unknown':
+            draft = EventDraft('UnknownEvent', {})
+        else:
+            payload = store.read_stream('artifact', a.digest)[-1].payload
+            draft = EventDraft('ArtifactPublished', payload)
+        store.append('artifact', a.digest, 2, [draft], 'unverified')
+        assert marker(store._connection, a.digest) == 1
+        assert store._connection.execute('SELECT version FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone()[0] == 2
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+
+
+@pytest.mark.parametrize('committed', [False, True])
+def test_owned_writer_sigkill_before_or_after_commit_is_atomic(tmp_path, committed):
+    import os
+    db = tmp_path / 'events.db'
+    with SQLiteEventStore(db) as store:
+        a, _, _ = setup(store, tmp_path)
+        script = """import sys
+from orchestrator.persistence import SQLiteEventStore, EventDraft
+s=SQLiteEventStore(sys.argv[1]); d=sys.argv[2]
+p=s.read_stream('artifact', d)[-1].payload
+with s._cancellation_proof_write():
+    s.append('artifact', d, 2, [EventDraft('ArtifactPublished', dict(p, publication_id='killed'))], 'killed')
+    if sys.argv[3]=='0':
+        print('ready', flush=True); input()
+if sys.argv[3]=='1':
+    print('ready', flush=True); input()
+"""
+        env = dict(os.environ)
+        env['PYTHONPATH'] = os.path.abspath('src')
+        proc = subprocess.Popen([sys.executable, '-u', '-c', script, str(db), a.digest, str(int(committed))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        try:
+            assert proc.stdout.readline().strip() == 'ready'
+            proc.kill()
+            proc.communicate(timeout=10)
+            assert store.current_version('artifact', a.digest) == (3 if committed else 2)
+            assert marker(store._connection, a.digest) == 0
+            assert diagnostic(store, a).payload['publication_id'] == a.publication_id
+            if committed:
+                from orchestrator.artifacts.incremental_checkpoint import snapshot_incremental
+                with store._cancellation_proof_write():
+                    assert snapshot_incremental(store, a.digest, 'killed', budget()).payload['publication_id'] == 'killed'
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=10)
+
+
+def test_controlled_nested_rollback_then_new_append_remains_consistent(tmp_path):
+    from orchestrator.persistence import EventDraft
+    from orchestrator.artifacts.incremental_checkpoint import snapshot_incremental
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        with store._cancellation_proof_write():
+            conn = store._connection
+            conn.execute('SAVEPOINT controlled_rollback')
+            store.append('artifact', a.digest, 2, [EventDraft('ArtifactPublished', dict(payload, publication_id='rolled'))], 'rolled')
+            assert marker(conn, a.digest) == 0
+            conn.execute('ROLLBACK TO controlled_rollback')
+            conn.execute('RELEASE controlled_rollback')
+            assert store.current_version('artifact', a.digest) == 2
+            assert marker(conn, a.digest) == 0
+            store.append('artifact', a.digest, 2, [EventDraft('ArtifactPublished', dict(payload, publication_id='kept'))], 'kept')
+            assert marker(conn, a.digest) == 0
+            assert snapshot_incremental(store, a.digest, 'kept', budget()).payload['publication_id'] == 'kept'
+
+
+@pytest.mark.parametrize('denied_table,denied_action', [('artifact_incremental_publication', sqlite3.SQLITE_INSERT), ('artifact_incremental_checkpoint', sqlite3.SQLITE_UPDATE)])
+def test_authorizer_denied_experimental_index_rolls_back_v1_append(tmp_path, denied_table, denied_action):
+    from orchestrator.persistence import EventDraft
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    db = tmp_path / 'events.db'
+    with SQLiteEventStore(db) as store:
+        a, _, _ = setup(store, tmp_path)
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        def deny_experimental_insert(action, arg1, arg2, db_name, source):
+            if action == denied_action and arg1 == denied_table:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        store._connection.set_authorizer(deny_experimental_insert)
+        try:
+            with pytest.raises(sqlite3.DatabaseError):
+                store.append('artifact', a.digest, 2, [EventDraft('ArtifactPublished', dict(payload, publication_id='denied'))], 'denied')
+        finally:
+            store._connection.set_authorizer(None)
+        assert store.current_version('artifact', a.digest) == 2
+        assert marker(store._connection, a.digest) == 0
+        assert store._connection.execute("SELECT 1 FROM artifact_incremental_publication WHERE publication_id='denied'").fetchone() is None
+        assert store._connection.execute('SELECT version FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone()[0] == 2
+    with SQLiteEventStore(db) as reopened:
+        assert reopened.current_version('artifact', a.digest) == 2
+        assert marker(reopened._connection, a.digest) == 0
+        assert diagnostic(reopened, a).payload['publication_id'] == a.publication_id
+
+
+def test_oversized_incremental_batch_commits_v1_and_stays_dirty(tmp_path):
+    from orchestrator.persistence import EventDraft
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        drafts = [EventDraft('ArtifactPublished', dict(payload, publication_id=f'bulk-{i}')) for i in range(129)]
+        store.append('artifact', a.digest, 2, drafts, 'large-batch')
+        assert store.current_version('artifact', a.digest) == 131
+        assert marker(store._connection, a.digest) == 1
+        assert store._connection.execute('SELECT version FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone()[0] == 2
+        with pytest.raises(CancellationHeld):
+            diagnostic(store, a)
+
+
+def test_denied_dirty_trigger_propagates_and_rolls_back_v1_write(tmp_path):
+    from orchestrator.persistence import EventDraft
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        def deny_marker(action, arg1, arg2, db_name, source):
+            if action == sqlite3.SQLITE_UPDATE and arg1 == 'artifact_dirty_marker' and source and source.startswith('artifact_dirty_'):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        store._connection.set_authorizer(deny_marker)
+        try:
+            with pytest.raises(sqlite3.DatabaseError):
+                store.append('artifact', a.digest, 2, [EventDraft('ArtifactPublished', dict(payload, publication_id='blocked'))], 'blocked')
+        finally:
+            store._connection.set_authorizer(None)
+        assert store.current_version('artifact', a.digest) == 2
+        assert marker(store._connection, a.digest) == 0
+        assert diagnostic(store, a).payload['publication_id'] == a.publication_id
+
+
+def test_oversized_payload_commits_v1_and_stays_dirty(tmp_path):
+    from orchestrator.persistence import EventDraft
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        store.append('artifact', a.digest, 2, [EventDraft('ArtifactPublished', dict(payload, publication_id='large', padding='x' * 70000))], 'large')
+        assert store.current_version('artifact', a.digest) == 3
+        assert marker(store._connection, a.digest) == 1
+        assert store._connection.execute('SELECT version FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone()[0] == 2
+
+
+def test_denial_inside_incremental_dirty_trigger_rolls_back_whole_append(tmp_path):
+    from orchestrator.persistence import EventDraft
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        def deny_trigger_marker(action, arg1, arg2, db_name, source):
+            if action == sqlite3.SQLITE_UPDATE and arg1 == 'artifact_dirty_marker' and source == 'artifact_dirty_artifact_incremental_publication_insert':
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        store._connection.set_authorizer(deny_trigger_marker)
+        try:
+            with pytest.raises(sqlite3.DatabaseError):
+                store.append('artifact', a.digest, 2, [EventDraft('ArtifactPublished', dict(payload, publication_id='trigger-denied'))], 'trigger-denied')
+        finally:
+            store._connection.set_authorizer(None)
+        assert store.current_version('artifact', a.digest) == 2
+        assert marker(store._connection, a.digest) == 0
+        assert store._connection.execute("SELECT 1 FROM idempotency_records WHERE idempotency_key='trigger-denied'").fetchone() is None
+        assert store._connection.execute("SELECT 1 FROM events WHERE idempotency_key='trigger-denied'").fetchone() is None
+
+
+def test_real_sqlite_full_rolls_back_and_reopens_consistent(tmp_path):
+    from orchestrator.persistence import EventDraft
+    db = tmp_path / 'bounded-full.db'
+    with SQLiteEventStore(db) as store:
+        a, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        before_checkpoint = tuple(conn.execute('SELECT * FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone())
+        before_publications = [tuple(r) for r in conn.execute('SELECT * FROM artifact_incremental_publication WHERE digest=? ORDER BY publication_id', (a.digest,))]
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        page_count = conn.execute('PRAGMA page_count').fetchone()[0]
+        assert page_count * conn.execute('PRAGMA page_size').fetchone()[0] < 4 * 1024 * 1024
+        assert conn.execute(f'PRAGMA max_page_count={page_count}').fetchone()[0] == page_count
+        seen = []
+        def observe(action, arg1, arg2, db_name, source):
+            if action == sqlite3.SQLITE_INSERT and arg1 in ('events', 'idempotency_records'):
+                seen.append(arg1)
+            return sqlite3.SQLITE_OK
+        conn.set_authorizer(observe)
+        try:
+            with pytest.raises(sqlite3.OperationalError) as failure:
+                store.append('artifact', a.digest, 2,
+                    [EventDraft('ArtifactPublished', dict(payload, publication_id='full', padding='x' * (4 * 1024 * 1024)))], 'full-fixture')
+        finally:
+            conn.set_authorizer(None)
+        assert failure.value.sqlite_errorcode == sqlite3.SQLITE_FULL
+        assert failure.value.sqlite_errorname == 'SQLITE_FULL'
+        assert 'events' in seen
+        assert 'idempotency_records' not in seen
+    with SQLiteEventStore(db) as reopened:
+        conn = reopened._connection
+        assert reopened.current_version('artifact', a.digest) == 2
+        assert conn.execute("SELECT 1 FROM events WHERE idempotency_key='full-fixture'").fetchone() is None
+        assert conn.execute("SELECT 1 FROM idempotency_records WHERE idempotency_key='full-fixture'").fetchone() is None
+        assert tuple(conn.execute('SELECT * FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone()) == before_checkpoint
+        assert [tuple(r) for r in conn.execute('SELECT * FROM artifact_incremental_publication WHERE digest=? ORDER BY publication_id', (a.digest,))] == before_publications
+        assert marker(conn, a.digest) == 0
+        assert diagnostic(reopened, a).payload['publication_id'] == a.publication_id

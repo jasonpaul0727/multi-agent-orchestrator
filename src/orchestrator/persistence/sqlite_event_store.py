@@ -849,7 +849,7 @@ class SQLiteEventStore:
                 from orchestrator.artifacts.evidence_checkpoint import verify_before_append
                 verify_before_append(self, stream_id)
                 from orchestrator.artifacts.incremental_checkpoint import before_append
-                before_append(self, stream_id, current_version)
+                incremental_candidate = before_append(self, stream_id, current_version)
 
             existing_events = self._read_rows(
                 stream_type,
@@ -940,8 +940,6 @@ class SQLiteEventStore:
                 # it supplies no artifact-access or cancellation authority.
                 from orchestrator.artifacts.evidence_checkpoint import refresh_after_append
                 refresh_after_append(self, stream_id)
-                from orchestrator.artifacts.incremental_checkpoint import after_append
-                after_append(self, stream_id, stored_events)
 
             connection.execute(
                 """
@@ -959,6 +957,9 @@ class SQLiteEventStore:
                     last_version,
                 ),
             )
+            if stream_type == "artifact":
+                from orchestrator.artifacts.incremental_checkpoint import after_append
+                after_append(self, stream_id, stored_events, incremental_candidate)
             if started_transaction:
                 connection.commit()
                 self._publish_post_commit()

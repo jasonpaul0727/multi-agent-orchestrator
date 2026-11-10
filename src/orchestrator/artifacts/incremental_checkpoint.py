@@ -108,7 +108,21 @@ def before_append(store, digest, version):
     conn = store._connection
     from .transactional_dirty import tracking_present
     if tracking_present(conn):
-        return
+        if not store._has_owned_write():
+            return None
+        from .transactional_dirty import require_clean_marker
+        from orchestrator.lifecycle.cancel_completion import CancellationBudget
+        diagnostic_budget = CancellationBudget(4000, 4 * 1024 * 1024, 65536, 300, 100)
+        try:
+            require_clean_marker(conn, digest, diagnostic_budget)
+            if not _structure(conn, diagnostic_budget):
+                return None
+            head = _head(conn, digest, version)
+            if head is None:
+                return None
+            return (store._owned_write_token(), head['version'], head['chain'])
+        except CancellationHeld:
+            return None
     if not _structure(conn):
         return
     if not store._has_owned_write():
@@ -120,10 +134,12 @@ def before_append(store, digest, version):
         conn.execute('DELETE FROM artifact_incremental_checkpoint WHERE digest=?', (digest,))
 
 
-def after_append(store, digest, events):
+def after_append(store, digest, events, candidate=None):
     conn = store._connection
     from .transactional_dirty import tracking_present
     if tracking_present(conn):
+        if candidate is not None:
+            _advance_tracked(store, digest, events, candidate)
         return
     if not _structure(conn):
         return
@@ -142,6 +158,81 @@ def after_append(store, digest, events):
         conn.execute('UPDATE artifact_incremental_checkpoint SET version=?, boundary_id=?, chain=? WHERE digest=?', (events[-1].stream_version, events[-1].event_id, chain, digest))
     except (CancellationHeld, sqlite3.IntegrityError, ValueError, TypeError):
         conn.execute('DELETE FROM artifact_incremental_checkpoint WHERE digest=?', (digest,))
+
+
+def _advance_tracked(store, digest, events, candidate):
+    """Advance one validated owned append; still not authority evidence."""
+    import uuid
+    conn = store._connection
+    token, version, chain = candidate
+    if not events or not store._has_owned_write() or store._owned_write_token() is not token:
+        return
+    # The original append already materializes its batch and may reread all
+    # history. Bound only this additional diagnostic maintenance.
+    if len(events) > 128:
+        return
+    total_bytes = 0
+    for event in events:
+        meta = conn.execute("SELECT typeof(payload_json), length(CAST(payload_json AS BLOB)) FROM events WHERE event_id=? AND stream_type='artifact' AND stream_id=?", (event.event_id, digest)).fetchone()
+        if meta is None or meta[0] != 'text' or type(meta[1]) is not int or meta[1] > 65536:
+            return
+        total_bytes += meta[1]
+        if total_bytes > 1024 * 1024:
+            return
+    # Validate all new envelopes before changing the index. A pre-existing
+    # DIRTY marker never produces a candidate, including idempotent replay.
+    publications = []
+    try:
+        for offset, event in enumerate(events, 1):
+            if event.stream_version != version + offset:
+                raise CancellationHeld('integrity')
+            record = _validate(event, digest)
+            chain = _step(chain, event)
+            if event.event_type == 'ArtifactPublished':
+                publications.append((digest, record.publication_id, event.event_id, event.stream_version))
+    except (CancellationHeld, ValueError, TypeError):
+        return
+    # Expected duplicate index keys are an ordinary ineligible diagnostic,
+    # not a reason to attempt a write that would abort the legacy append.
+    ids = set()
+    event_ids = set()
+    for _, publication_id, event_id, _ in publications:
+        if publication_id in ids or event_id in event_ids:
+            return
+        ids.add(publication_id)
+        event_ids.add(event_id)
+        if conn.execute('SELECT 1 FROM artifact_incremental_publication WHERE digest=? AND (publication_id=? OR event_id=?) LIMIT 1', (digest, publication_id, event_id)).fetchone():
+            return
+    name = 'artifact_dirty_advance_' + uuid.uuid4().hex
+    conn.execute(f'SAVEPOINT {name}')
+    try:
+        marker = conn.execute("SELECT typeof(dirty), dirty FROM artifact_dirty_marker WHERE digest=?", (digest,)).fetchone()
+        if marker is None or tuple(marker) != ('integer', 1):
+            raise CancellationHeld('integrity')
+        conn.executemany('INSERT INTO artifact_incremental_publication VALUES (?, ?, ?, ?)', publications)
+        changed = conn.execute('UPDATE artifact_incremental_checkpoint SET version=?, boundary_id=?, chain=? WHERE digest=? AND version=?',
+            (events[-1].stream_version, events[-1].event_id, chain, digest, version)).rowcount
+        if changed != 1 or _head(conn, digest, events[-1].stream_version) is None:
+            raise CancellationHeld('integrity')
+        changed = conn.execute('UPDATE artifact_dirty_marker SET dirty=0 WHERE digest=? AND dirty=1', (digest,)).rowcount
+        if changed != 1:
+            raise CancellationHeld('integrity')
+    except (CancellationHeld, ValueError, TypeError) as exc:
+        conn.execute(f'ROLLBACK TO SAVEPOINT {name}')
+        conn.execute(f'RELEASE SAVEPOINT {name}')
+        if not conn.in_transaction or not store._has_owned_write() or store._owned_write_token() is not token:
+            raise RuntimeError('diagnostic rollback lost write ownership') from exc
+        state = conn.execute("SELECT typeof(dirty), CASE WHEN typeof(dirty)='integer' THEN dirty END FROM artifact_dirty_marker WHERE digest=?", (digest,)).fetchone()
+        if state is None or tuple(state) != ('integer', 1):
+            raise RuntimeError('diagnostic rollback did not preserve DIRTY') from exc
+        return
+    except BaseException:
+        # SQLite does not identify whether an error originated in this direct
+        # statement or a nested marker trigger. Propagate all database errors.
+        conn.execute(f'ROLLBACK TO SAVEPOINT {name}')
+        conn.execute(f'RELEASE SAVEPOINT {name}')
+        raise
+    conn.execute(f'RELEASE SAVEPOINT {name}')
 
 
 def snapshot_incremental(store, digest, publication_id, budget):

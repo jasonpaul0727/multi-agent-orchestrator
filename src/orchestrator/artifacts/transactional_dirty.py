@@ -116,12 +116,12 @@ def _validate_unique_indexes(conn, budget=None):
 def _validate_triggers(conn, installed, budget=None):
     from .evidence_checkpoint import _charge
     from .incremental_checkpoint import _TRIGGERS
-    allowed = {**_TRIGGERS, **_BASE_TRIGGERS}
+    allowed = {**_TRIGGERS, **_BASE_TRIGGERS, **{'gw_scope_immutable_update': "CREATE TRIGGER gw_scope_immutable_update BEFORE UPDATE ON general_worker_scope\n        BEGIN SELECT RAISE(ABORT, 'general worker scope is immutable'); END", 'gw_scope_immutable_delete': "CREATE TRIGGER gw_scope_immutable_delete BEFORE DELETE ON general_worker_scope\n        BEGIN SELECT RAISE(ABORT, 'general worker scope is immutable'); END", 'mediation_scope_immutable_update': "CREATE TRIGGER mediation_scope_immutable_update BEFORE UPDATE ON mediation_scope\n        BEGIN SELECT RAISE(ABORT, 'mediation scope is immutable'); END", 'mediation_scope_immutable_delete': "CREATE TRIGGER mediation_scope_immutable_delete BEFORE DELETE ON mediation_scope\n        BEGIN SELECT RAISE(ABORT, 'mediation scope is immutable'); END"}}
     if installed:
         allowed.update(_trigger_sql())
-    tables = ('events', 'stream_versions', 'artifact_incremental_checkpoint', 'artifact_incremental_publication', 'artifact_dirty_marker')
-    placeholders = ','.join('?' for _ in tables)
-    where = "type='trigger' AND tbl_name IN (" + placeholders + ")"
+    # Any trigger may run indirectly during a controlled append.
+    tables = ()
+    where = "type='trigger'"
     seen = set()
     for schema in ('sqlite_master', 'sqlite_temp_master'):
         meta = conn.execute("SELECT typeof(name) AS nt, length(CAST(name AS BLOB)) AS n, typeof(sql) AS st, length(CAST(sql AS BLOB)) AS sn FROM " + schema + " WHERE " + where + " LIMIT 33", tables).fetchall()
