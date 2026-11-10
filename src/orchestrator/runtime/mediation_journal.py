@@ -167,9 +167,9 @@ class MediationJournal:
             _identifier(operation_id)
             if self.event_store._connection.in_transaction and not self.event_store._has_owned_write():
                 raise ValueError()
-            events, version = self.event_store.read_stream_with_version(STREAM, operation_id, max_events=MAX_EVENTS,
-                stream_bounds=(MAX_EVENTS, MAX_RECORD_BYTES, MAX_HISTORY_BYTES))
-            return _replay(operation_id, events, version)
+            with self.event_store._cancellation_proof_write():
+                events, version = self._bounded_history(operation_id)
+                return _replay(operation_id, events, version)
         except Exception:
             raise MediationJournalError() from None
 
@@ -198,6 +198,18 @@ class MediationJournal:
 
     def seal(self, operation_id):
         raise MediationJournalError()
+
+    def _bounded_history(self, operation_id):
+        from orchestrator.lifecycle.cancel_completion import CancellationBudget, CancellationHeld, read_event_window
+        budget = CancellationBudget(max_rows=1024, max_bytes=2 * 1024 * 1024,
+                                    max_row_bytes=65536, max_streams=4, max_nodes=1)
+        events, version = read_event_window(self.event_store, STREAM, operation_id, budget,
+            max_events=MAX_EVENTS, max_payload_bytes=MAX_RECORD_BYTES, max_payload_total=MAX_HISTORY_BYTES)
+        count, size = budget._windows[(STREAM, operation_id)]
+        if (version > MAX_EVENTS or budget.rows + 2 * count > budget.max_rows
+                or budget.bytes + 2 * size > budget.max_bytes):
+            raise CancellationHeld("budget")
+        return events, version
 
     def _append(self, operation_id, action, data):
         _identifier(operation_id)
@@ -234,6 +246,7 @@ class MediationJournal:
                 node_id=op.node_id, attempt_id=op.attempt_id, fencing_generation=op.fencing_generation,
                 correlation_id=op.run_id, causation_id=(_hash(events[-1].payload) if events else op.commitment_sha256))]
 
-        store.append_checked(STREAM, operation_id, key, decide,
-            stream_bounds=(MAX_EVENTS, MAX_RECORD_BYTES, MAX_HISTORY_BYTES))
+        with store._cancellation_proof_write():
+            self._bounded_history(operation_id)
+            store.append_checked(STREAM, operation_id, key, decide)
         return result

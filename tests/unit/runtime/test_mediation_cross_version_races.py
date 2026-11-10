@@ -371,8 +371,9 @@ def test_outcome_unknown_and_inert_intent_order_preserves_hold(tmp_path, winner)
         case.store.close()
 
 
-def test_unknown_transition_checks_corrupt_v2_census_before_recording(tmp_path):
+def test_unknown_transition_preserves_fence_despite_corrupt_v2_census(tmp_path):
     from datetime import datetime, timezone
+    from orchestrator.budget import BudgetLedger
     case = dispatch_case(tmp_path, register=False)
     try:
         candidate = v2_operation(case)
@@ -380,10 +381,16 @@ def test_unknown_transition_checks_corrupt_v2_census_before_recording(tmp_path):
         conn = case.store._connection
         conn.execute("DROP TRIGGER mediation_scope_immutable_delete")
         conn.execute("DELETE FROM mediation_scope WHERE stream_id=?", (candidate.operation_id,))
+        case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
+                                      outcome="outcome_unknown")
+        events = case.store.read_stream("scheduler", "global")
+        assert any(e.event_type == "AttemptOutcomeUnknown" for e in events)
+        assert not any(e.event_type == "AttemptSlotReleased" for e in events)
+        attempt = case.lifecycle.replay("run-1").node("node-1").attempts[-1]
+        assert BudgetLedger(case.store).get_reservation(attempt.reservation_id, run_id="run-1").status == "unknown"
         with pytest.raises(ValueError):
-            case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc),
-                                          outcome="outcome_unknown")
-        assert not any(e.event_type == "AttemptOutcomeUnknown" for e in case.store.read_stream("scheduler", "global"))
+            case.scheduler.reconcile_attempt(**case.identity, reconciled_at=datetime.now(timezone.utc),
+                                             outcome="failed", known_no_effect=True)
     finally:
         case.store.close()
 
@@ -597,7 +604,7 @@ def test_cancel_request_is_retained_but_auto_completion_holds_on_v2_history(tmp_
         case.store.close()
 
 
-def two_node_case(tmp_path):
+def two_node_case(tmp_path, *, admit_second=False):
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
     from orchestrator.config import ConfigCandidate, ConfigManager
@@ -633,7 +640,16 @@ def two_node_case(tmp_path):
                             lease_expires_at=now+timedelta(minutes=5), **ADMISSION)
     identity = dict(run_id="run-1", node_id="node-1", attempt_id=routing.attempt_id,
                     fencing_generation=routing.fencing_generation)
-    return SimpleNamespace(store=store, scheduler=scheduler, lifecycle=lifecycle, identity=identity)
+    identity2 = None
+    if admit_second:
+        route2, decision2 = routed_pair(reg, resolved.config, policy, node_id="node-2",
+                                        contract_hash=contracts[1].contract_hash)
+        scheduler.accept_routing(route2, decision2, accepted_at=now-timedelta(seconds=1),
+                                 lease_expires_at=now+timedelta(minutes=5), **ADMISSION)
+        identity2 = dict(run_id="run-1", node_id="node-2", attempt_id=route2.attempt_id,
+                         fencing_generation=route2.fencing_generation)
+    return SimpleNamespace(store=store, scheduler=scheduler, lifecycle=lifecycle, identity=identity,
+                           identity2=identity2, expiry=now+timedelta(minutes=6))
 
 
 @pytest.mark.parametrize("winner", ["intent", "cancel"])
@@ -1072,5 +1088,86 @@ def test_v1_post_commit_grant_preflights_before_decode(tmp_path, monkeypatch, en
         else:
             assert not case.journal._consume_fresh_prepare(op.identity, "request", prepared)
         assert not decoded
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("entry", ["load", "register", "close"])
+@pytest.mark.parametrize("damage", ["header", "version", "lag"])
+def test_public_v2_history_preflights_raw_metadata(tmp_path, monkeypatch, entry, damage):
+    case = dispatch_case(tmp_path, register=False)
+    decoded = []
+    original = case.store._row_to_event
+    def observed(row):
+        if row["stream_type"] == "mediation_v2":
+            decoded.append(True)
+        return original(row)
+    try:
+        candidate = v2_operation(case)
+        journal = MediationJournal(case.store)
+        journal.register(candidate)
+        conn = case.store._connection
+        if damage == "header":
+            conn.execute("DROP TRIGGER events_immutable_update")
+            conn.execute("UPDATE events SET correlation_id=? WHERE stream_type='mediation_v2' AND stream_id=?", ("x" * 100000, candidate.operation_id))
+        elif damage == "version":
+            conn.execute("UPDATE stream_versions SET current_version=? WHERE stream_type='mediation_v2' AND stream_id=?", ("x" * 100000, candidate.operation_id))
+        else:
+            conn.execute("UPDATE stream_versions SET current_version=0 WHERE stream_type='mediation_v2' AND stream_id=?", (candidate.operation_id,))
+        before = conn.execute("SELECT count(*) FROM events").fetchone()[0]
+        monkeypatch.setattr(case.store, "_row_to_event", observed)
+        with pytest.raises(MediationJournalError):
+            if entry == "load": journal.load(candidate.operation_id)
+            elif entry == "register": journal.register(candidate)
+            else: journal.close(candidate.operation_id)
+        assert not decoded
+        assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == before
+    finally:
+        case.store.close()
+
+
+def test_expiry_marks_both_nodes_despite_one_corrupt_v2_scope(tmp_path):
+    from orchestrator.budget import BudgetLedger
+    case = two_node_case(tmp_path, admit_second=True)
+    try:
+        from types import SimpleNamespace
+        admissions = [e for e in case.store.read_stream("scheduler", "global") if e.event_type == "RoutingDecisionAccepted"]
+        first = min(admissions, key=lambda e: e.payload["attempt_ref"]).node_id
+        first_identity = case.identity if first == "node-1" else case.identity2
+        candidate = v2_operation(SimpleNamespace(identity=first_identity))
+        MediationJournal(case.store).register(candidate)
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER mediation_scope_immutable_delete")
+        conn.execute("DELETE FROM mediation_scope WHERE stream_id=?", (candidate.operation_id,))
+        assert set(case.scheduler.mark_expired_attempts_unknown(as_of=case.expiry)) == {
+            case.identity["attempt_id"], case.identity2["attempt_id"]}
+        events = case.store.read_stream("scheduler", "global")
+        assert {e.node_id for e in events if e.event_type == "AttemptOutcomeUnknown"} == {"node-1", "node-2"}
+        assert not any(e.event_type == "AttemptSlotReleased" for e in events)
+        state = case.lifecycle.replay("run-1")
+        for node in state.nodes:
+            attempt = node.attempts[-1]
+            assert BudgetLedger(case.store).get_reservation(attempt.reservation_id, run_id="run-1").status == "unknown"
+    finally:
+        case.store.close()
+
+
+def test_expiry_continues_to_healthy_node_when_first_reservation_missing(tmp_path):
+    import json
+    from orchestrator.persistence.sqlite_event_store import _sha256_json
+    case = two_node_case(tmp_path, admit_second=True)
+    try:
+        admissions = [e for e in case.store.read_stream("scheduler", "global") if e.event_type == "RoutingDecisionAccepted"]
+        first, second = sorted(admissions, key=lambda e: e.payload["attempt_ref"])
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        row = conn.execute("SELECT payload_json FROM events WHERE stream_type='budget' AND event_type='BudgetReserved' AND node_id=?", (first.node_id,)).fetchone()
+        payload = json.loads(row[0]); payload["reservation_id"] = "unrelated-reservation"
+        conn.execute("UPDATE events SET payload_json=?, payload_hash=? WHERE stream_type='budget' AND event_type='BudgetReserved' AND node_id=?", (json.dumps(payload), _sha256_json(payload), first.node_id))
+        assert case.scheduler.mark_expired_attempts_unknown(as_of=case.expiry) == (second.attempt_id,)
+        assert case.scheduler.last_expiry_holds == (first.attempt_id,)
+        events = case.store.read_stream("scheduler", "global")
+        assert {e.node_id for e in events if e.event_type == "AttemptOutcomeUnknown"} == {second.node_id}
+        assert not any(e.event_type == "AttemptSlotReleased" for e in events)
     finally:
         case.store.close()

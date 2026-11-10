@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from orchestrator.agents import AgentRegistry
 from orchestrator.artifacts import ArtifactStore, EphemeralArtifactGrantAuthority
-from orchestrator.budget import BudgetLedger, BudgetReservation, RunLimit, UsageRecord
+from orchestrator.budget import BudgetError, BudgetLedger, BudgetReservation, RunLimit, UsageRecord
 from orchestrator.config.runtime import RunConfigSnapshot
 from orchestrator.models import AcceptedModelRoute, ModelGatewayFailure
 from orchestrator.persistence import EventDraft, SQLiteEventStore, StoredEvent
@@ -143,6 +143,7 @@ class Scheduler:
         self._general_usage_source = usage_source if usage_source is not None else UnavailableAttemptUsageSource()
         self._general_recovery_scope = None
         self._general_artifact_grants = artifact_grants
+        self.last_expiry_holds: tuple[str, ...] = ()
 
     def resolve_active_attempt(
         self, *, run_id: str, node_id: str, attempt_id: str,
@@ -1369,10 +1370,7 @@ class Scheduler:
                     raise SchedulerError("attempt completion idempotency key was reused")
                 self._validate_historical_terminal(run_id)
                 return None
-            if outcome == "outcome_unknown":
-                from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
-                GeneralWorkerGate(self.event_store)._v2_census(run_id, node_id)
-            else:
+            if outcome != "outcome_unknown":
                 self._check_general_release_claim(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
                     fencing_generation=fencing_generation, scope=general_scope, trusted_usage=general_usage,
                     events=events, entry="finish", usage=usage, known_no_effect=known_no_effect, at=completed_at)
@@ -1613,6 +1611,8 @@ class Scheduler:
             elif event.event_type == "AttemptSlotReleased":
                 active.pop(event.payload["attempt_ref"], None)
         marked: list[str] = []
+        held: list[str] = []
+        self.last_expiry_holds = ()
         for attempt_ref, event in sorted(active.items()):
             if attempt_ref in unknown:
                 continue
@@ -1630,6 +1630,12 @@ class Scheduler:
                 )
             except LifecycleConflict:
                 # A completion/reconciliation may have won after this read.
+                continue
+            except BudgetError:
+                # This attempt's safety state was not proven; do not fabricate
+                # unknown or release its slot, but continue with other leases.
+                held.append(event.payload["attempt_id"])
+                self.last_expiry_holds = tuple(held)
                 continue
             marked.append(event.payload["attempt_id"])
         return tuple(marked)

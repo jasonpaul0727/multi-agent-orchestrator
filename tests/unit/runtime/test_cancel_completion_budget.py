@@ -932,3 +932,208 @@ def test_missing_proof_index_is_diagnostic_integrity_hold(tmp_path):
         assert any(e.event_type == "RunCancellationRequested" for e in case.store.read_stream("run_lifecycle", "run-1"))
     finally:
         case.store.close()
+
+
+@pytest.mark.parametrize("has_worker", [False, True])
+@pytest.mark.parametrize("damage", ["missing", "unsettled", "oversized", "identity"])
+def test_cancel_completion_requires_settled_admitted_reservation(tmp_path, has_worker, damage):
+    import json
+    from datetime import datetime, timezone
+    from orchestrator.persistence.sqlite_event_store import _sha256_json
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=has_worker)
+    try:
+        case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc), outcome="failed", known_no_effect=True)
+        append_cancel_request(case)
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        if damage in {"missing", "unsettled"}:
+            conn.execute("DROP TRIGGER events_immutable_delete")
+            if damage == "missing":
+                conn.execute("DELETE FROM events WHERE stream_type='budget' AND stream_id='run-1'")
+            else:
+                row = conn.execute("SELECT stream_version FROM events WHERE stream_type='budget' AND event_type='BudgetReleased'").fetchone()
+                assert row is not None
+                conn.execute("DELETE FROM events WHERE stream_type='budget' AND stream_version=?", (row[0],))
+                conn.execute("UPDATE stream_versions SET current_version=? WHERE stream_type='budget' AND stream_id='run-1'", (row[0] - 1,))
+        elif damage == "oversized":
+            conn.execute("UPDATE events SET payload_json=? WHERE stream_type='budget' AND stream_version=1", ("x" * 100000,))
+        else:
+            conn.execute("UPDATE events SET node_id='other-node' WHERE stream_type='budget' AND event_type='BudgetReserved'")
+        result = case.lifecycle.complete_cancellation_if_idle("run-1")
+        assert result.outcome == "held"
+        events = case.store.read_stream("run_lifecycle", "run-1")
+        assert any(event.event_type == "RunCancellationRequested" for event in events)
+        assert not any(event.event_type == "RunCancelled" for event in events)
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("stream_type,event_type", [("run_lifecycle", "RunInitialized"), ("scheduler", "AttemptSlotReleased"), ("budget", "BudgetReserved")])
+def test_cancellation_rejects_unknown_evidence_envelope(tmp_path, stream_type, event_type):
+    from datetime import datetime, timezone
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc), outcome="failed", known_no_effect=True)
+        append_cancel_request(case)
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        conn.execute("UPDATE events SET schema_version=999 WHERE stream_type=? AND event_type=?", (stream_type, event_type))
+        result = case.lifecycle.complete_cancellation_if_idle("run-1")
+        assert result.outcome == "held"
+        assert not any(e.event_type == "RunCancelled" for e in case.store.read_stream("run_lifecycle", "run-1"))
+    finally:
+        case.store.close()
+
+
+def test_savepoint_rollback_cache_is_not_reused_by_public_completion(tmp_path):
+    from datetime import datetime, timezone
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget, read_event_window
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        case.scheduler.finish_attempt(**case.identity, completed_at=datetime.now(timezone.utc), outcome="failed", known_no_effect=True)
+        append_cancel_request(case)
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        with case.store._cancellation_proof_write():
+            budget = CancellationBudget(max_rows=1000, max_bytes=2000000, max_row_bytes=65536, max_streams=50, max_nodes=20)
+            conn.execute("SAVEPOINT cache_experiment")
+            conn.execute("UPDATE events SET event_type='ExperimentOnly' WHERE stream_type='budget' AND event_type='BudgetReleased'")
+            changed, _ = read_event_window(case.store, "budget", "run-1", budget)
+            assert any(e.event_type == "ExperimentOnly" for e in changed)
+            conn.execute("ROLLBACK TO SAVEPOINT cache_experiment")
+            conn.execute("RELEASE SAVEPOINT cache_experiment")
+            stale, _ = read_event_window(case.store, "budget", "run-1", budget)
+            assert any(e.event_type == "ExperimentOnly" for e in stale)
+            result = case.lifecycle.complete_cancellation_if_idle("run-1")
+            assert result.outcome == "pending_commit"
+        assert case.lifecycle.replay("run-1").status == "cancelled"
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("dependency", ["proposal", "artifact"])
+def test_multi_node_cancel_rejects_unknown_accepted_envelope(tmp_path, monkeypatch, dependency):
+    from orchestrator.lifecycle import LifecycleController, NodeSpec
+    from orchestrator.runtime.verifier_process import IsolatedVerifierProcess
+    from tests.unit.runtime.test_general_worker_acceptance import terminal_case, direct
+    from tests.unit.runtime.test_verifier_process import _ChildLauncher
+    original_append = LifecycleController.append_nodes
+    def add_second(self, run_id, nodes, **kwargs):
+        first = nodes[0]
+        contract = first.planning_contract.model_copy(update={"node_id": "node-2"})
+        second = NodeSpec(node_id="node-2", role=first.role, planning_contract=contract,
+                          planning_contract_hash=contract.contract_hash, max_attempts=3)
+        return original_append(self, run_id, (*nodes, second), **kwargs)
+    monkeypatch.setattr(LifecycleController, "append_nodes", add_second)
+    original_init = IsolatedVerifierProcess.__init__
+    def offline(self, **kwargs):
+        kwargs.setdefault("launcher", _ChildLauncher())
+        original_init(self, **kwargs)
+    monkeypatch.setattr(IsolatedVerifierProcess, "__init__", offline)
+    case = terminal_case(tmp_path)
+    try:
+        direct(case)
+        accepted = case.journal.read(case.operation.identity)
+        stream, stream_id = (("verification_proposals", "run-1") if dependency == "proposal"
+                             else ("artifact", accepted.acceptance.artifacts[0].digest))
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        conn.execute("UPDATE events SET schema_version=999 WHERE stream_type=? AND stream_id=?", (stream, stream_id))
+        case.lifecycle.request_cancel("run-1", reason_code="user_request")
+        assert case.lifecycle.last_cancellation_completion.outcome == "held"
+        assert not any(e.event_type == "RunCancelled" for e in case.store.read_stream("run_lifecycle", "run-1"))
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("version", [1, 2, "mixed", 999])
+def test_bounded_provider_links_preserve_supported_envelopes(tmp_path, version):
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget, CancellationHeld, validate_v1_links
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case, captured
+    case = dispatch_case(tmp_path)
+    try:
+        captured(case)
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        if version == "mixed":
+            conn.execute("UPDATE events SET schema_version=CASE WHEN stream_version=1 THEN 1 ELSE 2 END WHERE stream_type='provider_call'")
+        else:
+            conn.execute("UPDATE events SET schema_version=? WHERE stream_type='provider_call'", (version,))
+        with case.store._cancellation_proof_write():
+            budget = CancellationBudget(max_rows=1000, max_bytes=2000000, max_row_bytes=65536, max_streams=50, max_nodes=20)
+            if version == 999:
+                with pytest.raises(CancellationHeld, match="integrity"):
+                    validate_v1_links(case.store, case.operation, budget)
+            else:
+                validate_v1_links(case.store, case.operation, budget)
+    finally:
+        case.store.close()
+
+
+def test_cancel_reconcile_zero_committed_requires_budget_release(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        now = datetime.now(timezone.utc)
+        case.scheduler.finish_attempt(**case.identity, completed_at=now, outcome="outcome_unknown")
+        case.scheduler.reconcile_attempt(**case.identity, reconciled_at=now+timedelta(seconds=1), outcome="failed", known_no_effect=True)
+        append_cancel_request(case)
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        conn.execute("UPDATE events SET event_type='LostRelease' WHERE stream_type='budget' AND event_type='BudgetReleased'")
+        result = case.lifecycle.complete_cancellation_if_idle("run-1")
+        assert result.outcome == "held"
+        assert not any(e.event_type == "RunCancelled" for e in case.store.read_stream("run_lifecycle", "run-1"))
+    finally:
+        case.store.close()
+
+
+def test_cancel_reconcile_rejects_cost_conflicting_with_zero_no_effect(tmp_path):
+    import json
+    from datetime import datetime, timedelta, timezone
+    from orchestrator.persistence.sqlite_event_store import _sha256_json
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        now = datetime.now(timezone.utc)
+        case.scheduler.finish_attempt(**case.identity, completed_at=now, outcome="outcome_unknown")
+        case.scheduler.reconcile_attempt(**case.identity, reconciled_at=now+timedelta(seconds=1), outcome="failed", known_no_effect=True)
+        append_cancel_request(case)
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        for kind in ("CostCommitted", "BudgetReleased"):
+            row = conn.execute("SELECT payload_json FROM events WHERE stream_type='budget' AND event_type=?", (kind,)).fetchone()
+            payload = json.loads(row[0])
+            if kind == "CostCommitted": payload["cost_minor"] = 1
+            else: payload["released_minor"] = max(0, payload["released_minor"] - 1)
+            conn.execute("UPDATE events SET payload_json=?, payload_hash=? WHERE stream_type='budget' AND event_type=?", (json.dumps(payload), _sha256_json(payload), kind))
+        result = case.lifecycle.complete_cancellation_if_idle("run-1")
+        assert result.outcome == "held"
+        assert not any(e.event_type == "RunCancelled" for e in case.store.read_stream("run_lifecycle", "run-1"))
+    finally:
+        case.store.close()
+
+
+def test_cancel_reconcile_rejects_committed_fee_mismatch(tmp_path):
+    import json
+    from datetime import datetime, timedelta, timezone
+    from orchestrator.persistence.sqlite_event_store import _sha256_json
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        now = datetime.now(timezone.utc)
+        case.scheduler.finish_attempt(**case.identity, completed_at=now, outcome="outcome_unknown")
+        case.scheduler.reconcile_attempt(**case.identity, reconciled_at=now+timedelta(seconds=1), outcome="failed", known_no_effect=True)
+        append_cancel_request(case)
+        conn = case.store._connection
+        conn.execute("DROP TRIGGER events_immutable_update")
+        row = conn.execute("SELECT payload_json FROM events WHERE stream_type='budget' AND event_type='CostCommitted'").fetchone()
+        payload = json.loads(row[0]); payload["provider_fee_minor"] = 1
+        conn.execute("UPDATE events SET payload_json=?, payload_hash=? WHERE stream_type='budget' AND event_type='CostCommitted'", (json.dumps(payload), _sha256_json(payload)))
+        assert case.lifecycle.complete_cancellation_if_idle("run-1").outcome == "held"
+    finally:
+        case.store.close()

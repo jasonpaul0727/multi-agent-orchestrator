@@ -86,11 +86,13 @@ def read_version(store, stream_type, stream_id, budget):
         raise CancellationHeld("integrity")
     return row["value"]
 
-def read_event_window(store, stream_type, stream_id, budget):
+def read_event_window(store, stream_type, stream_id, budget, *, max_events=None,
+                      max_payload_bytes=None, max_payload_total=None):
     """Materialize a full physical stream only after bounded metadata preflight."""
     budget.bind(store)
     cache_key = (stream_type, stream_id)
-    if cache_key in budget._cache:
+    if (cache_key in budget._cache and max_events is None
+            and max_payload_bytes is None and max_payload_total is None):
         cached, changes = budget._cache[cache_key]
         if changes == store._connection.total_changes:
             return cached
@@ -113,6 +115,12 @@ def read_event_window(store, stream_type, stream_id, budget):
         (stream_type, stream_id, remaining + 1),
     ).fetchall()
     count = len(metadata)
+    if max_events is not None and count > max_events:
+        raise CancellationHeld("budget")
+    payload_sizes = [row["n5"] for row in metadata]
+    if ((max_payload_bytes is not None and any(n > max_payload_bytes for n in payload_sizes))
+            or (max_payload_total is not None and sum(payload_sizes) > max_payload_total)):
+        raise CancellationHeld("budget")
     # Metadata and payload queries each return one row per event.
     if count > remaining or count * 2 + 1 > remaining:
         raise CancellationHeld("budget")
@@ -142,6 +150,8 @@ def read_event_window(store, stream_type, stream_id, budget):
              FROM events WHERE stream_type=? AND stream_id=? ORDER BY stream_version LIMIT ?""",
         (stream_type, stream_id, count + 1),
     ).fetchall()
+    if stream_type in {"run_lifecycle", "budget", "artifact", "verification_proposals", "general_worker", "mediation_v2"} and any(row["schema_version"] != 1 for row in rows):
+        raise CancellationHeld("integrity")
     if ([row["r"] for row in rows] != [row["r"] for row in metadata]
             or any(type(row["stream_version"]) is not int or row["stream_version"] != index
                    for index, row in enumerate(rows, 1))):
@@ -282,7 +292,8 @@ def read_scheduler_release(store, run_id, node_id, attempt_id, generation, budge
                   schema_version, occurred_at, payload_json, payload_hash, idempotency_key,
                   run_id, node_id, attempt_id, fencing_generation, correlation_id, causation_id"""
         + where + " LIMIT 2", args).fetchall()
-    if [row["r"] for row in rows] != [row["r"] for row in metadata]:
+    if ([row["r"] for row in rows] != [row["r"] for row in metadata]
+            or any(row["schema_version"] != 1 for row in rows)):
         raise CancellationHeld("integrity")
     try:
         return [store._row_to_event(row) for row in rows]
@@ -382,6 +393,14 @@ def prove_basic_cancellation(store, run_id, budget):
             if (type(version_value) is not int or versions != list(range(1, len(versions) + 1))
                     or version_value != len(versions)):
                 raise CancellationHeld("integrity")
+    # The same bounded budget stream must prove each admitted reservation.
+    from orchestrator.budget import BudgetLedger
+    from orchestrator.runtime.general_worker_journal import metadata_hash
+    budget_events, _ = read_event_window(store, "budget", run_id, budget)
+    try:
+        reservation_states = BudgetLedger._replay_states(run_id, budget_events)
+    except (ValueError, TypeError, KeyError, BudgetError):
+        raise CancellationHeld("integrity") from None
     # Lifecycle-only terminal records do not prove the Scheduler released its
     # slot. Every admitted attempt needs its own exact, bounded release record.
     for node in state.nodes:
@@ -396,6 +415,60 @@ def prove_basic_cancellation(store, run_id, budget):
             if (any(getattr(release, key) != value for key, value in identity.items())
                     or any(release.payload.get(key) != value for key, value in identity.items())
                     or release.correlation_id != run_id or release.payload.get("outcome") != attempt.status):
+                raise CancellationHeld("integrity")
+            reservation_state = reservation_states.get(attempt.reservation_id)
+            if reservation_state is None:
+                raise CancellationHeld("integrity")
+            reservation = reservation_state.reservation
+            if (reservation.reservation_id != attempt.reservation_id or
+                    any(getattr(reservation, key) != value for key, value in identity.items()) or
+                    reservation.status not in {"released", "committed"}):
+                raise CancellationHeld("integrity")
+            related = [event for event in budget_events if event.payload.get("reservation_id") == attempt.reservation_id]
+            if any(any(getattr(event, key) != value for key, value in identity.items())
+                   or event.payload.get("run_id") != run_id for event in related):
+                raise CancellationHeld("integrity")
+            reservations = [e for e in related if e.event_type == "BudgetReserved"]
+            budget_releases = [e for e in related if e.event_type == "BudgetReleased"]
+            if len(reservations) != 1 or len(budget_releases) != 1:
+                raise CancellationHeld("integrity")
+            budget_release = budget_releases[0].payload
+            if (budget_release.get("currency") != reservation.currency
+                    or budget_release.get("status") != reservation.status):
+                raise CancellationHeld("integrity")
+            if reservation.status == "committed":
+                if (sum(e.event_type == "UsageObserved" for e in related) != 1
+                        or sum(e.event_type == "CostCommitted" for e in related) != 1):
+                    raise CancellationHeld("integrity")
+                expected_minor = max(0, reservation.reserved_minor - reservation_state.cost_minor)
+                expected_tokens = max(0, reservation.reserved_tokens - reservation_state.used_tokens)
+            else:
+                expected_minor, expected_tokens = reservation.reserved_minor, reservation.reserved_tokens
+            if (type(budget_release.get("released_minor")) is not int
+                    or type(budget_release.get("released_tokens")) is not int
+                    or budget_release["released_minor"] != expected_minor
+                    or budget_release["released_tokens"] != expected_tokens):
+                raise CancellationHeld("integrity")
+            usage_hash = release.payload.get("usage_hash")
+            import re
+            no_effect = (release.payload.get("known_no_effect") is True or
+                type(release.payload.get("no_effect_receipt_hash")) is str and
+                re.fullmatch(r"sha256:[0-9a-f]{64}", release.payload["no_effect_receipt_hash"]) is not None)
+            if reservation.status == "committed":
+                usage = reservation_state.usage
+                committed = next(e for e in related if e.event_type == "CostCommitted").payload
+                observed = next(e for e in related if e.event_type == "UsageObserved").payload
+                if (usage is None or reservation_state.cost_minor != usage.cost_minor
+                        or reservation_state.used_tokens != usage.total_tokens
+                        or metadata_hash(dict(committed)) != metadata_hash(BudgetLedger._committed_payload(usage))
+                        or metadata_hash(dict(observed)) != metadata_hash(BudgetLedger._usage_payload(usage))):
+                    raise CancellationHeld("integrity")
+                zero_no_effect = (usage_hash is None and no_effect and usage is not None
+                    and usage.cost_minor == 0 and usage.total_tokens == 0
+                    and usage.provider_fee_minor == 0 and usage.tool_fee_minor == 0)
+                if not zero_no_effect and (usage is None or metadata_hash(usage.model_dump(mode="json")) != usage_hash):
+                    raise CancellationHeld("integrity")
+            elif usage_hash is not None or not no_effect:
                 raise CancellationHeld("integrity")
     for (kind, stream_id), metadata in scope_map.items():
         if kind == "mediation_v2":
