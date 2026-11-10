@@ -641,10 +641,14 @@ def _watch_transaction(store_ref, statement):
             r"\s*ROLLBACK(?:\s+TRANSACTION)?\s+TO\s+(?:SAVEPOINT\s+)?" + identifier + r"\s*;?\s*",
             clean, flags=re.I | re.S,
         ) is not None
-    if command in {"BEGIN", "COMMIT", "END"} or (command == "ROLLBACK" and not rollback_to):
-        store = store_ref()
-        if store is not None:
-            _OWNED_WRITES.pop(store, None)
+    store = store_ref()
+    if store is None:
+        return
+    if rollback_to:
+        # SQLite total_changes does not decrease after ROLLBACK TO.
+        store._rollback_generation += 1
+    elif command in {"BEGIN", "COMMIT", "END", "ROLLBACK"}:
+        _OWNED_WRITES.pop(store, None)
 
 
 class SQLiteEventStore:
@@ -659,6 +663,7 @@ class SQLiteEventStore:
         self._connection = _open_connection(path)
         initialize_schema(self._connection)
         self._post_commit_actions = []
+        self._rollback_generation = 0
         store_ref = ref(self)
         self._connection.set_trace_callback(lambda sql: _watch_transaction(store_ref, sql))
 
@@ -685,6 +690,7 @@ class SQLiteEventStore:
             instance = cls.__new__(cls)
             instance._connection = connection
             instance._post_commit_actions = []
+            instance._rollback_generation = 0
             store_ref = ref(instance)
             connection.set_trace_callback(lambda sql: _watch_transaction(store_ref, sql))
             return instance
@@ -712,6 +718,11 @@ class SQLiteEventStore:
 
     def _owned_write_token(self):
         return _OWNED_WRITES[self][2] if self._has_owned_write() else None
+
+    def _owned_rollback_generation(self):
+        if not self._has_owned_write():
+            raise ValueError("owned write required")
+        return self._rollback_generation
 
     @contextmanager
     def _cancellation_proof_write(self):

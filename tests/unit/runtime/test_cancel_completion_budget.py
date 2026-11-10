@@ -1005,8 +1005,13 @@ def test_savepoint_rollback_cache_is_not_reused_by_public_completion(tmp_path):
             assert any(e.event_type == "ExperimentOnly" for e in changed)
             conn.execute("ROLLBACK TO SAVEPOINT cache_experiment")
             conn.execute("RELEASE SAVEPOINT cache_experiment")
-            stale, _ = read_event_window(case.store, "budget", "run-1", budget)
-            assert any(e.event_type == "ExperimentOnly" for e in stale)
+            counters = (budget.rows, budget.bytes, budget.streams)
+            with pytest.raises(ValueError, match="rollback"):
+                read_event_window(case.store, "budget", "run-1", budget)
+            assert (budget.rows, budget.bytes, budget.streams) == counters
+            fresh = CancellationBudget(max_rows=1000, max_bytes=2000000, max_row_bytes=65536, max_streams=50, max_nodes=20)
+            restored, _ = read_event_window(case.store, "budget", "run-1", fresh)
+            assert any(e.event_type == "BudgetReleased" for e in restored)
             result = case.lifecycle.complete_cancellation_if_idle("run-1")
             assert result.outcome == "pending_commit"
         assert case.lifecycle.replay("run-1").status == "cancelled"
@@ -1161,5 +1166,76 @@ def test_cancel_reconcile_rejects_matching_usage_and_commit_with_wrong_currency(
         events = case.store.read_stream("run_lifecycle", "run-1")
         assert any(event.event_type == "RunCancellationRequested" for event in events)
         assert not any(event.event_type == "RunCancelled" for event in events)
+    finally:
+        case.store.close()
+
+
+@pytest.mark.parametrize("statement", ["ROLLBACK TO nested", "ROLLBACK TRANSACTION TO SAVEPOINT nested", "/* prefix */ ROLLBACK /* x */ TO /* y */ SAVEPOINT nested"])
+def test_budget_is_invalidated_by_each_owned_savepoint_rollback(tmp_path, statement):
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget, read_event_window
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        with case.store._cancellation_proof_write():
+            budget = CancellationBudget(max_rows=1000, max_bytes=2000000, max_row_bytes=65536, max_streams=50, max_nodes=20)
+            read_event_window(case.store, "run_lifecycle", "run-1", budget)
+            counters = (budget.rows, budget.bytes, budget.streams)
+            case.store._connection.execute("SAVEPOINT nested")
+            case.store._connection.execute(statement)
+            case.store._connection.execute("RELEASE nested")
+            with pytest.raises(ValueError, match="rollback"):
+                read_event_window(case.store, "run_lifecycle", "run-1", budget)
+            assert (budget.rows, budget.bytes, budget.streams) == counters
+    finally:
+        case.store.close()
+
+
+def test_budget_cache_survives_successful_nested_savepoint_without_extra_charge(tmp_path):
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget, read_event_window
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        with case.store._cancellation_proof_write():
+            budget = CancellationBudget(max_rows=1000, max_bytes=2000000, max_row_bytes=65536, max_streams=50, max_nodes=20)
+            original = read_event_window(case.store, "run_lifecycle", "run-1", budget)
+            counters = (budget.rows, budget.bytes, budget.streams)
+            with case.store._cancellation_proof_write():
+                assert read_event_window(case.store, "run_lifecycle", "run-1", budget) is original
+            assert read_event_window(case.store, "run_lifecycle", "run-1", budget) is original
+            assert (budget.rows, budget.bytes, budget.streams) == counters
+    finally:
+        case.store.close()
+
+
+def test_budget_cannot_cross_outer_rollback(tmp_path):
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget, read_event_window
+    with SQLiteEventStore(tmp_path / "events.db") as store:
+        budget = CancellationBudget(max_rows=20, max_bytes=100000, max_row_bytes=10000, max_streams=20, max_nodes=20)
+        with pytest.raises(RuntimeError, match="outer abort"):
+            with store._cancellation_proof_write():
+                read_event_window(store, "run_lifecycle", "none", budget)
+                raise RuntimeError("outer abort")
+        counters = (budget.rows, budget.bytes, budget.streams)
+        with store._cancellation_proof_write():
+            with pytest.raises(ValueError, match="transaction changed"):
+                read_event_window(store, "run_lifecycle", "none", budget)
+        assert (budget.rows, budget.bytes, budget.streams) == counters
+
+
+def test_budget_fails_closed_after_nested_store_scope_rolls_back(tmp_path):
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget, read_event_window
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
+    case = dispatch_case(tmp_path, register=False)
+    try:
+        with case.store._cancellation_proof_write():
+            budget = CancellationBudget(max_rows=1000, max_bytes=2000000, max_row_bytes=65536, max_streams=50, max_nodes=20)
+            read_event_window(case.store, "run_lifecycle", "run-1", budget)
+            counters = (budget.rows, budget.bytes, budget.streams)
+            with pytest.raises(RuntimeError, match="nested abort"):
+                with case.store._cancellation_proof_write():
+                    raise RuntimeError("nested abort")
+            with pytest.raises(ValueError, match="rollback"):
+                read_event_window(case.store, "run_lifecycle", "run-1", budget)
+            assert (budget.rows, budget.bytes, budget.streams) == counters
     finally:
         case.store.close()

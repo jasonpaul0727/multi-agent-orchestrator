@@ -22,11 +22,7 @@ class CancellationHeld(ValueError):
 
 @dataclass(slots=True)
 class CancellationBudget:
-    """One proof only; never reuse this budget after a savepoint rollback.
-
-    SQLite total_changes does not track rollbacks. This is a caller contract,
-    not a runtime check; public completion creates a fresh budget per call.
-    """
+    """One proof only; a savepoint rollback invalidates this budget."""
     max_rows: int
     max_bytes: int
     max_row_bytes: int
@@ -37,6 +33,7 @@ class CancellationBudget:
     streams: int = 0
     _store: object = field(default=None, init=False, repr=False)
     _token: object = field(default=None, init=False, repr=False)
+    _rollback_generation: object = field(default=None, init=False, repr=False)
     _windows: dict = field(default_factory=dict, init=False, repr=False)
     _cache: dict = field(default_factory=dict, init=False, repr=False)
     _state: object = field(default=None, init=False, repr=False)
@@ -50,10 +47,13 @@ class CancellationBudget:
         if not store._has_owned_write():
             raise ValueError("owned write required")
         token = store._owned_write_token()
+        generation = store._owned_rollback_generation()
         if self._store is None:
-            self._store, self._token = store, token
+            self._store, self._token, self._rollback_generation = store, token, generation
         elif self._store is not store or self._token is not token:
             raise ValueError("cancellation proof transaction changed")
+        elif self._rollback_generation != generation:
+            raise ValueError("cancellation proof invalidated by savepoint rollback")
 
 
 _COLUMNS = ("event_id", "stream_type", "stream_id", "event_type", "occurred_at",
