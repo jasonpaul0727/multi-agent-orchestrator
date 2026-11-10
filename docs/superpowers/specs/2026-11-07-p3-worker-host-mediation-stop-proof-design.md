@@ -162,7 +162,7 @@ sequence numbers are unique within the operation. The registry is bounded
 and queries are indexed; overflow or corruption fails closed.
 
 Every creation, registration, prepare, launch-permit, acceptance, terminal
-failure, cancel, reconcile, release and successor-attempt path must use one
+failure, cancellation completion, reconcile, release and successor-attempt path must use one
 common in-transaction census across both v1 and v2 and across all attempts
 and generations of the same run/node. An unresolved prior actor or operation
 blocks incompatible creation, release, terminal acceptance and successor
@@ -171,6 +171,40 @@ work. These rules apply to existing public v1 journal entry points and all
 Scheduler paths, not merely to the new service. v1 continues to use its
 original receipt rules; neither a boolean nor a v1 receipt is upgraded into
 a v2 seal.
+
+A run-wide cancellation request that only records intent and establishes a
+fence is distinct from cancellation completion. It must serialize with permit
+creation using the same SQLite write lock, and any later permit must recheck
+that fence. It need not scan an unbounded run-wide node census before recording
+a request that performs no settlement or resource release. If intent wins,
+cancellation can still be requested to drive stopping; the actor remains in
+the census. If cancellation wins, a new intent is rejected. Corrupt or
+unresolved census never becomes proof of stop or authority to release: each
+node's completion, settlement and release still checks its bounded census.
+This exception applies only if the request cannot release, settle, or record a
+terminal RunCancelled state; otherwise intent and completion must be separated.
+A held census must not itself roll back cancellation intent. A request nested
+in an outer transaction becomes durable only when that transaction commits.
+Automatic completion must establish a complete run-wide view, including no
+unknown-node v1/v2 scope or event, plus each relevant bounded node census and
+stop proof. Reconcile both v1/v2 run-level scope and physical-event metadata
+against validated lifecycle admissions. For every admitted identity derive
+both deterministic stream IDs and check version metadata and physical-event
+presence, including missing-header/orphan history; unknown identities or
+any disagreement hold completion. New completion-proof work under the lock has a fixed independent budget for
+nodes, streams, history rows and all returned raw bytes before decoding; a
+caller-configurable max_nodes alone is not a fixed bound. Physical preflight
+must use indexed LIMIT remaining+1 windows rather than full-stream aggregate
+or unbounded distinct/sort. This bounds rows, returned data and decode work;
+it does not by itself bound SQL execution time or disk-page I/O. Start the
+budget before any lifecycle decode, avoid unbounded snapshot/checkpoint
+fallback, and include every dependent Provider, verification, budget, artifact
+and Scheduler read. The enclosing Scheduler transaction and pre-existing
+cancellation request path are not thereby claimed to have fixed total cost. If data is corrupt,
+the view cannot be proved complete, or the budget would be exceeded, retain
+the request without auto-completion. Existing safe nonterminal cancellation
+must remain available; no absence inferred from incomplete indexing permits
+terminal transition or release.
 
 Cross-stream atomicity means one SQLite connection in its owning thread under
 an owned BEGIN IMMEDIATE, including nested savepoints on that connection.
