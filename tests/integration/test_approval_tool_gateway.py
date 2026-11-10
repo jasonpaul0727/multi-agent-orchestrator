@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
 import multiprocessing
@@ -16,7 +17,9 @@ from orchestrator.isolation import SandboxResult, SandboxTerminationReceipt
 from orchestrator.persistence import SQLiteEventStore
 from orchestrator.security.policy import PolicyAuthority, PolicyManifest
 from orchestrator.tools import PolicyState, ToolGateway, ToolRequest, ToolRequestAlreadyUsed
-from tests.support.process_crash import block_at_crash_point, kill_at_crash_point
+from tests.support.process_crash import (
+    block_at_crash_point, block_before_store_commit, kill_at_crash_point,
+)
 
 
 _NOW = datetime(2026, 9, 26, 18, 0, tzinfo=timezone.utc)
@@ -442,6 +445,7 @@ def _execute_approval_until_crash(tmp_path, grant_id, marker, pipe, point):
     store, approvals, _launcher, gateway = _approval_fixture(
         tmp_path, launcher=_MarkerLauncher(marker),
     )
+    crash_hooks = ExitStack()
     try:
         if point == "approval.bound-before-consume":
             real_bind = approvals.bind_to_attempt
@@ -456,10 +460,6 @@ def _execute_approval_until_crash(tmp_path, grant_id, marker, pipe, point):
             real_append = store.append_checked
             in_budget_append = False
 
-            def trace_commit(statement):
-                if in_budget_append and statement.strip().upper() == "COMMIT":
-                    block_at_crash_point(pipe, point)
-
             def append_and_arm(stream_type, stream_id, key, decide):
                 nonlocal in_budget_append
                 in_budget_append = stream_type == "budget"
@@ -468,9 +468,15 @@ def _execute_approval_until_crash(tmp_path, grant_id, marker, pipe, point):
                 finally:
                     in_budget_append = False
                 if stream_type == "security" and key == f"approval-bind:{grant_id}":
-                    # The binding COMMIT has returned. Only the later budget
-                    # transaction's COMMIT can reach this crash barrier.
-                    store._connection.set_trace_callback(trace_commit)
+                    # Binding is durable before arming. Stop after the later
+                    # budget writes, before its outer Python commit call.
+                    assert not store._connection.in_transaction
+                    assert any(event.event_type == "ApprovalGrantBound" for event in result)
+                    crash_hooks.enter_context(block_before_store_commit(
+                        store, pipe, point, stream_type="budget", stream_id="run-1",
+                        event_types=("EffectIntentRecorded", "ApprovalGrantConsumed", "BudgetReserved"),
+                        when=lambda: in_budget_append,
+                    ))
                 return result
 
             store.append_checked = append_and_arm
@@ -491,6 +497,7 @@ def _execute_approval_until_crash(tmp_path, grant_id, marker, pipe, point):
         ), approval_grant_id=grant_id)
         raise AssertionError("approval execution returned without reaching crash point")
     finally:
+        crash_hooks.close()
         store.close()
         pipe.close()
 

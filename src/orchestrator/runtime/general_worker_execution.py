@@ -25,7 +25,7 @@ from orchestrator.workspace_identity import workspace_identity_hash
 from .acceptance_coordinator import AttemptExecutionCoordinator
 from .contracts import ArtifactRef, VerificationTask
 from .general_worker_authority import (
-    SchedulerProviderDispatchAuthority, _validate_general_eligibility, general_worker_host_scope,
+    SchedulerProviderDispatchAuthority, general_worker_host_scope,
 )
 from .general_worker_journal import (
     GeneralWorkerIdentity, GeneralWorkerJournal, GeneralWorkerResult, _identity_value,
@@ -134,22 +134,15 @@ class GeneralWorkerExecutionService:
 
     def _register(self, identity, task):
         scope = self._authority._scope()
-        result = None
-        def request(events, _version):
-            nonlocal result
-            binding = self._scheduler._resolve_general_verification_binding(**_identity_value(identity),
-                as_of=datetime.now(timezone.utc))
-            state = self._scheduler.lifecycle.replay(identity.run_id)
-            result = self._journal.request(context=task.context,
-                input_commitment=_input_commitment(task.model_dump(mode="json")),
-                accepted_route_sha256=metadata_hash(binding.active_attempt.accepted_route.model_dump(mode="json")),
-                workspace_identity_hash=state.workspace_identity_hash, host_scope_hash=scope,
-                output_byte_limit=min(task.output_byte_limit, 16_384))
-            _validate_general_eligibility(self._scheduler, self._journal, result,
-                purpose="request", host_scope_hash=scope, as_of=datetime.now(timezone.utc), events=events)
-        self._scheduler.event_store.append_checked("scheduler", "global", "general-request", request)
-        return result
-
+        binding = self._scheduler._resolve_general_verification_binding(**_identity_value(identity),
+            as_of=datetime.now(timezone.utc))
+        state = self._scheduler.lifecycle.replay(identity.run_id)
+        # The journal re-resolves these inputs inside its own locked gate.
+        return self._journal.request(context=task.context,
+            input_commitment=_input_commitment(task.model_dump(mode="json")),
+            accepted_route_sha256=metadata_hash(binding.active_attempt.accepted_route.model_dump(mode="json")),
+            workspace_identity_hash=state.workspace_identity_hash, host_scope_hash=scope,
+            output_byte_limit=min(task.output_byte_limit, 16_384))
     async def _execute_or_recover(self, *, identity, task_text, create):
         values = None
         try:
@@ -333,6 +326,8 @@ class GeneralWorkerExecutionService:
         # Recheck after the await, before recording any new launch intent.
         self._authority.resolve_eligibility(operation, purpose="request" if phase == "request" else "completion")
         operation = self._journal.prepare_turn(operation, phase=phase, prepared=prepared)
+        if not self._journal._consume_fresh_prepare(operation.identity, phase, prepared):
+            raise ValueError("replayed preparation is not a new launch permit")
         turn = GeneralWorkerTurn(phase, prepared.launch_id, task, response_text)
         session = await asyncio.to_thread(self._worker.start_turn, self._workspace, turn,
             prepared_launch=prepared, expected_workspace_identity_hash=operation.workspace_identity_hash)

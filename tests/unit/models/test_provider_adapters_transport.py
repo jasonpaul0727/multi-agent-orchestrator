@@ -1399,48 +1399,29 @@ def test_openai_compatible_gateway_never_sends_provider_correlation_header(tmp_p
 def test_registered_operation_other_generation_cannot_fall_through_to_legacy_verifier(
     tmp_path, register_before_gateway, expected_code, expected_verifier_calls, expected_broker_calls
 ):
-    from orchestrator.runtime.contracts import AttemptContext
-    from orchestrator.runtime.general_worker_journal import GeneralWorkerJournal
-    from orchestrator.persistence.sqlite_event_store import SQLiteEventStore
+    from tests.unit.runtime.test_general_worker_authority import dispatch_case
 
-    registry = model_registry()
-    original = model_request(registry)
-    journal_path = tmp_path / "provider-and-general-journal.db"
-    registered_generation = original.fencing_generation + 1
-    changed_generation = original.fencing_generation + 2
+    # Real frozen admission makes public registration valid. Only the gateway
+    # request is changed to a different generation; its permissive legacy
+    # verifier must never authorize a registered General Worker operation.
+    case = dispatch_case(tmp_path, register=False)
+    original = case.request
+    changed_generation = original.fencing_generation + 1
     changed = original.model_copy(update={
         "fencing_generation": changed_generation,
         "accepted_route": original.accepted_route.model_copy(update={
             "fencing_generation": changed_generation,
         }),
     })
-    context = AttemptContext(
-        run_id=original.run_id,
-        node_id=original.node_id,
-        attempt_id=original.attempt_id,
-        agent_instance_id="agent-1",
-        fencing_generation=registered_generation,
-        graph_version=1,
-        input_manifest_hash=HASH,
-        effective_config_hash=HASH,
-        registry_hash=HASH,
-        policy_manifest_hash=HASH,
-        routing_decision_hash=HASH,
-        planning_contract_hash=HASH,
-    )
 
-    with SQLiteEventStore(journal_path) as store:
-        journal = SQLiteProviderCallJournal(store)
+    with case.store:
+        journal = case.provider_journal
 
         def register_other_generation():
-            GeneralWorkerJournal(store).request(
-                context=context,
-                input_commitment=HASH,
-                accepted_route_sha256=HASH,
-                workspace_identity_hash=HASH,
-                host_scope_hash=HASH,
-                output_byte_limit=16_384,
-            )
+            operation = case.journal.request(**case.registration)
+            assert operation.context.fencing_generation == original.fencing_generation
+            assert operation.context.fencing_generation != changed.fencing_generation
+            assert case.journal.read(operation.identity) == operation
 
         if register_before_gateway:
             register_other_generation()
@@ -1469,7 +1450,7 @@ def test_registered_operation_other_generation_cannot_fall_through_to_legacy_ver
             HTTPTransportResponse(status=200, headers=(), body=b'{"ok":true}')
         )
         gateway = ProviderModelGateway(
-            registry=registry,
+            registry=case.registry,
             accepted_route_verifier=verifier,
             secret_broker=broker,
             transport=transport,

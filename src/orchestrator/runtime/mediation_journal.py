@@ -1,0 +1,252 @@
+"""Durable v2 metadata registry. This module grants no launch authority.
+
+Only registration, intent persistence and closure are implemented. ACK, stop
+and seal remain unavailable until an independently owned verifier is wired.
+Metadata does not establish a real unit, its systemd name validity, or its
+uniqueness across operations. A shared bounded, atomic host-owned census
+must enforce cross-operation unit uniqueness before launch is enabled.
+"""
+
+from dataclasses import asdict, replace
+import hashlib
+import json
+import re
+
+from orchestrator.persistence import EventDraft, SQLiteEventStore
+from orchestrator.persistence.mediation_identity import mediation_stream_id
+from .mediation_actors import ActorIntent, MediationActor, MediationOperation, MediationState
+
+STREAM = "mediation_v2"
+SCHEMA_VERSION = 2
+MAX_ACTORS = 128
+MAX_EVENTS = MAX_ACTORS + 2
+MAX_RECORD_BYTES = 16384
+MAX_HISTORY_BYTES = 262144
+ACTOR_KINDS = frozenset({"worker", "tool", "provider_sender", "verifier"})
+_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+class MediationJournalError(RuntimeError):
+    def __init__(self):
+        super().__init__("mediation_journal_invalid")
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                      allow_nan=False).encode("ascii")
+
+
+def _hash(value):
+    return "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _identifier(value):
+    if type(value) is not str or not _IDENTIFIER.fullmatch(value):
+        raise ValueError()
+
+
+def _digest(value):
+    if type(value) is not str or not _DIGEST.fullmatch(value):
+        raise ValueError()
+
+
+def _positive(value):
+    if type(value) is not int or value < 1 or value > 2**63 - 1:
+        raise ValueError()
+
+
+def _operation(value):
+    if type(value) is not MediationOperation:
+        raise ValueError()
+    for item in (value.operation_id, value.run_id, value.node_id, value.attempt_id):
+        _identifier(item)
+    _positive(value.fencing_generation)
+    if value.operation_id != mediation_stream_id(value.run_id, value.node_id, value.attempt_id, value.fencing_generation):
+        raise ValueError()
+    for item in (value.task_input_sha256, value.workspace_sha256, value.capability_sha256,
+                 value.manifest_sha256, value.policy_authority_sha256):
+        _digest(item)
+    _digest(value.commitment_sha256)
+    data = asdict(value)
+    del data["commitment_sha256"]
+    if _hash(data) != value.commitment_sha256:
+        raise ValueError()
+    return value
+
+
+def _intent(value, operation):
+    if type(value) is not ActorIntent:
+        raise ValueError()
+    for item in (value.operation_id, value.actor_id, value.kind, value.host_id, value.boot_id, value.unit_name, value.launch_id):
+        _identifier(item)
+    _positive(value.fencing_generation)
+    _positive(value.sequence)
+    if value.kind not in ACTOR_KINDS:
+        raise ValueError()
+    _digest(value.parameters_sha256)
+    _digest(value.intent_sha256)
+    data = asdict(value)
+    del data["intent_sha256"]
+    if _hash(data) != value.intent_sha256:
+        raise ValueError()
+    if value.operation_id != operation.operation_id or value.fencing_generation != operation.fencing_generation:
+        raise ValueError()
+    return value
+
+
+def _decode(cls, data):
+    if not isinstance(data, dict):
+        raise ValueError()
+    return cls(**data)
+
+
+def _apply(state, action, data):
+    if action == "Registered":
+        if state is not None:
+            raise ValueError()
+        return MediationState(_operation(_decode(MediationOperation, data)))
+    if state is None:
+        raise ValueError()
+    if action == "Permitted":
+        actor = _intent(_decode(ActorIntent, data), state.operation)
+        if state.closed or len(state.actors) >= MAX_ACTORS:
+            raise ValueError()
+        if any(a.intent.actor_id == actor.actor_id or a.intent.sequence == actor.sequence
+               or (a.intent.host_id, a.intent.boot_id, a.intent.unit_name) ==
+                  (actor.host_id, actor.boot_id, actor.unit_name) for a in state.actors):
+            raise ValueError()
+        return replace(state, actors=state.actors + (MediationActor(actor),), version=state.version + 1)
+    if action == "Closed" and data == {} and not state.closed:
+        return replace(state, closed=True, version=state.version + 1)
+    raise ValueError()
+
+
+def _replay(operation_id, events, version):
+    if version != len(events) or len(events) > MAX_EVENTS:
+        raise ValueError()
+    state = None
+    size = 0
+    keys = set()
+    for index, event in enumerate(events, 1):
+        payload = event.payload
+        if not isinstance(payload, dict) or set(payload) != {"schema_version", "operation_id", "action", "data"}:
+            raise ValueError()
+        if type(payload["schema_version"]) is not int or payload["schema_version"] != SCHEMA_VERSION:
+            raise ValueError()
+        if (event.schema_version != 1 or payload["operation_id"] != operation_id
+                or event.stream_version != index):
+            raise ValueError()
+        action = payload["action"]
+        if type(action) is not str or event.event_type != "Mediation" + action:
+            raise ValueError()
+        raw = _canonical(payload)
+        size += len(raw)
+        key = _hash(payload)
+        if len(raw) > MAX_RECORD_BYTES or size > MAX_HISTORY_BYTES or event.idempotency_key != key or key in keys:
+            raise ValueError()
+        keys.add(key)
+        state = _apply(state, action, payload["data"])
+        op = state.operation
+        if (op.operation_id != operation_id or event.run_id != op.run_id or event.node_id != op.node_id
+                or event.attempt_id != op.attempt_id or event.fencing_generation != op.fencing_generation
+                or event.correlation_id != op.run_id
+                or event.causation_id != (_hash(events[index - 2].payload) if index > 1 else op.commitment_sha256)):
+            raise ValueError()
+    return state
+
+
+class MediationJournal:
+    def __init__(self, event_store):
+        if type(event_store) is not SQLiteEventStore:
+            raise MediationJournalError()
+        self.event_store = event_store
+
+    def load(self, operation_id):
+        try:
+            _identifier(operation_id)
+            if self.event_store._connection.in_transaction and not self.event_store._has_owned_write():
+                raise ValueError()
+            with self.event_store._cancellation_proof_write():
+                events, version = self._bounded_history(operation_id)
+                return _replay(operation_id, events, version)
+        except Exception:
+            raise MediationJournalError() from None
+
+    def register(self, operation):
+        try:
+            _operation(operation)
+            return self._append(operation.operation_id, "Registered", asdict(operation))
+        except Exception:
+            raise MediationJournalError() from None
+
+    def permit(self, operation_id, actor_intent):
+        """No public execution permit exists until host authority is integrated."""
+        raise MediationJournalError()
+
+    def close(self, operation_id):
+        try:
+            return self._append(operation_id, "Closed", {})
+        except Exception:
+            raise MediationJournalError() from None
+
+    def record_ack(self, operation_id, actor_id, ack):
+        raise MediationJournalError()
+
+    def record_stop(self, operation_id, actor_id, stop, transport_proof):
+        raise MediationJournalError()
+
+    def seal(self, operation_id):
+        raise MediationJournalError()
+
+    def _bounded_history(self, operation_id):
+        from orchestrator.lifecycle.cancel_completion import CancellationBudget, CancellationHeld, read_event_window
+        budget = CancellationBudget(max_rows=1024, max_bytes=2 * 1024 * 1024,
+                                    max_row_bytes=65536, max_streams=4, max_nodes=1)
+        events, version = read_event_window(self.event_store, STREAM, operation_id, budget,
+            max_events=MAX_EVENTS, max_payload_bytes=MAX_RECORD_BYTES, max_payload_total=MAX_HISTORY_BYTES)
+        count, size = budget._windows[(STREAM, operation_id)]
+        if (version > MAX_EVENTS or budget.rows + 2 * count > budget.max_rows
+                or budget.bytes + 2 * size > budget.max_bytes):
+            raise CancellationHeld("budget")
+        return events, version
+
+    def _append(self, operation_id, action, data):
+        _identifier(operation_id)
+        store = self.event_store
+        if store._connection.in_transaction and not store._has_owned_write():
+            raise ValueError()
+        payload = dict(schema_version=SCHEMA_VERSION, operation_id=operation_id, action=action, data=data)
+        key = _hash(payload)
+        result = None
+
+        def decide(events, version):
+            nonlocal result
+            if not store._has_owned_write():
+                raise ValueError()
+            state = _replay(operation_id, events, version)
+            existing = [event for event in events if event.idempotency_key == key]
+            if existing:
+                if len(existing) != 1 or _canonical(existing[0].payload) != _canonical(payload):
+                    raise ValueError()
+                result = state
+                return None
+            result = _apply(state, action, data)
+            op = result.operation
+            if action in ("Registered", "Permitted"):
+                from .general_worker_gate import GeneralWorkerGate
+                gate = GeneralWorkerGate(store)
+                gate.check_v2_admission(op)
+                gate.check_v2_against_v1(op.run_id, op.node_id)
+            raw = _canonical(payload)
+            if (op.operation_id != operation_id or len(events) >= MAX_EVENTS or len(raw) > MAX_RECORD_BYTES
+                    or sum(len(_canonical(e.payload)) for e in events) + len(raw) > MAX_HISTORY_BYTES):
+                raise ValueError()
+            return [EventDraft("Mediation" + action, payload, run_id=op.run_id,
+                node_id=op.node_id, attempt_id=op.attempt_id, fencing_generation=op.fencing_generation,
+                correlation_id=op.run_id, causation_id=(_hash(events[-1].payload) if events else op.commitment_sha256))]
+
+        with store._cancellation_proof_write():
+            self._bounded_history(operation_id)
+            store.append_checked(STREAM, operation_id, key, decide)
+        return result

@@ -18,11 +18,36 @@ from tests.unit.runtime.test_general_worker_protocol import LAUNCH, task
 from orchestrator.runtime.general_worker_protocol import GeneralWorkerRequest
 
 
+# These cases exercise the journal reducer with synthetic metadata and no
+# admission. Public registration and prepare authority use real admissions in
+# test_general_worker_atomic_gate.py and the authority/execution suites.
+class ReducerJournal(GeneralWorkerJournal):
+    def request(self, *, context, input_commitment, accepted_route_sha256,
+        workspace_identity_hash, host_scope_hash, output_byte_limit):
+        from orchestrator.runtime.general_worker_journal import _guard, _request_operation, _safe
+        @_guard
+        def append():
+            data = _safe(dict(context=context, input_commitment=input_commitment,
+                accepted_route_sha256=accepted_route_sha256, workspace_identity_hash=workspace_identity_hash,
+                host_scope_hash=host_scope_hash, output_byte_limit=output_byte_limit))
+            return self._append(_request_operation(data), "Requested", data)
+        return append()
+
+    def prepare_turn(self, operation, *, phase, prepared):
+        from orchestrator.runtime.general_worker_journal import _guard, _safe
+        @_guard
+        def append():
+            if type(prepared) is not PreparedSandboxLaunch:
+                raise ValueError()
+            return self._append(operation, "TurnPrepared", _safe(dict(phase=phase, prepared=prepared)))
+        return append()
+
+
 H = "sha256:" + "a" * 64
 
 
 def requested(store):
-    journal = GeneralWorkerJournal(store)
+    journal = ReducerJournal(store)
     operation = journal.request(context=task().context, input_commitment=H,
         accepted_route_sha256=H, workspace_identity_hash=H, host_scope_hash=H,
         output_byte_limit=16_384)
@@ -45,7 +70,11 @@ def request_proposal(operation):
 
 
 @pytest.fixture
-def store(tmp_path):
+def store(tmp_path, monkeypatch):
+    # This file uses a synthetic reducer without Scheduler admission.
+    # Real cross-version gate coverage uses actual admission and connections.
+    from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+    monkeypatch.setattr(GeneralWorkerGate, "_check_no_v2", lambda _gate, _run, _node, _budget=None: None)
     with SQLiteEventStore(tmp_path / "events.db") as value:
         yield value
 
@@ -150,7 +179,7 @@ def reserved(store):
     context = task().context.model_copy(update={"registry_hash": request.accepted_route.registry_manifest_hash})
     route = request.accepted_route.model_copy(update={"fencing_generation": context.fencing_generation,
         "decision_id": "decision-" + context.routing_decision_hash[7:]})
-    journal = GeneralWorkerJournal(store)
+    journal = ReducerJournal(store)
     operation = journal.request(context=context, input_commitment=H,
         accepted_route_sha256=metadata_hash(route.model_dump(mode="json")),
         workspace_identity_hash=H, host_scope_hash=H, output_byte_limit=16_384)

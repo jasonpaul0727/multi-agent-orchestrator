@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import re
 from pathlib import Path
 import sqlite3
 import time
+import threading
 from typing import Any, Callable
 from urllib.parse import quote
+from weakref import WeakKeyDictionary, ref
 
 from orchestrator.identifiers import new_id
 
@@ -81,12 +85,23 @@ def _validate_version(value: Any, field_name: str) -> int:
     return value
 
 
+class _OwnedConnection(sqlite3.Connection):
+    """Keep the store's transaction observer installed for its lifetime."""
+
+    def set_trace_callback(self, callback):
+        if getattr(self, "_ownership_trace_installed", False):
+            raise RuntimeError("the store transaction observer cannot be replaced")
+        super().set_trace_callback(callback)
+        self._ownership_trace_installed = True
+
+
 def _open_connection(path: str | Path) -> sqlite3.Connection:
     connection = sqlite3.connect(
         str(path),
         timeout=5.0,
         isolation_level=None,
         check_same_thread=True,
+        factory=_OwnedConnection,
     )
     try:
         connection.row_factory = sqlite3.Row
@@ -226,6 +241,8 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             _migrate_snapshot_metadata(connection)
             _migrate_event_context(connection)
             _ensure_events_attempt_context_index(connection)
+            _migrate_general_worker_scope(connection)
+            _migrate_mediation_scope(connection)
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
             connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
@@ -246,6 +263,8 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         _migrate_snapshot_metadata(connection)
         _migrate_event_context(connection)
         _ensure_events_attempt_context_index(connection)
+        _migrate_general_worker_scope(connection)
+        _migrate_mediation_scope(connection)
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)")
         connection.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)")
@@ -255,6 +274,161 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         connection.rollback()
         raise
 
+
+def _migrate_general_worker_scope(connection: sqlite3.Connection) -> None:
+    """Build one immutable scope row per Worker stream in the migration transaction."""
+    migrated = connection.execute("SELECT 1 FROM schema_migrations WHERE version = 5").fetchone() is not None
+    exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='general_worker_scope'").fetchone() is not None
+    if migrated and not exists:
+        raise ValueError("general worker scope index is missing")
+    connection.execute("""CREATE TABLE IF NOT EXISTS general_worker_scope (
+        stream_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, node_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL, fencing_generation INTEGER NOT NULL CHECK (fencing_generation > 0))""")
+    if not migrated:
+        invalid = connection.execute("""
+            SELECT 1 FROM stream_versions s
+            LEFT JOIN events e ON e.stream_type=s.stream_type AND e.stream_id=s.stream_id AND e.stream_version=1
+            WHERE s.stream_type='general_worker' AND
+              (e.stream_id IS NULL OR typeof(e.run_id) != 'text' OR length(trim(e.run_id, char(9)||char(10)||char(13)||' '))=0
+               OR typeof(e.node_id) != 'text' OR length(trim(e.node_id, char(9)||char(10)||char(13)||' '))=0
+               OR typeof(e.attempt_id) != 'text' OR length(trim(e.attempt_id, char(9)||char(10)||char(13)||' '))=0
+               OR typeof(e.fencing_generation) != 'integer' OR e.fencing_generation <= 0)
+            LIMIT 1
+        """).fetchone()
+        inconsistent = connection.execute("""
+            SELECT 1 FROM events e JOIN events f ON f.stream_type=e.stream_type AND f.stream_id=e.stream_id
+                AND f.stream_version=1
+            WHERE e.stream_type='general_worker' AND (e.run_id IS NOT f.run_id OR e.node_id IS NOT f.node_id
+                OR e.attempt_id IS NOT f.attempt_id OR e.fencing_generation IS NOT f.fencing_generation)
+            LIMIT 1
+        """).fetchone()
+        if invalid or inconsistent:
+            raise ValueError("general worker scope contains unattributable history")
+        connection.execute("""INSERT INTO general_worker_scope
+            SELECT stream_id, run_id, node_id, attempt_id, fencing_generation FROM events
+            WHERE stream_type='general_worker' AND stream_version=1""")
+        connection.execute("INSERT INTO schema_migrations (version) VALUES (5)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_general_worker_scope_node ON general_worker_scope(run_id, node_id, stream_id)")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS gw_scope_check BEFORE INSERT ON events
+        WHEN NEW.stream_type='general_worker' BEGIN
+        SELECT CASE WHEN typeof(NEW.run_id) != 'text' OR length(trim(NEW.run_id, char(9)||char(10)||char(13)||' '))=0
+            OR typeof(NEW.node_id) != 'text' OR length(trim(NEW.node_id, char(9)||char(10)||char(13)||' '))=0
+            OR typeof(NEW.attempt_id) != 'text' OR length(trim(NEW.attempt_id, char(9)||char(10)||char(13)||' '))=0
+            OR typeof(NEW.fencing_generation) != 'integer' OR NEW.fencing_generation <= 0
+            THEN RAISE(ABORT, 'general worker scope requires identity') END;
+        SELECT CASE WHEN NEW.stream_version > 1 AND NOT EXISTS (
+            SELECT 1 FROM general_worker_scope s WHERE s.stream_id=NEW.stream_id
+            AND s.run_id=NEW.run_id AND s.node_id=NEW.node_id AND s.attempt_id=NEW.attempt_id
+            AND s.fencing_generation=NEW.fencing_generation)
+            THEN RAISE(ABORT, 'general worker scope mismatch') END;
+        END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS gw_scope_insert AFTER INSERT ON events
+        WHEN NEW.stream_type='general_worker' AND NEW.stream_version=1 BEGIN
+        INSERT INTO general_worker_scope VALUES (NEW.stream_id, NEW.run_id, NEW.node_id,
+            NEW.attempt_id, NEW.fencing_generation); END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS gw_scope_immutable_update BEFORE UPDATE ON general_worker_scope
+        BEGIN SELECT RAISE(ABORT, 'general worker scope is immutable'); END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS gw_scope_immutable_delete BEFORE DELETE ON general_worker_scope
+        BEGIN SELECT RAISE(ABORT, 'general worker scope is immutable'); END""")
+
+def _migrate_mediation_scope(connection: sqlite3.Connection) -> None:
+    """Index v2 event metadata; the index alone is not a launch authority."""
+    migrated = connection.execute("SELECT 1 FROM schema_migrations WHERE version=6").fetchone() is not None
+    exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mediation_scope'").fetchone() is not None
+    if migrated and not exists:
+        raise ValueError("mediation scope index is missing")
+    connection.execute("""CREATE TABLE IF NOT EXISTS mediation_scope (
+        stream_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, node_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL, fencing_generation INTEGER NOT NULL CHECK (fencing_generation > 0))""")
+    if not migrated:
+        invalid = connection.execute("""
+            SELECT 1 FROM stream_versions s
+            LEFT JOIN events e ON e.stream_type=s.stream_type AND e.stream_id=s.stream_id AND e.stream_version=1
+            WHERE s.stream_type='mediation_v2' AND
+              (e.stream_id IS NULL OR typeof(e.run_id) != 'text' OR length(trim(e.run_id))=0
+               OR typeof(e.node_id) != 'text' OR length(trim(e.node_id))=0
+               OR typeof(e.attempt_id) != 'text' OR length(trim(e.attempt_id))=0
+               OR typeof(e.fencing_generation) != 'integer' OR e.fencing_generation <= 0)
+            LIMIT 1
+        """).fetchone()
+        inconsistent = connection.execute("""
+            SELECT 1 FROM events e LEFT JOIN events f ON f.stream_type=e.stream_type AND f.stream_id=e.stream_id
+                AND f.stream_version=1
+            WHERE e.stream_type='mediation_v2' AND (f.stream_id IS NULL OR e.run_id IS NOT f.run_id
+                OR e.node_id IS NOT f.node_id OR e.attempt_id IS NOT f.attempt_id
+                OR e.fencing_generation IS NOT f.fencing_generation)
+            LIMIT 1
+        """).fetchone()
+        bad_header = connection.execute("""
+            SELECT 1 FROM events e
+            WHERE e.stream_type='mediation_v2' AND e.stream_version=1 AND
+              CASE WHEN length(CAST(e.payload_json AS BLOB)) > 16384 OR NOT json_valid(e.payload_json)
+                THEN 1 ELSE (
+                    e.schema_version != 1 OR e.event_type != 'MediationRegistered'
+                    OR json_extract(e.payload_json, '$.schema_version') IS NOT 2
+                    OR json_extract(e.payload_json, '$.operation_id') IS NOT e.stream_id
+                    OR json_extract(e.payload_json, '$.action') IS NOT 'Registered'
+                    OR json_extract(e.payload_json, '$.data.operation_id') IS NOT e.stream_id
+                    OR json_extract(e.payload_json, '$.data.run_id') IS NOT e.run_id
+                    OR json_extract(e.payload_json, '$.data.node_id') IS NOT e.node_id
+                    OR json_extract(e.payload_json, '$.data.attempt_id') IS NOT e.attempt_id
+                    OR json_extract(e.payload_json, '$.data.fencing_generation') IS NOT e.fencing_generation)
+              END LIMIT 1
+        """).fetchone()
+        bad_versions = connection.execute("""
+            SELECT 1 FROM stream_versions s LEFT JOIN events e
+              ON e.stream_type=s.stream_type AND e.stream_id=s.stream_id
+            WHERE s.stream_type='mediation_v2' GROUP BY s.stream_id, s.current_version
+            HAVING count(e.stream_id) != s.current_version OR min(e.stream_version) != 1
+                OR max(e.stream_version) != s.current_version OR count(e.stream_id) > 130
+                OR max(length(CAST(e.payload_json AS BLOB))) > 16384
+                OR sum(length(CAST(e.payload_json AS BLOB))) > 262144 LIMIT 1
+        """).fetchone()
+        orphan = connection.execute("""
+            SELECT 1 FROM events e LEFT JOIN stream_versions s
+              ON e.stream_type=s.stream_type AND e.stream_id=s.stream_id
+            WHERE e.stream_type='mediation_v2' AND s.stream_id IS NULL LIMIT 1
+        """).fetchone()
+        from .mediation_identity import mediation_stream_id
+        identities = connection.execute("""
+            SELECT stream_id, run_id, node_id, attempt_id, fencing_generation
+            FROM events WHERE stream_type='mediation_v2' AND stream_version=1
+        """)
+        for stream_id, run_id, node_id, attempt_id, generation in identities:
+            if stream_id != mediation_stream_id(run_id, node_id, attempt_id, generation):
+                raise ValueError("legacy mediation stream identity is incompatible")
+        if invalid or inconsistent or bad_header or bad_versions or orphan:
+            raise ValueError("mediation scope contains unattributable history")
+        connection.execute("""INSERT INTO mediation_scope
+            SELECT stream_id, run_id, node_id, attempt_id, fencing_generation FROM events
+            WHERE stream_type='mediation_v2' AND stream_version=1""")
+        connection.execute("INSERT INTO schema_migrations (version) VALUES (6)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_mediation_scope_node ON mediation_scope(run_id, node_id, stream_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_mediation_event_node ON events(stream_type, run_id, node_id, stream_version, stream_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_cancel_events_run ON events(stream_type, run_id, stream_id, stream_version)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_cancel_v1_scope_run ON general_worker_scope(run_id, stream_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_cancel_v2_scope_run ON mediation_scope(run_id, stream_id)")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS mediation_scope_check BEFORE INSERT ON events
+        WHEN NEW.stream_type='mediation_v2' BEGIN
+        SELECT CASE WHEN typeof(NEW.run_id) != 'text' OR length(trim(NEW.run_id))=0
+            OR typeof(NEW.node_id) != 'text' OR length(trim(NEW.node_id))=0
+            OR typeof(NEW.attempt_id) != 'text' OR length(trim(NEW.attempt_id))=0
+            OR typeof(NEW.fencing_generation) != 'integer' OR NEW.fencing_generation <= 0
+            THEN RAISE(ABORT, 'mediation scope requires identity') END;
+        SELECT CASE WHEN NEW.stream_version > 1 AND NOT EXISTS (
+            SELECT 1 FROM mediation_scope s WHERE s.stream_id=NEW.stream_id
+            AND s.run_id=NEW.run_id AND s.node_id=NEW.node_id AND s.attempt_id=NEW.attempt_id
+            AND s.fencing_generation=NEW.fencing_generation)
+            THEN RAISE(ABORT, 'mediation scope mismatch') END;
+        END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS mediation_scope_insert AFTER INSERT ON events
+        WHEN NEW.stream_type='mediation_v2' AND NEW.stream_version=1 BEGIN
+        INSERT INTO mediation_scope VALUES (NEW.stream_id, NEW.run_id, NEW.node_id,
+            NEW.attempt_id, NEW.fencing_generation); END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS mediation_scope_immutable_update BEFORE UPDATE ON mediation_scope
+        BEGIN SELECT RAISE(ABORT, 'mediation scope is immutable'); END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS mediation_scope_immutable_delete BEFORE DELETE ON mediation_scope
+        BEGIN SELECT RAISE(ABORT, 'mediation scope is immutable'); END""")
 
 def _migrate_snapshot_metadata(connection: sqlite3.Connection) -> None:
     """Add authenticated snapshot metadata to databases from Task 3."""
@@ -368,6 +542,13 @@ def _ensure_events_attempt_context_index(connection: sqlite3.Connection) -> None
         ON events(stream_type, run_id, node_id, attempt_id)
         """
     )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_scheduler_release_context
+        ON events(stream_type, run_id, node_id, attempt_id, fencing_generation,
+                  event_type, stream_id, stream_version)
+        """
+    )
 
 
 def _legacy_snapshot_metadata_hash(
@@ -438,6 +619,44 @@ def _draft_request_hash(stream_type: str, stream_id: str, drafts: list[EventDraf
     )
 
 
+_OWNED_WRITES = WeakKeyDictionary()
+
+
+def _watch_transaction(store_ref, statement):
+    """Invalidate on transaction replacement, retaining only actual ROLLBACK TO."""
+    # Most traced statements are ordinary reads/writes. Avoid tokenizing their
+    # potentially large bound payloads; only ROLLBACK needs detailed parsing.
+    # SQLite accepts empty statements and BOM tokens before the command.
+    # Consume them together with SQL whitespace/comments, in any order.
+    prefix = re.sub(r"\A(?:[\x09-\x0d \ufeff;]|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", statement, flags=re.S)
+    command = re.match(r"([A-Za-z_]+)", prefix)
+    if command is None:
+        # Never retain proof ownership when the traced command is unknown.
+        store = store_ref()
+        if store is not None:
+            _OWNED_WRITES.pop(store, None)
+        return
+    command = command.group(1).upper()
+    rollback_to = False
+    if command == "ROLLBACK":
+        # Preserve quoted identifiers while removing comments everywhere.
+        token = re.compile(r"(?P<quoted>'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\])|(?P<comment>--[^\n]*|/\*.*?\*/)", re.S)
+        clean = token.sub(lambda match: match.group("quoted") or " ", prefix)
+        identifier = r"(?:\"(?:\"\"|[^\"])*\"|'(?:''|[^'])*'|`(?:``|[^`])*`|\[[^\]]*\]|(?!SAVEPOINT\b)[A-Za-z_\u0080-\uffff][\w$\u0080-\uffff]*)"
+        rollback_to = re.fullmatch(
+            r"\s*ROLLBACK(?:\s+TRANSACTION)?\s+TO\s+(?:SAVEPOINT\s+)?" + identifier + r"\s*;?\s*",
+            clean, flags=re.I | re.S,
+        ) is not None
+    store = store_ref()
+    if store is None:
+        return
+    if rollback_to:
+        # SQLite total_changes does not decrease after ROLLBACK TO.
+        store._rollback_generation += 1
+    elif command in {"BEGIN", "COMMIT", "END", "ROLLBACK"}:
+        _OWNED_WRITES.pop(store, None)
+
+
 class SQLiteEventStore:
     """Append-only event storage with stream-version CAS and idempotency.
 
@@ -449,6 +668,10 @@ class SQLiteEventStore:
     def __init__(self, path: str | Path) -> None:
         self._connection = _open_connection(path)
         initialize_schema(self._connection)
+        self._post_commit_actions = []
+        self._rollback_generation = 0
+        store_ref = ref(self)
+        self._connection.set_trace_callback(lambda sql: _watch_transaction(store_ref, sql))
 
     @classmethod
     def open_read_only(cls, path: str | Path) -> "SQLiteEventStore":
@@ -465,17 +688,84 @@ class SQLiteEventStore:
         uri = "file:" + quote(str(database), safe="/") + "?mode=ro"
         connection = sqlite3.connect(
             uri, uri=True, timeout=5.0, isolation_level=None, check_same_thread=True,
+            factory=_OwnedConnection,
         )
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout = 5000")
             instance = cls.__new__(cls)
             instance._connection = connection
+            instance._post_commit_actions = []
+            instance._rollback_generation = 0
+            store_ref = ref(instance)
+            connection.set_trace_callback(lambda sql: _watch_transaction(store_ref, sql))
             return instance
         except BaseException:
             connection.close()
             raise
 
+    def _defer_until_commit(self, action):
+        if not self._has_owned_write() or not callable(action):
+            raise ValueError("deferred action requires an owned write transaction")
+        self._post_commit_actions.append(action)
+
+    def _publish_post_commit(self):
+        actions, self._post_commit_actions = self._post_commit_actions, []
+        for action in actions:
+            try:
+                action()
+            except Exception:
+                # A failed publication never changes the durable commit.
+                pass
+    def _has_owned_write(self):
+        marker = _OWNED_WRITES.get(self)
+        return (self._connection.in_transaction and marker is not None
+            and marker[0] is self._connection and marker[1] == threading.get_ident())
+
+    def _owned_write_token(self):
+        return _OWNED_WRITES[self][2] if self._has_owned_write() else None
+
+    def _owned_rollback_generation(self):
+        if not self._has_owned_write():
+            raise ValueError("owned write required")
+        return self._rollback_generation
+
+    @contextmanager
+    def _cancellation_proof_write(self):
+        """Enter a same-thread owned write scope before bounded proof reads."""
+        connection = self._connection
+        started = not connection.in_transaction
+        if not started and not self._has_owned_write():
+            raise ValueError("unknown ambient transaction")
+        if started:
+            connection.execute("BEGIN IMMEDIATE")
+            _OWNED_WRITES[self] = (connection, threading.get_ident(), object())
+            self._post_commit_actions = []
+        else:
+            connection.execute("SAVEPOINT cancellation_proof")
+        token = self._owned_write_token()
+        try:
+            yield started
+            if not self._has_owned_write() or self._owned_write_token() is not token:
+                raise ValueError("cancellation proof lost write ownership")
+            if started:
+                connection.commit()
+                self._publish_post_commit()
+            else:
+                connection.execute("RELEASE SAVEPOINT cancellation_proof")
+        except BaseException:
+            if started:
+                connection.rollback()
+            else:
+                try:
+                    connection.execute("ROLLBACK TO SAVEPOINT cancellation_proof")
+                finally:
+                    connection.execute("RELEASE SAVEPOINT cancellation_proof")
+            raise
+        finally:
+            if started:
+                _OWNED_WRITES.pop(self, None)
+                self._post_commit_actions = []
     def append(
         self,
         stream_type: str,
@@ -504,6 +794,8 @@ class SQLiteEventStore:
         savepoint: str | None = None
         if started_transaction:
             connection.execute("BEGIN IMMEDIATE")
+            _OWNED_WRITES[self] = (connection, threading.get_ident(), object())
+            self._post_commit_actions = []
         else:
             savepoint = "orchestrator_append"
             connection.execute(f"SAVEPOINT {savepoint}")
@@ -536,6 +828,7 @@ class SQLiteEventStore:
                     raise RuntimeError("idempotency record points to missing events")
                 if started_transaction:
                     connection.commit()
+                    self._publish_post_commit()
                 else:
                     connection.execute(f"RELEASE SAVEPOINT {savepoint}")
                 return original_events
@@ -654,6 +947,7 @@ class SQLiteEventStore:
             )
             if started_transaction:
                 connection.commit()
+                self._publish_post_commit()
             else:
                 connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             return stored_events
@@ -666,6 +960,10 @@ class SQLiteEventStore:
                 finally:
                     connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
+        finally:
+            if started_transaction:
+                _OWNED_WRITES.pop(self, None)
+                self._post_commit_actions = []
 
     def append_checked(
         self,
@@ -673,6 +971,7 @@ class SQLiteEventStore:
         stream_id: str,
         idempotency_key: str,
         decide: Callable[[list[StoredEvent], int], Iterable[EventDraft] | None],
+        *, stream_bounds: tuple[int, int, int] | None = None,
     ) -> list[StoredEvent]:
         """Run a locked read-modify-append operation atomically.
 
@@ -696,10 +995,14 @@ class SQLiteEventStore:
         savepoint: str | None = None
         if started_transaction:
             connection.execute("BEGIN IMMEDIATE")
+            _OWNED_WRITES[self] = (connection, threading.get_ident(), object())
+            self._post_commit_actions = []
         else:
             savepoint = "orchestrator_append_checked"
             connection.execute(f"SAVEPOINT {savepoint}")
         try:
+            if stream_bounds is not None:
+                self._validate_stream_bounds(stream_type, stream_id, stream_bounds)
             events = self._read_rows(
                 stream_type,
                 stream_id,
@@ -714,6 +1017,7 @@ class SQLiteEventStore:
                 ]
                 if started_transaction:
                     connection.commit()
+                    self._publish_post_commit()
                 else:
                     connection.execute(f"RELEASE SAVEPOINT {savepoint}")
                 return existing
@@ -726,6 +1030,7 @@ class SQLiteEventStore:
             )
             if started_transaction:
                 connection.commit()
+                self._publish_post_commit()
             else:
                 connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             return appended
@@ -738,6 +1043,10 @@ class SQLiteEventStore:
                 finally:
                     connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
+        finally:
+            if started_transaction:
+                _OWNED_WRITES.pop(self, None)
+                self._post_commit_actions = []
 
     def read_stream(
         self,
@@ -811,6 +1120,8 @@ class SQLiteEventStore:
         stream_type: str,
         stream_id: str,
         after_version: int = 0,
+        *, max_events: int | None = None,
+        stream_bounds: tuple[int, int, int] | None = None,
     ) -> tuple[list[StoredEvent], int]:
         """Read a stream and its version from one SQLite read transaction.
 
@@ -821,6 +1132,8 @@ class SQLiteEventStore:
         stream_type = _validate_identifier(stream_type, "stream_type")
         stream_id = _validate_identifier(stream_id, "stream_id")
         after_version = _validate_version(after_version, "after_version")
+        if max_events is not None and (type(max_events) is not int or max_events < 1):
+            raise ValueError("max_events must be positive")
         connection = self._connection
         savepoint: str | None = None
         started_transaction = not connection.in_transaction
@@ -830,6 +1143,8 @@ class SQLiteEventStore:
             savepoint = "orchestrator_stream_read"
             connection.execute(f"SAVEPOINT {savepoint}")
         try:
+            if stream_bounds is not None:
+                self._validate_stream_bounds(stream_type, stream_id, stream_bounds)
             rows = connection.execute(
                 """
                 SELECT event_id, stream_type, stream_id, stream_version,
@@ -838,10 +1153,12 @@ class SQLiteEventStore:
                        fencing_generation, correlation_id, causation_id
                 FROM events
                 WHERE stream_type = ? AND stream_id = ? AND stream_version > ?
-                ORDER BY stream_version ASC
+                ORDER BY stream_version ASC LIMIT ?
                 """,
-                (stream_type, stream_id, after_version),
+                (stream_type, stream_id, after_version, -1 if max_events is None else max_events + 1),
             ).fetchall()
+            if max_events is not None and len(rows) > max_events:
+                raise ValueError("stream exceeds event bound")
             version_row = connection.execute(
                 """
                 SELECT current_version
@@ -899,6 +1216,56 @@ class SQLiteEventStore:
         ).fetchall()
         return [row["stream_id"] for row in rows]
 
+    def _read_scheduler_releases(self, run_id, node_id, attempt_id, fencing_generation):
+        """Read at most one bounded release using the attempt context index."""
+        for value, name in ((run_id, "run_id"), (node_id, "node_id"), (attempt_id, "attempt_id")):
+            _validate_identifier(value, name)
+        if type(fencing_generation) is not int or fencing_generation < 1:
+            raise ValueError("invalid fencing generation")
+        rows = self._connection.execute("""
+            SELECT event_id, stream_type, stream_id, stream_version, event_type, schema_version,
+                   occurred_at, CASE WHEN length(CAST(payload_json AS BLOB)) <= 16384
+                       THEN payload_json ELSE NULL END AS payload_json,
+                   payload_hash, idempotency_key, run_id, node_id, attempt_id,
+                   fencing_generation, correlation_id, causation_id
+            FROM events WHERE stream_type='scheduler' AND stream_id='global'
+              AND event_type='AttemptSlotReleased' AND run_id=? AND node_id=? AND attempt_id=?
+              AND fencing_generation=? ORDER BY stream_version LIMIT 2
+        """, (run_id, node_id, attempt_id, fencing_generation)).fetchall()
+        if len(rows) > 1:
+            raise ValueError("duplicate attempt releases")
+        return [self._row_to_event(row) for row in rows]
+    def stream_ids_for_worker_node(self, run_id: str, node_id: str, *, limit: int) -> list[str]:
+        run_id = _validate_identifier(run_id, "run_id")
+        node_id = _validate_identifier(node_id, "node_id")
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be positive")
+        rows = self._connection.execute(
+            "SELECT stream_id FROM general_worker_scope WHERE run_id=? AND node_id=? ORDER BY stream_id LIMIT ?",
+            (run_id, node_id, limit)).fetchall()
+        return [row["stream_id"] for row in rows]
+    def stream_ids_for_mediation_node(self, run_id: str, node_id: str, *, limit: int) -> list[str]:
+        """Return bounded v2 scope candidates, not an authorization decision."""
+        run_id = _validate_identifier(run_id, "run_id")
+        node_id = _validate_identifier(node_id, "node_id")
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be positive")
+        rows = self._connection.execute("""
+            WITH scope AS (
+                SELECT stream_id, run_id, node_id, attempt_id, fencing_generation
+                  FROM mediation_scope WHERE run_id=? AND node_id=? ORDER BY stream_id LIMIT ?
+            ), headers AS (
+                SELECT stream_id, run_id, node_id, attempt_id, fencing_generation
+                  FROM events WHERE stream_type='mediation_v2' AND run_id=? AND node_id=?
+                  AND stream_version=1 ORDER BY stream_id LIMIT ?
+            )
+            SELECT 0 AS source, * FROM scope UNION ALL SELECT 1 AS source, * FROM headers
+        """, (run_id, node_id, limit, run_id, node_id, limit)).fetchall()
+        scope = [tuple(row)[1:] for row in rows if row["source"] == 0]
+        headers = [tuple(row)[1:] for row in rows if row["source"] == 1]
+        if scope != headers:
+            raise ValueError("mediation scope disagrees with event headers")
+        return [row[0] for row in scope]
     def stream_ids_for_context(
         self, stream_type: str, run_id: str, node_id: str, attempt_id: str
     ) -> list[str]:
@@ -918,6 +1285,26 @@ class SQLiteEventStore:
             (stream_type, run_id, node_id, attempt_id),
         ).fetchall()
         return [row["stream_id"] for row in rows]
+
+    def _validate_stream_bounds(self, stream_type, stream_id, bounds):
+        """Check physical rows under the caller's transaction before materialization."""
+        if (type(bounds) is not tuple or len(bounds) != 3
+                or any(type(value) is not int or value < 1 for value in bounds)
+                or not self._connection.in_transaction):
+            raise ValueError("invalid stream bounds")
+        row = self._connection.execute(
+            """SELECT COUNT(*) AS n, COALESCE(MIN(stream_version), 0) AS low,
+                      COALESCE(MAX(stream_version), 0) AS high,
+                      COALESCE(MAX(length(CAST(payload_json AS BLOB))), 0) AS largest,
+                      COALESCE(SUM(length(CAST(payload_json AS BLOB))), 0) AS total
+                 FROM events WHERE stream_type = ? AND stream_id = ?""",
+            (stream_type, stream_id),
+        ).fetchone()
+        version = self.current_version(stream_type, stream_id)
+        count, low, high, largest, total = row
+        if (count > bounds[0] or largest > bounds[1] or total > bounds[2]
+                or count != version or high != version or low != (1 if count else 0)):
+            raise ValueError("invalid bounded stream")
 
     def _read_rows(
         self,

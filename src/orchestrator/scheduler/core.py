@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from orchestrator.agents import AgentRegistry
 from orchestrator.artifacts import ArtifactStore, EphemeralArtifactGrantAuthority
-from orchestrator.budget import BudgetLedger, BudgetReservation, RunLimit, UsageRecord
+from orchestrator.budget import BudgetError, BudgetLedger, BudgetReservation, RunLimit, UsageRecord
 from orchestrator.config.runtime import RunConfigSnapshot
 from orchestrator.models import AcceptedModelRoute, ModelGatewayFailure
 from orchestrator.persistence import EventDraft, SQLiteEventStore, StoredEvent
@@ -143,6 +143,7 @@ class Scheduler:
         self._general_usage_source = usage_source if usage_source is not None else UnavailableAttemptUsageSource()
         self._general_recovery_scope = None
         self._general_artifact_grants = artifact_grants
+        self.last_expiry_holds: tuple[str, ...] = ()
 
     def resolve_active_attempt(
         self, *, run_id: str, node_id: str, attempt_id: str,
@@ -339,6 +340,11 @@ class Scheduler:
                     raise SchedulerError("route acceptance idempotency key was reused")
                 return None
 
+            from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+            try:
+                GeneralWorkerGate(self.event_store).check_release(request.run_id, request.node_id)
+            except Exception:
+                raise SchedulerError("route acceptance requires resolved worker authority") from None
             state = self.lifecycle.replay(request.run_id)
             if (
                 request.run_id != decision.run_id
@@ -1095,8 +1101,23 @@ class Scheduler:
         return any(event.event_type == "AttemptSlotReleased" and all(getattr(event, name) == value
             for name, value in _identity_value(identity).items()) for event in events)
 
+    @staticmethod
+    def _matches_terminal_receipt(event, event_type, payload):
+        return (event.event_type == event_type and _hash(dict(event.payload)) == _hash(payload)
+            and event.run_id == payload["run_id"] and event.node_id == payload["node_id"]
+            and event.attempt_id == payload["attempt_id"]
+            and event.fencing_generation == payload["fencing_generation"]
+            and event.correlation_id == payload["run_id"])
+    def _validate_historical_terminal(self, run_id):
+        try:
+            self.recovery.recover_control_state(run_id)
+        except RunRecoveryError:
+            raise SchedulerError("historical terminal receipt lacks consistent durable state") from None
     def _check_general_release_claim(self, *, run_id, node_id, attempt_id, fencing_generation,
         scope, trusted_usage, events, entry, usage, known_no_effect, at):
+        from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+        gate = GeneralWorkerGate(self.event_store)
+        gate.check_release(run_id, node_id)
         operation = self._check_general_release(run_id, node_id, attempt_id, fencing_generation, scope)
         if operation is None or self._has_general_release(events, operation.identity):
             return
@@ -1106,6 +1127,9 @@ class Scheduler:
             events=events, entry=entry, usage=usage, known_no_effect=known_no_effect, at=at)
         if needs_usage and (trusted_usage is None or trusted_usage != usage):
             raise SchedulerError("general release lost trusted usage authority")
+        if entry in {"finish", "cancel"}:
+            gate._check_release_snapshot(self, run_id=run_id, node_id=node_id,
+                attempt_id=attempt_id, fencing_generation=fencing_generation)
 
     def _finish_general_verified_attempt(self, *, identity: GeneralWorkerIdentity,
         task_sha256: str) -> GeneralWorkerResult:
@@ -1193,7 +1217,10 @@ class Scheduler:
             result = None
             def decide(events, _version):
                 nonlocal result
-                completed_at = datetime.now(timezone.utc)
+                from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+                gate = GeneralWorkerGate(self.event_store)
+                gate.check_release(identity.run_id, identity.node_id)
+                completed_at = gate._now
                 current_binding = _validate_general_eligibility(self, journal, operation, purpose="acceptance",
                     host_scope_hash=scope, as_of=completed_at, events=events)
                 current_proposal = VerifierProposalJournal(self.event_store).read_proposal(identity.run_id, task_sha256)
@@ -1246,8 +1273,6 @@ class Scheduler:
         key = f"finish:{attempt_ref}"
 
         def decide(events, _version):
-            if self._general_operation(run_id, node_id, attempt_id, fencing_generation) is not None:
-                raise SchedulerError("general registration requires owned terminal preflight")
             proposal = VerifierProposalJournal(self.event_store).read_proposal(run_id, task_sha256)
             if proposal is None or proposal.evidence.outcome != "accepted":
                 raise SchedulerError("completion requires an accepted durable verifier proof")
@@ -1256,11 +1281,16 @@ class Scheduler:
                 completed_at=completed_at.isoformat(), outcome="succeeded",
                 usage_hash=_hash(usage.model_dump(mode="json")), known_no_effect=False,
                 task_sha256=proposal.task_sha256, evidence_sha256=proposal.evidence_sha256)
-            prior = next((event for event in events if event.idempotency_key == key), None)
-            if prior is not None:
-                if prior.event_type != "AttemptSlotReleased" or prior.payload != payload:
+            prior = [event for event in events if event.idempotency_key == key]
+            if prior:
+                if len(prior) != 1 or not self._matches_terminal_receipt(prior[0], "AttemptSlotReleased", payload):
                     raise SchedulerError("attempt completion idempotency key was reused")
+                self._validate_historical_terminal(run_id)
                 return None
+            from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+            GeneralWorkerGate(self.event_store).check_release(run_id, node_id)
+            if self._general_operation(run_id, node_id, attempt_id, fencing_generation) is not None:
+                raise SchedulerError("general registration requires owned terminal preflight")
             binding = self.resolve_verification_binding(
                 run_id=run_id, node_id=node_id, attempt_id=attempt_id,
                 fencing_generation=fencing_generation, as_of=completed_at,
@@ -1304,6 +1334,8 @@ class Scheduler:
         usage: UsageRecord | None = None,
         known_no_effect: bool = False,
     ) -> None:
+        if type(fencing_generation) is not int or fencing_generation <= 0 or type(known_no_effect) is not bool:
+            raise SchedulerError("attempt completion has invalid receipt identity or proof")
         if outcome == "succeeded":
             raise SchedulerError("attempt success requires durable verifier proof")
         completed_at = _aware(completed_at, "completed_at")
@@ -1327,18 +1359,21 @@ class Scheduler:
         }
         key = f"finish:{attempt_ref}"
 
+        new_release = False
+
         def decide(events: list[StoredEvent], version: int):
+            nonlocal new_release
+            prior = [item for item in events if item.idempotency_key == key]
+            if prior:
+                expected_type = "AttemptOutcomeUnknown" if outcome == "outcome_unknown" else "AttemptSlotReleased"
+                if len(prior) != 1 or not self._matches_terminal_receipt(prior[0], expected_type, op_payload):
+                    raise SchedulerError("attempt completion idempotency key was reused")
+                self._validate_historical_terminal(run_id)
+                return None
             if outcome != "outcome_unknown":
                 self._check_general_release_claim(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
                     fencing_generation=fencing_generation, scope=general_scope, trusted_usage=general_usage,
                     events=events, entry="finish", usage=usage, known_no_effect=known_no_effect, at=completed_at)
-            prior = next((item for item in events if item.idempotency_key == key), None)
-            if prior is not None:
-                if prior.event_type not in {"AttemptSlotReleased", "AttemptOutcomeUnknown"} or any(
-                    prior.payload.get(name) != value for name, value in op_payload.items()
-                ):
-                    raise SchedulerError("attempt completion idempotency key was reused")
-                return None
             accepted = _active_acceptance(events, attempt_ref)
             if accepted is None or accepted.payload.get("run_id") != run_id:
                 raise LifecycleConflict("attempt is not holding an active scheduler lease")
@@ -1348,9 +1383,6 @@ class Scheduler:
             if completed_at < accepted_at:
                 raise LifecycleConflict("attempt completion precedes route acceptance")
             expires_at = datetime.fromisoformat(accepted.payload["lease_expires_at"])
-            if general_scope is not None and outcome != "outcome_unknown":
-                self._resolve_general_release_snapshot(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
-                    fencing_generation=fencing_generation, as_of=datetime.now(timezone.utc))
             if outcome != "outcome_unknown" and completed_at >= expires_at:
                 raise LifecycleConflict("late attempt result must be reconciled, not accepted")
             decision_hash = accepted.payload["decision_hash"]
@@ -1418,7 +1450,7 @@ class Scheduler:
                 causation_id=decision_hash,
                 outcome=outcome,
             )
-            self.lifecycle.complete_cancellation_if_idle(run_id)
+            new_release = True
             return [
                 EventDraft(
                     "AttemptSlotReleased",
@@ -1435,7 +1467,10 @@ class Scheduler:
         general_scope, general_usage = (self._prepare_general_release(run_id=run_id, node_id=node_id,
             attempt_id=attempt_id, fencing_generation=fencing_generation, entry="finish", usage=usage,
             known_no_effect=known_no_effect, at=completed_at) if outcome != "outcome_unknown" else (None, None))
-        self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
+        with self.event_store._cancellation_proof_write():
+            self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
+            if new_release:
+                self.lifecycle.complete_cancellation_if_idle(run_id)
 
     def acknowledge_cancellation(
         self,
@@ -1485,15 +1520,19 @@ class Scheduler:
         }
         key = f"cancel-ack:{attempt_ref}"
 
+        new_release = False
+
         def decide(events: list[StoredEvent], version: int):
+            nonlocal new_release
+            prior = [item for item in events if item.idempotency_key == key]
+            if prior:
+                if len(prior) != 1 or not self._matches_terminal_receipt(prior[0], "AttemptSlotReleased", op_payload):
+                    raise SchedulerError("attempt cancellation idempotency key was reused")
+                self._validate_historical_terminal(run_id)
+                return None
             self._check_general_release_claim(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
                 fencing_generation=fencing_generation, scope=general_scope, trusted_usage=general_usage,
                 events=events, entry="cancel", usage=usage, known_no_effect=no_effect_receipt_hash is not None, at=stopped_at)
-            prior = next((item for item in events if item.idempotency_key == key), None)
-            if prior is not None:
-                if prior.event_type != "AttemptSlotReleased" or dict(prior.payload) != op_payload:
-                    raise SchedulerError("attempt cancellation idempotency key was reused")
-                return None
             accepted = _active_acceptance(events, attempt_ref)
             if accepted is None or accepted.payload.get("run_id") != run_id:
                 raise LifecycleConflict("attempt is not holding an active scheduler lease")
@@ -1503,9 +1542,6 @@ class Scheduler:
                 raise LifecycleConflict("cancellation receipt precedes attempt acceptance")
             if stopped_at >= datetime.fromisoformat(accepted.payload["lease_expires_at"]):
                 raise LifecycleConflict("expired attempt must be reconciled, not cancelled")
-            if general_scope is not None:
-                self._resolve_general_release_snapshot(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
-                    fencing_generation=fencing_generation, as_of=datetime.now(timezone.utc))
             state = self.lifecycle.replay(run_id)
             if state.status != "cancelling":
                 raise SchedulerError("cancellation acknowledgement requires a cancelling Run")
@@ -1540,7 +1576,7 @@ class Scheduler:
                 fencing_generation=fencing_generation,
                 causation_id=cancellation_event.event_id,
             )
-            self.lifecycle.complete_cancellation_if_idle(run_id)
+            new_release = True
             return [
                 EventDraft(
                     "AttemptSlotReleased", op_payload,
@@ -1553,7 +1589,10 @@ class Scheduler:
         general_scope, general_usage = self._prepare_general_release(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
             fencing_generation=fencing_generation, entry="cancel", usage=usage,
             known_no_effect=no_effect_receipt_hash is not None, at=stopped_at)
-        self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
+        with self.event_store._cancellation_proof_write():
+            self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
+            if new_release:
+                self.lifecycle.complete_cancellation_if_idle(run_id)
 
     def mark_expired_attempts_unknown(self, *, as_of: datetime) -> tuple[str, ...]:
         """Fence expired leases into OutcomeUnknown without freeing their slots."""
@@ -1572,6 +1611,8 @@ class Scheduler:
             elif event.event_type == "AttemptSlotReleased":
                 active.pop(event.payload["attempt_ref"], None)
         marked: list[str] = []
+        held: list[str] = []
+        self.last_expiry_holds = ()
         for attempt_ref, event in sorted(active.items()):
             if attempt_ref in unknown:
                 continue
@@ -1590,6 +1631,12 @@ class Scheduler:
             except LifecycleConflict:
                 # A completion/reconciliation may have won after this read.
                 continue
+            except BudgetError:
+                # This attempt's safety state was not proven; do not fabricate
+                # unknown or release its slot, but continue with other leases.
+                held.append(event.payload["attempt_id"])
+                self.last_expiry_holds = tuple(held)
+                continue
             marked.append(event.payload["attempt_id"])
         return tuple(marked)
 
@@ -1605,6 +1652,8 @@ class Scheduler:
         usage: UsageRecord | None = None,
         known_no_effect: bool = False,
     ) -> None:
+        if type(fencing_generation) is not int or fencing_generation <= 0 or type(known_no_effect) is not bool:
+            raise SchedulerError("attempt reconciliation has invalid receipt identity or proof")
         if outcome == "succeeded":
             raise SchedulerError("attempt success requires durable verifier proof")
         reconciled_at = _aware(reconciled_at, "reconciled_at")
@@ -1626,17 +1675,19 @@ class Scheduler:
         }
         key = f"reconcile:{attempt_ref}"
 
+        new_release = False
+
         def decide(events: list[StoredEvent], version: int):
+            nonlocal new_release
+            prior = [item for item in events if item.idempotency_key == key]
+            if prior:
+                if len(prior) != 1 or not self._matches_terminal_receipt(prior[0], "AttemptSlotReleased", op_payload):
+                    raise SchedulerError("attempt reconciliation idempotency key was reused")
+                self._validate_historical_terminal(run_id)
+                return None
             self._check_general_release_claim(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
                 fencing_generation=fencing_generation, scope=general_scope, trusted_usage=general_usage,
                 events=events, entry="reconcile", usage=usage, known_no_effect=known_no_effect, at=reconciled_at)
-            prior = next((item for item in events if item.idempotency_key == key), None)
-            if prior is not None:
-                if prior.event_type != "AttemptSlotReleased" or any(
-                    prior.payload.get(name) != value for name, value in op_payload.items()
-                ):
-                    raise SchedulerError("attempt reconciliation idempotency key was reused")
-                return None
             unknown = next(
                 (item for item in events if item.event_type == "AttemptOutcomeUnknown"
                  and item.payload.get("attempt_ref") == attempt_ref),
@@ -1697,7 +1748,7 @@ class Scheduler:
                 causation_id=decision_hash,
                 outcome=outcome,
             )
-            self.lifecycle.complete_cancellation_if_idle(run_id)
+            new_release = True
             return [
                 EventDraft(
                     "AttemptSlotReleased",
@@ -1714,7 +1765,10 @@ class Scheduler:
         general_scope, general_usage = self._prepare_general_release(run_id=run_id, node_id=node_id, attempt_id=attempt_id,
             fencing_generation=fencing_generation, entry="reconcile", usage=usage,
             known_no_effect=known_no_effect, at=reconciled_at)
-        self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
+        with self.event_store._cancellation_proof_write():
+            self.event_store.append_checked(_SCHEDULER_STREAM, _SCHEDULER_ID, key, decide)
+            if new_release:
+                self.lifecycle.complete_cancellation_if_idle(run_id)
 
     def _ledger_for_run(self, run_id: str) -> BudgetLedger:
         return BudgetLedger(self.event_store, {run_id: _run_limit(self.lifecycle.config_snapshot(run_id))})

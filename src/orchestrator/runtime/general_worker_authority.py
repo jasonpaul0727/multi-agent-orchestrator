@@ -248,7 +248,12 @@ def _validate_general_eligibility(scheduler, journal, operation, *, purpose, hos
     if type(purpose) is not str or purpose not in {"request", "dispatch", "completion", "acceptance"}:
         raise ValueError()
     journal._validate_operation(operation)
-    current = journal.read(operation.identity)
+    from orchestrator.runtime.general_worker_gate import GeneralWorkerGate
+    gate = GeneralWorkerGate(scheduler.event_store)
+    budget = gate._budget()
+    gate._check_no_v2(operation.identity.run_id, operation.identity.node_id, budget)
+    operations = gate._v1_operations(operation.identity.run_id, operation.identity.node_id, budget)
+    current = next((item for item, _ in operations if item.identity == operation.identity), None)
     if current is None or _canonical(_safe(current)) != _canonical(_safe(operation)):
         raise ValueError()
     identity = _identity_value(operation.identity)
@@ -283,7 +288,7 @@ def _validate_general_eligibility(scheduler, journal, operation, *, purpose, hos
             or operation.call is None or call.stream_id != operation.call.provider_call_stream_id
             or call.status != "known_success"):
             raise ValueError()
-        journal._validate_links(operation)
+        # The owned node census above already validated this operation and its links.
     _require_no_other_general_holds(scheduler, operation, recovered)
     return binding
 

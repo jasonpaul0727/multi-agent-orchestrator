@@ -1,6 +1,9 @@
 """Bounded test-only rendezvous for parent-issued process death."""
 
+from contextlib import contextmanager
 import math
+import multiprocessing
+from unittest.mock import patch
 import os
 import signal
 from multiprocessing.connection import Connection
@@ -67,3 +70,34 @@ def kill_at_crash_point(
             os.kill(process.pid, signal.SIGKILL)
             process.join(timeout=cleanup_timeout)
             assert not process.is_alive(), "child survived SIGKILL cleanup"
+
+
+@contextmanager
+def block_before_store_commit(
+    store, pipe, point, *, stream_type, stream_id, event_types, when=None,
+):
+    """Child-only barrier before the outer Python commit call, not inside SQL COMMIT.
+
+    Keep the production transaction observer intact. The target connection must
+    still own its transaction and contain the expected pending writes before
+    announcing the barrier. Other connections continue to commit normally.
+    """
+    from orchestrator.persistence.sqlite_event_store import _OwnedConnection
+
+    assert multiprocessing.parent_process() is not None, "crash hook is child-only"
+    connection = store._connection
+    real_commit = _OwnedConnection.commit
+
+    def commit(current):
+        if current is connection and (when is None or when()):
+            assert current.in_transaction
+            assert store._has_owned_write()
+            assert tuple(event.event_type for event in store.read_stream(
+                stream_type, stream_id,
+            )) == event_types
+            block_at_crash_point(pipe, point)
+            raise AssertionError("parent did not kill child at commit barrier")
+        return real_commit(current)
+
+    with patch.object(_OwnedConnection, "commit", commit):
+        yield
