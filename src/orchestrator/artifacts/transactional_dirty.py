@@ -182,13 +182,15 @@ def tracking_present(conn):
     return conn.execute("SELECT 1 FROM sqlite_master WHERE name LIKE 'artifact_dirty_%' LIMIT 1").fetchone() is not None
 
 
-def require_clean_marker(conn, digest, budget):
+def require_clean_marker(conn, digest, budget, *, allow_dirty=False, require_tracking=False):
     """Check diagnostic state only; no schema-continuity or authority claim."""
     import sqlite3
     from orchestrator.lifecycle.cancel_completion import CancellationHeld
     from .evidence_checkpoint import _charge
 
     if not tracking_present(conn):
+        if require_tracking:
+            raise CancellationHeld('integrity')
         return
     try:
         expected = {**_DIRTY_TABLES, **_trigger_sql()}
@@ -206,7 +208,8 @@ def require_clean_marker(conn, digest, budget):
         if len(versions) != 1 or tuple(versions[0]) != ('integer', 1):
             raise CancellationHeld('integrity')
         marker = conn.execute("SELECT typeof(dirty), CASE WHEN typeof(dirty)='integer' THEN dirty END FROM artifact_dirty_marker WHERE digest=? LIMIT 2", (digest,)).fetchall()
-        if len(marker) != 1 or tuple(marker[0]) != ('integer', 0):
+        allowed_markers = (('integer', 0), ('integer', 1)) if allow_dirty else (('integer', 0),)
+        if len(marker) != 1 or tuple(marker[0]) not in allowed_markers:
             raise CancellationHeld('integrity')
     except (sqlite3.DatabaseError, RuntimeError, TypeError, ValueError):
         raise CancellationHeld('integrity') from None

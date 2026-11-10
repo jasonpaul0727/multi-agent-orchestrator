@@ -78,6 +78,64 @@ def initialize_incremental(store, digest, budget):
         conn.execute('INSERT INTO artifact_incremental_checkpoint VALUES (?, 1, ?, ?, ?)', (digest, version, events[-1].event_id if events else None, chain))
 
 
+def rebuild_incremental(store, digest, budget):
+    """Fully rebuild opted-in diagnostic state; never grants authority."""
+    import uuid
+    from .transactional_dirty import require_clean_marker
+    conn = store._connection
+    budget.bind(store)
+    require_clean_marker(conn, digest, budget, allow_dirty=True, require_tracking=True)
+    if not _structure(conn, budget):
+        raise CancellationHeld('integrity')
+    # A rebuild always scans afresh, even if this budget read the digest earlier.
+    budget._cache.pop(('artifact', digest), None)
+    budget._windows.pop(('artifact', digest), None)
+    events, version = _event_window(store, digest, budget)
+    if not events or version < 1:
+        raise CancellationHeld('integrity')
+    chain = hashlib.sha256(b'artifact-incremental-v1').hexdigest()
+    publications = []
+    ids = set()
+    for event in events:
+        record = _validate(event, digest)
+        chain = _step(chain, event)
+        if event.event_type == 'ArtifactPublished':
+            if record.publication_id in ids:
+                raise CancellationHeld('integrity')
+            ids.add(record.publication_id)
+            publications.append((digest, record.publication_id, event.event_id, event.stream_version))
+    # Bound existing index deletion without materializing its values.  New
+    # rows and all old-row deletes are charged before any state is changed.
+    _charge(budget, 1, 256)
+    remaining = budget.max_rows - budget.rows
+    old = conn.execute("""SELECT length(CAST(digest AS BLOB)) AS d,
+        length(CAST(publication_id AS BLOB)) AS p, length(CAST(event_id AS BLOB)) AS e,
+        length(CAST(version AS BLOB)) AS v FROM artifact_incremental_publication
+        WHERE digest=? LIMIT ?""", (digest, remaining + 1)).fetchall()
+    if len(old) > remaining or any(any(type(r[k]) is not int or r[k] > budget.max_row_bytes for k in ('d','p','e','v')) or sum(r[k] for k in ('d','p','e','v')) > budget.max_row_bytes for r in old):
+        raise CancellationHeld('budget')
+    old_bytes = sum(sum(r[k] for k in ('d','p','e','v')) + 128 for r in old)
+    new_bytes = sum(len(d.encode('utf-8')) + len(p.encode('utf-8')) + len(e.encode('utf-8')) + 192 for d,p,e,_ in publications)
+    _charge(budget, len(old) * 2 + len(publications) + 4, old_bytes + new_bytes + 1024)
+    budget.bind(store)
+    name = 'artifact_dirty_rebuild_' + uuid.uuid4().hex
+    conn.execute(f'SAVEPOINT {name}')
+    try:
+        conn.execute('DELETE FROM artifact_incremental_publication WHERE digest=?', (digest,))
+        conn.execute('DELETE FROM artifact_incremental_checkpoint WHERE digest=?', (digest,))
+        conn.execute('INSERT INTO artifact_incremental_checkpoint VALUES (?, 1, ?, ?, ?)', (digest, version, events[-1].event_id, chain))
+        conn.executemany('INSERT INTO artifact_incremental_publication VALUES (?, ?, ?, ?)', publications)
+        if _head(conn, digest, version) is None:
+            raise CancellationHeld('integrity')
+        if conn.execute('UPDATE artifact_dirty_marker SET dirty=0 WHERE digest=? AND dirty=1', (digest,)).rowcount != 1:
+            raise CancellationHeld('integrity')
+    except BaseException:
+        conn.execute(f'ROLLBACK TO SAVEPOINT {name}')
+        conn.execute(f'RELEASE SAVEPOINT {name}')
+        raise
+    conn.execute(f'RELEASE SAVEPOINT {name}')
+
+
 def _head(conn, digest, expected_version):
     meta = conn.execute("""SELECT typeof(schema_version) AS st, typeof(version) AS vt,
         typeof(boundary_id) AS bt, length(CAST(boundary_id AS BLOB)) AS bn,

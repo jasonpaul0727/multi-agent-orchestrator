@@ -773,3 +773,229 @@ def test_real_sqlite_full_rolls_back_and_reopens_consistent(tmp_path):
         assert [tuple(r) for r in conn.execute('SELECT * FROM artifact_incremental_publication WHERE digest=? ORDER BY publication_id', (a.digest,))] == before_publications
         assert marker(conn, a.digest) == 0
         assert diagnostic(reopened, a).payload['publication_id'] == a.publication_id
+
+
+def test_full_rebuild_restores_only_dirty_digest_after_legacy_write(tmp_path):
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental, snapshot_incremental
+    from orchestrator.persistence import EventDraft
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, b, _ = setup(store, tmp_path)
+        payload = store.read_stream('artifact', a.digest)[-1].payload
+        conn = store._connection
+        conn.execute('BEGIN')  # Unknown ambient writer cannot incrementally finalize.
+        store.append('artifact', a.digest, 2, [EventDraft('ArtifactPublished', dict(payload, publication_id='legacy-new'))], 'legacy-new')
+        conn.commit()
+        assert marker(conn, a.digest) == 1
+        with store._cancellation_proof_write():
+            rebuild_incremental(store, a.digest, budget())
+            assert marker(conn, a.digest) == 0
+            assert snapshot_incremental(store, a.digest, 'legacy-new', budget()).payload['publication_id'] == 'legacy-new'
+            assert snapshot_incremental(store, b.digest, b.publication_id, budget()).payload['publication_id'] == b.publication_id
+
+
+@pytest.mark.parametrize('damage', ['unknown', 'tail', 'hash', 'budget', 'missing_marker'])
+def test_rebuild_failure_keeps_prior_marker_and_index(tmp_path, damage):
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    from orchestrator.persistence import EventDraft
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, b, _ = setup(store, tmp_path)
+        conn = store._connection
+        if damage == 'unknown':
+            store.append('artifact', a.digest, 2, [EventDraft('UnknownEvent', {})], 'unknown-rebuild')
+        elif damage == 'tail':
+            conn.execute("""INSERT INTO events SELECT 'tail-for-rebuild', stream_type, stream_id, 999,
+                event_type, schema_version, occurred_at, payload_json, payload_hash, 'tail-for-rebuild',
+                run_id, node_id, attempt_id, fencing_generation, correlation_id, causation_id
+                FROM events WHERE stream_type='artifact' AND stream_id=? AND stream_version=1""", (a.digest,))
+        elif damage == 'hash':
+            ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name='events_immutable_update'").fetchone()[0]
+            conn.execute('DROP TRIGGER events_immutable_update')
+            conn.execute("UPDATE events SET payload_hash='bad' WHERE stream_type='artifact' AND stream_id=? AND stream_version=1", (a.digest,))
+            conn.execute(ddl)
+        elif damage == 'missing_marker':
+            conn.execute('DELETE FROM artifact_dirty_marker WHERE digest=?', (a.digest,))
+        else:
+            conn.execute('UPDATE artifact_dirty_marker SET dirty=1 WHERE digest=?', (a.digest,))
+        before = [tuple(r) for r in conn.execute('SELECT * FROM artifact_incremental_publication WHERE digest=? ORDER BY publication_id', (a.digest,))]
+        checkpoint = tuple(conn.execute('SELECT * FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone())
+        before_marker = conn.execute('SELECT dirty FROM artifact_dirty_marker WHERE digest=?', (a.digest,)).fetchone()
+        with store._cancellation_proof_write():
+            with pytest.raises(CancellationHeld):
+                rebuild_incremental(store, a.digest, CancellationBudget(10, 4096, 1024, 3, 3) if damage == 'budget' else budget())
+        assert [tuple(r) for r in conn.execute('SELECT * FROM artifact_incremental_publication WHERE digest=? ORDER BY publication_id', (a.digest,))] == before
+        assert tuple(conn.execute('SELECT * FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone()) == checkpoint
+        assert conn.execute('SELECT dirty FROM artifact_dirty_marker WHERE digest=?', (a.digest,)).fetchone() == before_marker
+        assert diagnostic(store, b).payload['publication_id'] == b.publication_id
+
+
+def test_rebuild_failed_index_insert_rolls_back_inside_outer_owned_transaction(tmp_path):
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        conn.execute('UPDATE artifact_dirty_marker SET dirty=1 WHERE digest=?', (a.digest,))
+        old_checkpoint = tuple(conn.execute('SELECT * FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone())
+        old_index = [tuple(r) for r in conn.execute('SELECT * FROM artifact_incremental_publication WHERE digest=?', (a.digest,))]
+        def deny(action, arg1, arg2, db_name, source):
+            if action == sqlite3.SQLITE_INSERT and arg1 == 'artifact_incremental_publication':
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        with store._cancellation_proof_write():
+            conn.execute('CREATE TABLE outer_work (value INTEGER)')
+            conn.execute('INSERT INTO outer_work VALUES (7)')
+            conn.set_authorizer(deny)
+            try:
+                with pytest.raises(sqlite3.DatabaseError):
+                    rebuild_incremental(store, a.digest, budget())
+            finally:
+                conn.set_authorizer(None)
+        assert conn.execute('SELECT value FROM outer_work').fetchone()[0] == 7
+        assert marker(conn, a.digest) == 1
+        assert tuple(conn.execute('SELECT * FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone()) == old_checkpoint
+        assert [tuple(r) for r in conn.execute('SELECT * FROM artifact_incremental_publication WHERE digest=?', (a.digest,))] == old_index
+
+
+def test_rebuild_outer_savepoint_rollback_restores_dirty_and_old_index(tmp_path):
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        conn.execute('UPDATE artifact_dirty_marker SET dirty=1 WHERE digest=?', (a.digest,))
+        with store._cancellation_proof_write():
+            conn.execute('SAVEPOINT outer_rebuild')
+            rebuild_incremental(store, a.digest, budget())
+            assert marker(conn, a.digest) == 0
+            conn.execute('ROLLBACK TO outer_rebuild')
+            conn.execute('RELEASE outer_rebuild')
+            assert marker(conn, a.digest) == 1
+
+
+def test_rebuild_rejects_unopted_database_without_creating_objects(tmp_path):
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a = ArtifactStore(tmp_path / 'artifacts', event_store=store).publish_bytes(b'a', source={'run_id':'a'}, readable_scope=('a',))
+        with store._cancellation_proof_write():
+            initialize_incremental(store, a.digest, budget())
+            with pytest.raises(CancellationHeld):
+                rebuild_incremental(store, a.digest, budget())
+        assert store._connection.execute("SELECT 1 FROM sqlite_master WHERE name LIKE 'artifact_dirty_%'").fetchone() is None
+
+
+@pytest.mark.parametrize('committed', [False, True])
+def test_rebuild_sigkill_before_or_after_commit_is_atomic(tmp_path, committed):
+    import os
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    db = tmp_path / 'rebuild-kill.db'
+    with SQLiteEventStore(db) as store:
+        a, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        conn.execute('UPDATE artifact_dirty_marker SET dirty=1 WHERE digest=?', (a.digest,))
+        checkpoint = tuple(conn.execute('SELECT * FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone())
+        index = [tuple(r) for r in conn.execute('SELECT * FROM artifact_incremental_publication WHERE digest=?', (a.digest,))]
+        script = """import sys
+from orchestrator.persistence import SQLiteEventStore
+from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+from orchestrator.lifecycle.cancel_completion import CancellationBudget
+s=SQLiteEventStore(sys.argv[1])
+with s._cancellation_proof_write():
+    rebuild_incremental(s, sys.argv[2], CancellationBudget(4000, 4*1024*1024, 65536, 300, 100))
+    if sys.argv[3]=='0': print('ready',flush=True); input()
+if sys.argv[3]=='1': print('ready',flush=True); input()
+"""
+        env = dict(os.environ, PYTHONPATH=os.path.abspath('src'))
+        proc = subprocess.Popen([sys.executable, '-u', '-c', script, str(db), a.digest, str(int(committed))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        try:
+            assert proc.stdout.readline().strip() == 'ready'
+            proc.kill()
+            proc.communicate(timeout=10)
+            assert marker(conn, a.digest) == (0 if committed else 1)
+            assert tuple(conn.execute('SELECT * FROM artifact_incremental_checkpoint WHERE digest=?', (a.digest,)).fetchone()) == checkpoint
+            assert [tuple(r) for r in conn.execute('SELECT * FROM artifact_incremental_publication WHERE digest=?', (a.digest,))] == index
+            if committed:
+                assert diagnostic(store, a).payload['publication_id'] == a.publication_id
+            else:
+                with pytest.raises(CancellationHeld):
+                    diagnostic(store, a)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=10)
+
+
+def test_old_process_cannot_write_during_rebuild_transaction(tmp_path):
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    db = tmp_path / 'rebuild-race.db'
+    with SQLiteEventStore(db) as store:
+        a, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        conn.execute('UPDATE artifact_dirty_marker SET dirty=1 WHERE digest=?', (a.digest,))
+        script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1],timeout=10); print('attempting',flush=True); c.execute('BEGIN IMMEDIATE'); c.execute('UPDATE artifact_incremental_publication SET version=version WHERE digest=?',(sys.argv[2],)); c.commit(); print('committed',flush=True)"
+        proc = None
+        try:
+            with store._cancellation_proof_write():
+                rebuild_incremental(store, a.digest, budget())
+                proc = subprocess.Popen([sys.executable, '-u', '-c', script, str(db), a.digest], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                assert proc.stdout.readline().strip() == 'attempting'
+                with pytest.raises(subprocess.TimeoutExpired):
+                    proc.wait(timeout=0.3)
+                assert marker(conn, a.digest) == 0
+            output, errors = proc.communicate(timeout=10)
+            assert proc.returncode == 0, errors
+            assert 'committed' in output
+            assert marker(conn, a.digest) == 1
+            with pytest.raises(CancellationHeld):
+                diagnostic(store, a)
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=10)
+
+
+@pytest.mark.parametrize('damage', ['missing_event', 'unknown_schema', 'malformed_business', 'duplicate_publication'])
+def test_rebuild_rejects_semantically_corrupt_or_incomplete_history(tmp_path, damage):
+    import hashlib
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    from orchestrator.lifecycle.cancel_completion import CancellationHeld
+    from orchestrator.persistence import EventDraft
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, _, _ = setup(store, tmp_path)
+        conn = store._connection
+        if damage == 'duplicate_publication':
+            payload = store.read_stream('artifact', a.digest)[-1].payload
+            store.append('artifact', a.digest, 2, [EventDraft('ArtifactPublished', payload)], 'duplicate-pub')
+        else:
+            trigger = 'events_immutable_delete' if damage == 'missing_event' else 'events_immutable_update'
+            ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (trigger,)).fetchone()[0]
+            conn.execute(f'DROP TRIGGER {trigger}')
+            if damage == 'missing_event':
+                conn.execute("DELETE FROM events WHERE stream_type='artifact' AND stream_id=? AND stream_version=1", (a.digest,))
+            elif damage == 'unknown_schema':
+                conn.execute("UPDATE events SET schema_version=2 WHERE stream_type='artifact' AND stream_id=? AND stream_version=1", (a.digest,))
+            else:
+                value = '{}'
+                conn.execute("UPDATE events SET payload_json=?, payload_hash=? WHERE stream_type='artifact' AND stream_id=? AND stream_version=1", (value, hashlib.sha256(value.encode()).hexdigest(), a.digest))
+            conn.execute(ddl)
+        assert marker(conn, a.digest) == 1
+        with store._cancellation_proof_write():
+            with pytest.raises(CancellationHeld):
+                rebuild_incremental(store, a.digest, budget())
+        assert marker(conn, a.digest) == 1
+
+
+def test_rebuild_replaces_corrupt_index_with_exact_historical_publications(tmp_path):
+    from orchestrator.artifacts.incremental_checkpoint import rebuild_incremental
+    with SQLiteEventStore(tmp_path / 'events.db') as store:
+        a, b, _ = setup(store, tmp_path)
+        conn = store._connection
+        conn.execute('DELETE FROM artifact_incremental_publication WHERE digest=?', (a.digest,))
+        conn.execute('INSERT INTO artifact_incremental_publication VALUES (?, ?, ?, ?)', (a.digest, 'orphan', 'fake', 999))
+        with store._cancellation_proof_write():
+            rebuild_incremental(store, a.digest, budget())
+        rows = [tuple(r) for r in conn.execute('SELECT publication_id,event_id,version FROM artifact_incremental_publication WHERE digest=?', (a.digest,))]
+        published = store.read_stream('artifact', a.digest)[-1]
+        assert rows == [(a.publication_id, published.event_id, published.stream_version)]
+        assert diagnostic(store, a).payload['publication_id'] == a.publication_id
+        assert diagnostic(store, b).payload['publication_id'] == b.publication_id
