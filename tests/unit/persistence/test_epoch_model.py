@@ -367,3 +367,164 @@ def test_path_replacement_after_anchor_cannot_select_new_inode(private_dir, monk
     with pytest.raises(ValueError):
         simulation._read_trace(private_dir, trace)
     assert replaced
+
+
+@pytest.mark.parametrize(('guard', 'database', 'expected_reason'), [
+    (None, None, 'no_receipts'),
+    (record('guard_prepare'), None, 'database_receipt_missing'),
+    (None, record('db_prepared'), 'guard_receipt_missing'),
+    (record('guard_prepare'), record('db_prepared'), 'prepared_before_activation'),
+    (record('guard_active'), record('db_prepared'), 'matching_prior_receipts'),
+    (record('guard_active', generation=2), record('db_prepared'), 'receipt_mismatch'),
+    (record('guard_active'), record('db_prepared', epoch='other'), 'receipt_mismatch'),
+    (record('guard_active', extra='unexpected'), record('db_prepared'), 'malformed_receipt'),
+    (record('guard_active'), record('db_prepared', generation=True), 'malformed_receipt'),
+])
+def test_each_guard_db_commit_cut_recovers_uncertain(guard, database, expected_reason):
+    from orchestrator.persistence._epoch_model import ModelState, assess_recovery, recover_model
+    result = assess_recovery(guard, database)
+    assert result.state is ModelState.UNCERTAIN
+    assert result.reason == expected_reason
+    assert result.restart_requires_new_epoch is True
+    assert recover_model(guard, database) is ModelState.UNCERTAIN
+
+
+@pytest.mark.parametrize(('rows', 'reason'), [
+    ([record('guard_prepare'), record('db_commit_unknown')], 'commit_unknown'),
+    ([record('guard_prepare'), record('db_prepared'), record('db_commit_unknown')], 'commit_unknown'),
+    ([*records(), record('operation_begin'), record('db_commit_unknown')], 'commit_unknown'),
+    ([*records(), record('operation_begin'), record('guard_lost')], 'guard_lost'),
+    ([*records(), record('guard_lost')], 'guard_lost'),
+    ([*records(), record('operation_begin')], 'operation_incomplete'),
+    ([record('guard_prepare'), record('guard_lost')], 'guard_lost'),
+    ([record('admission_denied')], 'admission_denied'),
+    ([record('guard_prepare'), record('db_prepared'), record('restart')], 'prepared_before_activation'),
+    ([*records(), record('restart')], 'matching_prior_receipts'),
+])
+def test_cli_reports_modeled_failures_without_authority(private_dir, rows, reason):
+    proc = cli(private_dir, write_trace(private_dir, rows))
+    report = json.loads(proc.stdout)
+    assert proc.returncode != 0
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == reason
+    assert report['simulation_only'] is True and report['non_authoritative'] is True
+    assert 'fixture-instance' not in proc.stdout and 'fixture-epoch' not in proc.stdout
+    assert 'eligible' not in proc.stdout.lower()
+
+
+def test_cli_reports_a_completed_simulated_operation(private_dir):
+    proc = cli(private_dir, write_trace(private_dir, [*records(), record('operation_begin'),
+                                                      record('operation_commit')]))
+    report = json.loads(proc.stdout)
+    assert proc.returncode == 0
+    assert report['state'] == 'ACTIVE_SIMULATED'
+    assert report['reason'] == 'ok'
+    assert report['simulation_only'] and report['non_authoritative']
+
+
+@pytest.mark.parametrize('rows', [
+    [record('guard_prepare'), record('db_prepared'), record('db_prepared'), record('guard_active')],
+    [record('guard_prepare'), record('guard_active'), record('db_prepared')],
+    [*records(), record('operation_commit')],
+    [*records(), record('operation_begin'), record('operation_begin')],
+    [*records(), record('operation_begin'), record('operation_commit', generation=2)],
+    [*records(), record('operation_begin'), record('guard_lost', epoch='other')],
+    [record('guard_prepare'), record('db_commit_unknown', generation=True)],
+])
+def test_duplicate_reordered_or_wrong_generation_remain_uncertain(private_dir, rows):
+    report = json.loads(cli(private_dir, write_trace(private_dir, rows)).stdout)
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == 'invalid_trace'
+
+
+def test_two_competing_establishers_do_not_both_become_simulated_active():
+    import threading
+    from orchestrator.persistence._epoch_model import EpochModel, ModelState
+
+    class FixtureGuard:
+        """An in-memory test fixture; it grants no real process access."""
+        def __init__(self):
+            self.barrier = threading.Barrier(2)
+            self.lock = threading.Lock()
+            self.claimed = False
+
+        def claim(self):
+            self.barrier.wait(timeout=5)
+            with self.lock:
+                if self.claimed:
+                    return False
+                self.claimed = True
+                return True
+
+    guard = FixtureGuard()
+    outcomes = []
+    errors = []
+
+    def contender():
+        try:
+            model = EpochModel()
+            if guard.claim():
+                model.start(record('guard_prepare'))
+                model.mark_db_prepared(record('db_prepared'))
+                outcomes.append(model.activate_simulated(record('guard_active')))
+            else:
+                outcomes.append(model.admission_denied(record('admission_denied')))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=contender) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=6)
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    assert outcomes.count(ModelState.ACTIVE_SIMULATED) == 1
+    assert outcomes.count(ModelState.UNCERTAIN) == 1
+
+
+def test_thrown_simulated_commit_cannot_activate():
+    from orchestrator.persistence._epoch_model import EpochModel, ModelState
+
+    def broken_commit():
+        raise OSError('private fixture details')
+
+    model = EpochModel()
+    model.start(record('guard_prepare'))
+    try:
+        broken_commit()
+    except OSError:
+        state = model.db_commit_exception(record('db_commit_exception'))
+    assert state is ModelState.UNCERTAIN
+    assert model.reason == 'commit_exception'
+    assert model.mark_db_prepared(record('db_prepared')) is ModelState.UNCERTAIN
+    assert model.activate_simulated(record('guard_active')) is ModelState.UNCERTAIN
+
+
+def test_cli_reports_simulated_commit_exception_redacted(private_dir):
+    rows = [record('guard_prepare'), record('db_commit_exception'), *records()[1:]]
+    proc = cli(private_dir, write_trace(private_dir, rows))
+    report = json.loads(proc.stdout)
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == 'commit_exception'
+    assert 'private fixture' not in proc.stdout + proc.stderr
+
+
+def test_guard_loss_during_operation_cannot_be_undone_by_late_commit():
+    from orchestrator.persistence._epoch_model import EpochModel, ModelState
+    model = EpochModel()
+    model.start(record('guard_prepare'))
+    model.mark_db_prepared(record('db_prepared'))
+    model.activate_simulated(record('guard_active'))
+    model.operation_begin(record('operation_begin'))
+    assert model.guard_lost(record('guard_lost')) is ModelState.UNCERTAIN
+    assert model.operation_commit(record('operation_commit')) is ModelState.UNCERTAIN
+    assert model.reason == 'guard_lost'
+
+
+def test_restart_during_inflight_operation_is_uncertain(private_dir):
+    rows = [*records(), record('operation_begin'), record('restart')]
+    report = json.loads(cli(private_dir, write_trace(private_dir, rows)).stdout)
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == 'operation_incomplete'
+    assert report['simulation_only'] and report['non_authoritative']

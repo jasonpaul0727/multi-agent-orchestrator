@@ -146,17 +146,26 @@ def _replay(raw):
             if type(record) is not dict:
                 raise ValueError('invalid record')
             kind = record.get('kind')
-            if kind == 'guard_prepare':
-                state = model.start(record)
-            elif kind == 'db_prepared':
-                state = model.mark_db_prepared(record)
-            elif kind == 'guard_active':
-                state = model.activate_simulated(record)
-            else:
-                state = ModelState.UNCERTAIN
+            handlers = {
+                'guard_prepare': model.start,
+                'db_prepared': model.mark_db_prepared,
+                'guard_active': model.activate_simulated,
+                'admission_denied': model.admission_denied,
+                'operation_begin': model.operation_begin,
+                'operation_commit': model.operation_commit,
+                'db_commit_unknown': model.db_commit_unknown,
+                'db_commit_exception': model.db_commit_exception,
+                'guard_lost': model.guard_lost,
+                'restart': model.restart,
+            }
+            if type(kind) is not str or kind not in handlers:
+                return SimulationReport(True, True, 'UNCERTAIN', tuple(transitions), 'invalid_trace')
+            state = handlers[kind](record)
             transitions.append(state.value)
             if state is ModelState.UNCERTAIN:
-                return SimulationReport(True, True, state.value, tuple(transitions), 'invalid_trace')
+                return SimulationReport(True, True, state.value, tuple(transitions), model.reason)
+        if model.operation_in_flight:
+            return SimulationReport(True, True, 'UNCERTAIN', tuple(transitions), 'operation_incomplete')
         if model.state is not ModelState.ACTIVE_SIMULATED:
             return SimulationReport(True, True, 'UNCERTAIN', tuple(transitions), 'incomplete_trace')
         return SimulationReport(True, True, model.state.value, tuple(transitions), 'ok')
@@ -224,7 +233,12 @@ def simulate_journal(directory, path):
                 or data['state'] not in ('ACTIVE_SIMULATED', 'UNCERTAIN')
                 or type(data['transitions']) is not list or len(data['transitions']) > _MAX_RECORDS
                 or any(item not in ('ESTABLISHING', 'ACTIVE_SIMULATED', 'UNCERTAIN') for item in data['transitions'])
-                or data['reason'] not in ('ok', 'input_unavailable', 'invalid_trace', 'incomplete_trace', 'helper_cleanup_unconfirmed')
+                or data['reason'] not in ('ok', 'input_unavailable', 'invalid_trace', 'incomplete_trace',
+                                          'helper_cleanup_unconfirmed', 'commit_unknown', 'commit_exception', 'guard_lost',
+                                          'operation_incomplete', 'admission_denied', 'no_receipts',
+                                          'database_receipt_missing', 'guard_receipt_missing',
+                                          'prepared_before_activation', 'matching_prior_receipts',
+                                          'receipt_mismatch', 'malformed_receipt')
                 or (data['reason'] == 'ok') != (data['state'] == 'ACTIVE_SIMULATED')):
             raise ValueError('invalid response')
         return SimulationReport(True, True, data['state'], tuple(data['transitions']), data['reason'])
