@@ -295,9 +295,10 @@ def test_private_connection_closes_on_failure(tmp_path, monkeypatch):
     (True, 0, 'budget_exhausted'),
     (True, 1, 'budget_exhausted'),
     (False, 1, 'budget_exhausted'),
-    (False, 2, None),
-    (True, 3, 'budget_exhausted'),
-    (True, 4, None),
+    (False, 2, 'budget_exhausted'),
+    (False, 3, None),
+    (True, 4, 'budget_exhausted'),
+    (True, 5, None),
 ])
 def test_schema_budget_never_fetches_beyond_row_limit(tmp_path, monkeypatch, has_table, maximum, expected):
     module = observation_module()
@@ -708,3 +709,160 @@ c.close()
                     child.kill()
                     child.communicate(timeout=5)
                     raise
+
+
+@pytest.mark.parametrize('kind', ['table_name', 'table_ddl', 'index_name', 'trigger_name',
+                                  'index_ddl', 'trigger_ddl', 'temp_table_name',
+                                  'temp_index_name', 'temp_index_ddl',
+                                  'temp_trigger_name', 'temp_trigger_ddl'])
+def test_metadata_name_and_sql_preflight_before_python_materialization(tmp_path, monkeypatch, kind):
+    module = observation_module()
+    db = tmp_path / 'metadata.db'
+    huge = 'z' * 70000
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE fixture (x)')
+        if kind == 'table_name':
+            conn.execute(f'CREATE TABLE "{huge}" (x)')
+        elif kind == 'table_ddl':
+            conn.execute(f'CREATE TABLE oversized_table ("{huge}" TEXT)')
+        elif kind == 'index_name':
+            conn.execute(f'CREATE INDEX "{huge}" ON fixture(x)')
+        elif kind == 'trigger_name':
+            conn.execute(f'CREATE TRIGGER "{huge}" AFTER INSERT ON fixture BEGIN SELECT 1; END')
+        elif kind == 'index_ddl':
+            conn.execute(f"CREATE INDEX short_idx ON fixture(x) WHERE x='{huge}'")
+        elif kind == 'trigger_ddl':
+            conn.execute(f"CREATE TRIGGER short_tr AFTER INSERT ON fixture BEGIN SELECT '{huge}'; END")
+    real_connect = sqlite3.connect
+    fetched = []
+
+    class GuardCursor(sqlite3.Cursor):
+        def fetchone(self):
+            row = super().fetchone()
+            if row is not None:
+                fetched.append(1)
+                assert not any(isinstance(value, str) and len(value.encode()) > 65536 for value in row), (
+                    'oversized metadata reached Python')
+            return row
+
+    class GuardConnection(sqlite3.Connection):
+        def cursor(self, *args, **kwargs):
+            return super().cursor(factory=GuardCursor)
+
+    def connect(*args, **kwargs):
+        conn = real_connect(*args, factory=GuardConnection, **kwargs)
+        if kind == 'temp_table_name':
+            conn.execute(f'CREATE TEMP TABLE "{huge}" (x)')
+        elif kind in ('temp_index_name', 'temp_index_ddl'):
+            conn.execute('CREATE TEMP TABLE local_table (x)')
+            if kind == 'temp_index_name':
+                conn.execute(f'CREATE INDEX "{huge}" ON local_table(x)')
+            else:
+                conn.execute(f"CREATE INDEX local_idx ON local_table(x) WHERE x='{huge}'")
+        elif kind == 'temp_trigger_name':
+            conn.execute(f'CREATE TEMP TRIGGER "{huge}" AFTER INSERT ON main.fixture BEGIN SELECT 1; END')
+        elif kind == 'temp_trigger_ddl':
+            conn.execute(f"CREATE TEMP TRIGGER local_tr AFTER INSERT ON main.fixture BEGIN SELECT '{huge}'; END")
+        return conn
+
+    monkeypatch.setattr(module.sqlite3, 'connect', connect)
+    result = module._observe_in_process(db, module.ObservationLimits())
+    assert fetched, 'custom cursor did not observe actual SQLite fetches'
+    assert 'budget_exhausted' in result.reasons
+    assert result.objects == ()
+    assert str(tmp_path) not in repr(result)
+
+
+def test_foreign_temp_triggers_are_not_inspectable_by_one_shot_runner(tmp_path, monkeypatch):
+    module = observation_module()
+    db = tmp_path / 'private.db'
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE fixture (x)')
+    foreign = sqlite3.connect(db)
+    try:
+        foreign.execute('CREATE TEMP TRIGGER foreign_trigger AFTER INSERT ON main.fixture BEGIN SELECT 1; END')
+        normal = module._run_schema_observation(db, module.ObservationLimits())
+        assert normal.temp_objects == ()
+        assert 'cross_connection_temp_unobservable' in normal.reasons
+        proc = subprocess.run([sys.executable, '-m', 'orchestrator.diagnostics.sqlite_continuity', '--database', str(db)],
+                              capture_output=True, text=True, timeout=10)
+        assert proc.returncode == 0, proc.stderr
+        assert 'current_connection_temp_triggers_none' in json.loads(proc.stdout)['findings']
+        assert 'foreign_trigger' not in proc.stdout + proc.stderr
+        real_connect = sqlite3.connect
+
+        def connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            conn.execute('CREATE TEMP TRIGGER current_trigger AFTER INSERT ON main.fixture BEGIN SELECT 1; END')
+            return conn
+
+        monkeypatch.setattr(module.sqlite3, 'connect', connect)
+        current = module._observe_in_process(db, module.ObservationLimits())
+        assert [(o.kind, o.name) for o in current.temp_objects] == [('trigger', 'current_trigger')]
+        assert not any(o.name == 'foreign_trigger' for o in current.temp_objects)
+        assert 'cross_connection_temp_unobservable' in current.reasons
+        from orchestrator.diagnostics import sqlite_continuity as cli
+        monkeypatch.setattr(cli, '_run_schema_observation', lambda *_: current)
+        report = cli.diagnose_store(db, module.ObservationLimits())
+        assert 'current_connection_temp_triggers_present' in report.findings
+        assert 'foreign_trigger' not in repr(report) and 'current_trigger' not in repr(report)
+        assert foreign.execute("SELECT count(*) FROM sqlite_temp_master WHERE name='foreign_trigger'").fetchone()[0] == 1
+    finally:
+        foreign.close()
+
+
+
+def test_private_temp_unique_and_nonunique_indexes_are_observed(tmp_path, monkeypatch):
+    module = observation_module()
+    db = tmp_path / 'private.db'
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE fixture (x)')
+    real_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.execute('CREATE TEMP TABLE local_table (x, y)')
+        conn.execute('CREATE UNIQUE INDEX local_unique ON local_table(x)')
+        conn.execute('CREATE INDEX local_nonunique ON local_table(y)')
+        return conn
+
+    monkeypatch.setattr(module.sqlite3, 'connect', connect)
+    result = module._observe_in_process(db, module.ObservationLimits())
+    indexes = {item.name: item.unique for item in result.temp_objects if item.kind == 'index'}
+    assert indexes == {'local_unique': True, 'local_nonunique': False}
+    assert 'cross_connection_temp_unobservable' in result.reasons
+
+
+def test_malformed_isolated_schema_returns_redacted_failure(tmp_path):
+    db = tmp_path / 'secret-path.db'
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE fixture (x)')
+        conn.execute('CREATE TRIGGER my_trigger AFTER INSERT ON fixture BEGIN SELECT 1; END')
+        conn.execute('PRAGMA writable_schema=ON')
+        conn.execute("UPDATE sqlite_master SET sql=NULL WHERE name='my_trigger'")
+        conn.execute('PRAGMA writable_schema=OFF')
+    proc = subprocess.run([sys.executable, '-m', 'orchestrator.diagnostics.sqlite_continuity',
+                           '--database', str(db)], capture_output=True, text=True, timeout=10)
+    assert proc.returncode != 0
+    report = json.loads(proc.stdout)
+    assert set(report['findings']) & {'database_unavailable', 'metadata_invalid', 'budget_exhausted'}
+    assert report['non_authoritative'] is True
+    assert str(tmp_path) not in proc.stdout + proc.stderr
+    assert 'my_trigger' not in proc.stdout + proc.stderr
+
+
+
+def test_cli_oversized_schema_is_bounded_and_redacted(tmp_path):
+    db = tmp_path / 'private-db-name.db'
+    name = 'private_index_' + 'z' * 70000
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE fixture (x)')
+        conn.execute(f'CREATE INDEX "{name}" ON fixture(x)')
+    before = db.read_bytes()
+    proc = subprocess.run([sys.executable, '-m', 'orchestrator.diagnostics.sqlite_continuity',
+                           '--database', str(db)], capture_output=True, text=True, timeout=10)
+    assert proc.returncode != 0
+    assert 'budget_exhausted' in json.loads(proc.stdout)['findings']
+    assert len(proc.stdout) < 4096 and not proc.stderr
+    assert str(tmp_path) not in proc.stdout and 'private_index_' not in proc.stdout
+    assert db.read_bytes() == before

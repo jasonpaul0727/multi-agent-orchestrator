@@ -34,6 +34,8 @@ def diagnose_store(path: Path, limits: ObservationLimits) -> DiagnosticReport:
             suffix = 'present' if ('trigger', trigger) in names else 'missing'
             findings.append(f'{trigger}_name_{suffix}')
         findings.append(f'recursive_triggers_{observation.recursive_triggers}')
+        temp_status = 'present' if any(item.kind == 'trigger' for item in observation.temp_objects) else 'none'
+        findings.append(f'current_connection_temp_triggers_{temp_status}')
     unknowns = ['storage_not_observed', 'writer_inventory_unproven',
                 'cross_connection_temp_unobservable']
     if ObservationReason.SIDECAR_CHANGED in observation.reasons:

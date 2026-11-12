@@ -101,9 +101,12 @@ class SchemaObservation:
     objects: tuple[SchemaObject, ...]
     recursive_triggers: int | None
     reasons: tuple[ObservationReason, ...]
+    temp_objects: tuple[SchemaObject, ...] = ()
 
 
-def _read_schema(conn, budget):
+def _read_schema(conn, budget, schema):
+    if schema not in ('main', 'temp'):
+        raise ValueError('invalid schema')
     # Fixed-size metadata comes back before any untrusted text. The query has
     # a remaining+1 sentinel, but we never fetch it without row budget. If no
     # row remains for EOF detection, fail conservatively instead.
@@ -113,7 +116,7 @@ def _read_schema(conn, budget):
     cursor.execute(
         'SELECT rowid, typeof(type), length(CAST(type AS BLOB)), '
         'typeof(name), length(CAST(name AS BLOB)), '
-        'typeof(sql), length(CAST(sql AS BLOB)) FROM main.sqlite_master LIMIT ?',
+        f'typeof(sql), length(CAST(sql AS BLOB)) FROM {schema}.sqlite_master LIMIT ?',
         (budget.max_rows - budget.rows + 1,),
     )
     metadata = []
@@ -135,7 +138,7 @@ def _read_schema(conn, budget):
     objects = []
     for rowid, kl, nl, sl, sql_type in metadata:
         budget._charge(queries=1, rows=1, bytes_=kl + nl + sl + 128)
-        cursor.execute('SELECT type, name, sql FROM main.sqlite_master WHERE rowid=?', (rowid,))
+        cursor.execute(f'SELECT type, name, sql FROM {schema}.sqlite_master WHERE rowid=?', (rowid,))
         row = cursor.fetchone()
         if row is None:
             raise _InvalidMetadata
@@ -153,21 +156,27 @@ def _read_schema(conn, budget):
             # Index names are already preflighted; this scalar result is bounded.
             budget._charge(queries=1, rows=1, bytes_=128 + nl)
             cursor.execute(
-                'SELECT il."unique" FROM main.sqlite_master AS m, '
-                'pragma_index_list(m.tbl_name) AS il WHERE m.rowid=? AND il.name=? LIMIT 1',
-                (rowid, name),
+                f'SELECT il."unique" FROM {schema}.sqlite_master AS m, '
+                'pragma_index_list(m.tbl_name, ?) AS il WHERE m.rowid=? AND il.name=? LIMIT 1',
+                (schema, rowid, name),
             )
             found = cursor.fetchone()
             if found is None or found[0] not in (0, 1):
                 raise _InvalidMetadata
             unique = bool(found[0])
         objects.append(SchemaObject(kind, name, identity, unique))
+    return tuple(objects)
+
+
+def _read_recursive(conn, budget):
     budget._charge(queries=1, rows=1, bytes_=128)
+    cursor = conn.cursor()
+    cursor.row_factory = None
     cursor.execute('PRAGMA recursive_triggers')
     recursive = cursor.fetchone()
     if recursive is None or recursive[0] not in (0, 1):
         raise _InvalidMetadata
-    return tuple(objects), recursive[0]
+    return recursive[0]
 
 
 _HELPER_TIMEOUT_SECONDS = 2.0
@@ -218,8 +227,10 @@ def _observe_in_process(path: Path, limits: ObservationLimits) -> SchemaObservat
         uri = 'file:' + quote(str(path), safe='/') + '?mode=ro'
         conn = sqlite3.connect(uri, uri=True, timeout=1.0, isolation_level=None)
         conn.execute('BEGIN')
-        objects, recursive = _read_schema(conn, budget)
-        result = SchemaObservation(objects, recursive, _UNKNOWNS)
+        objects = _read_schema(conn, budget, 'main')
+        temp_objects = _read_schema(conn, budget, 'temp')
+        recursive = _read_recursive(conn, budget)
+        result = SchemaObservation(objects, recursive, _UNKNOWNS, temp_objects)
     except _Exhausted:
         result = _failed(ObservationReason.BUDGET_EXHAUSTED)
     except _InvalidMetadata:
@@ -244,7 +255,8 @@ def _observe_in_process(path: Path, limits: ObservationLimits) -> SchemaObservat
                 result = _failed()
             elif after[2:] != before[2:]:
                 result = SchemaObservation(result.objects, result.recursive_triggers,
-                                           result.reasons + (ObservationReason.SIDECAR_CHANGED,))
+                                           result.reasons + (ObservationReason.SIDECAR_CHANGED,),
+                                           result.temp_objects)
         except (OSError, ValueError, UnicodeError):
             result = _failed()
     return result
@@ -307,9 +319,10 @@ def _run_schema_observation(path: Path, limits: ObservationLimits) -> SchemaObse
         return _failed()
     try:
         data = json.loads(output)
-        if set(data) != {'objects', 'recursive_triggers', 'reasons'}:
+        if set(data) != {'objects', 'recursive_triggers', 'reasons', 'temp_objects'}:
             raise ValueError
         objects = tuple(SchemaObject(**item) for item in data['objects'])
+        temp_objects = tuple(SchemaObject(**item) for item in data['temp_objects'])
         reasons = tuple(ObservationReason(reason) for reason in data['reasons'])
         valid_extras = {ObservationReason.BUDGET_EXHAUSTED,
                         ObservationReason.DATABASE_UNAVAILABLE,
@@ -320,7 +333,7 @@ def _run_schema_observation(path: Path, limits: ObservationLimits) -> SchemaObse
                 or not set(reasons[2:]) <= valid_extras
                 or len(set(reasons[2:]) - {ObservationReason.SIDECAR_CHANGED}) > 1):
             raise ValueError
-        return SchemaObservation(objects, data['recursive_triggers'], reasons)
+        return SchemaObservation(objects, data['recursive_triggers'], reasons, temp_objects)
     except (ValueError, TypeError, KeyError, UnicodeError, json.JSONDecodeError):
         return _failed()
 
