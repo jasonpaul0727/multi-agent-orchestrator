@@ -72,7 +72,7 @@ def main(argv=None):
         from orchestrator.diagnostics._simulation_trace import simulate_journal
         report = simulate_journal(args.simulation_directory, args.simulate_journal)
         print(json.dumps(asdict(report), sort_keys=True, separators=(',', ':')))
-        return int(report.reason != 'ok')
+        return int(report.reason not in ('ok', 'retired'))
     if args.simulation_directory is not None:
         parser.error('--simulation-directory requires simulation mode')
     report = diagnose_store(args.database, ObservationLimits())

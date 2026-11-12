@@ -528,3 +528,167 @@ def test_restart_during_inflight_operation_is_uncertain(private_dir):
     assert report['state'] == 'UNCERTAIN'
     assert report['reason'] == 'operation_incomplete'
     assert report['simulation_only'] and report['non_authoritative']
+
+
+def digest_record(kind, digit, **updates):
+    return record(kind, digest=digit * 64, **updates)
+
+
+def clean_retirement():
+    return [*records(), record('retire'), record('guard_release')]
+
+
+def next_epoch(kind, **updates):
+    values = {'epoch': 'new-fixture-epoch', 'generation': 2}
+    values.update(updates)
+    return record(kind, **values)
+
+
+def test_retirement_precedes_guard_release(private_dir):
+    proc = cli(private_dir, write_trace(private_dir, clean_retirement()))
+    report = json.loads(proc.stdout)
+    assert proc.returncode == 0
+    assert report['state'] == 'RETIRED'
+    assert report['reason'] == 'retired'
+    assert report['simulation_only'] and report['non_authoritative']
+    assert report['transitions'][-2:] == ['RETIRED', 'RETIRED']
+
+
+@pytest.mark.parametrize(('tail', 'reason'), [
+    ([record('guard_release')], 'invalid_trace'),
+    ([record('operation_begin'), record('retire')], 'operation_incomplete'),
+    ([record('retire')], 'guard_release_missing'),
+    ([record('retire'), record('guard_release_failed')], 'guard_release_failed'),
+    ([record('retire'), record('guard_release_unknown')], 'guard_release_unknown'),
+    ([record('retire'), record('process_killed')], 'process_killed'),
+    ([record('process_killed')], 'process_killed'),
+    ([record('retire'), record('restart')], 'guard_release_missing'),
+    ([record('retire'), record('guard_release'), record('guard_release')], 'invalid_trace'),
+    ([record('retire', generation=2)], 'invalid_trace'),
+])
+def test_retirement_failures_are_uncertain(private_dir, tail, reason):
+    proc = cli(private_dir, write_trace(private_dir, [*records(), *tail]))
+    report = json.loads(proc.stdout)
+    assert proc.returncode != 0
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == reason
+    assert report['simulation_only'] and report['non_authoritative']
+    assert str(private_dir) not in proc.stdout + proc.stderr
+
+
+def test_clean_restart_uses_new_epoch_and_requires_fresh_digest_rebuild(private_dir):
+    old = [*records(), digest_record('digest_register', 'a'), digest_record('digest_register', 'b'),
+           digest_record('digest_rebuild_simulated', 'a'), digest_record('digest_rebuild_simulated', 'b'),
+           record('retire'), record('guard_release'), record('restart')]
+    new = [next_epoch('guard_prepare'), next_epoch('db_prepared'), next_epoch('guard_active')]
+    proc = cli(private_dir, write_trace(private_dir, old + new))
+    report = json.loads(proc.stdout)
+    assert proc.returncode == 0
+    assert report['state'] == 'ACTIVE_SIMULATED'
+    assert report['registered_digests_rebuild_required_simulated'] == 2
+    assert report['registered_digests_rebuilt_simulated'] == 0
+    assert report['simulation_only'] and report['non_authoritative']
+    assert 'a' * 64 not in proc.stdout and 'b' * 64 not in proc.stdout
+    assert 'eligible' not in proc.stdout.lower()
+
+    rebuilt = [next_epoch('digest_rebuild_simulated', digest='a' * 64)]
+    report = json.loads(cli(private_dir, write_trace(private_dir, old + new + rebuilt)).stdout)
+    assert report['registered_digests_rebuild_required_simulated'] == 1
+    assert report['registered_digests_rebuilt_simulated'] == 1
+
+
+@pytest.mark.parametrize('new_start', [
+    record('guard_prepare'),
+    next_epoch('guard_prepare', generation=1),
+    next_epoch('guard_prepare', instance='another-instance'),
+    record('guard_prepare', generation=2),
+    next_epoch('guard_prepare', version=True),
+])
+def test_old_epoch_token_or_wrong_restart_identity_cannot_be_reused(private_dir, new_start):
+    report = json.loads(cli(private_dir, write_trace(private_dir,
+        [*clean_retirement(), record('restart'), new_start])).stdout)
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == 'invalid_trace'
+
+
+def test_restart_requires_new_epoch_before_digest_rebuild(private_dir):
+    old = [*records(), digest_record('digest_register', 'a'), digest_record('digest_rebuild_simulated', 'a'),
+           record('retire'), record('guard_release'), record('restart')]
+    report = json.loads(cli(private_dir, write_trace(private_dir, old)).stdout)
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == 'new_epoch_required'
+    old_token = digest_record('digest_rebuild_simulated', 'a')
+    report = json.loads(cli(private_dir, write_trace(private_dir, old + [old_token])).stdout)
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == 'invalid_trace'
+
+
+def test_epoch_and_generation_aba_after_two_restarts_is_rejected(private_dir):
+    first_restart = [*clean_retirement(), record('restart'), next_epoch('guard_prepare'),
+                     next_epoch('db_prepared'), next_epoch('guard_active'), next_epoch('retire'),
+                     next_epoch('guard_release'), next_epoch('restart')]
+    old_epoch = record('guard_prepare', generation=3)
+    report = json.loads(cli(private_dir, write_trace(private_dir, first_restart + [old_epoch])).stdout)
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == 'invalid_trace'
+
+
+@pytest.mark.parametrize('extra', [
+    digest_record('digest_register', 'A'),
+    record('digest_register', digest='a' * 63),
+    record('digest_register', digest=1),
+    record('digest_register', digest='a' * 64, extra='unexpected'),
+    digest_record('digest_rebuild_simulated', 'a'),
+    record('retire', digest='a' * 64),
+])
+def test_invalid_digest_or_extra_fields_are_rejected_without_disclosure(private_dir, extra):
+    proc = cli(private_dir, write_trace(private_dir, [*records(), extra]))
+    report = json.loads(proc.stdout)
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == 'invalid_trace'
+    assert report['registered_digests_rebuild_required_simulated'] is None
+    assert report['registered_digests_rebuilt_simulated'] is None
+    assert 'a' * 64 not in proc.stdout + proc.stderr
+
+
+def test_duplicate_digest_registration_or_rebuild_cannot_restore_clean(private_dir):
+    registered = [*records(), digest_record('digest_register', 'a')]
+    for tail in ([digest_record('digest_register', 'a')],
+                 [digest_record('digest_rebuild_simulated', 'a'),
+                  digest_record('digest_rebuild_simulated', 'a')]):
+        report = json.loads(cli(private_dir, write_trace(private_dir, registered + tail)).stdout)
+        assert report['state'] == 'UNCERTAIN'
+        assert report['reason'] == 'invalid_trace'
+        assert report['registered_digests_rebuilt_simulated'] is None
+
+
+def test_late_release_and_restart_cannot_clear_unknown_release():
+    from orchestrator.persistence._epoch_model import EpochModel, ModelState
+    model = EpochModel()
+    model.start(record('guard_prepare'))
+    model.mark_db_prepared(record('db_prepared'))
+    model.activate_simulated(record('guard_active'))
+    model.retire(record('retire'))
+    assert model.guard_release_unknown(record('guard_release_unknown')) is ModelState.UNCERTAIN
+    assert model.guard_release(record('guard_release')) is ModelState.UNCERTAIN
+    assert model.restart(record('restart')) is ModelState.UNCERTAIN
+    assert model.reason == 'guard_release_unknown'
+
+
+def test_simulated_digest_inventory_is_bounded():
+    from orchestrator.persistence._epoch_model import EpochModel, ModelState
+    model = EpochModel()
+    model.start(record('guard_prepare'))
+    model.mark_db_prepared(record('db_prepared'))
+    model.activate_simulated(record('guard_active'))
+    for number in range(128):
+        assert model.digest_register(record('digest_register', digest=f'{number:064x}')) is ModelState.ACTIVE_SIMULATED
+    assert model.digest_register(record('digest_register', digest=f'{128:064x}')) is ModelState.UNCERTAIN
+    assert model.reason == 'invalid_trace'
+
+
+def test_restart_after_release_rejects_another_instance(private_dir):
+    rows = [*clean_retirement(), record('restart', instance='another-instance')]
+    report = json.loads(cli(private_dir, write_trace(private_dir, rows)).stdout)
+    assert report['state'] == 'UNCERTAIN'
+    assert report['reason'] == 'invalid_trace'

@@ -33,6 +33,8 @@ class SimulationReport:
     state: str
     transitions: tuple[str, ...]
     reason: str
+    registered_digests_rebuild_required_simulated: int | None = None
+    registered_digests_rebuilt_simulated: int | None = None
 
 
 def _failure(reason='input_unavailable'):
@@ -156,6 +158,13 @@ def _replay(raw):
                 'db_commit_unknown': model.db_commit_unknown,
                 'db_commit_exception': model.db_commit_exception,
                 'guard_lost': model.guard_lost,
+                'retire': model.retire,
+                'guard_release': model.guard_release,
+                'guard_release_failed': model.guard_release_failed,
+                'guard_release_unknown': model.guard_release_unknown,
+                'process_killed': model.process_killed,
+                'digest_register': model.digest_register,
+                'digest_rebuild_simulated': model.digest_rebuild_simulated,
                 'restart': model.restart,
             }
             if type(kind) is not str or kind not in handlers:
@@ -166,9 +175,17 @@ def _replay(raw):
                 return SimulationReport(True, True, state.value, tuple(transitions), model.reason)
         if model.operation_in_flight:
             return SimulationReport(True, True, 'UNCERTAIN', tuple(transitions), 'operation_incomplete')
+        if model.state is ModelState.RETIRED:
+            if not model.guard_released:
+                return SimulationReport(True, True, 'UNCERTAIN', tuple(transitions), 'guard_release_missing')
+            return SimulationReport(True, True, model.state.value, tuple(transitions), 'retired',
+                                    model.registered_digests_rebuild_required_simulated, model.registered_digests_rebuilt_simulated)
+        if model.restart_pending:
+            return SimulationReport(True, True, 'UNCERTAIN', tuple(transitions), 'new_epoch_required')
         if model.state is not ModelState.ACTIVE_SIMULATED:
             return SimulationReport(True, True, 'UNCERTAIN', tuple(transitions), 'incomplete_trace')
-        return SimulationReport(True, True, model.state.value, tuple(transitions), 'ok')
+        return SimulationReport(True, True, model.state.value, tuple(transitions), 'ok',
+                                model.registered_digests_rebuild_required_simulated, model.registered_digests_rebuilt_simulated)
     except (ValueError, TypeError, UnicodeError, RecursionError):
         return _failure('invalid_trace')
 
@@ -228,20 +245,32 @@ def simulate_journal(directory, path):
         return _failure()
     try:
         data = json.loads(output, object_pairs_hook=_unique_object)
-        if (type(data) is not dict or set(data) != {'simulation_only', 'non_authoritative', 'state', 'transitions', 'reason'}
+        if (type(data) is not dict or set(data) != {'simulation_only', 'non_authoritative', 'state', 'transitions', 'reason',
+                                                       'registered_digests_rebuild_required_simulated', 'registered_digests_rebuilt_simulated'}
                 or data['simulation_only'] is not True or data['non_authoritative'] is not True
-                or data['state'] not in ('ACTIVE_SIMULATED', 'UNCERTAIN')
+                or data['state'] not in ('ACTIVE_SIMULATED', 'RETIRED', 'UNCERTAIN')
                 or type(data['transitions']) is not list or len(data['transitions']) > _MAX_RECORDS
-                or any(item not in ('ESTABLISHING', 'ACTIVE_SIMULATED', 'UNCERTAIN') for item in data['transitions'])
-                or data['reason'] not in ('ok', 'input_unavailable', 'invalid_trace', 'incomplete_trace',
+                or any(item not in ('ABSENT', 'ESTABLISHING', 'ACTIVE_SIMULATED', 'RETIRED', 'UNCERTAIN')
+                       for item in data['transitions'])
+                or data['reason'] not in ('ok', 'retired', 'input_unavailable', 'invalid_trace', 'incomplete_trace',
                                           'helper_cleanup_unconfirmed', 'commit_unknown', 'commit_exception', 'guard_lost',
                                           'operation_incomplete', 'admission_denied', 'no_receipts',
                                           'database_receipt_missing', 'guard_receipt_missing',
                                           'prepared_before_activation', 'matching_prior_receipts',
-                                          'receipt_mismatch', 'malformed_receipt')
-                or (data['reason'] == 'ok') != (data['state'] == 'ACTIVE_SIMULATED')):
+                                          'receipt_mismatch', 'malformed_receipt', 'guard_release_missing',
+                                          'guard_release_failed', 'guard_release_unknown', 'process_killed',
+                                          'new_epoch_required')
+                or (data['reason'] == 'ok') != (data['state'] == 'ACTIVE_SIMULATED')
+                or (data['reason'] == 'retired') != (data['state'] == 'RETIRED')):
             raise ValueError('invalid response')
-        return SimulationReport(True, True, data['state'], tuple(data['transitions']), data['reason'])
+        counts = (data['registered_digests_rebuild_required_simulated'], data['registered_digests_rebuilt_simulated'])
+        if data['state'] == 'UNCERTAIN':
+            if counts != (None, None):
+                raise ValueError('invalid response')
+        elif (any(type(value) is not int or not 0 <= value <= _MAX_RECORDS for value in counts)
+              or sum(counts) > _MAX_RECORDS):
+            raise ValueError('invalid response')
+        return SimulationReport(True, True, data['state'], tuple(data['transitions']), data['reason'], *counts)
     except (ValueError, TypeError, KeyError, UnicodeError):
         return _failure()
 
