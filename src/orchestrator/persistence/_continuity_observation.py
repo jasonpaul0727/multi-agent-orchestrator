@@ -105,6 +105,101 @@ class SchemaObservation:
     sidecar_samples: tuple = field(default=(), repr=False)
 
 
+@dataclass(frozen=True)
+class SchemaComparison:
+    """Redacted comparison of two samples, never a continuity proof."""
+    status: str
+    unknowns: tuple[str, ...] = ('schema_continuity_unproven',)
+
+
+def _comparable_schema(observation):
+    # Refuse partial/error samples and malformed caller-created values. The
+    # bounds mirror the largest supported one-shot observation limits.
+    if (type(observation) is not SchemaObservation
+            or type(observation.reasons) is not tuple
+            or len(observation.reasons) != 2
+            or any(type(reason) is not ObservationReason for reason in observation.reasons)
+            or observation.reasons != _UNKNOWNS
+            or type(observation.recursive_triggers) is not int
+            or observation.recursive_triggers not in (0, 1)
+            or type(observation.objects) is not tuple
+            or type(observation.temp_objects) is not tuple
+            or len(observation.objects) + len(observation.temp_objects) > 4096
+            or type(observation.sidecar_samples) is not tuple
+            or len(observation.sidecar_samples) != 2):
+        return None
+    for pair in observation.sidecar_samples:
+        if type(pair) is not tuple or len(pair) != 2:
+            return None
+        for item in pair:
+            if item is not None and (type(item) is not tuple or len(item) != 4
+                    or any(type(value) is not int or not 0 <= value < 2**64 for value in item)
+                    or not stat.S_ISREG(item[2])):
+                return None
+    if observation.sidecar_samples[0] != observation.sidecar_samples[1]:
+        return None
+
+    total = 0
+    canonical = []
+    for objects in (observation.objects, observation.temp_objects):
+        group = []
+        names = set()
+        for item in objects:
+            if (type(item) is not SchemaObject or type(item.kind) is not str
+                    or item.kind not in ('table', 'index', 'view', 'trigger')
+                    or type(item.name) is not str or len(item.name) > 65536
+                    or type(item.ddl_identity) is not str or len(item.ddl_identity) != 64
+                    or any(c not in '0123456789abcdef' for c in item.ddl_identity)
+                    or (type(item.unique) is not bool if item.kind == 'index' else item.unique is not None)):
+                return None
+            try:
+                name_size = len(item.name.encode('utf-8'))
+            except UnicodeError:
+                return None
+            if name_size > 65536:
+                return None
+            if (item.kind, item.name) in names:
+                return None
+            names.add((item.kind, item.name))
+            total += name_size + 128
+            if total > 8 * 1024 * 1024:
+                return None
+            group.append((item.kind, item.name, item.ddl_identity, item.unique))
+        canonical.append(tuple(sorted(group, key=lambda item: (item[0], item[1], item[2]))))
+    return (tuple(canonical), observation.recursive_triggers)
+
+
+def _compare_schema_observations(path, limits, between, *, begin_sample=None, end_sample=None):
+    # The optional private hooks bracket our own runner so the CLI can pair
+    # storage samples with these same observations. They cannot supply samples.
+    def sample():
+        allowed = begin_sample() if begin_sample is not None else True
+        observation = _run_schema_observation(path, limits) if allowed else None
+        if end_sample is not None and not end_sample(observation):
+            return None
+        return observation
+
+    before = sample()
+    between()
+    after = sample()
+    left = _comparable_schema(before)
+    right = _comparable_schema(after)
+    if left is None or right is None:
+        return SchemaComparison('unavailable')
+    return SchemaComparison('match' if left == right else 'different')
+
+
+def compare_schema_observations(path: Path, limits: ObservationLimits) -> SchemaComparison:
+    """Collect two private path observations; equality does not prove continuity.
+
+    Supplied observations are not accepted: their completeness or provenance
+    cannot be established. Python isolation is not a security boundary.
+    """
+    if not isinstance(path, (str, Path)) or not isinstance(limits, ObservationLimits):
+        return SchemaComparison('unavailable')
+    return _compare_schema_observations(path, limits, lambda: None)
+
+
 def _read_schema(conn, budget, schema):
     if schema not in ('main', 'temp'):
         raise ValueError('invalid schema')

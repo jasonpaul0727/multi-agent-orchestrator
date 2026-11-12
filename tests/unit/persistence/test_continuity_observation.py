@@ -866,3 +866,118 @@ def test_cli_oversized_schema_is_bounded_and_redacted(tmp_path):
     assert len(proc.stdout) < 4096 and not proc.stderr
     assert str(tmp_path) not in proc.stdout and 'private_index_' not in proc.stdout
     assert db.read_bytes() == before
+
+
+def test_schema_comparison_reports_change_and_incomplete_samples(tmp_path):
+    from dataclasses import asdict
+    from orchestrator.persistence._continuity_observation import (
+        ObservationLimits, _compare_schema_observations, compare_schema_observations)
+    db = tmp_path / 'private-name.db'
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE secret_name (secret_column)')
+    def change():
+        with sqlite3.connect(db) as conn:
+            conn.execute('CREATE INDEX hidden_index ON secret_name(secret_column)')
+    result = _compare_schema_observations(db, ObservationLimits(), change)
+    assert result.status == 'different'
+    assert compare_schema_observations(db, ObservationLimits(max_rows=0)).status == 'unavailable'
+    encoded = json.dumps(asdict(result))
+    assert 'schema_continuity_unproven' in encoded
+    assert 'hidden_index' not in encoded and 'secret_name' not in encoded and str(db) not in encoded
+
+
+def test_cli_comparison_includes_redacted_schema_result(tmp_path):
+    db = tmp_path / 'sensitive-name.db'
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE secret_table (x)')
+    proc = subprocess.run([sys.executable, '-m', 'orchestrator.diagnostics.sqlite_continuity',
+                           '--database', str(db), '--compare-delay-ms', '0'],
+                          capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert report['schema_comparison']['status'] == 'match'
+    assert 'schema_continuity_unproven' in report['schema_comparison']['unknowns']
+    assert 'secret_table' not in proc.stdout and str(db) not in proc.stdout
+
+
+def test_schema_comparison_rejects_malformed_and_partial_samples(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from orchestrator.persistence import _continuity_observation as module
+    db = tmp_path / 'fixture.db'
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE first (x)')
+        conn.execute('CREATE TABLE second (x)')
+    sample = module._run_schema_observation(db, module.ObservationLimits())
+    assert len(sample.objects) >= 2
+    reordered = replace(sample, objects=sample.objects[::-1])
+    responses = iter((sample, reordered))
+    monkeypatch.setattr(module, '_run_schema_observation', lambda *_: next(responses))
+    assert module.compare_schema_observations(db, module.ObservationLimits()).status == 'match'
+
+    broken = (
+        replace(sample, reasons=sample.reasons + (module.ObservationReason.BUDGET_EXHAUSTED,)),
+        replace(sample, sidecar_samples=()),
+        replace(sample, sidecar_samples=((None, None), (None, (1, 2, 3, 4)))),
+        replace(sample, sidecar_samples=(([0] * 5000, None), ([0] * 5000, None))),
+        replace(sample, reasons=('writer_inventory_unproven', 'cross_connection_temp_unobservable')),
+        replace(sample, objects=sample.objects + sample.objects),
+        replace(sample, objects=(module.SchemaObject('table', 'sample', 'not-a-hash', None),)),
+        replace(sample, recursive_triggers=None),
+    )
+    for bad in broken:
+        monkeypatch.setattr(module, '_run_schema_observation', lambda *_, value=bad: value)
+        result = module.compare_schema_observations(db, module.ObservationLimits())
+        assert result.status == 'unavailable'
+        assert 'schema_continuity_unproven' in result.unknowns
+
+
+def test_cli_schema_comparison_unavailable_on_missing_database(tmp_path):
+    db = tmp_path / 'missing-private.db'
+    proc = subprocess.run([sys.executable, '-m', 'orchestrator.diagnostics.sqlite_continuity',
+                           '--database', str(db), '--compare-delay-ms', '0'],
+                          capture_output=True, text=True, timeout=10)
+    assert proc.returncode != 0
+    report = json.loads(proc.stdout)
+    assert report['schema_comparison']['status'] == 'unavailable'
+    assert 'schema_continuity_unproven' in report['schema_comparison']['unknowns']
+    assert str(db) not in proc.stdout + proc.stderr
+
+
+
+def test_path_comparison_rejects_external_observations_and_handles_empty_schema(tmp_path):
+    from dataclasses import replace
+    from orchestrator.persistence._continuity_observation import (
+        ObservationLimits, _run_schema_observation, compare_schema_observations)
+    empty_db = tmp_path / 'empty.db'
+    sqlite3.connect(empty_db).close()
+    observed = _run_schema_observation(empty_db, ObservationLimits())
+    assert compare_schema_observations(empty_db, ObservationLimits()).status == 'match'
+    assert compare_schema_observations(observed, observed).status == 'unavailable'
+
+    populated_db = tmp_path / 'populated.db'
+    with sqlite3.connect(populated_db) as conn:
+        conn.execute('CREATE TABLE first (x)')
+        conn.execute('CREATE TABLE second (x)')
+    populated = _run_schema_observation(populated_db, ObservationLimits())
+    truncated = replace(populated, objects=())
+    assert compare_schema_observations(truncated, truncated).status == 'unavailable'
+
+
+def test_cli_reports_real_schema_change_between_samples(tmp_path):
+    db = tmp_path / 'fixture.db'
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE before_object (x)')
+    script = """import sqlite3,sys
+from orchestrator.diagnostics import sqlite_continuity as cli
+def change(_):
+    with sqlite3.connect(sys.argv[1]) as c:
+        c.execute('CREATE TABLE after_object (x)')
+cli._comparison_delay = change
+sys.exit(cli.main(['--database', sys.argv[1], '--compare-delay-ms', '0']))
+"""
+    proc = subprocess.run([sys.executable, '-c', script, str(db)], capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0, proc.stderr
+    output = json.loads(proc.stdout)
+    assert output['schema_comparison']['status'] == 'different'
+    assert 'schema_continuity_unproven' in output['schema_comparison']['unknowns']
+    assert 'before_object' not in proc.stdout and 'after_object' not in proc.stdout and str(db) not in proc.stdout

@@ -289,7 +289,7 @@ def test_comparison_cleanup_uncertainty_stays_failure(tmp_path, monkeypatch, cap
     db = tmp_path / 'private.db'
     with sqlite3.connect(db) as conn:
         conn.execute('CREATE TABLE fixture (x)')
-    original = cli._run_schema_observation
+    original = schema._run_schema_observation
     calls = 0
     def fail_second(path, limits):
         nonlocal calls
@@ -297,11 +297,13 @@ def test_comparison_cleanup_uncertainty_stays_failure(tmp_path, monkeypatch, cap
         if calls == 2:
             return schema._failed(schema.ObservationReason.HELPER_CLEANUP_UNCONFIRMED)
         return original(path, limits)
-    monkeypatch.setattr(cli, '_run_schema_observation', fail_second)
+    monkeypatch.setattr(schema, '_run_schema_observation', fail_second)
     assert cli.main(['--database', str(db), '--compare-delay-ms', '0']) != 0
     captured = capsys.readouterr()
     result = json.loads(captured.out)
     assert 'helper_cleanup_unconfirmed' in result['after']['findings']
+    assert calls == 2
+    assert result['schema_comparison']['status'] == 'unavailable'
     assert {'parent_unknown', 'db_unknown', 'wal_unknown', 'shm_unknown'} == set(result['comparison']['findings'])
     assert str(tmp_path) not in captured.out + captured.err
 

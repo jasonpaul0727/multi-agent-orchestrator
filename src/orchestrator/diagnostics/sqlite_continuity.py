@@ -17,7 +17,7 @@ from orchestrator.isolation._sqlite_storage_observation import (
     StorageObservation, compare_storage_observations, observe_storage,
 )
 from orchestrator.persistence._continuity_observation import (
-    ObservationLimits, ObservationReason, _run_schema_observation,
+    ObservationLimits, ObservationReason, _run_schema_observation, _compare_schema_observations,
 )
 
 
@@ -28,9 +28,7 @@ class DiagnosticReport:
     unknowns: tuple[str, ...]
 
 
-def _diagnose_sample(path: Path, limits: ObservationLimits):
-    storage = observe_storage(path)
-    observation = _run_schema_observation(path, limits) if storage.preflight_ok else None
+def _diagnose_observation(path: Path, storage: StorageObservation, observation):
     errors = {ObservationReason.BUDGET_EXHAUSTED, ObservationReason.DATABASE_UNAVAILABLE,
               ObservationReason.METADATA_INVALID, ObservationReason.HELPER_CLEANUP_UNCONFIRMED}
     failures = (tuple(reason.value for reason in observation.reasons if reason in errors)
@@ -55,7 +53,7 @@ def _diagnose_sample(path: Path, limits: ObservationLimits):
     unknowns = ['sqlite_handle_binding_unproven', 'storage_continuity_unproven',
                 'physical_storage_durability_unproven',
                 'pathname_samples_may_race', 'sqlite_read_only_may_create_sidecars',
-                'writer_inventory_unproven',
+                'writer_inventory_unproven', 'schema_continuity_unproven',
                 'cross_connection_temp_unobservable', 'independent_connection_state_unobserved']
     samples = []
     if storage.preflight_ok:
@@ -71,6 +69,12 @@ def _diagnose_sample(path: Path, limits: ObservationLimits):
                               unknowns=tuple(unknowns))
     sample = storage if not failures else StorageObservation((), False, 'database_unavailable')
     return report, sample
+
+
+def _diagnose_sample(path: Path, limits: ObservationLimits):
+    storage = observe_storage(path)
+    observation = _run_schema_observation(path, limits) if storage.preflight_ok else None
+    return _diagnose_observation(path, storage, observation)
 
 
 def diagnose_store(path: Path, limits: ObservationLimits) -> DiagnosticReport:
@@ -118,12 +122,23 @@ def main(argv=None):
         report = diagnose_store(args.database, ObservationLimits())
         print(json.dumps(asdict(report), sort_keys=True, separators=(',', ':')))
         return int(bool(failures.intersection(report.findings)))
-    first, first_sample = _diagnose_sample(args.database, ObservationLimits())
-    _comparison_delay(args.compare_delay_ms / 1000)
-    second, second_sample = _diagnose_sample(args.database, ObservationLimits())
+    limits = ObservationLimits()
+    samples = []
+    storage = None
+    def begin_sample():
+        nonlocal storage
+        storage = observe_storage(args.database)
+        return storage.preflight_ok
+    def end_sample(observation):
+        samples.append(_diagnose_observation(args.database, storage, observation))
+        return samples[-1][1].preflight_ok
+    schema_comparison = _compare_schema_observations(
+        args.database, limits, lambda: _comparison_delay(args.compare_delay_ms / 1000),
+        begin_sample=begin_sample, end_sample=end_sample)
+    (first, first_sample), (second, second_sample) = samples
     comparison = compare_storage_observations(first_sample, second_sample)
     output = {'non_authoritative': True, 'before': asdict(first), 'after': asdict(second),
-              'comparison': asdict(comparison)}
+              'comparison': asdict(comparison), 'schema_comparison': asdict(schema_comparison)}
     print(json.dumps(output, sort_keys=True, separators=(',', ':')))
     return int(bool(failures.intersection(first.findings) or failures.intersection(second.findings)))
 

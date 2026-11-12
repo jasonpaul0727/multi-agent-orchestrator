@@ -8,6 +8,8 @@ import sqlite3
 import subprocess
 import sys
 
+import pytest
+
 from orchestrator.artifacts import ArtifactStore
 from orchestrator.persistence import EventDraft, SQLiteEventStore
 from orchestrator.persistence.snapshots import SnapshotStore
@@ -216,3 +218,164 @@ def test_table_name_findings_do_not_validate_schema_or_infer_entry(tmp_path):
     assert 'writer_inventory_unproven' in report['unknowns']
     assert 'independent_connection_state_unobserved' in report['unknowns']
     assert 'eligible' not in json.dumps(report)
+
+
+@pytest.fixture
+def diagnostic_case(tmp_path, monkeypatch):
+    from orchestrator.runtime.verifier_process import IsolatedVerifierProcess
+    from tests.unit.runtime.test_general_worker_acceptance import terminal_case, direct
+    from tests.unit.runtime.test_verifier_process import _ChildLauncher
+
+    original = IsolatedVerifierProcess.__init__
+    def offline(self, **kwargs):
+        kwargs.setdefault('launcher', _ChildLauncher())
+        original(self, **kwargs)
+    monkeypatch.setattr(IsolatedVerifierProcess, '__init__', offline)
+    case = terminal_case(tmp_path)
+    try:
+        direct(case)
+        accepted = case.journal.read(case.operation.identity)
+        yield case, accepted
+    finally:
+        case.store.close()
+
+
+def _diagnostic_publications(case, accepted):
+    from orchestrator.artifacts.incremental_checkpoint import initialize_incremental, rebuild_incremental
+    from orchestrator.artifacts.transactional_dirty import install_dirty_tracking, register_digest
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget
+
+    def budget():
+        return CancellationBudget(4000, 4 * 1024 * 1024, 65536, 300, 100)
+
+    digest = accepted.capture.response_artifact.digest
+    target = next(ArtifactStore._record_from_event(event, digest)
+                  for event in case.store.read_stream('artifact', digest)
+                  if event.event_type == 'ArtifactPublished'
+                  and event.payload['publication_id'] == accepted.acceptance.response_publication_id)
+    raw = case.artifacts._path_for_digest(digest).read_bytes()
+    other = case.artifacts.publish_bytes(raw, source={'run_id': 'other'}, readable_scope=('other',))
+    assert target.digest == other.digest and target.publication_id != other.publication_id
+    with case.store._cancellation_proof_write():
+        initialize_incremental(case.store, digest, budget())
+        install_dirty_tracking(case.store)
+        register_digest(case.store, digest)
+        rebuild_incremental(case.store, digest, budget())
+    return target, other, budget
+
+
+def _validate_complete_v1(case, accepted):
+    from orchestrator.lifecycle.cancel_completion import CancellationBudget, validate_v1_links, validate_v1_terminal
+    with case.store._cancellation_proof_write():
+        budget = CancellationBudget(2000, 4_000_000, 200_000, 100, 20)
+        assert validate_v1_links(case.store, accepted, budget) is None
+        release = validate_v1_terminal(case.store, accepted, budget)
+        assert release.event_type == 'AttemptSlotReleased'
+        assert ('artifact', accepted.capture.response_artifact.digest) in budget._cache
+        return release
+
+
+def _assert_redacted_schema_comparison(comparison, db, target):
+    from dataclasses import asdict
+    encoded = json.dumps(asdict(comparison))
+    assert comparison.status == 'match'
+    assert 'schema_continuity_unproven' in comparison.unknowns
+    assert str(db) not in encoded and target.digest not in encoded
+    assert 'artifact_dirty_' not in encoded and 'eligible' not in encoded
+
+
+def test_drop_mutate_restore_identical_schema_cannot_establish_continuity(tmp_path, diagnostic_case):
+    from orchestrator.artifacts.incremental_checkpoint import snapshot_incremental
+    from orchestrator.persistence._continuity_observation import ObservationLimits, _compare_schema_observations
+
+    db = tmp_path / 'events.db'
+    case, accepted = diagnostic_case
+    store = case.store
+    target, other, budget = _diagnostic_publications(case, accepted)
+    baseline = _validate_complete_v1(case, accepted)
+    trigger_name = 'artifact_dirty_artifact_incremental_publication_update'
+    old_rowid = store._connection.execute(
+        "SELECT rowid FROM sqlite_master WHERE type='trigger' AND name=?", (trigger_name,)).fetchone()[0]
+    assert store._connection.execute('SELECT count(*) FROM sqlite_master').fetchone()[0] > 1
+    script = """import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+c.execute("BEGIN IMMEDIATE")
+name="artifact_dirty_artifact_incremental_publication_update"
+ddl=c.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()[0]
+c.execute("DROP TRIGGER " + name)
+assert c.execute("UPDATE artifact_incremental_publication SET version=version+100 WHERE digest=? AND publication_id=?", (sys.argv[2],sys.argv[3])).rowcount == 1
+c.execute(ddl)
+c.commit()
+c.close()
+"""
+    def attack():
+        child = subprocess.run([sys.executable, '-c', script, str(db), target.digest, other.publication_id],
+                               capture_output=True, text=True, timeout=10)
+        assert child.returncode == 0, child.stderr
+    comparison = _compare_schema_observations(db, ObservationLimits(), attack)
+    new_rowid = store._connection.execute(
+        "SELECT rowid FROM sqlite_master WHERE type='trigger' AND name=?", (trigger_name,)).fetchone()[0]
+    assert new_rowid != old_rowid
+    assert store._connection.execute('SELECT dirty FROM artifact_dirty_marker WHERE digest=?',
+                                     (target.digest,)).fetchone()[0] == 0
+    assert store._connection.execute('SELECT version FROM artifact_incremental_publication WHERE digest=? AND publication_id=?',
+                                     (target.digest, other.publication_id)).fetchone()[0] > 100
+    _assert_redacted_schema_comparison(comparison, db, target)
+    assert 'schema_continuity_unproven' in cli_report(db)['unknowns']
+    with store._cancellation_proof_write():
+        event = snapshot_incremental(store, target.digest, target.publication_id, budget())
+    assert event.payload['publication_id'] == target.publication_id
+    assert _validate_complete_v1(case, accepted) == baseline
+
+
+def test_future_legacy_process_temp_reset_is_invisible_and_report_is_non_authoritative(tmp_path, diagnostic_case):
+    import select
+    from orchestrator.artifacts.incremental_checkpoint import snapshot_incremental
+    from orchestrator.persistence._continuity_observation import ObservationLimits, _compare_schema_observations
+
+    db = tmp_path / 'events.db'
+    case, accepted = diagnostic_case
+    store = case.store
+    target, other, budget = _diagnostic_publications(case, accepted)
+    baseline = _validate_complete_v1(case, accepted)
+    script = """import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+c.execute("CREATE TEMP TRIGGER reset_marker AFTER UPDATE ON main.artifact_incremental_publication BEGIN UPDATE artifact_dirty_marker SET dirty=0 WHERE digest=NEW.digest; END")
+assert c.execute("SELECT count(*) FROM sqlite_temp_master WHERE type='trigger' AND name='reset_marker'").fetchone()[0] == 1
+assert c.execute("UPDATE artifact_incremental_publication SET version=version+100 WHERE digest=? AND publication_id=?", (sys.argv[2],sys.argv[3])).rowcount == 1
+c.commit()
+assert c.execute("SELECT count(*) FROM sqlite_temp_master WHERE type='trigger' AND name='reset_marker'").fetchone()[0] == 1
+assert c.execute("SELECT dirty FROM artifact_dirty_marker WHERE digest=?", (sys.argv[2],)).fetchone()[0] == 0
+print('ready', flush=True)
+sys.stdin.read(1)
+c.close()
+"""
+    child = None
+    def attack():
+        nonlocal child
+        child = subprocess.Popen([sys.executable, '-u', '-c', script, str(db), target.digest, other.publication_id],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert select.select([child.stdout], [], [], 10)[0], 'child did not finish mutation'
+        assert child.stdout.readline().strip() == 'ready'
+    try:
+        comparison = _compare_schema_observations(db, ObservationLimits(), attack)
+        assert store._connection.execute('SELECT dirty FROM artifact_dirty_marker WHERE digest=?', (target.digest,)).fetchone()[0] == 0
+        assert store._connection.execute('SELECT version FROM artifact_incremental_publication WHERE digest=? AND publication_id=?', (target.digest, other.publication_id)).fetchone()[0] > 100
+        assert store._connection.execute("SELECT count(*) FROM sqlite_temp_master WHERE name='reset_marker'").fetchone()[0] == 0
+        from orchestrator.persistence._continuity_observation import _run_schema_observation
+        assert not _run_schema_observation(db, ObservationLimits()).temp_objects
+        _assert_redacted_schema_comparison(comparison, db, target)
+        assert 'schema_continuity_unproven' in cli_report(db)['unknowns']
+        with store._cancellation_proof_write():
+            event = snapshot_incremental(store, target.digest, target.publication_id, budget())
+        assert event.payload['publication_id'] == target.publication_id
+        assert _validate_complete_v1(case, accepted) == baseline
+    finally:
+        if child is not None:
+            try:
+                output, error = child.communicate(input='x', timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate(timeout=5)
+                raise
+            assert child.returncode == 0, error
