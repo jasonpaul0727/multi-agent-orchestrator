@@ -10,9 +10,12 @@ import argparse
 from dataclasses import asdict, dataclass
 import json
 import sys
+from time import sleep as _comparison_delay
 from pathlib import Path
 
-from orchestrator.isolation._sqlite_storage_observation import observe_storage
+from orchestrator.isolation._sqlite_storage_observation import (
+    StorageObservation, compare_storage_observations, observe_storage,
+)
 from orchestrator.persistence._continuity_observation import (
     ObservationLimits, ObservationReason, _run_schema_observation,
 )
@@ -25,7 +28,7 @@ class DiagnosticReport:
     unknowns: tuple[str, ...]
 
 
-def diagnose_store(path: Path, limits: ObservationLimits) -> DiagnosticReport:
+def _diagnose_sample(path: Path, limits: ObservationLimits):
     storage = observe_storage(path)
     observation = _run_schema_observation(path, limits) if storage.preflight_ok else None
     errors = {ObservationReason.BUDGET_EXHAUSTED, ObservationReason.DATABASE_UNAVAILABLE,
@@ -63,28 +66,42 @@ def diagnose_store(path: Path, limits: ObservationLimits) -> DiagnosticReport:
     if ((observation is not None and ObservationReason.SIDECAR_CHANGED in observation.reasons)
             or any(left != right for left, right in zip(samples, samples[1:]))):
         unknowns.append('sidecar_changed')
-    return DiagnosticReport(non_authoritative=True, findings=tuple(findings),
-                            unknowns=tuple(unknowns))
+    report = DiagnosticReport(non_authoritative=True, findings=tuple(findings),
+                              unknowns=tuple(unknowns))
+    sample = storage if not failures else StorageObservation((), False, 'database_unavailable')
+    return report, sample
+
+
+def diagnose_store(path: Path, limits: ObservationLimits) -> DiagnosticReport:
+    return _diagnose_sample(path, limits)[0]
 
 
 def main(argv=None):
     arguments = sys.argv[1:] if argv is None else argv
     simulation_requested = any(arg.startswith('--simulate') for arg in arguments)
+    comparison_requested = any(arg.startswith('--compare-delay-ms') for arg in arguments)
 
     class _Parser(argparse.ArgumentParser):
         def error(self, message):
             if simulation_requested:
                 message = 'invalid simulation arguments'
+            elif comparison_requested:
+                message = 'invalid comparison arguments'
             super().error(message)
 
     parser = _Parser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--database', type=Path)
     mode.add_argument('--simulate-journal', type=Path)
+    parser.add_argument('--compare-delay-ms', type=int)
     parser.add_argument('--simulation-directory', type=Path,
                         help='existing private directory containing the simulation trace')
     args = parser.parse_args(arguments)
+    if args.compare_delay_ms is not None and not 0 <= args.compare_delay_ms <= 1000:
+        parser.error('invalid comparison delay')
     if args.simulate_journal is not None:
+        if args.compare_delay_ms is not None:
+            parser.error('comparison requires database mode')
         if args.simulation_directory is None:
             parser.error('--simulation-directory is required in simulation mode')
         from orchestrator.diagnostics._simulation_trace import simulate_journal
@@ -93,10 +110,19 @@ def main(argv=None):
         return int(report.reason not in ('ok', 'retired'))
     if args.simulation_directory is not None:
         parser.error('--simulation-directory requires simulation mode')
-    report = diagnose_store(args.database, ObservationLimits())
-    print(json.dumps(asdict(report), sort_keys=True, separators=(',', ':')))
     failures = {'budget_exhausted', 'database_unavailable', 'metadata_invalid', 'helper_cleanup_unconfirmed'}
-    return int(bool(failures.intersection(report.findings)))
+    if args.compare_delay_ms is None:
+        report = diagnose_store(args.database, ObservationLimits())
+        print(json.dumps(asdict(report), sort_keys=True, separators=(',', ':')))
+        return int(bool(failures.intersection(report.findings)))
+    first, first_sample = _diagnose_sample(args.database, ObservationLimits())
+    _comparison_delay(args.compare_delay_ms / 1000)
+    second, second_sample = _diagnose_sample(args.database, ObservationLimits())
+    comparison = compare_storage_observations(first_sample, second_sample)
+    output = {'non_authoritative': True, 'before': asdict(first), 'after': asdict(second),
+              'comparison': asdict(comparison)}
+    print(json.dumps(output, sort_keys=True, separators=(',', ':')))
+    return int(bool(failures.intersection(first.findings) or failures.intersection(second.findings)))
 
 
 if __name__ == '__main__':

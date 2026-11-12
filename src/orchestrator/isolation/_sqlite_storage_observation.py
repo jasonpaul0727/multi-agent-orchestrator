@@ -174,9 +174,11 @@ def observe_storage(path):
                 raise ValueError
         elif path_sample or sidecar_sample:
             raise ValueError
-        return StorageObservation(tuple(findings), data['preflight_ok'], data['reason'],
-                                  tuple(tuple(item) for item in path_sample),
-                                  tuple(None if item is None else tuple(item) for item in sidecar_sample))
+        sample = StorageObservation(tuple(findings), data['preflight_ok'], data['reason'],
+                                    tuple(tuple(item) for item in path_sample),
+                                    tuple(None if item is None else tuple(item) for item in sidecar_sample))
+        _validate_comparison_sample(sample)
+        return sample
     except (ValueError, TypeError, KeyError, UnicodeError, json.JSONDecodeError):
         return _failed()
 
@@ -196,6 +198,101 @@ def _helper_main():
     except (ValueError, TypeError, KeyError, OSError, UnicodeError):
         output = b'{"findings":[],"preflight_ok":false,"reason":"database_unavailable","path_sample":[],"sidecar_sample":[]}'
     sys.stdout.buffer.write(output)
+
+
+@dataclass(frozen=True)
+class StorageComparison:
+    findings: tuple[str, ...]
+    unknowns: tuple[str, ...]
+
+
+def _validate_comparison_sample(sample):
+    """Validate bounded private data; this never establishes storage authority."""
+    if type(sample) is not StorageObservation:
+        raise TypeError('storage observation required')
+    allowed = {role + '_' + state for role in _ROLES for state in _STATES}
+    allowed |= {role + '_link_count_gt_one' for role in _ROLES}
+    allowed |= {'path_invalid', 'parent_symlink_seen', 'parent_non_directory',
+                'parent_unavailable', 'storage_unsupported'}
+    if (type(sample.findings) is not tuple or len(sample.findings) > 6
+            or any(type(value) is not str or value not in allowed for value in sample.findings)
+            or len(set(sample.findings)) != len(sample.findings)
+            or type(sample.preflight_ok) is not bool
+            or (sample.reason is not None and type(sample.reason) is not str)
+            or type(sample.path_sample) is not tuple or type(sample.sidecar_sample) is not tuple):
+        raise ValueError('invalid storage observation')
+    if not sample.preflight_ok:
+        if (sample.reason not in ('database_unavailable', 'helper_cleanup_unconfirmed')
+                or sample.path_sample or sample.sidecar_sample):
+            raise ValueError('invalid storage observation')
+        if not sample.findings:
+            return
+        if sample.reason == 'helper_cleanup_unconfirmed':
+            raise ValueError('invalid storage observation')
+        single_failures = {'path_invalid', 'parent_symlink_seen', 'parent_non_directory',
+                           'parent_unavailable', 'storage_unsupported'}
+        if len(sample.findings) == 1 and sample.findings[0] in single_failures:
+            return
+        states = {role: [state for state in _STATES if role + '_' + state in sample.findings]
+                  for role in _ROLES}
+        if (any(len(values) != 1 for values in states.values())
+                or not any(states[role][0] in ('symlink_seen', 'nonregular', 'unavailable')
+                           or (role == 'db' and states[role][0] == 'missing') for role in _ROLES)
+                or any(role + '_link_count_gt_one' in sample.findings and states[role][0] != 'present'
+                       for role in _ROLES)
+                or set(sample.findings) & single_failures):
+            raise ValueError('invalid storage observation')
+        return
+    if sample.reason is not None or not 2 <= len(sample.path_sample) <= 65 or len(sample.sidecar_sample) != 2:
+        raise ValueError('invalid storage observation')
+    def valid_identity(item):
+        return (type(item) is tuple and len(item) == 4
+                and all(type(v) is int and 0 <= v < 2**64 for v in item))
+    if (any(not valid_identity(item) for item in sample.path_sample)
+            or any(item[2] != stat.S_IFDIR or item[3] != 0 for item in sample.path_sample[:-1])
+            or not stat.S_ISREG(sample.path_sample[-1][2]) or sample.path_sample[-1][3] < 1
+            or any(item is not None and (not valid_identity(item) or not stat.S_ISREG(item[2]) or item[3] < 1)
+                   for item in sample.sidecar_sample)):
+        raise ValueError('invalid storage observation')
+    expected = ['db_present']
+    values = (sample.path_sample[-1], *sample.sidecar_sample)
+    for role, item in zip(_ROLES, values):
+        if role != 'db':
+            expected.append(role + ('_missing' if item is None else '_present'))
+        if item is not None and item[3] > 1:
+            expected.append(role + '_link_count_gt_one')
+    if set(expected) != set(sample.findings):
+        raise ValueError('invalid storage observation')
+
+
+def compare_storage_observations(before, after):
+    """Compare two discrete pathname samples without inferring continuity."""
+    _validate_comparison_sample(before)
+    _validate_comparison_sample(after)
+    unknowns = ('between_samples_unobserved', 'sqlite_handle_binding_unproven',
+                'pathname_samples_may_race')
+    if not before.preflight_ok or not after.preflight_ok:
+        return StorageComparison(('parent_unknown',) + tuple(role + '_unknown' for role in _ROLES), unknowns)
+    first = (before.path_sample[-1], *before.sidecar_sample)
+    second = (after.path_sample[-1], *after.sidecar_sample)
+    parent_status = ('parent_sample_matches' if before.path_sample[:-1] == after.path_sample[:-1]
+                     else 'parent_identity_changed')
+    findings = [parent_status]
+    for role, left, right in zip(_ROLES, first, second):
+        if left is None and right is not None:
+            status = 'missing_to_present'
+        elif left is not None and right is None:
+            status = 'present_to_missing'
+        elif left is None:
+            status = 'sample_matches'
+        elif left[:2] != right[:2]:
+            status = 'identity_changed'
+        elif left[2:] != right[2:]:
+            status = 'metadata_changed'
+        else:
+            status = 'sample_matches'
+        findings.append(role + '_' + status)
+    return StorageComparison(tuple(findings), unknowns)
 
 
 if __name__ == '__main__' and sys.argv[1:] == ['--helper']:
