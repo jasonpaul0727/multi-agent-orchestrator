@@ -2,7 +2,8 @@
 
 SQLite mode=ro avoids database writes but may use or create WAL/SHM sidecars,
 depending on the VFS and existing sidecars. Observed sidecar changes are
-non-authoritative unknowns. This is not a storage or handle-binding proof.
+non-authoritative unknowns. Table names do not identify who opened a
+database or validate its schema. This is not a storage or handle-binding proof.
 """
 
 import argparse
@@ -30,6 +31,9 @@ def diagnose_store(path: Path, limits: ObservationLimits) -> DiagnosticReport:
     findings = list(failures)
     if not failures:
         names = {(item.kind, item.name) for item in observation.objects}
+        for table in ('events', 'stream_versions', 'snapshots'):
+            suffix = 'present' if ('table', table) in names else 'missing'
+            findings.append(f'{table}_table_name_{suffix}')
         for trigger in ('events_immutable_update', 'events_immutable_delete'):
             suffix = 'present' if ('trigger', trigger) in names else 'missing'
             findings.append(f'{trigger}_name_{suffix}')
@@ -37,7 +41,7 @@ def diagnose_store(path: Path, limits: ObservationLimits) -> DiagnosticReport:
         temp_status = 'present' if any(item.kind == 'trigger' for item in observation.temp_objects) else 'none'
         findings.append(f'current_connection_temp_triggers_{temp_status}')
     unknowns = ['storage_not_observed', 'writer_inventory_unproven',
-                'cross_connection_temp_unobservable']
+                'cross_connection_temp_unobservable', 'independent_connection_state_unobserved']
     if ObservationReason.SIDECAR_CHANGED in observation.reasons:
         unknowns.append('sidecar_changed')
     return DiagnosticReport(non_authoritative=True, findings=tuple(findings),
