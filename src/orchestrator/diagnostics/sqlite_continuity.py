@@ -53,6 +53,7 @@ def _diagnose_sample(path: Path, limits: ObservationLimits):
         temp_status = 'present' if any(item.kind == 'trigger' for item in observation.temp_objects) else 'none'
         findings.append(f'current_connection_temp_triggers_{temp_status}')
     unknowns = ['sqlite_handle_binding_unproven', 'storage_continuity_unproven',
+                'physical_storage_durability_unproven',
                 'pathname_samples_may_race', 'sqlite_read_only_may_create_sidecars',
                 'writer_inventory_unproven',
                 'cross_connection_temp_unobservable', 'independent_connection_state_unobserved']
@@ -87,6 +88,8 @@ def main(argv=None):
                 message = 'invalid simulation arguments'
             elif comparison_requested:
                 message = 'invalid comparison arguments'
+            else:
+                message = 'invalid diagnostic arguments'
             super().error(message)
 
     parser = _Parser(description=__doc__)

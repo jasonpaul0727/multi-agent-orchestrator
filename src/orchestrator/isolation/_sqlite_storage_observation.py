@@ -270,7 +270,7 @@ def compare_storage_observations(before, after):
     _validate_comparison_sample(before)
     _validate_comparison_sample(after)
     unknowns = ('between_samples_unobserved', 'sqlite_handle_binding_unproven',
-                'pathname_samples_may_race')
+                'pathname_samples_may_race', 'physical_storage_durability_unproven')
     if not before.preflight_ok or not after.preflight_ok:
         return StorageComparison(('parent_unknown',) + tuple(role + '_unknown' for role in _ROLES), unknowns)
     first = (before.path_sample[-1], *before.sidecar_sample)
