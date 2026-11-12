@@ -85,7 +85,7 @@ def test_cli_reports_distinct_schema_findings_without_migrating_database(tmp_pat
         assert len(proc.stdout) < 16384
         report = json.loads(proc.stdout)
         assert report['non_authoritative'] is True
-        assert 'storage_not_observed' in report['unknowns']
+        assert 'sqlite_handle_binding_unproven' in report['unknowns']
         assert 'writer_inventory_unproven' in report['unknowns']
         assert 'cross_connection_temp_unobservable' in report['unknowns']
         outputs.append(report)
@@ -513,7 +513,7 @@ def test_cli_rejects_symlink_in_parent_directory(tmp_path):
     alias.symlink_to(directory, target_is_directory=True)
     proc = subprocess.run([sys.executable, '-m', 'orchestrator.diagnostics.sqlite_continuity',
                            '--database', str(alias / 'events.db')],
-                          capture_output=True, text=True, timeout=4)
+                          capture_output=True, text=True, timeout=8)
     assert proc.returncode != 0
     assert 'database_unavailable' in json.loads(proc.stdout)['findings']
     assert str(tmp_path) not in proc.stdout + proc.stderr

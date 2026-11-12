@@ -12,6 +12,7 @@ import json
 import sys
 from pathlib import Path
 
+from orchestrator.isolation._sqlite_storage_observation import observe_storage
 from orchestrator.persistence._continuity_observation import (
     ObservationLimits, ObservationReason, _run_schema_observation,
 )
@@ -25,11 +26,18 @@ class DiagnosticReport:
 
 
 def diagnose_store(path: Path, limits: ObservationLimits) -> DiagnosticReport:
-    observation = _run_schema_observation(path, limits)
+    storage = observe_storage(path)
+    observation = _run_schema_observation(path, limits) if storage.preflight_ok else None
     errors = {ObservationReason.BUDGET_EXHAUSTED, ObservationReason.DATABASE_UNAVAILABLE,
               ObservationReason.METADATA_INVALID, ObservationReason.HELPER_CLEANUP_UNCONFIRMED}
-    failures = tuple(reason.value for reason in observation.reasons if reason in errors)
-    findings = list(failures)
+    failures = (tuple(reason.value for reason in observation.reasons if reason in errors)
+                if observation is not None else (storage.reason,))
+    after = None
+    if storage.preflight_ok:
+        after = observe_storage(path)
+        if not after.preflight_ok or after.path_sample != storage.path_sample:
+            failures += (after.reason or 'database_unavailable',)
+    findings = list(storage.findings) + list(failures)
     if not failures:
         names = {(item.kind, item.name) for item in observation.objects}
         for table in ('events', 'stream_versions', 'snapshots'):
@@ -41,9 +49,19 @@ def diagnose_store(path: Path, limits: ObservationLimits) -> DiagnosticReport:
         findings.append(f'recursive_triggers_{observation.recursive_triggers}')
         temp_status = 'present' if any(item.kind == 'trigger' for item in observation.temp_objects) else 'none'
         findings.append(f'current_connection_temp_triggers_{temp_status}')
-    unknowns = ['storage_not_observed', 'writer_inventory_unproven',
+    unknowns = ['sqlite_handle_binding_unproven', 'storage_continuity_unproven',
+                'pathname_samples_may_race', 'sqlite_read_only_may_create_sidecars',
+                'writer_inventory_unproven',
                 'cross_connection_temp_unobservable', 'independent_connection_state_unobserved']
-    if ObservationReason.SIDECAR_CHANGED in observation.reasons:
+    samples = []
+    if storage.preflight_ok:
+        samples.append(storage.sidecar_sample)
+    if observation is not None:
+        samples.extend(observation.sidecar_samples)
+    if after is not None and after.preflight_ok:
+        samples.append(after.sidecar_sample)
+    if ((observation is not None and ObservationReason.SIDECAR_CHANGED in observation.reasons)
+            or any(left != right for left, right in zip(samples, samples[1:]))):
         unknowns.append('sidecar_changed')
     return DiagnosticReport(non_authoritative=True, findings=tuple(findings),
                             unknowns=tuple(unknowns))

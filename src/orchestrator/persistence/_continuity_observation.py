@@ -8,7 +8,7 @@ Observed regular sidecar changes are unknowns, not evidence of damage; samples
 cannot detect intervening changes or bind the handles SQLite actually used.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 import hashlib
 import json
@@ -102,6 +102,7 @@ class SchemaObservation:
     recursive_triggers: int | None
     reasons: tuple[ObservationReason, ...]
     temp_objects: tuple[SchemaObject, ...] = ()
+    sidecar_samples: tuple = field(default=(), repr=False)
 
 
 def _read_schema(conn, budget, schema):
@@ -208,6 +209,8 @@ def _path_snapshot(path):
                 raise ValueError('directory required')
         elif not stat.S_ISREG(info.st_mode):
             raise ValueError('regular file required')
+        if directory:
+            return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), 0)
         return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink)
 
     parents = tuple(identity(item, True, directory=True) for item in reversed(path.parents))
@@ -253,10 +256,10 @@ def _observe_in_process(path: Path, limits: ObservationLimits) -> SchemaObservat
             after = _path_snapshot(path)
             if after[:2] != before[:2]:
                 result = _failed()
-            elif after[2:] != before[2:]:
-                result = SchemaObservation(result.objects, result.recursive_triggers,
-                                           result.reasons + (ObservationReason.SIDECAR_CHANGED,),
-                                           result.temp_objects)
+            else:
+                if after[2:] != before[2:]:
+                    result = replace(result, reasons=result.reasons + (ObservationReason.SIDECAR_CHANGED,))
+                result = replace(result, sidecar_samples=(before[2:], after[2:]))
         except (OSError, ValueError, UnicodeError):
             result = _failed()
     return result
@@ -304,22 +307,27 @@ def _run_schema_observation(path: Path, limits: ObservationLimits) -> SchemaObse
         except (OSError, subprocess.TimeoutExpired):
             return _failed(ObservationReason.HELPER_CLEANUP_UNCONFIRMED)
         return _failed()
-    except BaseException:
+    except BaseException as exc:
         # Preserve interruption while attempting to reap only the child we own.
+        cleanup_unconfirmed = False
         try:
             child.kill()
-        except OSError:
+        except ProcessLookupError:
             pass
+        except OSError:
+            cleanup_unconfirmed = True
         try:
             child.communicate(timeout=_CLEANUP_TIMEOUT_SECONDS)
         except (OSError, subprocess.TimeoutExpired):
-            pass
+            cleanup_unconfirmed = True
+        if cleanup_unconfirmed:
+            exc.add_note('helper_cleanup_unconfirmed')
         raise
     if child.returncode != 0 or len(output) > _MAX_RESPONSE_BYTES:
         return _failed()
     try:
         data = json.loads(output)
-        if set(data) != {'objects', 'recursive_triggers', 'reasons', 'temp_objects'}:
+        if set(data) != {'objects', 'recursive_triggers', 'reasons', 'temp_objects', 'sidecar_samples'}:
             raise ValueError
         objects = tuple(SchemaObject(**item) for item in data['objects'])
         temp_objects = tuple(SchemaObject(**item) for item in data['temp_objects'])
@@ -333,7 +341,23 @@ def _run_schema_observation(path: Path, limits: ObservationLimits) -> SchemaObse
                 or not set(reasons[2:]) <= valid_extras
                 or len(set(reasons[2:]) - {ObservationReason.SIDECAR_CHANGED}) > 1):
             raise ValueError
-        return SchemaObservation(objects, data['recursive_triggers'], reasons, temp_objects)
+        samples = data['sidecar_samples']
+        if (not isinstance(samples, list) or len(samples) not in (0, 2)
+                or any(not isinstance(pair, list) or len(pair) != 2
+                       or any(item is not None and (not isinstance(item, list) or len(item) != 4
+                              or any(type(v) is not int or v < 0 or v >= 2**64 for v in item)
+                              or not stat.S_ISREG(item[2])) for item in pair)
+                       for pair in samples)):
+            raise ValueError
+        has_error = bool(set(reasons[2:]) - {ObservationReason.SIDECAR_CHANGED})
+        if not samples:
+            if not has_error or ObservationReason.SIDECAR_CHANGED in reasons:
+                raise ValueError
+        elif ((samples[0] != samples[1]) != (ObservationReason.SIDECAR_CHANGED in reasons)):
+            raise ValueError
+        private_samples = tuple(tuple(None if item is None else tuple(item) for item in pair)
+                                for pair in samples)
+        return SchemaObservation(objects, data['recursive_triggers'], reasons, temp_objects, private_samples)
     except (ValueError, TypeError, KeyError, UnicodeError, json.JSONDecodeError):
         return _failed()
 
