@@ -9,6 +9,7 @@ database or validate its schema. This is not a storage or handle-binding proof.
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import sys
 from pathlib import Path
 
 from orchestrator.persistence._continuity_observation import (
@@ -49,9 +50,31 @@ def diagnose_store(path: Path, limits: ObservationLimits) -> DiagnosticReport:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--database', required=True, type=Path)
-    args = parser.parse_args(argv)
+    arguments = sys.argv[1:] if argv is None else argv
+    simulation_requested = any(arg.startswith('--simulate') for arg in arguments)
+
+    class _Parser(argparse.ArgumentParser):
+        def error(self, message):
+            if simulation_requested:
+                message = 'invalid simulation arguments'
+            super().error(message)
+
+    parser = _Parser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--database', type=Path)
+    mode.add_argument('--simulate-journal', type=Path)
+    parser.add_argument('--simulation-directory', type=Path,
+                        help='existing private directory containing the simulation trace')
+    args = parser.parse_args(arguments)
+    if args.simulate_journal is not None:
+        if args.simulation_directory is None:
+            parser.error('--simulation-directory is required in simulation mode')
+        from orchestrator.diagnostics._simulation_trace import simulate_journal
+        report = simulate_journal(args.simulation_directory, args.simulate_journal)
+        print(json.dumps(asdict(report), sort_keys=True, separators=(',', ':')))
+        return int(report.reason != 'ok')
+    if args.simulation_directory is not None:
+        parser.error('--simulation-directory requires simulation mode')
     report = diagnose_store(args.database, ObservationLimits())
     print(json.dumps(asdict(report), sort_keys=True, separators=(',', ':')))
     failures = {'budget_exhausted', 'database_unavailable', 'metadata_invalid', 'helper_cleanup_unconfirmed'}
