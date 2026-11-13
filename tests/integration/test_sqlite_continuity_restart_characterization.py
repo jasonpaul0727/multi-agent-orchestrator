@@ -345,3 +345,160 @@ sys.stdin.read(1)
     with sqlite3.connect(db) as connection:
         assert connection.execute("SELECT value FROM local_history").fetchall() == [("second-generation",)]
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_owned_finalize_sqlite_full_rolls_back_event_and_diagnostic_state(tmp_path, monkeypatch):
+    """A connection-local page cap at finalize is not a natural disk or trigger fault."""
+    from orchestrator.persistence import EventDraft
+    from orchestrator.persistence.sqlite_event_store import _OwnedConnection
+
+    db = tmp_path / "finalize-full.db"
+    with SQLiteEventStore(db) as store:
+        record = _fixture(store, tmp_path)
+        conn = store._connection
+        initial_version = store.current_version("artifact", record.digest)
+        initial_events = [tuple(row) for row in conn.execute(
+            "SELECT * FROM events WHERE stream_type='artifact' AND stream_id=? ORDER BY stream_version",
+            (record.digest,),
+        )]
+        initial_version_row = tuple(conn.execute(
+            "SELECT * FROM stream_versions WHERE stream_type='artifact' AND stream_id=?", (record.digest,)
+        ).fetchone())
+        initial_marker = _marker(store, record.digest)
+        initial_checkpoint = tuple(conn.execute(
+            "SELECT * FROM artifact_incremental_checkpoint WHERE digest=?", (record.digest,)
+        ).fetchone())
+        initial_index = [tuple(row) for row in conn.execute(
+            "SELECT * FROM artifact_incremental_publication WHERE digest=?", (record.digest,)
+        )]
+        payload = dict(store.read_stream("artifact", record.digest)[-1].payload,
+                       publication_id="q" * 40000)
+        observed = {}
+        real_executemany = sqlite3.Connection.executemany
+
+        def cap_at_finalize(current, sql, parameters):
+            if current is conn and sql.startswith("INSERT INTO artifact_incremental_publication"):
+                # Inspect the same owned transaction at the exact Python SQL
+                # call; no authorizer/prepare event is treated as execution.
+                observed["in_transaction"] = current.in_transaction
+                observed["event_count"] = current.execute(
+                    "SELECT count(*) FROM events WHERE idempotency_key='own-finalize-full'"
+                ).fetchone()[0]
+                observed["idempotency_count"] = current.execute(
+                    "SELECT count(*) FROM idempotency_records WHERE idempotency_key='own-finalize-full'"
+                ).fetchone()[0]
+                observed["marker"] = _marker(store, record.digest)
+                observed["pages"] = current.execute("PRAGMA page_count").fetchone()[0]
+                observed["freelist"] = current.execute("PRAGMA freelist_count").fetchone()[0]
+                assert observed["pages"] * current.execute("PRAGMA page_size").fetchone()[0] < 4 * 1024 * 1024
+                observed["cap"] = current.execute(
+                    "PRAGMA max_page_count=" + str(observed["pages"])
+                ).fetchone()[0]
+                try:
+                    return real_executemany(current, sql, parameters)
+                except sqlite3.OperationalError as exc:
+                    observed["statement_error"] = exc
+                    raise
+            return real_executemany(current, sql, parameters)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(_OwnedConnection, "executemany", cap_at_finalize, raising=False)
+            with pytest.raises(sqlite3.OperationalError) as failure:
+                with store._cancellation_proof_write():
+                    store.append(
+                        "artifact", record.digest, initial_version,
+                        [EventDraft("ArtifactPublished", payload)], "own-finalize-full",
+                    )
+        assert observed["in_transaction"] is True
+        assert observed["event_count"] == observed["idempotency_count"] == 1
+        assert observed["marker"] == 1 and observed["freelist"] == 0
+        assert observed["cap"] == observed["pages"]
+        assert failure.value.sqlite_errorcode == sqlite3.SQLITE_FULL
+        assert failure.value.sqlite_errorname == "SQLITE_FULL"
+        assert observed["statement_error"] is failure.value  # no cleanup error masked it
+        assert not conn.in_transaction
+
+    # All fixture handles have closed before the independent reopen.
+    with SQLiteEventStore(db) as reopened:
+        conn = reopened._connection
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM events WHERE stream_type='artifact' AND stream_id=? ORDER BY stream_version",
+            (record.digest,),
+        )] == initial_events
+        assert tuple(conn.execute(
+            "SELECT * FROM stream_versions WHERE stream_type='artifact' AND stream_id=?", (record.digest,)
+        ).fetchone()) == initial_version_row
+        assert _marker(reopened, record.digest) == initial_marker
+        assert tuple(conn.execute(
+            "SELECT * FROM artifact_incremental_checkpoint WHERE digest=?", (record.digest,)
+        ).fetchone()) == initial_checkpoint
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM artifact_incremental_publication WHERE digest=?", (record.digest,)
+        )] == initial_index
+        assert conn.execute(
+            "SELECT count(*) FROM idempotency_records WHERE idempotency_key='own-finalize-full'"
+        ).fetchone()[0] == 0
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_isolated_process_fsize_limit_reports_sqlite_ioerr_write_and_recovers(tmp_path):
+    """Linux child-only VFS fault; this is not a hardware or application-path test."""
+    import json
+    import resource
+
+    db = tmp_path / "ioerr-child.db"
+    parent_limit = resource.getrlimit(resource.RLIMIT_FSIZE)
+    parent_handler = signal.getsignal(signal.SIGXFSZ)
+    script = """import json,os,resource,signal,sqlite3,sys
+db=sys.argv[1]
+c=sqlite3.connect(db)
+assert c.execute('PRAGMA journal_mode=WAL').fetchone()[0]=='wal'
+c.execute('PRAGMA wal_autocheckpoint=0')
+c.execute('CREATE TABLE fixture (value BLOB)')
+c.execute('INSERT INTO fixture VALUES (?)',(b'baseline',))
+c.commit()
+wal_size=os.path.getsize(db+'-wal')
+limit=wal_size+4096
+initial=resource.getrlimit(resource.RLIMIT_FSIZE)
+assert initial[1] == resource.RLIM_INFINITY or limit <= initial[1]
+signal.signal(signal.SIGXFSZ,signal.SIG_IGN)
+resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))
+assert resource.getrlimit(resource.RLIMIT_FSIZE)==(limit,limit)
+stage='begin'
+try:
+    c.execute('BEGIN IMMEDIATE')
+    stage='insert'
+    c.execute('INSERT INTO fixture VALUES (zeroblob(262144))')
+    stage='commit'
+    c.commit()
+    outcome={'stage':stage,'result':'no_error'}
+except sqlite3.OperationalError as e:
+    outcome={'stage':stage,'type':type(e).__name__,'code':e.sqlite_errorcode,
+             'name':e.sqlite_errorname,'in_transaction':c.in_transaction}
+    c.rollback()
+    outcome['rollback']='ok'
+c.close()
+outcome['close']='ok'
+print(json.dumps({'limit':limit,'wal_size':wal_size,'initial':initial,
+                  'final':resource.getrlimit(resource.RLIMIT_FSIZE),**outcome}),flush=True)
+"""
+    child = _start(script, db)
+    try:
+        stdout, stderr = child.communicate(timeout=20)
+        assert child.returncode == 0, stderr[-2000:]
+    finally:
+        _reap(child)
+    result = json.loads(stdout)
+    assert result["final"] == [result["limit"], result["limit"]]
+    assert result["limit"] == result["wal_size"] + 4096 < 4 * 1024 * 1024
+    assert result["stage"] == "commit"
+    assert result["type"] == "OperationalError"
+    assert result["code"] == sqlite3.SQLITE_IOERR_WRITE
+    assert result["name"] == "SQLITE_IOERR_WRITE"
+    assert result["in_transaction"] is False
+    assert result["rollback"] == result["close"] == "ok"
+    assert resource.getrlimit(resource.RLIMIT_FSIZE) == parent_limit
+    assert signal.getsignal(signal.SIGXFSZ) == parent_handler
+    with sqlite3.connect(db) as reopened:
+        assert reopened.execute("SELECT value FROM fixture").fetchall() == [(b"baseline",)]
+        assert reopened.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
