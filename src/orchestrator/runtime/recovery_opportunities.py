@@ -192,7 +192,14 @@ def _load_recovery_records(scheduler, *, run_id, events):
         elif plan.outcome == "new_child_required":
             status = "new_child_required"
         elif plan.outcome == "authorized" and attempt.status == "failed":
-            status = "ready"
+            evidence = classification.evidence
+            if (plan.action == "same_model_retry" and plan.authorization is not None
+                    and evidence is not None
+                    and plan.authorization.previous_model_id in evidence.exhausted_model_ids):
+                # The unchanged Router always excludes this exact candidate.
+                reason = "routing_candidates_unavailable"
+            else:
+                status = "ready"
         evidence = classification.evidence
         opportunity = RecoveryOpportunity(
             run_id=run_id, node_id=source.node_id, source_attempt_id=source.attempt_id,

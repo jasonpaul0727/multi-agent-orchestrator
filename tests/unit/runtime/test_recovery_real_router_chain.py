@@ -12,6 +12,7 @@ from tests.support.recovery_continuation import (
     durable_state,
     forbid_recovery_execution,
     recovery_case,
+    routing_observations,
 )
 from tests.unit.lifecycle.test_scheduler import NOW
 from tests.unit.runtime.test_recovery_continuation import admit
@@ -86,7 +87,7 @@ def test_real_router_chain_preserves_history_and_blocks_later_retry(tmp_path, mo
                 assert plan.authorization.evidence_hash == evidence["evidence_hash"]
                 assert plan.authorization.source_decision_hash == first_decision.decision_hash
                 assert plan_event.payload["plan"]["authorization"]["authorization_hash"] == plan.authorization.authorization_hash
-                assert opportunity.status == "ready"
+                assert (opportunity.status, opportunity.reason) == ("blocked", "routing_candidates_unavailable")
             else:
                 assert plan.outcome == "blocked" and plan.authorization is None
                 assert opportunity.status == "reconciliation_required"
@@ -98,8 +99,25 @@ def test_real_router_chain_preserves_history_and_blocks_later_retry(tmp_path, mo
             assert second.accepted_route is None and second.task is None
             if outcome == "known_failure":
                 assert (second.status, second.reason) == ("blocked", "routing_candidates_unavailable")
-                assert len(routed) == 2
-                later_request, later_decision = routed[-1]
+                # Admission now stops at the statically blocked opportunity.
+                assert len(routed) == 1
+                # Independently ask the real, unmodified Router about the same
+                # authenticated plan/counters; this call has no admission effect.
+                later_request = first_request.model_copy(update={
+                    "request_id": "recovery-router-probe",
+                    "attempt_id": "recovery-router-probe",
+                    "fencing_generation": 3,
+                    "prior_decision_hash": first_decision.decision_hash,
+                    "previous_model_id": plan.authorization.previous_model_id,
+                    "recovery_authorization": plan.authorization,
+                    "retry_level": 2,
+                    "exhausted_model_ids": tuple(evidence["exhausted_model_ids"]),
+                    "routing_as_of_event_time": NOW + timedelta(seconds=15),
+                })
+                later_decision = actual_route(
+                    ModelRouter(), later_request, config=case.config, registry=case.registry,
+                    contract=case.contract, **routing_observations(case),
+                )
                 assert later_request.recovery_authorization.authorization_hash == plan.authorization.authorization_hash
                 assert later_request.exhausted_model_ids == ("model-1",)
                 assert later_request.recovery_authorization.authorized_model_ids == ("model-1",)
@@ -112,4 +130,53 @@ def test_real_router_chain_preserves_history_and_blocks_later_retry(tmp_path, mo
                 assert len(routed) == 1  # unresolved outcome never reaches the router
             assert durable_state(store) == before
             assert tuple(store.read_stream("scheduler", "global")) == records
+    assert attempted == []
+
+
+def test_exhausted_other_model_does_not_block_real_same_model_retry(tmp_path, monkeypatch):
+    """A prior failed model must not exclude a different authorized model."""
+    routed = []
+    actual_route = ModelRouter.route
+
+    def capture_route(self, request, **kwargs):
+        decision = actual_route(self, request, **kwargs)
+        routed.append((request, decision))
+        return decision
+
+    with forbid_recovery_execution() as attempted:
+        with SQLiteEventStore(tmp_path / "different-model.db") as store:
+            case = recovery_case(
+                store, failure_code="provider_unavailable", routing_budget=True, multi_model=True,
+            )
+            assert case.plan.action == "same_tier_fallback"
+            monkeypatch.setattr(ModelRouter, "route", capture_route)
+            first = admit(case)
+            assert first.status == "admitted" and first.accepted_route.model_id == "model-2"
+            first_decision = routed[-1][1]
+            assert first_decision.selected_model_id == "model-2"
+            case.scheduler.finish_attempt(
+                run_id="run-1", node_id="node-1", attempt_id=first.accepted_route.attempt_id,
+                fencing_generation=2, completed_at=NOW + timedelta(seconds=12),
+                outcome="failed", known_no_effect=True,
+            )
+            plan = case.scheduler.plan_attempt_recovery(
+                run_id="run-1", node_id="node-1", attempt_id=first.accepted_route.attempt_id,
+                fencing_generation=2, source_decision=first_decision, contract=case.contract,
+                failure=ModelGatewayFailure(
+                    code="rate_limited", phase="provider", outcome="known_failure",
+                    retryable=True, http_status=429,
+                ),
+            )
+            assert plan.action == "same_model_retry"
+            assert plan.authorization.previous_model_id == "model-2"
+            classified = store.read_stream("scheduler", "global")[-2]
+            assert classified.payload["classification"]["evidence"]["exhausted_model_ids"] == ["model-1"]
+            opportunity = RecoveryOpportunityService(case.scheduler).list_opportunities(run_id="run-1")[-1]
+            assert opportunity.status == "ready"
+            successor = admit(
+                case, source_attempt_id=first.accepted_route.attempt_id,
+                source_fencing_generation=2, accepted_at=NOW + timedelta(seconds=15),
+            )
+            assert successor.status == "admitted" and successor.accepted_route.model_id == "model-2"
+            assert len(routed) == 2 and routed[-1][1].selected_model_id == "model-2"
     assert attempted == []

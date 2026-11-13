@@ -265,7 +265,7 @@ def test_later_same_model_retry_preserves_exhausted_model_safety_boundary(tmp_pa
         )
         assert plan.action == "same_model_retry"
         latest = RecoveryOpportunityService(case.scheduler).list_opportunities(run_id="run-1")[-1]
-        assert latest.status == "ready"
+        assert (latest.status, latest.reason) == ("blocked", "routing_candidates_unavailable")
         before = durable_state(store)
         result = admit(case, source_attempt_id=request.attempt_id, source_fencing_generation=2,
                        accepted_at=NOW + timedelta(seconds=15))

@@ -176,7 +176,7 @@ def test_consumed_successor_reopens_to_exact_accepted_route(tmp_path, successor_
         assert durable_state(store) == before
 
 
-def test_older_consumed_source_stays_bound_while_latest_source_is_ready(tmp_path):
+def test_older_consumed_source_stays_bound_while_latest_source_is_blocked(tmp_path):
     # Catches joining by node/latest attempt instead of the exact authorization hash.
     from orchestrator.models import ModelGatewayFailure
 
@@ -200,7 +200,7 @@ def test_older_consumed_source_stays_bound_while_latest_source_is_ready(tmp_path
         assert older.successor == accepted.accepted_route
         assert older.authorization_hash == case.plan.authorization.authorization_hash
         assert (latest.source_fencing_generation, latest.status, latest.reason) == (
-            2, "ready", "bounded_same_model_retry",
+            2, "blocked", "routing_candidates_unavailable",
         )
         assert latest.successor is None and latest.authorization_hash == plan.authorization.authorization_hash
         assert latest.source_decision_hash == decision.decision_hash
