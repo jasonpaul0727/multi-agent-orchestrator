@@ -4,10 +4,12 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import multiprocessing
+from multiprocessing.connection import wait as _wait_connections
 import os
 from pathlib import Path
 import sys
 import traceback
+from time import monotonic as _clock
 from types import SimpleNamespace
 
 import pytest
@@ -60,7 +62,48 @@ def _continue(app, observations, text, lease_expires_at):
     )
 
 
+_PAIR_PHASE_SECONDS = 15.0
+# After startup the parent has at most six separate 15-second protocol waits.
+# Children share this absolute fallback; the parent's shorter phase limits and
+# exact-child cleanup remain authoritative if any intermediate step stalls.
+_PAIR_EXECUTION_PHASES = 6
+
+
+def _receive_pair_deadlines(pipe):
+    message = _receive_until(pipe, _clock() + _PAIR_PHASE_SECONDS, phase="startup_deadlines")
+    assert (isinstance(message, tuple) and len(message) == 3
+            and message[0] == "startup_deadlines"), "phase=startup_deadlines invalid message"
+    startup_deadline, execution_deadline = message[1:]
+    assert (type(startup_deadline) is float and type(execution_deadline) is float
+            and execution_deadline > startup_deadline), "phase=startup_deadlines invalid limits"
+    assert _clock() < startup_deadline, "phase=startup_deadlines deadline expired"
+    return startup_deadline, execution_deadline
+
+
+def _receive_until(pipe, deadline, *, phase):
+    remaining = deadline - _clock()
+    if remaining <= 0:
+        raise AssertionError(f"phase={phase} pid={os.getpid()} deadline expired")
+    try:
+        if not pipe.poll(remaining):
+            raise AssertionError(f"phase={phase} pid={os.getpid()} deadline expired")
+        return pipe.recv()
+    except EOFError:
+        raise AssertionError(f"phase={phase} pid={os.getpid()} parent pipe closed") from None
+    except OSError:
+        raise AssertionError(f"phase={phase} pid={os.getpid()} pipe_read_failed") from None
+
+
+def _await_pair_start(pipe, startup_deadline, execution_deadline):
+    if _receive_until(pipe, startup_deadline, phase="startup_ack") != "startup_ack":
+        raise AssertionError(f"phase=startup_ack pid={os.getpid()} unexpected message")
+    if _receive_until(pipe, execution_deadline, phase="start") != "start":
+        raise AssertionError(f"phase=start pid={os.getpid()} unexpected message")
+
+
 def _continuation_owner(database, pipe, observations, text, lease_expires_at, hold_nested):
+    startup_deadline, execution_deadline = _receive_pair_deadlines(pipe)
+    pipe.send(("phase", "opening_application", os.getpid()))
     with ControlPlaneApplication(database, limits=_application_limits()) as app:
         real_append = app._event_store.append_checked
 
@@ -77,12 +120,12 @@ def _continuation_owner(database, pipe, observations, text, lease_expires_at, ho
                 accepted = real_accept(*args, **kwargs)
                 # This snapshot precedes any possible loser write: the outer lock is held.
                 pipe.send(("nested", _durable_digest(app)))
-                assert receive_process_message(pipe) == "release"
+                assert _receive_until(pipe, execution_deadline, phase="release") == "release"
                 return accepted
 
             app._scheduler.accept_routing = hold_after_nested
         pipe.send(("ready", os.getpid()))
-        assert receive_process_message(pipe) == "start"
+        _await_pair_start(pipe, startup_deadline, execution_deadline)
         try:
             result = _continue(app, observations, text, lease_expires_at)
         except RecoveryContinuationError as error:
@@ -126,14 +169,16 @@ def _mutate(app, observations, mutation):
 
 
 def _mutation_owner(database, pipe, observations, mutation):
+    startup_deadline, execution_deadline = _receive_pair_deadlines(pipe)
+    pipe.send(("phase", "opening_application", os.getpid()))
     with ControlPlaneApplication(database, limits=_application_limits()) as app:
         pipe.send(("ready", os.getpid()))
-        assert receive_process_message(pipe) == "start"
+        _await_pair_start(pipe, startup_deadline, execution_deadline)
 
         def mutate_under_lock(_events, _version):
             _mutate(app, observations, mutation)
             pipe.send(("mutated", _durable_digest(app)))
-            assert receive_process_message(pipe) == "release"
+            assert _receive_until(pipe, execution_deadline, phase="release") == "release"
             return None
 
         app._event_store.append_checked("scheduler", "global", "test-recovery-mutation", mutate_under_lock)
@@ -151,12 +196,76 @@ def _spawn_pair(context, first, second):
 
 
 def _start_pair(parents, children, processes):
-    for process, child in zip(processes, children):
-        process.start()
+    # One absolute startup budget covers both starts, imports and app opens.
+    startup_deadline = _clock() + _PAIR_PHASE_SECONDS
+    execution_deadline = startup_deadline + _PAIR_PHASE_SECONDS * _PAIR_EXECUTION_PHASES
+    phases = ["before_start"] * len(processes)
+    pending = set(range(len(processes)))
+
+    def failed(index, reason):
+        process = processes[index]
+        raise AssertionError(
+            f"phase=startup child={index} pid={process.pid} exitcode={process.exitcode} "
+            f"child_phase={phases[index]} reason={reason}"
+        ) from None
+
+    for index, (parent, child, process) in enumerate(zip(parents, children, processes)):
+        if _clock() >= startup_deadline:
+            failed(index, "deadline")
+        try:
+            process.start()
+        except (OSError, RuntimeError):
+            failed(index, "spawn_error")
+        phases[index] = "spawned"
         child.close()
-    ready = [receive_process_message(pipe) for pipe in parents]
-    assert all(message[0] == "ready" for message in ready)
-    assert len({message[1] for message in ready} | {os.getpid()}) == 3
+        try:
+            parent.send(("startup_deadlines", startup_deadline, execution_deadline))
+        except (OSError, EOFError):
+            failed(index, "deadline_send_failed")
+
+    assert len({process.pid for process in processes} | {os.getpid()}) == len(processes) + 1
+    while pending:
+        remaining = startup_deadline - _clock()
+        if remaining <= 0:
+            failed(min(pending), "deadline")
+        handles = [parents[index] for index in pending] + [process.sentinel for process in processes]
+        try:
+            available = _wait_connections(handles, timeout=remaining)
+        except OSError:
+            raise AssertionError("phase=startup reason=wait_failed") from None
+        if not available or _clock() >= startup_deadline:
+            failed(min(pending), "deadline")
+        # A child that exits before acknowledgement is not a live participant,
+        # even if its ready message is buffered at the same time.
+        for index, process in enumerate(processes):
+            if process.sentinel in available:
+                failed(index, "child_exited")
+        for index in tuple(pending):
+            if parents[index] not in available:
+                continue
+            try:
+                message = parents[index].recv()
+            except EOFError:
+                failed(index, "pipe_closed")
+            except OSError:
+                failed(index, "pipe_read_failed")
+            if message == ("ready", processes[index].pid):
+                phases[index] = "ready"
+                pending.remove(index)
+            elif message == ("phase", "opening_application", processes[index].pid):
+                phases[index] = "opening_application"
+            else:
+                failed(index, "invalid_message")
+    for index, process in enumerate(processes):
+        if process.exitcode is not None:
+            failed(index, "child_exited")
+    for index, parent in enumerate(parents):
+        if _clock() >= startup_deadline:
+            failed(index, "deadline_before_ack")
+        try:
+            parent.send("startup_ack")
+        except (OSError, EOFError):
+            failed(index, "ack_send_failed")
 
 
 def _finish_pair(processes):
@@ -166,12 +275,40 @@ def _finish_pair(processes):
 
 
 def _close_pair(parents, children, processes):
-    try:
-        for process in processes:
+    # A failed first reap must not leave the other owned child running.
+    primary = sys.exception()
+    failure = None
+    interruption = None
+
+    def remember(exc):
+        nonlocal failure, interruption
+        if not isinstance(exc, Exception):
+            if interruption is None:
+                interruption = exc
+        elif failure is None:
+            failure = exc
+
+    for process in processes:
+        try:
             reap_process(process)
-    finally:
-        for pipe in (*parents, *children):
+        except BaseException as exc:
+            remember(exc)
+    for pipe in (*parents, *children):
+        try:
             pipe.close()
+        except BaseException as exc:
+            remember(exc)
+    if primary is not None and not isinstance(primary, Exception):
+        if failure is not None or interruption is not None:
+            BaseException.add_note(primary, "pair_cleanup_unconfirmed")
+    elif interruption is not None:
+        BaseException.add_note(interruption, "pair_cleanup_unconfirmed")
+        raise interruption from None
+    elif failure is not None:
+        if primary is not None:
+            BaseException.add_note(primary, "pair_cleanup_unconfirmed")
+        else:
+            raise failure
 
 
 def _assert_resources(app, *, admitted, authorization_hash, budget_mutation=False):
