@@ -81,6 +81,10 @@ admit a successor or dispatch work. A consumed authorization's `already_admitted
 inventory status identifies a historical accepted route; it does not authorize
 preparing or executing that Attempt now. Both recovery host methods require
 committed application readiness and reject use after close or failed startup.
+For an otherwise eligible failed attempt, the planner can authorize a
+same-model retry that the Router excludes because the prior model is exhausted;
+discovery reports it as `blocked` with `routing_candidates_unavailable`, while
+`ready` does not guarantee current health, budget, or other admission checks.
 
 For a selected opportunity, the host explicitly re-supplies the exact original
 task text and calls `continue_recovery` with these keyword arguments:
