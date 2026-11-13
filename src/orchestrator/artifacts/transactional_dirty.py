@@ -211,5 +211,7 @@ def require_clean_marker(conn, digest, budget, *, allow_dirty=False, require_tra
         allowed_markers = (('integer', 0), ('integer', 1)) if allow_dirty else (('integer', 0),)
         if len(marker) != 1 or tuple(marker[0]) not in allowed_markers:
             raise CancellationHeld('integrity')
+    except CancellationHeld:
+        raise
     except (sqlite3.DatabaseError, RuntimeError, TypeError, ValueError):
         raise CancellationHeld('integrity') from None
