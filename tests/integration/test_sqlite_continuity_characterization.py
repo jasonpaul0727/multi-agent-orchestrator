@@ -275,14 +275,33 @@ def _validate_complete_v1(case, accepted):
         return release
 
 
-def _assert_redacted_schema_comparison(comparison, db, target):
+def _assert_redacted_schema_comparison(comparison, db, target, diagnostics=None):
     from dataclasses import asdict
     encoded = json.dumps(asdict(comparison))
-    assert comparison.status == 'match'
+    assert comparison.status == 'match', f"schema comparison observations: {diagnostics}"
     assert 'schema_continuity_unproven' in comparison.unknowns
     assert str(db) not in encoded and target.digest not in encoded
     assert 'artifact_dirty_' not in encoded and 'eligible' not in encoded
 
+
+def _assert_empty_temp_observation(observation):
+    from orchestrator.persistence._continuity_observation import _comparable_schema
+    # An unavailable observation also has an empty temp_objects tuple. Only
+    # check TEMP after the one-shot runner returned a complete usable sample.
+    reasons = [reason.value for reason in observation.reasons]
+    assert _comparable_schema(observation) is not None, f"TEMP observation unavailable: {reasons}"
+    assert not observation.temp_objects
+
+
+@pytest.mark.parametrize("reason", [
+    "database_unavailable", "budget_exhausted", "metadata_invalid", "helper_cleanup_unconfirmed",
+])
+def test_failed_temp_observation_must_not_pass_empty_check(reason):
+    from orchestrator.persistence._continuity_observation import ObservationReason, _failed
+    failed = _failed(ObservationReason(reason))
+    assert not failed.temp_objects
+    with pytest.raises(AssertionError):
+        _assert_empty_temp_observation(failed)
 
 def test_drop_mutate_restore_identical_schema_cannot_establish_continuity(tmp_path, diagnostic_case):
     from orchestrator.artifacts.incremental_checkpoint import snapshot_incremental
@@ -328,10 +347,214 @@ c.close()
     assert _validate_complete_v1(case, accepted) == baseline
 
 
-def test_future_legacy_process_temp_reset_is_invisible_and_report_is_non_authoritative(tmp_path, diagnostic_case):
+def _compare_with_redacted_diagnostics(db, limits, between, monkeypatch):
+    """Test-only probe: report categories and timing, never paths or metadata."""
+    import time
+    from orchestrator.persistence._continuity_observation import (
+        _compare_schema_observations, _comparable_schema,
+    )
+
+    samples = []
+    active = [None]
+    real_popen = subprocess.Popen
+
+    class HelperProbe:
+        def __init__(self, child, detail):
+            self._child = child
+            self._detail = detail
+            self._started = time.monotonic()
+            self._communications = 0
+
+        def __getattr__(self, name):
+            return getattr(self._child, name)
+
+        def kill(self):
+            try:
+                self._child.kill()
+            except ProcessLookupError:
+                self._detail["kill_status"] = "not_found"
+                raise
+            except OSError:
+                self._detail["kill_status"] = "error"
+                raise
+            self._detail["kill_status"] = "requested"
+
+        def communicate(self, *args, **kwargs):
+            self._communications += 1
+            first = self._communications == 1
+            status_key = "helper_status" if first else "cleanup_status"
+            try:
+                output = self._child.communicate(*args, **kwargs)
+            except subprocess.TimeoutExpired:
+                self._detail[status_key] = "timeout"
+                if first:
+                    self._detail["helper_elapsed_ms"] = round(
+                        (time.monotonic() - self._started) * 1000, 1
+                    )
+                raise
+            except OSError:
+                self._detail[status_key] = "communication_error"
+                if first:
+                    self._detail["helper_elapsed_ms"] = round(
+                        (time.monotonic() - self._started) * 1000, 1
+                    )
+                raise
+            if first:
+                self._detail["helper_status"] = "exited"
+                self._detail["helper_exit_code"] = self._child.returncode
+                self._detail["helper_output_bytes"] = len(output[0] or b"")
+                self._detail["helper_elapsed_ms"] = round(
+                    (time.monotonic() - self._started) * 1000, 1
+                )
+            else:
+                self._detail["cleanup_status"] = "reaped"
+                self._detail["cleanup_exit_code"] = self._child.returncode
+            return output
+
+    def traced_popen(*args, **kwargs):
+        command = args[0] if args else kwargs.get("args")
+        is_helper = (
+            active[0] is not None and isinstance(command, (list, tuple))
+            and "orchestrator.persistence._continuity_observation" in command
+            and "--helper" in command
+        )
+        try:
+            child = real_popen(*args, **kwargs)
+        except (OSError, ValueError):
+            if is_helper:
+                active[0]["helper_status"] = "spawn_error"
+            raise
+        return HelperProbe(child, active[0]) if is_helper else child
+
+    def begin_sample():
+        detail = {"helper_status": "not_started"}
+        samples.append(detail)
+        active[0] = detail
+        detail["_started"] = time.monotonic()
+        return True
+
+    def end_sample(observation):
+        detail = active[0]
+        detail["elapsed_ms"] = round((time.monotonic() - detail.pop("_started")) * 1000, 1)
+        detail["reasons"] = [reason.value for reason in observation.reasons]
+        detail["complete"] = _comparable_schema(observation) is not None
+        detail["temp_count"] = len(observation.temp_objects)
+        active[0] = None
+        return True  # Instrumentation must not alter the production decision.
+
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess, "Popen", traced_popen)
+        comparison = _compare_schema_observations(
+            db, limits, between, begin_sample=begin_sample, end_sample=end_sample,
+        )
+    return comparison, samples
+
+@pytest.mark.parametrize("failed_index", [0, 1])
+def test_comparison_diagnostics_identify_failed_side_without_private_data(tmp_path, monkeypatch, failed_index):
+    from types import SimpleNamespace
+    from orchestrator.persistence import _continuity_observation as observation
+
+    db = tmp_path / "private-database-name.db"
+    with sqlite3.connect(db) as connection:
+        connection.execute("CREATE TABLE fixture (x)")
+    original = observation._run_schema_observation
+    calls = []
+
+    def inject_failure(path, limits):
+        index = len(calls)
+        calls.append(index)
+        if index == failed_index:
+            return observation._failed(observation.ObservationReason.METADATA_INVALID)
+        return original(path, limits)
+
+    monkeypatch.setattr(observation, "_run_schema_observation", inject_failure)
+    comparison, samples = _compare_with_redacted_diagnostics(
+        db, observation.ObservationLimits(), lambda: None, monkeypatch,
+    )
+    assert comparison.status == "unavailable" and len(samples) == 2
+    assert samples[failed_index]["complete"] is False
+    assert "metadata_invalid" in samples[failed_index]["reasons"]
+    assert samples[1 - failed_index]["complete"] is True
+    with pytest.raises(AssertionError) as failure:
+        _assert_redacted_schema_comparison(comparison, db, SimpleNamespace(digest="private-digest"), samples)
+    message = str(failure.value)
+    assert "metadata_invalid" in message
+    assert str(db) not in message and "private-digest" not in message
+    assert "CREATE TABLE" not in message
+
+
+def test_comparison_diagnostics_record_helper_timeout_and_cleanup_without_leaks(tmp_path, monkeypatch):
+    from orchestrator.persistence import _continuity_observation as observation
+
+    class TimedOutHelper:
+        returncode = None
+        calls = 0
+
+        def communicate(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired("private-command", kwargs["timeout"])
+            return b"", None
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: TimedOutHelper())
+    comparison, samples = _compare_with_redacted_diagnostics(
+        tmp_path / "private-db-path", observation.ObservationLimits(), lambda: None, monkeypatch,
+    )
+    assert comparison.status == "unavailable" and len(samples) == 2
+    for detail in samples:
+        assert detail["helper_status"] == "timeout" and detail["cleanup_exit_code"] == -9
+        assert "database_unavailable" in detail["reasons"] and detail["complete"] is False
+        assert detail["helper_elapsed_ms"] >= 0 and detail["elapsed_ms"] >= 0
+    encoded = json.dumps(samples)
+    assert str(tmp_path) not in encoded and "private-command" not in encoded
+
+@pytest.mark.parametrize(("first", "cleanup", "expected_reason"), [
+    ("communication_error", "reaped", "database_unavailable"),
+    ("timeout", "communication_error", "helper_cleanup_unconfirmed"),
+    ("timeout", "timeout", "helper_cleanup_unconfirmed"),
+])
+def test_comparison_diagnostics_preserve_first_failure_and_cleanup_outcome(
+    tmp_path, monkeypatch, first, cleanup, expected_reason,
+):
+    from orchestrator.persistence import _continuity_observation as observation
+
+    class FaultingHelper:
+        returncode = None
+        calls = 0
+
+        def communicate(self, *args, **kwargs):
+            self.calls += 1
+            outcome = first if self.calls == 1 else cleanup
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired("private-command", kwargs["timeout"])
+            if outcome == "communication_error":
+                raise OSError("private-error")
+            self.returncode = -9
+            return b"", None
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: FaultingHelper())
+    comparison, samples = _compare_with_redacted_diagnostics(
+        tmp_path / "private-db-path", observation.ObservationLimits(), lambda: None, monkeypatch,
+    )
+    assert comparison.status == "unavailable" and len(samples) == 2
+    for detail in samples:
+        assert detail["helper_status"] == first
+        assert detail["cleanup_status"] == cleanup
+        assert expected_reason in detail["reasons"] and detail["complete"] is False
+    encoded = json.dumps(samples)
+    assert str(tmp_path) not in encoded and "private-command" not in encoded
+    assert "private-error" not in encoded
+
+def test_future_legacy_process_temp_reset_is_invisible_and_report_is_non_authoritative(tmp_path, diagnostic_case, monkeypatch):
     import select
     from orchestrator.artifacts.incremental_checkpoint import snapshot_incremental
-    from orchestrator.persistence._continuity_observation import ObservationLimits, _compare_schema_observations
+    from orchestrator.persistence._continuity_observation import ObservationLimits
 
     db = tmp_path / 'events.db'
     case, accepted = diagnostic_case
@@ -358,13 +581,16 @@ c.close()
         assert select.select([child.stdout], [], [], 10)[0], 'child did not finish mutation'
         assert child.stdout.readline().strip() == 'ready'
     try:
-        comparison = _compare_schema_observations(db, ObservationLimits(), attack)
+        comparison, samples = _compare_with_redacted_diagnostics(db, ObservationLimits(), attack, monkeypatch)
+        encoded_samples = json.dumps(samples)
+        assert str(db) not in encoded_samples and target.digest not in encoded_samples
+        assert "artifact_dirty_" not in encoded_samples and "CREATE " not in encoded_samples
         assert store._connection.execute('SELECT dirty FROM artifact_dirty_marker WHERE digest=?', (target.digest,)).fetchone()[0] == 0
         assert store._connection.execute('SELECT version FROM artifact_incremental_publication WHERE digest=? AND publication_id=?', (target.digest, other.publication_id)).fetchone()[0] > 100
         assert store._connection.execute("SELECT count(*) FROM sqlite_temp_master WHERE name='reset_marker'").fetchone()[0] == 0
+        _assert_redacted_schema_comparison(comparison, db, target, samples)
         from orchestrator.persistence._continuity_observation import _run_schema_observation
-        assert not _run_schema_observation(db, ObservationLimits()).temp_objects
-        _assert_redacted_schema_comparison(comparison, db, target)
+        _assert_empty_temp_observation(_run_schema_observation(db, ObservationLimits()))
         assert 'schema_continuity_unproven' in cli_report(db)['unknowns']
         with store._cancellation_proof_write():
             event = snapshot_incremental(store, target.digest, target.publication_id, budget())
