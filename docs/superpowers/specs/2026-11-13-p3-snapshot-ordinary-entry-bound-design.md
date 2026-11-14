@@ -1,6 +1,17 @@
 # Narrow design draft: stream ordinary snapshot directory names
 
-Status: independently reviewed for the narrow correction; implementation pending. This is a correction to the existing max_entries
+Status: BLOCKED. Do not implement or ship the staged changes below until a
+separately reviewed design resolves destination ownership and cleanup across
+snapshot_workspace and both launchers. A self-owned test showed a newly
+introduced scan failure can route through pathname cleanup after a destination
+replacement and remove the replacement. Launcher staging cleanup has the same
+class of pathname risk based on code review; that outer case is not yet
+independently reproduced. Checking the pathname identity once does not exclude
+a later replacement. Retaining uncertain staging instead requires a reviewed
+privacy, capacity and recovery policy. The saved experimental patch is not an
+approved implementation. Full v1 validation remains in force.
+
+The historical candidate was a correction to the existing max_entries
 contract in snapshot_workspace, not a new quota for protected names, a global
 resource policy, a production isolation proof, or completion of the v1 async
 handoff resource gate. Each implementation stage requires independent review.
@@ -155,8 +166,10 @@ anchoring through rename on this or every actual deployment target, casefold
 behavior of other filesystems, or physical storage continuity.
 
 For a rename or replacement that makes the anchored descriptor, its scandir,
-fstat, identity check or revalidation fail, fail closed and attempt owned
-cleanup according to the priority rules. Do not switch to listdir, retry a
+fstat, identity check or revalidation fail, fail closed. The current pathname
+cleanup is unsafe under replacement; new scan failures must not trigger it
+before a separately reviewed ownership and recovery design. Do not switch to
+listdir, retry a
 different mode, or reopen any pathname, even if a fresh pathname reports the
 same inode: it does not repair the broken handle/TOCTOU guarantee. The stable
 tree behavior must remain usable; do not classify an entire filesystem as
@@ -172,8 +185,9 @@ production-verified.
 
 For stable valid trees within limits, preserve accepted names, excluded
 protected spellings, sorting, byte/depth rules, summary and target contents.
-Over-limit trees remain rejected and the owned partial target is cleaned by
-the existing path. Early quota detection can change the reported error
+Over-limit trees remain rejected. The current implementation attempts cleanup
+by pathname; that name may have been replaced, so neither ownership nor
+successful cleanup is established. Early quota detection can change the reported error
 precedence for input having both excess entries and another defect. Example:
 max_entries=2, an earlier-sorted escaping symlink and a later ordinary name
 currently report symlink during ordered traversal; streaming pre-reservation
@@ -241,10 +255,12 @@ as themselves; the design never converts cancellation or interruption into
 success. This is a promise about newly introduced scandir errors, not a claim
 to repair or redact every pre-existing exception chain elsewhere.
 
-Attempt the original partial-target cleanup only after this function has
-actually created its own destination; do not touch an existing destination.
-The current shutil.rmtree(ignore_errors=True) may silently leave files, and
-this proposal does not claim otherwise. Tests can verify the cleanup call and
+Creating a destination does not prove that the pathname still names it during
+cleanup. The existing shutil.rmtree(ignore_errors=True) can act on a replacement
+or silently leave files. New scan failures must not reach that pathname cleanup
+until an independently reviewed ownership and recovery design establishes safe
+behavior. Tests can characterize cleanup on self-owned fixtures but cannot prove
+concurrent safety; they can verify the call and
 successful removal of own fixtures; an injected failure may show only that
 all eligible cleanup was attempted, not that disk bytes disappeared. Root,
 child and iterator descriptors should be closed once under their respective
@@ -252,7 +268,7 @@ ownership scopes; do not turn interrupt or close failure into a successful
 snapshot. Maintain full privacy in public exception output, including formatted
 traceback and launcher wrapper, for newly injected scandir failures.
 
-## Staged work (three independently reviewed substantive changes)
+## Staged work (historical candidates; blocked pending a new safety design)
 
 Each stage requires a real RED for its precise new behavior, the smallest
 implementation, GREEN and a scoped independent review before the coordinator
