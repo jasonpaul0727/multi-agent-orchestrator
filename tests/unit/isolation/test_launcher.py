@@ -4,6 +4,7 @@ import orchestrator.isolation.launcher as launcher_module
 
 from pathlib import Path
 import os
+import io
 import subprocess
 import tempfile
 import threading
@@ -23,6 +24,315 @@ from orchestrator.isolation.launcher import (
     _validate_command,
     _validated_workspace,
 )
+
+
+class _CollectorControl(BaseException):
+    pass
+
+
+class _CollectorPipe(io.FileIO):
+    """A real, fixture-owned pipe end with finite boundary fault injection."""
+
+    def __init__(self, fd, mode, name):
+        super().__init__(fd, mode, closefd=True)
+        self.name_for_test = name
+        self.close_calls = 0
+        self.close_error = None
+        self.close_before_error = False
+        self.fileno_error = None
+        self.closed_error = None
+
+    def fileno(self):
+        if self.fileno_error is not None:
+            raise self.fileno_error
+        return super().fileno()
+
+    @property
+    def closed(self):
+        if self.closed_error is not None:
+            raise self.closed_error
+        return super().closed
+
+    def close(self):
+        self.close_calls += 1
+        if self.close_error is not None:
+            if self.close_before_error:
+                super().close()
+            raise self.close_error
+        super().close()
+
+
+@pytest.fixture
+def collector_rig(monkeypatch, request):
+    """Retain real objects so teardown never retries a possibly reused fd."""
+    from types import SimpleNamespace
+
+    ends = []
+    pipes = {}
+    for name in ("stdin", "stdout", "stderr"):
+        reader_fd, writer_fd = os.pipe()
+        reader = _CollectorPipe(reader_fd, "rb", name if name != "stdin" else "input-reader")
+        writer = _CollectorPipe(writer_fd, "wb", name if name == "stdin" else name + "-writer")
+        ends.extend((reader, writer))
+        pipes[name] = writer if name == "stdin" else reader
+        if name != "stdin" and not getattr(request, "param", False):
+            io.FileIO.close(writer)
+
+    class Transport:
+        returncode = 0
+        stdin, stdout, stderr = (pipes[name] for name in ("stdin", "stdout", "stderr"))
+
+        def poll(self):
+            # Keep input writable until completion, with no external process.
+            return 0 if io.FileIO.closed.__get__(self.stdin) else None
+
+        def wait(self, *, timeout):
+            assert timeout == 2.0
+            return 0
+
+    process = Transport()
+    session = SandboxSession(process=process, unit_name="collector.service", systemctl="unused",
+        client_env={}, output_limit=1024, timeout_seconds=10, input_bytes=b"payload",
+        staging=SimpleNamespace(cleanup=lambda: pytest.fail("direct collector cannot clean staging")))
+    state = SimpleNamespace(pipes=pipes, process=process, session=session, selectors=[],
+        constructor_error=None, register_error=None, register_at=1, select_error=None,
+        unregister_error=None, selector_close_error=None, before_select=None)
+    selector_type = launcher_module.selectors.DefaultSelector
+
+    class Selector:
+        def __init__(self):
+            self.real = selector_type()
+            self.close_calls = 0
+            self.register_calls = 0
+
+        def register(self, stream, events):
+            self.register_calls += 1
+            if state.register_error is not None and self.register_calls == state.register_at:
+                raise state.register_error
+            return self.real.register(stream, events)
+
+        def unregister(self, stream):
+            if state.unregister_error is not None:
+                raise state.unregister_error
+            return self.real.unregister(stream)
+
+        def get_map(self):
+            return self.real.get_map()
+
+        def select(self, timeout):
+            if state.before_select is not None:
+                state.before_select()
+            if state.select_error is not None:
+                raise state.select_error
+            return self.real.select(timeout)
+
+        def close(self):
+            self.close_calls += 1
+            self.real.close()
+            if state.selector_close_error is not None:
+                raise state.selector_close_error
+
+    def selector_factory():
+        if state.constructor_error is not None:
+            raise state.constructor_error
+        selector = Selector()
+        state.selectors.append(selector)
+        return selector
+
+    monkeypatch.setattr(launcher_module.selectors, "DefaultSelector", selector_factory)
+    try:
+        yield state
+    finally:
+        for selector in state.selectors:
+            selector.real.close()
+        for stream in ends:
+            # Bypass injection only on this fixture's retained FileIO objects.
+            io.FileIO.close(stream)
+            stream.closed_error = stream.fileno_error = stream.close_error = None
+
+
+def _assert_collector_closed_once(rig):
+    assert [rig.pipes[name].close_calls for name in ("stdin", "stdout", "stderr")] == [1, 1, 1]
+    assert all(selector.close_calls == 1 for selector in rig.selectors)
+    for stream in rig.pipes.values():
+        if stream.close_error is None or stream.close_before_error:
+            assert io.FileIO.closed.__get__(stream)
+
+
+@pytest.mark.parametrize(("boundary", "position"), [("constructor", 0)] + [
+    (boundary, position) for boundary in ("fileno", "set-blocking", "register") for position in (1, 2, 3)])
+def test_collector_setup_failure_closes_every_owned_pipe(collector_rig, monkeypatch, boundary, position):
+    rig = collector_rig
+    primary = OSError("setup failure")
+    if boundary == "constructor":
+        rig.constructor_error = primary
+    elif boundary == "register":
+        rig.register_error, rig.register_at = primary, position
+    else:
+        stream = rig.pipes[("stdout", "stderr", "stdin")[position - 1]]
+        if boundary == "fileno":
+            stream.fileno_error = primary
+        else:
+            target_fd = io.FileIO.fileno(stream)
+            set_blocking = os.set_blocking
+
+            def fail_set_blocking(fd, value):
+                if fd == target_fd:
+                    raise primary
+                return set_blocking(fd, value)
+
+            monkeypatch.setattr(os, "set_blocking", fail_set_blocking)
+    with pytest.raises(OSError) as caught:
+        rig.session._collect()
+    assert caught.value is primary
+    _assert_collector_closed_once(rig)
+    if boundary == "constructor":
+        assert rig.selectors == []  # No returned selector handle was owned.
+
+
+@pytest.mark.parametrize("boundary", ["closed", "read-fileno", "unregister", "select"])
+def test_collector_loop_boundary_failure_still_closes_owned_resources(collector_rig, boundary):
+    rig = collector_rig
+    primary = OSError("loop failure")
+    if boundary == "closed":
+        rig.pipes["stdin"].closed_error = primary
+    elif boundary == "read-fileno":
+        rig.before_select = lambda: setattr(rig.pipes["stdout"], "fileno_error", primary)
+    elif boundary == "unregister":
+        rig.unregister_error = primary
+    else:
+        rig.select_error = primary
+    with pytest.raises(OSError) as caught:
+        rig.session._collect()
+    assert caught.value is primary
+    _assert_collector_closed_once(rig)
+
+
+@pytest.mark.parametrize("path", ["empty-input", "eof", "input-complete", "input-oserror", "input-after-exit"])
+@pytest.mark.parametrize("after_close", [False, True])
+def test_collector_records_normal_close_attempt_before_failure(collector_rig, monkeypatch, path, after_close):
+    rig = collector_rig
+    primary = OSError("normal close failure")
+    stream = rig.pipes["stdout" if path == "eof" else "stdin"]
+    stream.close_error, stream.close_before_error = primary, after_close
+    if path == "empty-input":
+        rig.session._input_bytes = b""
+    elif path == "input-oserror":
+        def broken_write(_fd, _payload):
+            raise BrokenPipeError("input peer closed")
+        monkeypatch.setattr(os, "write", broken_write)
+    elif path == "input-after-exit":
+        monkeypatch.setattr(rig.process, "poll", lambda: 0)
+    with pytest.raises(OSError) as caught:
+        rig.session._collect()
+    assert caught.value is primary
+    _assert_collector_closed_once(rig)
+
+
+@pytest.mark.parametrize("failed_close", ["selector", "stdin", "stdout", "stderr"])
+def test_collector_cleanup_error_does_not_skip_other_closes_or_mask_primary(collector_rig, failed_close):
+    rig = collector_rig
+    primary = OSError("collection failure")
+    secondary = OSError("private secondary sentinel")
+    rig.select_error = primary
+    if failed_close == "selector":
+        rig.selector_close_error = secondary
+    else:
+        rig.pipes[failed_close].close_error = secondary
+    with pytest.raises(OSError) as caught:
+        rig.session._collect()
+    assert caught.value is primary
+    _assert_collector_closed_once(rig)
+    assert caught.value.__notes__ == [
+        "sandbox_session_selector_close_failed" if failed_close == "selector" else "sandbox_session_pipe_close_failed",
+        "sandbox_session_secondary_failure",
+    ]
+    import traceback
+    assert "private secondary sentinel" not in "".join(traceback.format_exception(caught.value))
+
+
+@pytest.mark.parametrize("primary_control", [False, True])
+def test_collector_preserves_primary_control_or_first_cleanup_control(collector_rig, primary_control):
+    rig = collector_rig
+    primary = _CollectorControl("primary") if primary_control else OSError("ordinary primary")
+    first_control = _CollectorControl("first cleanup")
+    rig.select_error = primary
+    rig.selector_close_error = OSError("private selector secondary")
+    rig.pipes["stdin"].close_error = first_control
+    rig.pipes["stdout"].close_error = _CollectorControl("private later control")
+    rig.pipes["stderr"].close_error = OSError("private pipe secondary")
+    with pytest.raises(BaseException) as caught:
+        rig.session._collect()
+    assert caught.value is (primary if primary_control else first_control)
+    _assert_collector_closed_once(rig)
+    notes = caught.value.__notes__
+    assert len(notes) == len(set(notes))
+    assert set(notes) == {"sandbox_session_selector_close_failed", "sandbox_session_pipe_close_failed",
+        "sandbox_session_secondary_failure"} | (set() if primary_control else {"sandbox_session_primary_superseded"})
+
+
+def test_collector_first_cleanup_error_is_preserved_without_primary(collector_rig):
+    rig = collector_rig
+    # Real EOF and input completion have already attempted the pipes by this point.
+    first = OSError("selector final close")
+    rig.selector_close_error = first
+    with pytest.raises(OSError) as caught:
+        rig.session._collect()
+    assert caught.value is first
+    _assert_collector_closed_once(rig)
+
+
+@pytest.mark.parametrize("collector_rig", [True], indirect=True)
+def test_collector_first_final_cleanup_control_wins_without_primary(collector_rig, monkeypatch):
+    rig = collector_rig
+    # Held real output pipes reach the existing bounded cancellation break.
+    rig.session._stop_grace_seconds = 0.001
+    rig.session._cancel_requested.set()
+    monkeypatch.setattr(rig.session, "cancel", lambda: False)
+    first = _CollectorControl("first final control")
+    rig.selector_close_error = OSError("private ordinary final cleanup")
+    rig.pipes["stdout"].close_error = first
+    rig.pipes["stderr"].close_error = _CollectorControl("private later final control")
+    with pytest.raises(_CollectorControl) as caught:
+        rig.session._collect()
+    assert caught.value is first
+    _assert_collector_closed_once(rig)
+    assert set(first.__notes__) == {"sandbox_session_selector_close_failed",
+        "sandbox_session_pipe_close_failed", "sandbox_session_secondary_failure"}
+
+
+@pytest.mark.parametrize("notes_fail", [False, True])
+def test_collector_note_insertion_cannot_replace_selected_error(collector_rig, notes_fail):
+    class Primary(OSError):
+        def add_note(self, _note):
+            pytest.fail("must bypass an exception's add_note override")
+
+        def __setattr__(self, name, value):
+            if name == "__notes__" and notes_fail:
+                raise _CollectorControl("note insertion failed")
+            return super().__setattr__(name, value)
+
+    rig = collector_rig
+    primary = Primary("collection")
+    rig.select_error = primary
+    rig.selector_close_error = OSError("private cleanup")
+    with pytest.raises(Primary) as caught:
+        rig.session._collect()
+    assert caught.value is primary
+    _assert_collector_closed_once(rig)
+    if not notes_fail:
+        assert primary.__notes__ == ["sandbox_session_selector_close_failed", "sandbox_session_secondary_failure"]
+
+
+def test_collector_deduplicates_owned_objects_and_preserves_stdin_eligibility(collector_rig):
+    rig = collector_rig
+    rig.process.stderr = rig.process.stdout
+    rig.session._input_bytes = None
+    rig.constructor_error = OSError("setup")
+    with pytest.raises(OSError):
+        rig.session._collect()
+    assert rig.pipes["stdout"].close_calls == 1
+    assert rig.pipes["stdin"].close_calls == rig.pipes["stderr"].close_calls == 0
 
 
 @pytest.mark.parametrize(

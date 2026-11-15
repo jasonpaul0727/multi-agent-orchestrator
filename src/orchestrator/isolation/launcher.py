@@ -585,20 +585,25 @@ class SandboxSession:
                             owner._retire_session(self)
 
     def _collect(self) -> SandboxResult:
-        assert self._process.stdout is not None and self._process.stderr is not None
-        selector = selectors.DefaultSelector()
-        streams = {self._process.stdout: bytearray(), self._process.stderr: bytearray()}
-        for stream in streams:
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream, selectors.EVENT_READ)
+        stdout, stderr = self._process.stdout, self._process.stderr
         input_stream = self._process.stdin if self._input_bytes is not None else None
+        pipes = []
+        for stream in (input_stream, stdout, stderr):
+            if stream is not None and all(stream is not owned for owned in pipes):
+                pipes.append(stream)
+        attempted: set[int] = set()
+
+        def close_once(resource):
+            identity = id(resource)
+            if identity not in attempted:
+                # A failed close may already have released and reused its fd.
+                attempted.add(identity)
+                resource.close()
+
+        selector = None
+        primary = None
+        cleanup_failures = []
         input_offset = 0
-        if input_stream is not None:
-            if self._input_bytes:
-                os.set_blocking(input_stream.fileno(), False)
-                selector.register(input_stream, selectors.EVENT_WRITE)
-            else:
-                input_stream.close()
         cancelled = False
         timed_out = False
         output_limited = False
@@ -606,6 +611,18 @@ class SandboxSession:
         next_kill_retry = self._started
         stop_deadline = None
         try:
+            assert stdout is not None and stderr is not None
+            streams = {stdout: bytearray(), stderr: bytearray()}
+            selector = selectors.DefaultSelector()
+            for stream in streams:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ)
+            if input_stream is not None:
+                if self._input_bytes:
+                    os.set_blocking(input_stream.fileno(), False)
+                    selector.register(input_stream, selectors.EVENT_WRITE)
+                else:
+                    close_once(input_stream)
             while selector.get_map() or self._process.poll() is None:
                 now = time.monotonic()
                 if self._cancel_requested.is_set():
@@ -624,7 +641,7 @@ class SandboxSession:
                     cancelled or timed_out or output_limited or self._process.poll() is not None
                 ):
                     selector.unregister(input_stream)
-                    input_stream.close()
+                    close_once(input_stream)
                 for key, _ in selector.select(timeout=0.1):
                     stream = key.fileobj
                     if stream is input_stream:
@@ -635,12 +652,12 @@ class SandboxSession:
                             continue
                         except OSError:
                             selector.unregister(stream)
-                            stream.close()
+                            close_once(stream)
                             continue
                         input_offset += sent
                         if input_offset == len(self._input_bytes):
                             selector.unregister(stream)
-                            stream.close()
+                            close_once(stream)
                         continue
                     try:
                         chunk = os.read(stream.fileno(), 8192)
@@ -648,7 +665,7 @@ class SandboxSession:
                         continue
                     if not chunk:
                         selector.unregister(stream)
-                        stream.close()
+                        close_once(stream)
                         continue
                     captured = sum(len(value) for value in streams.values())
                     remaining = max(0, self._output_limit - captured)
@@ -659,13 +676,22 @@ class SandboxSession:
                         cancelled = True
             if stop_deadline is None or time.monotonic() < stop_deadline:
                 self._process.wait(timeout=self._stop_grace_seconds)
+        except BaseException as error:
+            primary = error
         finally:
-            selector.close()
-            if input_stream is not None and not input_stream.closed:
-                input_stream.close()
-            for stream in streams:
-                if not stream.closed:
-                    stream.close()
+            if selector is not None:
+                try:
+                    close_once(selector)
+                except BaseException as error:
+                    cleanup_failures.append((error, "sandbox_session_selector_close_failed"))
+            for stream in pipes:
+                try:
+                    close_once(stream)
+                except BaseException as error:
+                    cleanup_failures.append((error, "sandbox_session_pipe_close_failed"))
+        selected = _select_session_cleanup_failure(primary, cleanup_failures)
+        if selected is not None:
+            raise selected from None
         elapsed = max(0.0, time.monotonic() - self._started)
         returncode = int(self._process.returncode) if self._process.returncode is not None else 125
         if (
@@ -679,8 +705,8 @@ class SandboxSession:
         return SandboxResult(
             unit_name=self.unit_name,
             returncode=returncode,
-            stdout=bytes(streams[self._process.stdout]),
-            stderr=bytes(streams[self._process.stderr]),
+            stdout=bytes(streams[stdout]),
+            stderr=bytes(streams[stderr]),
             elapsed_seconds=elapsed,
             termination_receipt=None,
             cancelled=cancel_signal_accepted and not timed_out and not output_limited,
@@ -688,6 +714,38 @@ class SandboxSession:
             output_limited=output_limited,
             input_written=self._input_bytes is None or input_offset == len(self._input_bytes),
         )
+
+
+def _select_session_cleanup_failure(
+    primary: BaseException | None,
+    cleanup_failures: list[tuple[BaseException, str]],
+) -> BaseException | None:
+    """Choose the session failure without exposing secondary error details."""
+    if primary is not None and not isinstance(primary, Exception):
+        selected = primary
+    else:
+        selected = next((error for error, _note in cleanup_failures
+            if not isinstance(error, Exception)), None)
+        if selected is None:
+            selected = primary if primary is not None else (
+                cleanup_failures[0][0] if cleanup_failures else None)
+    if selected is None:
+        return None
+    notes = []
+    for _error, note in cleanup_failures:
+        if note not in notes:
+            notes.append(note)
+    if primary is not None and selected is not primary:
+        notes.append("sandbox_session_primary_superseded")
+    if (primary is not None and primary is not selected
+        or any(error is not selected for error, _note in cleanup_failures)):
+        notes.append("sandbox_session_secondary_failure")
+    for note in notes:
+        try:
+            BaseException.add_note(selected, note)
+        except BaseException:
+            pass  # Diagnostics must never replace the chosen failure.
+    return selected
 
 
 def _validate_command(command: Sequence[str]) -> None:
