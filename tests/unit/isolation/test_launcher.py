@@ -69,12 +69,14 @@ def collector_rig(monkeypatch, request):
 
     ends = []
     pipes = {}
+    peers = {}
     for name in ("stdin", "stdout", "stderr"):
         reader_fd, writer_fd = os.pipe()
         reader = _CollectorPipe(reader_fd, "rb", name if name != "stdin" else "input-reader")
         writer = _CollectorPipe(writer_fd, "wb", name if name == "stdin" else name + "-writer")
         ends.extend((reader, writer))
         pipes[name] = writer if name == "stdin" else reader
+        peers[name] = reader if name == "stdin" else writer
         if name != "stdin" and not getattr(request, "param", False):
             io.FileIO.close(writer)
 
@@ -94,7 +96,7 @@ def collector_rig(monkeypatch, request):
     session = SandboxSession(process=process, unit_name="collector.service", systemctl="unused",
         client_env={}, output_limit=1024, timeout_seconds=10, input_bytes=b"payload",
         staging=SimpleNamespace(cleanup=lambda: pytest.fail("direct collector cannot clean staging")))
-    state = SimpleNamespace(pipes=pipes, process=process, session=session, selectors=[],
+    state = SimpleNamespace(pipes=pipes, peers=peers, process=process, session=session, selectors=[],
         constructor_error=None, register_error=None, register_at=1, select_error=None,
         unregister_error=None, selector_close_error=None, before_select=None)
     selector_type = launcher_module.selectors.DefaultSelector
@@ -734,6 +736,479 @@ def test_wait_refuses_after_direct_collector_result_conversion_failure(collector
     with pytest.raises(IsolationUnavailable, match="sandbox_session_wait_failed"):
         rig.session.wait()
     _assert_collector_closed_once(rig)
+
+
+def _observe_real_session(rig, monkeypatch):
+    from types import SimpleNamespace
+
+    observed = SimpleNamespace(actions=[], wait_timeouts=[])
+    collect, poll, wait = rig.session._collect, rig.process.poll, rig.process.wait
+
+    def collect_once(*, _cleanup_notes=None):
+        observed.actions.append("collect")
+        return collect(_cleanup_notes=_cleanup_notes)
+
+    def poll_transport():
+        observed.actions.append("poll")
+        return poll()
+
+    def wait_transport(*, timeout):
+        observed.actions.append("wait")
+        observed.wait_timeouts.append(timeout)
+        return wait(timeout=timeout)
+
+    def accept_cancel():
+        observed.actions.append("cancel")
+        rig.session._cancel_requested.set()
+        rig.session._cancel_signal_accepted = True
+        return True
+
+    monkeypatch.setattr(rig.session, "_collect", collect_once)
+    monkeypatch.setattr(rig.process, "poll", poll_transport)
+    monkeypatch.setattr(rig.process, "wait", wait_transport)
+    monkeypatch.setattr(rig.session, "cancel", accept_cancel)
+    monkeypatch.setattr(rig.session._staging, "cleanup", lambda: observed.actions.append("cleanup"))
+    return observed
+
+
+def _seed_real_pipe_bytes(rig, stdout=b"stdout", stderr=b"stderr", input_bytes=b"input"):
+    for name, payload in (("stdout", stdout), ("stderr", stderr)):
+        assert rig.peers[name].write(payload) == len(payload)
+        io.FileIO.close(rig.peers[name])
+    rig.session._input_bytes = input_bytes
+
+
+def _closed_fixture_handle_count(rig):
+    ends = (*rig.pipes.values(), *rig.peers.values())
+    return sum(io.FileIO.closed.__get__(stream) for stream in ends) + sum(
+        selector.real.get_map() is None for selector in rig.selectors)
+
+
+@pytest.fixture
+def fd_sentinel():
+    from types import SimpleNamespace
+
+    reader_fd, writer_fd = os.pipe()
+    reader, writer = io.FileIO(reader_fd, "rb"), io.FileIO(writer_fd, "wb")
+    os.set_blocking(reader.fileno(), False)
+    replacements = []
+
+    def duplicate_after_real_close(old_fd, *, vacancy_budget):
+        # dup allocates a free number; it never overwrites an unknown occupant.
+        # The bound counts the fixture's explicitly closed endpoints/selectors,
+        # including the target. Reused earlier numbers can only overestimate it.
+        assert vacancy_budget > 0
+        for _ in range(vacancy_budget):
+            replacement = io.FileIO(os.dup(reader.fileno()), "rb")
+            replacements.append(replacement)
+            if replacement.fileno() == old_fd:
+                return replacement
+            assert replacement.fileno() < old_fd, "released descriptor was unexpectedly occupied"
+        raise AssertionError("fixture did not obtain the released descriptor number")
+
+    try:
+        yield SimpleNamespace(reader=reader, writer=writer, replacements=replacements,
+            duplicate_after_real_close=duplicate_after_real_close)
+    finally:
+        for replacement in replacements:
+            replacement.close()
+        reader.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("stream_name", ["stdin", "stdout", "stderr"])
+@pytest.mark.parametrize("close_path", ["normal", "final"])
+@pytest.mark.parametrize("after_real_close", [False, True])
+def test_transport_pipe_close_failure_preserves_real_fd_ownership_and_inert_replay(
+    collector_rig, fd_sentinel, monkeypatch, stream_name, close_path, after_real_close,
+):
+    rig = collector_rig
+    observed = _observe_real_session(rig, monkeypatch)
+    victim = rig.pipes[stream_name]
+    old_fd = io.FileIO.fileno(victim)
+    original_stat = os.fstat(old_fd)
+    close_failure, body_failure = OSError("pipe close"), OSError("collection body")
+    victim.close_error = close_failure
+    victim.close_before_error = after_real_close
+    original_close = victim.close
+    replacement = None
+
+    def close_with_owned_replacement():
+        nonlocal replacement
+        try:
+            original_close()
+        except OSError:
+            if after_real_close and replacement is None:
+                assert io.FileIO.closed.__get__(victim)
+                replacement = fd_sentinel.duplicate_after_real_close(
+                    old_fd, vacancy_budget=_closed_fixture_handle_count(rig))
+            raise
+
+    monkeypatch.setattr(victim, "close", close_with_owned_replacement)
+    if close_path == "final":
+        rig.select_error = body_failure
+    with pytest.raises(OSError) as caught:
+        rig.session.wait()
+    assert caught.value is (body_failure if close_path == "final" else close_failure)
+    _assert_collector_closed_once(rig)
+    if after_real_close:
+        assert replacement is not None and replacement.fileno() == old_fd
+        assert os.fstat(old_fd).st_ino == os.fstat(fd_sentinel.reader.fileno()).st_ino
+        assert fd_sentinel.writer.write(b"replacement after cleanup") == 25
+        assert replacement.read(25) == b"replacement after cleanup"
+    else:
+        assert not io.FileIO.closed.__get__(victim)
+        assert os.fstat(old_fd) == original_stat  # The failed close still owns its original pipe end.
+        assert fd_sentinel.replacements == []
+    actions = list(observed.actions)
+    for _ in range(2):
+        with pytest.raises(IsolationUnavailable, match="sandbox_session_wait_failed"):
+            rig.session.wait()
+    assert observed.actions == actions
+    _assert_collector_closed_once(rig)
+    if replacement is not None:
+        assert fd_sentinel.writer.write(b"replacement after replay") == 24
+        assert replacement.read(24) == b"replacement after replay"
+
+
+def test_transport_selector_close_after_real_close_preserves_reused_fd(collector_rig, fd_sentinel, monkeypatch):
+    rig = collector_rig
+    observed = _observe_real_session(rig, monkeypatch)
+    primary = OSError("collection body")
+    rig.select_error = primary
+    replacement = None
+
+    def arm_real_selector_close():
+        selector = rig.selectors[0]
+        old_fd = selector.real.fileno()
+        original_close = selector.close
+
+        def close_then_replace():
+            nonlocal replacement
+            original_close()  # Real selector clears its own internal fd first.
+            replacement = fd_sentinel.duplicate_after_real_close(
+                old_fd, vacancy_budget=_closed_fixture_handle_count(rig))
+            raise OSError("selector close after release")
+
+        monkeypatch.setattr(selector, "close", close_then_replace)
+
+    rig.before_select = arm_real_selector_close
+    with pytest.raises(OSError) as caught:
+        rig.session.wait()
+    assert caught.value is primary
+    _assert_collector_closed_once(rig)
+    assert replacement is not None
+    assert fd_sentinel.writer.write(b"selector replacement") == 20
+    assert replacement.read(20) == b"selector replacement"
+    actions = list(observed.actions)
+    with pytest.raises(IsolationUnavailable, match="sandbox_session_wait_failed"):
+        rig.session.wait()
+    assert observed.actions == actions
+    assert fd_sentinel.writer.write(b"still open") == 10
+    assert replacement.read(10) == b"still open"
+
+
+@pytest.mark.parametrize("collector_rig", [True], indirect=True)
+def test_transport_alias_reads_one_owned_object_and_replays_identical_bytes(collector_rig, monkeypatch):
+    rig = collector_rig
+    _seed_real_pipe_bytes(rig, stdout=b"aliased stdout and stderr", stderr=b"fixture-only")
+    observed = _observe_real_session(rig, monkeypatch)
+    rig.process.stderr = rig.process.stdout
+    rig.process.returncode = 7
+    result = rig.session.wait()
+    assert result.stdout == result.stderr == b"aliased stdout and stderr"
+    assert result.returncode == 7 and result.input_written and not result.termination_confirmed
+    assert rig.peers["stdin"].read(5) == b"input"
+    assert rig.pipes["stdout"].close_calls == rig.pipes["stdin"].close_calls == 1
+    assert rig.pipes["stderr"].close_calls == 0
+    assert not io.FileIO.closed.__get__(rig.pipes["stderr"])
+    assert rig.selectors[0].register_calls == 2
+    actions = list(observed.actions)
+    assert rig.session.wait() is result
+    assert observed.actions == actions
+
+
+def test_transport_three_field_object_alias_closes_once_on_real_registration_conflict(collector_rig, monkeypatch):
+    rig = collector_rig
+    observed = _observe_real_session(rig, monkeypatch)
+    rig.process.stdout = rig.process.stderr = rig.process.stdin
+    with pytest.raises(KeyError):
+        rig.session.wait()
+    assert rig.pipes["stdin"].close_calls == 1
+    assert rig.pipes["stdout"].close_calls == rig.pipes["stderr"].close_calls == 0
+    assert rig.selectors[0].close_calls == 1
+    assert all(not io.FileIO.closed.__get__(rig.pipes[name]) for name in ("stdout", "stderr"))
+    actions = list(observed.actions)
+    with pytest.raises(IsolationUnavailable, match="sandbox_session_wait_failed"):
+        rig.session.wait()
+    assert observed.actions == actions
+
+
+@pytest.mark.parametrize("collector_rig", [True], indirect=True)
+@pytest.mark.parametrize("callback_boundary", ["select", "pipe-close"])
+def test_transport_caught_reentry_preserves_real_bytes_status_and_healthy_cache(collector_rig, monkeypatch, callback_boundary):
+    rig = collector_rig
+    output, error, payload = b"o" * 3500, b"e" * 3000, b"input" * 800
+    _seed_real_pipe_bytes(rig, output, error, payload)
+    rig.session._output_limit = 10000
+    rig.process.returncode = 7
+    observed = _observe_real_session(rig, monkeypatch)
+    nested = []
+
+    def catch_reentry():
+        with pytest.raises(IsolationUnavailable) as caught:
+            rig.session.wait()
+        nested.append(caught.value)
+
+    if callback_boundary == "select":
+        rig.before_select = lambda: catch_reentry() if not nested else None
+    else:
+        original_close = rig.pipes["stdout"].close
+
+        def reentrant_close():
+            catch_reentry()
+            original_close()
+
+        monkeypatch.setattr(rig.pipes["stdout"], "close", reentrant_close)
+    result = rig.session.wait()
+    assert len(nested) == 1 and nested[0].args == ("sandbox_session_wait_failed",)
+    assert not getattr(rig.session, "_wait_failed", False)
+    assert result.stdout == output and result.stderr == error and result.input_written
+    assert rig.peers["stdin"].read(len(payload)) == payload
+    assert result.returncode == 7 and not result.cancelled and not result.timed_out and not result.output_limited
+    assert not result.termination_confirmed
+    _assert_collector_closed_once(rig)
+    actions = list(observed.actions)
+    assert rig.session.wait() is result
+    assert observed.actions == actions and observed.wait_timeouts == [2.0]
+
+
+@pytest.mark.parametrize("collector_rig", [True], indirect=True)
+def test_transport_real_output_uses_one_combined_cap_and_preserves_flags(collector_rig, monkeypatch):
+    rig = collector_rig
+    _seed_real_pipe_bytes(rig, b"12345", b"abcde", b"")
+    rig.session._output_limit = 7
+    observed = _observe_real_session(rig, monkeypatch)
+    result = rig.session.wait()
+    assert len(result.stdout) + len(result.stderr) == 7
+    assert b"12345".startswith(result.stdout) and b"abcde".startswith(result.stderr)
+    assert result.output_limited and not result.cancelled and not result.timed_out and result.input_written
+    assert result.returncode == 0 and "cancel" in observed.actions and not result.termination_confirmed
+    _assert_collector_closed_once(rig)
+
+
+@pytest.mark.parametrize("collector_rig", [True], indirect=True)
+@pytest.mark.parametrize("reason", ["cancel", "timeout"])
+def test_transport_real_held_pipes_keep_cancel_and_timeout_grace_semantics(collector_rig, monkeypatch, reason):
+    rig = collector_rig
+    assert rig.peers["stdout"].write(b"partial output") == 14
+    rig.session._stop_grace_seconds = 0.01
+    rig.process.returncode = None
+    monkeypatch.setattr(rig.process, "poll", lambda: None)
+    monkeypatch.setattr(rig.process, "wait", lambda **_options: pytest.fail("expired stop grace cannot wait again"))
+    if reason == "cancel":
+        rig.session._cancel_requested.set()
+    else:
+        rig.session._started = time.monotonic() - rig.session._timeout_seconds - 1
+    observed = _observe_real_session(rig, monkeypatch)
+    started = time.monotonic()
+    result = rig.session.wait()
+    assert time.monotonic() - started < 2
+    assert result.stdout == b"partial output" and result.stderr == b""
+    assert result.returncode == 125 and not result.input_written and not result.output_limited
+    assert result.cancelled is (reason == "cancel") and result.timed_out is (reason == "timeout")
+    assert not result.termination_confirmed and observed.wait_timeouts == []
+    assert "cancel" in observed.actions and "cleanup" not in observed.actions
+    _assert_collector_closed_once(rig)
+
+
+def _wait_thread(session, outcomes, name, finished=None):
+    def run():
+        try:
+            outcomes[name] = session.wait()
+        except BaseException as error:
+            outcomes[name] = error
+        finally:
+            if finished is not None:
+                finished.set()
+
+    return threading.Thread(target=run, name="transport-test-" + name, daemon=False)
+
+
+@pytest.mark.parametrize("collector_rig", [True], indirect=True)
+def test_transport_healthy_second_thread_serializes_behind_real_collector(collector_rig, monkeypatch):
+    rig = collector_rig
+    _seed_real_pipe_bytes(rig)
+    observed = _observe_real_session(rig, monkeypatch)
+    entered, second_attempted = threading.Barrier(2), threading.Barrier(2)
+    release = threading.Event()
+    outcomes = {}
+    first = _wait_thread(rig.session, outcomes, "first")
+    second = _wait_thread(rig.session, outcomes, "second")
+    actual_lock = rig.session._wait_lock
+
+    class ObservedLock:
+        def __enter__(self):
+            if threading.current_thread() is second:
+                second_attempted.wait(timeout=3)
+            if not actual_lock.acquire(timeout=3):
+                raise RuntimeError("test wait lock did not become available")
+            return self
+
+        def __exit__(self, *_error):
+            actual_lock.release()
+
+    monkeypatch.setattr(rig.session, "_wait_lock", ObservedLock())
+
+    held = False
+
+    def hold_first_select():
+        nonlocal held
+        if not held:
+            held = True
+            entered.wait(timeout=3)
+            assert release.wait(timeout=3), "fixture must release first collector"
+
+    rig.before_select = hold_first_select
+    started, entered_done, attempted_done = [], False, False
+    try:
+        first.start()
+        started.append(first)
+        entered.wait(timeout=3)
+        entered_done = True
+        second.start()
+        started.append(second)
+        second_attempted.wait(timeout=3)
+        attempted_done = True
+        assert observed.actions.count("collect") == 1 and len(rig.selectors) == 1
+        assert second.is_alive() and outcomes == {}
+    finally:
+        release.set()
+        if not entered_done:
+            entered.abort()
+        if not attempted_done:
+            second_attempted.abort()
+        for thread in started:
+            thread.join(timeout=4)
+        assert all(not thread.is_alive() for thread in started)
+    assert isinstance(outcomes["first"], launcher_module.SandboxResult)
+    assert outcomes["second"] is outcomes["first"]
+    assert outcomes["first"].stdout == b"stdout" and outcomes["first"].stderr == b"stderr"
+    assert observed.actions.count("collect") == observed.actions.count("wait") == observed.actions.count("cleanup") == 1
+    assert rig.peers["stdin"].read(5) == b"input"
+    _assert_collector_closed_once(rig)
+
+
+def test_transport_failed_second_thread_refuses_while_real_cleanup_is_still_active(collector_rig, monkeypatch):
+    rig = collector_rig
+    observed = _observe_real_session(rig, monkeypatch)
+    primary = OSError("collector before blocked cleanup")
+    rig.select_error = primary
+    entered = threading.Barrier(2)
+    release, second_finished = threading.Event(), threading.Event()
+    outcomes = {}
+    first = _wait_thread(rig.session, outcomes, "first")
+    second = _wait_thread(rig.session, outcomes, "second", second_finished)
+    original_close = rig.pipes["stdout"].close
+
+    def held_close():
+        entered.wait(timeout=3)
+        assert release.wait(timeout=3), "fixture must release owned close"
+        original_close()
+
+    monkeypatch.setattr(rig.pipes["stdout"], "close", held_close)
+    started, entered_done = [], False
+    try:
+        first.start()
+        started.append(first)
+        entered.wait(timeout=3)
+        entered_done = True
+        actions = list(observed.actions)
+        counters = [rig.pipes[name].close_calls for name in ("stdin", "stdout", "stderr")]
+        second.start()
+        started.append(second)
+        assert second_finished.wait(timeout=2), "failed wait must refuse while cleanup remains blocked"
+        assert first.is_alive() and not release.is_set()
+        assert type(outcomes["second"]) is IsolationUnavailable
+        assert outcomes["second"].args == ("sandbox_session_wait_failed",)
+        assert observed.actions == actions
+        assert [rig.pipes[name].close_calls for name in ("stdin", "stdout", "stderr")] == counters
+    finally:
+        release.set()
+        if not entered_done:
+            entered.abort()
+        for thread in started:
+            thread.join(timeout=4)
+        assert all(not thread.is_alive() for thread in started)
+    assert outcomes["first"] is primary
+    assert rig.session._result is None
+    assert getattr(rig.session, "_wait_owner_thread", None) is None
+    _assert_collector_closed_once(rig)
+
+
+@pytest.mark.parametrize("collector_rig", [True], indirect=True)
+@pytest.mark.parametrize("fail_final_poll", [False, True])
+def test_transport_real_collection_preserves_qualified_handoff_and_fresh_poll_gate(collector_rig, monkeypatch, fail_final_poll):
+    rig = collector_rig
+    _seed_real_pipe_bytes(rig)
+    observed = _observe_real_session(rig, monkeypatch)
+    unit, group = _attempt_identity()
+    rig.session.unit_name, rig.session._scope_cgroup = unit, group
+    # Healthy handoff retains staging; failed fresh poll must gate even enabled discard.
+    rig.session._cleanup_on_termination = fail_final_poll
+    receipt = launcher_module.SandboxTerminationReceipt(unit,
+        "/" + group.relative_to("/sys/fs/cgroup").as_posix(), "inactive", True)
+    actions = []
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", lambda **_arguments: actions.append("receipt") or receipt)
+    monkeypatch.setattr(launcher_module, "_discard_staging", lambda _staging: actions.append("discard"))
+
+    class Owner:
+        def _retire_session(self, session):
+            assert session is rig.session and session._result is None
+            actions.append("retire")
+
+    owner = Owner()
+    rig.session._owner_ref = lambda: actions.append("owner") or owner
+    collected = False
+    final_polls = 0
+    primary = OSError("fresh post-receipt poll")
+    actual_collect, actual_poll = rig.session._collect, rig.process.poll
+
+    def collect(*, _cleanup_notes=None):
+        nonlocal collected
+        result = actual_collect(_cleanup_notes=_cleanup_notes)
+        collected = True
+        return result
+
+    def poll():
+        nonlocal final_polls
+        if collected:
+            final_polls += 1
+            if fail_final_poll and final_polls == 2:
+                raise primary
+        return actual_poll()
+
+    monkeypatch.setattr(rig.session, "_collect", collect)
+    monkeypatch.setattr(rig.process, "poll", poll)
+    if fail_final_poll:
+        with pytest.raises(OSError) as caught:
+            rig.session.wait()
+        assert caught.value is primary and rig.session._result is None
+        assert actions == ["receipt"]
+    else:
+        result = rig.session.wait()
+        assert result.termination_receipt is receipt
+        assert result.stdout == b"stdout" and result.stderr == b"stderr" and result.input_written
+        assert actions == ["receipt", "owner", "retire"]
+    assert "cleanup" not in observed.actions and "discard" not in actions
+    _assert_collector_closed_once(rig)
+    snapshot = (list(observed.actions), list(actions), final_polls)
+    if fail_final_poll:
+        with pytest.raises(IsolationUnavailable, match="sandbox_session_wait_failed"):
+            rig.session.wait()
+    else:
+        assert rig.session.wait() is result
+    assert (observed.actions, actions, final_polls) == snapshot
 
 
 @pytest.mark.parametrize(

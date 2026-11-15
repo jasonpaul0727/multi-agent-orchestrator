@@ -65,9 +65,9 @@
 **Consumes:** Reviewed A/B behavior.
 **Produces:** Actual descriptor reuse/alias and thread/replay evidence, not a synthetic stop witness.
 
-- [ ] Use own real pipes and controlled duplication: close attempt may fail before or after actual close; place a fixture replacement at the old FD number where applicable and prove it survives later collector/wait cleanup. Tests explicitly clean their own sentinels without touching unrelated descriptors.
-- [ ] Cover aliased pipe objects, caught same-thread reentry, bounded barrier-driven second thread, healthy identical result replay, bytes/status/input/output cap preservation, false cleanup flag and failed-poll nondeletion. Do not relabel already-green guards as RED.
-- [ ] Run focused changed tests plus existing related launcher/overlay/GeneralWorker consumer tests as justified, without real Provider/systemd calls. Write `session-cleanup-c-report.md`; independent scoped review and parent third substantive test/evidence commit/push/quota.
+- [x] Use own real pipes and controlled duplication: close attempt may fail before or after actual close; place a fixture replacement at the old FD number where applicable and prove it survives later collector/wait cleanup. Tests explicitly clean their own sentinels without touching unrelated descriptors.
+- [x] Cover aliased pipe objects, caught same-thread reentry, bounded barrier-driven second thread, healthy identical result replay, bytes/status/input/output cap preservation, false cleanup flag and failed-poll nondeletion. Do not relabel already-green guards as RED.
+- [x] Run focused changed tests plus existing related launcher/overlay/GeneralWorker consumer tests as justified, without real Provider/systemd calls. Write `session-cleanup-c-report.md`; independent scoped review and parent third substantive test/evidence commit/push/quota.
 
 ## Whole-task acceptance
 
