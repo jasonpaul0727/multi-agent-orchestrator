@@ -26,31 +26,33 @@ Preserve existing pure model and production code. Full v1/unknown reconciliation
 **Files:** create `tests/support/dual_view_sqlite_codec.py`, `tests/support/dual_view_sqlite_store.py`, `tests/unit/runtime/test_dual_view_sqlite_store.py`.
 **Interfaces:** finite `encode(value)->str`, `decode(text)->value` using exact registered types; `create_store(path:Path)->None`; context manager `SqliteDualViewStore(path)` and `read()->ModelState`.
 
-- [ ] Write failing behavioral tests for exact roundtrip, duplicate JSON keys, unknown tags/fields/versions, bool-as-int/non-finite/depth/size rejection; immutable input isolation.
-- [ ] Run RED, implement only required codec.
-- [ ] Write RED tests for exclusive create, missing/open-existing/foreign DB/schema/version refusal and verified empty read; implement lifecycle and WAL/FULL/bounded timeout settings.
-- [ ] Independently review A and fix findings; normalize own new files, focused tests, commit and ordinary feature push; immediately check quota.
+- [x] Write failing behavioral tests for exact roundtrip, duplicate JSON keys, unknown tags/fields/versions, bool-as-int/non-finite/depth/size rejection; immutable input isolation.
+- [x] Run RED, implement only required codec.
+- [x] Write RED tests for exclusive create, missing/open-existing/foreign DB/schema/version refusal and verified empty read; implement lifecycle and WAL/FULL/bounded timeout settings.
+- [x] Independently review A and fix findings; normalize own new files, focused tests, commit and ordinary feature push; immediately check quota.
 
 ### Stage B: One-transaction events, winner and resources
 
 **Interfaces:** `apply(command,*,hook=None)->(ModelState,Observation)` accepts only fixed persistent commands; `commit(envelope,*,hook=None)->(ModelState,Observation)`, owns local Prepare+Commit; `read()` always fully verifies.
 
-- [ ] RED: source registered, separate stop/effect YES facts, v1 history unchanged, B proposal/commit produces one winner/reservation and debit; exact repeat unchanged; altered envelope conflicts; other version/entry superseded according to model.
-- [ ] RED: unknown/closed generation/stale source/expiry/limits block; winner retained after unknown but no new winner; wrong source/fences invalid; all event/projection/index rows match replay.
-- [ ] RED: exception after events/projection/index update rolls back; malformed/gapped events, changed projections/resources/winner and foreign schema refuse without repair. Add bounded hooks by spec and preserve primary exception when cleanup fails.
-- [ ] GREEN, independent B review, focused tests, second substantive commit/push; quota immediately after push.
+- [x] RED: source registered, separate stop/effect YES facts, v1 history unchanged, B proposal/commit produces one winner/reservation and debit; exact repeat unchanged; altered envelope conflicts; other version/entry superseded according to model.
+- [x] RED: unknown/closed generation/stale source/expiry/limits block; winner retained after unknown but no new winner; wrong source/fences invalid; all event/projection/index rows match replay.
+- [x] RED: exception after events/projection/index update rolls back; malformed/gapped events, changed projections/resources/winner and foreign schema refuse without repair. Add bounded hooks by spec and preserve primary exception when cleanup fails.
+- [x] GREEN, independent B review, focused tests, second substantive commit/push; quota immediately after push.
 
 ### Stage C: Actual process races, SIGKILL and reopen
 
 **Files:** create `tests/integration/test_dual_view_sqlite_processes.py`; optional `tests/support/dual_view_sqlite_process.py` fixed-purpose test harness.
 
-- [ ] RED/GREEN: real independent processes with opened/locked/phase ack/release protocol, shared bounded startup deadline, verify actual busy lock before deterministic loser proceeds; both winner orders and simultaneous race, exact duplicate/different envelope, independent source and unknown/generation first-writer races.
-- [ ] RED/GREEN: SIGKILL only owned child after after_begin/after_events/after_projection/after_indexes/before_commit/after_commit acknowledgement; every precommit cut old state, postcommit complete state and retry once. New process opens/validates entire DB after all writers exit; pending empty.
-- [ ] Set wal_autocheckpoint=0 on every connection and keep parent connection across races/cuts, no manual checkpoint until all writers gone; record runtime/compile options and filesystem. Verify no production reverse dependency or Provider/network access; do not modify old pure model.
-- [ ] Independently review C and resolve findings; focused tests, third substantive commit/push; quota immediately after push.
+- [x] RED/GREEN: real independent processes with opened/locked/phase ack/release protocol, shared bounded startup deadline, verify actual busy lock before deterministic loser proceeds; both winner orders and simultaneous race, exact duplicate/different envelope, independent source and unknown/generation first-writer races.
+- [x] RED/GREEN: SIGKILL only owned child after after_begin/after_events/after_projection/after_indexes/before_commit/after_commit acknowledgement; every precommit cut old state, postcommit complete state and retry once. New process opens/validates entire DB after all writers exit; pending empty.
+- [x] Set wal_autocheckpoint=0 on every connection and keep parent connection across races/cuts, no manual checkpoint until all writers gone; record runtime/compile options and filesystem. Verify no production reverse dependency or Provider/network access; do not modify old pure model.
+- [x] Independently review C and resolve findings; focused tests, third substantive commit/push; quota immediately after push.
 
 ### Finish
 
-- [ ] Independent whole-slice spec/quality review, fixes with TDD, exact final source verification.
-- [ ] One final full pytest with explicit isolated PYTHONPATH and distinct JUnit in the same existing progress ledger. Do not modify source or duplicate suite while live; investigate any failure, preserve all red evidence.
-- [ ] Record final local/remote SHA, actual coverage and limitations, completed count and next P3 gates in progress.md. Mark only this local persistence prerequisite complete; do not claim P3 complete or activate production retry.
+- [x] Independent whole-slice spec/quality review, fixes with TDD, exact final source verification.
+- [x] One final full pytest with explicit isolated PYTHONPATH and distinct JUnit in the same existing progress ledger. Do not modify source or duplicate suite while live; investigate any failure, preserve all red evidence.
+- [x] Record final local/remote SHA, actual coverage and limitations, completed count and next P3 gates in progress.md. Mark only this local persistence prerequisite complete; do not claim P3 complete or activate production retry.
+
+Final validation: combined source 2a684d9426cfd3a5b622979ed85ffa8706ffbc24, independent task/stage/whole reviews PASS, full pytest 5042 passed / 1 xfailed / 28 JUnit record_property compatibility warnings in 1441.11s. JUnit p3-durable-wire-full-2a684d9-20261115.xml retained in the existing progress ledger. This completes this bounded task only; full P3, production admission/stop/settlement authority and staging custody remain open.
