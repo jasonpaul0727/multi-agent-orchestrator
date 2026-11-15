@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -384,3 +385,151 @@ def test_model_dictionary_mutation_during_key_observation_is_rejected(monkeypatc
     monkeypatch.setattr(protocol, "type", observe_type, raising=False)
     rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, unsafe)))
     assert 1 <= len(inspected) <= len(keys)
+
+
+@pytest.mark.parametrize("field, contract", [
+    ("input_artifacts", ArtifactRef), ("tool_capabilities", ToolCapabilityRef),
+])
+@pytest.mark.parametrize("mutation", ["grow", "shrink", "finite-growth"])
+def test_collection_snapshot_rejects_length_changes_without_following_new_elements(
+    monkeypatch, field, contract, mutation,
+):
+    # A live list iterator follows appended items and silently accepts a shortened list.
+    h = "sha256:" + "a" * 64
+
+    def reference(index):
+        if contract is ArtifactRef:
+            return ArtifactRef(digest=f"sha256:{index:064x}", size_bytes=0,
+                artifact_type="text", media_type="text/plain")
+        return ToolCapabilityRef(grant_id=f"grant-{index:03}", tool_id="tool", scope_hash=h)
+
+    source = [reference(0), reference(1)]
+    unsafe = task().model_copy(update={field: source})
+    converted = []
+    original = protocol._model_fields
+
+    def observe_fields(model, expected):
+        snapshot = original(model, expected)
+        if expected is contract:
+            converted.append(model)
+            if mutation == "shrink" and len(converted) == 1:
+                source.pop()
+            elif mutation == "grow" and len(converted) == 1:
+                source.append(reference(2))
+            elif mutation == "finite-growth" and len(converted) <= 4:
+                source.append(reference(len(source)))
+        return snapshot
+
+    monkeypatch.setattr(protocol, "_model_fields", observe_fields)
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, unsafe)))
+    assert 1 <= len(converted) <= 2
+
+
+@pytest.mark.parametrize("phase", ["request", "complete"])
+def test_encode_builds_valid_outbound_snapshot_without_generic_plain_copy(monkeypatch, phase):
+    # Reintroducing generic outbound copying would revisit the entire schema snapshot.
+    observed = []
+    original = protocol._plain
+
+    def observe_plain(value):
+        observed.append(type(value))
+        return original(value)
+
+    monkeypatch.setattr(protocol, "_plain", observe_plain)
+    turn = GeneralWorkerTurn(phase, LAUNCH, task(), "é" if phase == "complete" else None)
+    payload = encode_general_worker_turn(turn)
+    assert json.loads(payload)["phase"] == phase
+    assert len(observed) == 0
+
+
+@pytest.mark.parametrize("limit, response", [
+    (3, "xxxx"), (20_000, "x" * 16_385), (3, "xxx\ud800"),
+], ids=["task-byte-limit", "protocol-byte-limit", "overlong-surrogate"])
+def test_completion_character_cap_rejects_before_encoding_response(limit, response):
+    # Without the cheap character gate, even already-invalid strings reach UTF-8 encoding.
+    encoded = []
+    previous = sys.getprofile()
+
+    def observe_encoding(frame, event, function):
+        if (event == "c_call" and getattr(function, "__name__", None) == "encode"
+            and getattr(function, "__self__", None) is response):
+            encoded.append(function)
+
+    try:
+        sys.setprofile(observe_encoding)
+        rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("complete", LAUNCH,
+            task(limit), response)))
+    finally:
+        sys.setprofile(previous)
+    assert len(encoded) == 0
+
+
+@pytest.mark.parametrize("phase, response", [
+    ("complete", "xxxx"), ("complete", ["private-response"]),
+    ("complete", "éxx"), ("request", "private-response"),
+], ids=["over-character-cap", "wrong-type", "over-byte-cap", "request-response"])
+def test_invalid_response_rejects_before_copying_nested_contracts(monkeypatch, phase, response):
+    # Response rejection should not spend work snapshotting the task's nested models.
+    observed = []
+    original = protocol._model_fields
+
+    def observe_fields(model, expected):
+        if expected is not WorkerTask:
+            observed.append(expected)
+        return original(model, expected)
+
+    monkeypatch.setattr(protocol, "_model_fields", observe_fields)
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn(phase, LAUNCH, task(3), response)))
+    assert len(observed) == 0
+
+
+@pytest.mark.parametrize("field, contract", [
+    ("input_artifacts", ArtifactRef), ("tool_capabilities", ToolCapabilityRef),
+])
+def test_empty_collection_growth_before_element_snapshot_is_rejected(monkeypatch, field, contract):
+    # Re-reading the initial count after context conversion would follow this new item.
+    h = "sha256:" + "a" * 64
+    if contract is ArtifactRef:
+        added = ArtifactRef(digest=h, size_bytes=0, artifact_type="text", media_type="text/plain")
+    else:
+        added = ToolCapabilityRef(grant_id="grant", tool_id="tool", scope_hash=h)
+    source = []
+    unsafe = task().model_copy(update={field: source})
+    converted = []
+    original = protocol._model_fields
+
+    def observe_fields(model, expected):
+        snapshot = original(model, expected)
+        if expected is AttemptContext:
+            source.append(added)
+        elif expected is contract:
+            converted.append(model)
+        return snapshot
+
+    monkeypatch.setattr(protocol, "_model_fields", observe_fields)
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, unsafe)))
+    assert len(converted) == 0
+
+
+@pytest.mark.parametrize("limit, response, content", [
+    (1, "", b""), (1, "x", b"x"), (2, "é", b"\xc3\xa9"),
+    (3, "éx", b"\xc3\xa9x"), (4, "\U0001f642", b"\xf0\x9f\x99\x82"),
+], ids=["empty", "one-byte", "two-byte", "mixed-byte", "four-byte"])
+def test_completion_preserves_exact_utf8_content_at_response_limit(limit, response, content):
+    # Character admission must still accept exact byte boundaries, including empty output.
+    turn = GeneralWorkerTurn("complete", LAUNCH, task(limit), response)
+    payload = encode_general_worker_turn(turn)
+    assert decode_general_worker_turn(payload) == turn
+    result = child(payload)
+    assert (result.returncode, result.stderr) == (0, b"")
+    decoded = decode_general_worker_proposal(result.stdout, turn)
+    assert decoded.blobs[0].content == content
+
+
+@pytest.mark.parametrize("limit, response", [
+    (2, "éx"), (4, "\U0001f642x"), (1, "\ud800"), (3, "x\udfff"),
+], ids=["two-byte-over", "four-byte-over", "high-surrogate", "low-surrogate"])
+def test_completion_rejects_exact_utf8_overflow_and_short_surrogates(limit, response):
+    # Strings within the character cap still require a strict exact UTF-8 byte check.
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("complete", LAUNCH,
+        task(limit), response)))

@@ -182,20 +182,24 @@ def _launch_identity(value: object) -> None:
         raise ValueError("invalid launch identity")
 
 
+def _response(phase: str, value: object, byte_limit: int) -> None:
+    if phase == "request":
+        if value is not None:
+            raise ValueError("unexpected response")
+        return
+    cap = min(MAX_OUTPUT_BYTES, byte_limit)
+    if (type(value) is not str or len(value) > cap
+        or len(value.encode("utf-8", errors="strict")) > cap):
+        raise ValueError("invalid response")
+
+
 def _validate_turn(value: dict) -> None:
     _fields(value, {"schema", "phase", "launch_id", "task", "response_text"})
     if value["schema"] != _TURN_SCHEMA or value["phase"] not in ("request", "complete"):
         raise ValueError("invalid turn kind")
     _launch_identity(value["launch_id"])
     _task(value["task"])
-    response = value["response_text"]
-    if value["phase"] == "request":
-        if response is not None:
-            raise ValueError("unexpected response")
-    elif type(response) is not str or len(response.encode("utf-8", errors="strict")) > min(
-        MAX_OUTPUT_BYTES, value["task"]["output_byte_limit"]
-    ):
-        raise ValueError("invalid response")
+    _response(value["phase"], value["response_text"], value["task"]["output_byte_limit"])
 
 
 def _model_fields(value: object, expected: type) -> dict:
@@ -228,28 +232,43 @@ def _turn_value(turn: GeneralWorkerTurn) -> dict:
 
     if type(turn) is not GeneralWorkerTurn:
         raise ValueError("unexpected turn type")
-    if type(turn.phase) is not str or turn.phase not in ("request", "complete"):
+    phase, launch_id, response = turn.phase, turn.launch_id, turn.response_text
+    if type(phase) is not str or phase not in ("request", "complete"):
         raise ValueError("invalid turn kind")
-    _launch_identity(turn.launch_id)
+    _launch_identity(launch_id)
     fields = _model_fields(turn.task, WorkerTask)
     _text(fields["role"], maximum=64, pattern=_IDENTIFIER)
     _text(fields["task_text"], maximum=100_000, blank=True)
     _integer(fields["output_byte_limit"], 1, 1_073_741_824)
+    _response(phase, response, fields["output_byte_limit"])
+    counts = {}
     for name, cap in (("input_artifacts", 128), ("tool_capabilities", 64)):
-        if type(fields[name]) not in (list, tuple) or len(fields[name]) > cap:
+        source = fields[name]
+        if type(source) not in (list, tuple):
             raise ValueError("invalid array")
+        count = len(source)
+        if count > cap:
+            raise ValueError("invalid array")
+        counts[name] = count
     fields["context"] = _model_fields(fields["context"], AttemptContext)
     _context(fields["context"])
     for name, expected, validate in (("input_artifacts", ArtifactRef, _artifact),
         ("tool_capabilities", ToolCapabilityRef, _capability)):
+        source, count = fields[name], counts[name]
         snapshots = []
-        for item in fields[name]:
-            snapshot = _model_fields(item, expected)
+        for index in range(count):
+            if len(source) != count:
+                raise ValueError("array changed during snapshot")
+            snapshot = _model_fields(source[index], expected)
             validate(snapshot)
+            if len(source) != count:
+                raise ValueError("array changed during snapshot")
             snapshots.append(snapshot)
+        if len(source) != count:
+            raise ValueError("array changed during snapshot")
         fields[name] = snapshots
-    value = _plain({"schema": _TURN_SCHEMA, "phase": turn.phase,
-        "launch_id": turn.launch_id, "task": fields, "response_text": turn.response_text})
+    value = {"schema": _TURN_SCHEMA, "phase": phase,
+        "launch_id": launch_id, "task": fields, "response_text": response}
     _validate_turn(value)
     return value
 
