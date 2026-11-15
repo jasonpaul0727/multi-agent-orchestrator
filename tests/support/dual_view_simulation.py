@@ -88,6 +88,20 @@ class Outcome(Enum):
     HELD_INVALID = auto()
     RECONCILIATION = auto()
     CONFLICT = auto()
+    PREPARED = auto()
+    WINNER = auto()
+    SUPERSEDED = auto()
+    PRECONDITIONS_MET_NON_AUTHORITY = auto()
+
+
+class Invalidation(Enum):
+    UNKNOWN = auto()
+    REVOKED = auto()
+    STALE = auto()
+    INPUT = auto()
+    EFFECT = auto()
+    OLD_SEND = auto()
+    RESERVATION = auto()
 
 
 @dataclass(frozen=True)
@@ -145,9 +159,48 @@ class Propose:
 
 
 @dataclass(frozen=True)
+class PrepareCommit:
+    envelope: Envelope
+
+
+@dataclass(frozen=True)
+class Commit:
+    envelope: Envelope
+
+
+@dataclass(frozen=True)
+class CloseGeneration:
+    source: Source
+    generation: int
+
+
+@dataclass(frozen=True)
+class Invalidate:
+    source: Source
+    reason: Invalidation
+
+
+@dataclass(frozen=True)
+class SimulateDispatchCheck:
+    envelope: Envelope
+
+
+@dataclass(frozen=True)
+class Reservation:
+    envelope: Envelope
+    revoked: bool = False
+
+
+@dataclass(frozen=True)
+class Winner:
+    envelope: Envelope
+    reservation: Reservation
+
+
+@dataclass(frozen=True)
 class Event:
     ordinal: int
-    command: RegisterSource | SetFacts | Propose
+    command: RegisterSource | SetFacts | Propose | Commit | CloseGeneration | Invalidate
 
 
 @dataclass(frozen=True)
@@ -157,6 +210,12 @@ class SourceState:
     fixture: Fixture
     facts: tuple[Value, ...]
     first_yes: tuple[int | None, ...]
+    budget: int
+    attempts: int
+    max_attempts: int
+    retry_level: int
+    max_retries: int
+    invalidations: tuple[Invalidation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -164,6 +223,9 @@ class ModelState:
     sources: tuple[SourceState, ...] = ()
     events: tuple[Event, ...] = ()
     proposals: tuple[Envelope, ...] = ()
+    pending: tuple[Envelope, ...] = ()
+    winners: tuple[Winner, ...] = ()
+    closed_generations: tuple[tuple[Source, int], ...] = ()
     clock: int = 0
     simulation_only: bool = True
     non_authoritative: bool = True
@@ -210,14 +272,24 @@ def _command_shape_ok(command):
                         and type(pair[0]) is Fact and type(pair[1]) is Value
                         and pair[1] is not Value.UNSET for pair in changes)
                 and len({pair[0] for pair in changes}) == len(changes))
-    return type(command) is Propose and _envelope_ok(command.envelope)
+    if type(command) in (Propose, PrepareCommit, Commit, SimulateDispatchCheck):
+        return _envelope_ok(command.envelope)
+    if type(command) is CloseGeneration:
+        return type(command.source) is Source and type(command.generation) is int and command.generation == 0
+    return (type(command) is Invalidate and type(command.source) is Source
+            and type(command.reason) is Invalidation)
 
 def _state_ok(state):
     if (type(state) is not ModelState or state.simulation_only is not True
             or state.non_authoritative is not True
             or type(state.sources) is not tuple or len(state.sources) > 2):
         return False
-    if type(state.events) is not tuple or len(state.events) > 64 or type(state.proposals) is not tuple or len(state.proposals) > 4 or not _clock_ok(state.clock):
+    if (type(state.events) is not tuple or len(state.events) > 64
+            or type(state.proposals) is not tuple or len(state.proposals) > 4
+            or type(state.pending) is not tuple or len(state.pending) > 4
+            or type(state.winners) is not tuple or len(state.winners) > 2
+            or type(state.closed_generations) is not tuple or len(state.closed_generations) > 2
+            or not _clock_ok(state.clock)):
         return False
     if not all(type(event) is Event and type(event.ordinal) is int and event.ordinal == i
                and _command_shape_ok(event.command)
@@ -229,10 +301,29 @@ def _state_ok(state):
                and all(type(value) is Value for value in item.facts)
                and type(item.first_yes) is tuple and len(item.first_yes) == len(Fact)
                and all(ordinal is None or (type(ordinal) is int and 1 <= ordinal <= len(state.events))
-                       for ordinal in item.first_yes) for item in state.sources):
+                       for ordinal in item.first_yes)
+               and type(item.budget) is int and 0 <= item.budget <= 1
+               and type(item.attempts) is int and 2 <= item.attempts <= 3
+               and type(item.max_attempts) is int and item.max_attempts in (2, 3)
+               and type(item.retry_level) is int and item.retry_level in (1, 2)
+               and type(item.max_retries) is int and item.max_retries == 2
+               and type(item.invalidations) is tuple
+               and all(type(reason) is Invalidation for reason in item.invalidations)
+               and len(set(item.invalidations)) == len(item.invalidations)
+               for item in state.sources):
         return False
     return (len({item.source for item in state.sources}) == len(state.sources)
-            and all(_envelope_ok(proposal) for proposal in state.proposals))
+            and all(_envelope_ok(proposal) for proposal in state.proposals)
+            and all(_envelope_ok(item) for item in state.pending)
+            and len({(item.source, item.request) for item in state.pending}) == len(state.pending)
+            and all(type(item) is Winner and _envelope_ok(item.envelope)
+                    and type(item.reservation) is Reservation
+                    and item.reservation.envelope == item.envelope
+                    and type(item.reservation.revoked) is bool for item in state.winners)
+            and len({item.envelope.source for item in state.winners}) == len(state.winners)
+            and all(type(item) is tuple and len(item) == 2 and type(item[0]) is Source
+                    and type(item[1]) is int and item[1] == 0 for item in state.closed_generations)
+            and len(set(state.closed_generations)) == len(state.closed_generations))
 
 
 def _find(state, source):
@@ -266,6 +357,50 @@ def _envelope_ok(envelope):
             and _clock_ok(eligibility.expires))
 
 
+def _binding_ok(envelope, source):
+    if source.history != envelope.history or source.fixture is not envelope.fixture:
+        return False
+    source_model, source_provider, evidence = _identity(envelope.source)
+    expected_provider = Provider.P0 if envelope.model is Model.M0 else Provider.P1
+    if envelope.provider is not expected_provider or (envelope.action is Action.SAME and envelope.model is not source_model):
+        return False
+    if envelope.version is Version.B and envelope.action is Action.SAME:
+        eligibility = envelope.eligibility
+        return (eligibility is not None and eligibility.source is envelope.source
+                and eligibility.model is source_model and eligibility.provider is source_provider
+                and eligibility.evidence is evidence and eligibility.policy is Policy.P0
+                and eligibility.retry_level == 2 and eligibility.expires >= envelope.created)
+    return envelope.eligibility is None
+
+
+def _live(state, envelope, source, *, check_resources, check_expiry=True):
+    if Invalidation.UNKNOWN in source.invalidations or source.facts[_index(Fact.FAILED)] is Value.UNKNOWN:
+        return Outcome.RECONCILIATION
+    if source.invalidations or any(value is not Value.YES for value in source.facts):
+        return Outcome.HELD
+    if (envelope.created > state.clock or (check_expiry and (state.clock > envelope.expires
+            or (envelope.eligibility is not None and state.clock > envelope.eligibility.expires)))):
+        return Outcome.HELD
+    closed, effect = source.first_yes[_index(Fact.CLOSED)], source.first_yes[_index(Fact.NO_EFFECT)]
+    if closed is None or effect is None or closed >= effect:
+        return Outcome.HELD
+    if ((envelope.source, 0) in state.closed_generations) != (envelope.generation == 1):
+        return Outcome.HELD
+    if check_resources and (source.budget < 1 or source.attempts >= source.max_attempts
+                            or source.retry_level >= source.max_retries):
+        return Outcome.HELD
+    return None
+
+
+def _proposal(state, envelope):
+    return next((item for item in state.proposals
+                 if item.source is envelope.source and item.request is envelope.request), None)
+
+
+def _winner(state, source):
+    return next((item for item in state.winners if item.envelope.source is source), None)
+
+
 def step(state: ModelState, command: object) -> tuple[ModelState, Observation]:
     """Perform one bounded synthetic transition, holding malformed inputs."""
     if not _state_ok(state):
@@ -278,8 +413,12 @@ def step(state: ModelState, command: object) -> tuple[ModelState, Observation]:
             return _out(state, Outcome.REGISTERED if (found.history, found.fixture) == (command.history, command.fixture) else Outcome.HELD_INVALID)
         if len(state.events) == 64:
             return _out(state, Outcome.HELD_INVALID)
+        budget = 0 if command.fixture is Fixture.BUDGET_EMPTY else 1
+        max_attempts = 2 if command.fixture is Fixture.ATTEMPTS_FULL else 3
+        retry_level = 2 if command.fixture is Fixture.RETRY_FULL else 1
         source = SourceState(command.source, command.history, command.fixture,
-                             (Value.UNSET,) * len(Fact), (None,) * len(Fact))
+                             (Value.UNSET,) * len(Fact), (None,) * len(Fact),
+                             budget, 2, max_attempts, retry_level, 2)
         return _out(_append(state, command, sources=state.sources + (source,)), Outcome.REGISTERED)
     if type(command) is SetFacts:
         if type(command.source) is not Source or not _clock_ok(command.clock) or command.clock < state.clock:
@@ -318,34 +457,107 @@ def step(state: ModelState, command: object) -> tuple[ModelState, Observation]:
         if existing is not None:
             return _out(state, Outcome.PROPOSED if existing == envelope else Outcome.CONFLICT)
         found = _find(state, envelope.source)
-        if found is None or found.history != envelope.history or found.fixture is not envelope.fixture:
+        if found is None or not _binding_ok(envelope, found):
             return _out(state, Outcome.HELD_INVALID)
-        source_model, source_provider, evidence = _identity(envelope.source)
-        expected_provider = Provider.P0 if envelope.model is Model.M0 else Provider.P1
-        if envelope.provider is not expected_provider or (envelope.action is Action.SAME and envelope.model is not source_model):
-            return _out(state, Outcome.HELD_INVALID)
-        if envelope.version is Version.B and envelope.action is Action.SAME:
-            eligibility = envelope.eligibility
-            if (eligibility is None or eligibility.source is not envelope.source
-                    or eligibility.model is not source_model or eligibility.provider is not source_provider
-                    or eligibility.evidence is not evidence or eligibility.policy is not Policy.P0
-                    or eligibility.retry_level != 2 or eligibility.expires < envelope.created):
-                return _out(state, Outcome.HELD_INVALID)
-        elif envelope.eligibility is not None:
-            return _out(state, Outcome.HELD_INVALID)
-        if found.facts[_index(Fact.FAILED)] is Value.UNKNOWN:
-            return _out(state, Outcome.RECONCILIATION)
-        if any(value is not Value.YES for value in found.facts):
-            return _out(state, Outcome.HELD)
-        if (envelope.created > state.clock or state.clock > envelope.expires
-                or (envelope.eligibility is not None and state.clock > envelope.eligibility.expires)):
-            return _out(state, Outcome.HELD)
-        closed, effect = found.first_yes[_index(Fact.CLOSED)], found.first_yes[_index(Fact.NO_EFFECT)]
-        if closed is None or effect is None or closed >= effect:
+        source_model, _, _ = _identity(envelope.source)
+        blocked = _live(state, envelope, found, check_resources=True)
+        if blocked is not None:
+            return _out(state, blocked)
+        # A fallback or escalation cannot target its own source model. This
+        # synthetic model does not simulate tier or capability qualification.
+        if envelope.action is not Action.SAME and envelope.model is source_model:
             return _out(state, Outcome.HELD)
         if envelope.model in found.history and not (envelope.version is Version.B and envelope.action is Action.SAME):
             return _out(state, Outcome.HELD)
         if len(state.events) == 64 or len(state.proposals) == 4:
             return _out(state, Outcome.HELD_INVALID)
         return _out(_append(state, command, proposals=state.proposals + (envelope,)), Outcome.PROPOSED)
+    if type(command) in (PrepareCommit, Commit, SimulateDispatchCheck):
+        if not _command_shape_ok(command):
+            return _out(state, Outcome.HELD_INVALID)
+        envelope = command.envelope
+        proposed = _proposal(state, envelope)
+        if proposed is not None and proposed != envelope:
+            return _out(state, Outcome.CONFLICT)
+        winner = _winner(state, envelope.source)
+        source = _find(state, envelope.source)
+        if source is None:
+            return _out(state, Outcome.HELD_INVALID)
+        if proposed is None and not _binding_ok(envelope, source):
+            return _out(state, Outcome.HELD_INVALID)
+        if (type(command) is not SimulateDispatchCheck and winner is not None
+                and winner.envelope == envelope and proposed is not None):
+            return _out(state, Outcome.WINNER)
+        if (Invalidation.UNKNOWN in source.invalidations
+                or source.facts[_index(Fact.FAILED)] is Value.UNKNOWN):
+            return _out(state, Outcome.RECONCILIATION)
+        if proposed is None:
+            return _out(state, Outcome.HELD)
+        if type(command) is SimulateDispatchCheck:
+            if winner is None or winner.envelope != envelope:
+                return _out(state, Outcome.HELD)
+            blocked = _live(state, envelope, source, check_resources=False)
+            if blocked is not None:
+                return _out(state, blocked)
+            if winner.reservation.envelope != envelope or winner.reservation.revoked:
+                return _out(state, Outcome.HELD)
+            return _out(state, Outcome.PRECONDITIONS_MET_NON_AUTHORITY)
+        if winner is not None:
+            return _out(state, Outcome.WINNER if winner.envelope == envelope else Outcome.SUPERSEDED)
+        blocked = _live(state, envelope, source, check_resources=True)
+        if blocked is not None:
+            return _out(state, blocked)
+        if type(command) is PrepareCommit:
+            if envelope in state.pending:
+                return _out(state, Outcome.PREPARED)
+            if sum(item.source is envelope.source for item in state.pending) >= 2 or len(state.pending) >= 4:
+                return _out(state, Outcome.HELD_INVALID)
+            return _out(replace(state, pending=state.pending + (envelope,)), Outcome.PREPARED)
+        if envelope not in state.pending:
+            return _out(state, Outcome.HELD)
+        if len(state.events) == 64:
+            return _out(state, Outcome.HELD_INVALID)
+        updated = replace(source, budget=source.budget - 1, attempts=source.attempts + 1,
+                          retry_level=source.retry_level + 1)
+        sources = tuple(updated if item.source is envelope.source else item for item in state.sources)
+        winner = Winner(envelope, Reservation(envelope))
+        pending = tuple(item for item in state.pending if item != envelope)
+        return _out(_append(state, command, sources=sources, pending=pending,
+                            winners=state.winners + (winner,)), Outcome.WINNER)
+    if type(command) is CloseGeneration:
+        if not _command_shape_ok(command):
+            return _out(state, Outcome.HELD_INVALID)
+        source = _find(state, command.source)
+        if source is None:
+            return _out(state, Outcome.HELD_INVALID)
+        marker = (command.source, command.generation)
+        if marker in state.closed_generations:
+            return _out(state, Outcome.RECORDED)
+        if _winner(state, command.source) is not None:
+            return _out(state, Outcome.HELD)
+        proposals = [item for item in state.proposals if item.source is command.source and item.generation == 0]
+        if not proposals:
+            return _out(state, Outcome.HELD)
+        blocked = _live(state, proposals[0], source, check_resources=True, check_expiry=False)
+        if blocked is not None:
+            return _out(state, blocked)
+        if len(state.events) == 64:
+            return _out(state, Outcome.HELD_INVALID)
+        return _out(_append(state, command, closed_generations=state.closed_generations + (marker,)), Outcome.RECORDED)
+    if type(command) is Invalidate:
+        if not _command_shape_ok(command):
+            return _out(state, Outcome.HELD_INVALID)
+        source = _find(state, command.source)
+        if source is None:
+            return _out(state, Outcome.HELD_INVALID)
+        if command.reason in source.invalidations:
+            return _out(state, Outcome.RECORDED)
+        if len(state.events) == 64:
+            return _out(state, Outcome.HELD_INVALID)
+        updated = replace(source, invalidations=source.invalidations + (command.reason,))
+        sources = tuple(updated if item.source is command.source else item for item in state.sources)
+        winners = tuple(replace(item, reservation=replace(item.reservation, revoked=True))
+                        if item.envelope.source is command.source and command.reason is Invalidation.RESERVATION
+                        else item for item in state.winners)
+        return _out(_append(state, command, sources=sources, winners=winners), Outcome.RECORDED)
     return _out(state, Outcome.HELD_INVALID)
