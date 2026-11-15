@@ -8,7 +8,8 @@ import subprocess
 
 import pytest
 
-from orchestrator.runtime.contracts import AttemptContext, ToolCapabilityRef, WorkerTask
+from orchestrator.runtime import general_worker_protocol as protocol
+from orchestrator.runtime.contracts import ArtifactRef, AttemptContext, ToolCapabilityRef, WorkerTask
 from orchestrator.runtime.general_worker_protocol import (
     GeneralWorkerProtocolError, GeneralWorkerRequest, GeneralWorkerTurn,
     decode_general_worker_proposal, decode_general_worker_turn, encode_general_worker_turn,
@@ -42,6 +43,7 @@ def rejected(call):
     with pytest.raises(GeneralWorkerProtocolError) as caught:
         call()
     error = caught.value
+    assert str(error) == "general_worker_protocol_invalid"
     assert error.__context__ is None and error.__cause__ is None
     assert "private-" not in repr(error) + str(error) + repr(error.__dict__)
     return error
@@ -185,3 +187,200 @@ def test_constructed_task_cannot_change_fingerprint_on_roundtrip():
     value = json.loads(encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, task())))
     value["task"]["tool_capabilities"] = [item.model_dump() for item in refs]
     rejected(lambda: decode_general_worker_turn(wire(value)))
+
+
+@pytest.mark.parametrize("field, expected, count", [
+    ("input_artifacts", ArtifactRef, 129),
+    ("tool_capabilities", ToolCapabilityRef, 65),
+])
+@pytest.mark.parametrize("collection", [list, tuple])
+def test_encode_rejects_collection_count_before_converting_any_element(
+    monkeypatch, field, expected, count, collection,
+):
+    # Moving count validation after element conversion spends work on rejected input.
+    h = "sha256:" + "a" * 64
+    if expected is ArtifactRef:
+        refs = [ArtifactRef(digest=f"sha256:{index:064x}", size_bytes=0,
+            artifact_type="text", media_type="text/plain") for index in range(count)]
+    else:
+        refs = [ToolCapabilityRef(grant_id=f"grant-{index:03}", tool_id="tool",
+            scope_hash=h) for index in range(count)]
+    unsafe = task().model_copy(update={field: collection(refs)})
+    converted = []
+    original = protocol._model_fields
+
+    def observe_fields(value, contract):
+        if contract is expected:
+            converted.append(value)
+        return original(value, contract)
+
+    monkeypatch.setattr(protocol, "_model_fields", observe_fields)
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, unsafe)))
+    assert len(converted) == 0
+
+
+@pytest.mark.parametrize("field, value", [
+    ("task_text", "x" * 100_001),
+    ("task_text", ["private-nested", {"private-key": ["private-value"]}]),
+    ("role", {"private-key": ["private-value"]}),
+    ("output_byte_limit", [1]),
+], ids=["overlong-task", "task-container", "role-container", "limit-container"])
+def test_encode_rejects_task_scalar_before_recursive_plain_copy(monkeypatch, field, value):
+    # Calling generic copying before schema validation visits rejected scalar data.
+    unsafe = task().model_copy(update={field: value})
+    visited = []
+    original = protocol._plain
+
+    def observe_plain(item):
+        if item is value:
+            visited.append(item)
+        return original(item)
+
+    monkeypatch.setattr(protocol, "_plain", observe_plain)
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, unsafe)))
+    assert len(visited) == 0
+
+
+@pytest.mark.parametrize("contract, field, value", [
+    (AttemptContext, "run_id", "x" * 129),
+    (AttemptContext, "graph_version", [3]),
+    (ArtifactRef, "media_type", "x" * 129),
+    (ArtifactRef, "size_bytes", {"private-key": [0]}),
+    (ToolCapabilityRef, "grant_id", "x" * 129),
+    (ToolCapabilityRef, "scope_hash", ["private-scope"]),
+], ids=["context-long", "context-container", "artifact-long", "artifact-container",
+    "capability-long", "capability-container"])
+def test_encode_rejects_nested_scalar_before_recursive_plain_copy(
+    monkeypatch, contract, field, value,
+):
+    # Nested schema validation must precede visiting invalid scalar contents.
+    h = "sha256:" + "a" * 64
+    if contract is AttemptContext:
+        model = task().context
+        update = {"context": model.model_copy(update={field: value})}
+    elif contract is ArtifactRef:
+        model = ArtifactRef(digest=h, size_bytes=0, artifact_type="text", media_type="text/plain")
+        update = {"input_artifacts": (model.model_copy(update={field: value}),)}
+    else:
+        model = ToolCapabilityRef(grant_id="grant", tool_id="tool", scope_hash=h)
+        update = {"tool_capabilities": (model.model_copy(update={field: value}),)}
+    visited = []
+    original = protocol._plain
+
+    def observe_plain(item):
+        if item is value:
+            visited.append(item)
+        return original(item)
+
+    monkeypatch.setattr(protocol, "_plain", observe_plain)
+    unsafe = task().model_copy(update=update)
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, unsafe)))
+    assert len(visited) == 0
+
+
+@pytest.mark.parametrize("field, value", [
+    ("phase", ["request"]),
+    ("launch_id", "x" * 100_001),
+], ids=["phase-container", "overlong-launch"])
+def test_encode_rejects_turn_scalar_before_observing_task(monkeypatch, field, value):
+    # Invalid envelope scalars must fail without inspecting a task contract.
+    observed = []
+    original = protocol._model_fields
+
+    def observe_fields(model, contract):
+        observed.append(contract)
+        return original(model, contract)
+
+    monkeypatch.setattr(protocol, "_model_fields", observe_fields)
+    turn = replace(GeneralWorkerTurn("request", LAUNCH, task()), **{field: value})
+    rejected(lambda: encode_general_worker_turn(turn))
+    assert len(observed) == 0
+
+
+def test_encode_rejects_wrong_model_field_count_before_inspecting_keys(monkeypatch):
+    # Removing the size gate would inspect each injected key before rejecting.
+    unsafe = task().model_copy(update={f"private-extra-{index}": None for index in range(20)})
+    keys = tuple(object.__getattribute__(unsafe, "__dict__"))
+    inspected = []
+
+    def observe_type(value):
+        if any(value is key for key in keys):
+            inspected.append(value)
+        return type(value)
+
+    monkeypatch.setattr(protocol, "type", observe_type, raising=False)
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, unsafe)))
+    assert len(inspected) == 0
+
+
+def test_model_field_snapshot_detaches_from_later_source_dictionary_changes():
+    # Returning a live model dictionary lets later host mutations change the observation.
+    model = task()
+    snapshot = protocol._model_fields(model, WorkerTask)
+    object.__getattribute__(model, "__dict__")["task_text"] = ["private-mutated"]
+    assert snapshot["task_text"] == "private-task-sentinel é\r\n"
+
+
+@pytest.mark.parametrize("contract, field", [
+    (WorkerTask, "role"), (AttemptContext, "run_id"),
+    (ArtifactRef, "artifact_type"), (ToolCapabilityRef, "grant_id"),
+])
+@pytest.mark.parametrize("string_subclass", [False, True])
+def test_same_count_forged_model_keys_never_invoke_hash_or_equality(contract, field, string_subclass):
+    # A lookup or set construction before exact-str validation invokes caller code.
+    callbacks = []
+
+    class ForgedKey:
+        def __hash__(self):
+            callbacks.append("hash")
+            return hash(field)
+
+        def __eq__(self, other):
+            callbacks.append("equality")
+            return other == field
+
+    class ForgedString(str):
+        __hash__ = ForgedKey.__hash__
+        __eq__ = ForgedKey.__eq__
+
+    h = "sha256:" + "a" * 64
+    if contract is WorkerTask:
+        model = unsafe = task()
+    elif contract is AttemptContext:
+        model = task().context
+        unsafe = task().model_copy(update={"context": model})
+    elif contract is ArtifactRef:
+        model = ArtifactRef(digest=h, size_bytes=0, artifact_type="text", media_type="text/plain")
+        unsafe = task().model_copy(update={"input_artifacts": (model,)})
+    else:
+        model = ToolCapabilityRef(grant_id="grant", tool_id="tool", scope_hash=h)
+        unsafe = task().model_copy(update={"tool_capabilities": (model,)})
+    fields = object.__getattribute__(model, "__dict__")
+    key = ForgedString(field) if string_subclass else ForgedKey()
+    fields[key] = fields.pop(field)
+    callbacks.clear()
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, unsafe)))
+    assert callbacks == []
+
+
+@pytest.mark.parametrize("mutation", ["grow", "shrink", "replace"])
+def test_model_dictionary_mutation_during_key_observation_is_rejected(monkeypatch, mutation):
+    # The snapshot must reject detectable size/key changes during bounded observation.
+    unsafe = task()
+    fields = object.__getattribute__(unsafe, "__dict__")
+    keys = tuple(fields)
+    inspected = []
+
+    def observe_type(value):
+        if any(value is key for key in keys):
+            inspected.append(value)
+            if len(inspected) == 1:
+                if mutation in ("shrink", "replace"):
+                    del fields["output_byte_limit"]
+                if mutation in ("grow", "replace"):
+                    fields["private-added"] = None
+        return type(value)
+
+    monkeypatch.setattr(protocol, "type", observe_type, raising=False)
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, unsafe)))
+    assert 1 <= len(inspected) <= len(keys)
