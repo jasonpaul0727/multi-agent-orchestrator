@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from enum import Enum
 import os
+import socket
 
 from ._staging_a2_contract import AttemptBinding, FailureKind, FailureRecord, NativePhase, OwnerState, Role
 from ._staging_contract import _integer, _require
@@ -48,6 +49,7 @@ class _Group:
     members: tuple
     attempted: bool = False
     closed: bool = False
+    actor: Role = Role.HOST
 
 
 class AcquisitionLedger:
@@ -145,6 +147,9 @@ class AcquisitionLedger:
         for cap in caps:
             record = self.require_current(cap)
             _require(record.group is None)
+            if type(obj) is socket.socket:
+                _require(len(caps) == 1)
+                group.actor = record.role
             record.group = group
 
     def adopt_returned_arena(self, arena):
@@ -269,7 +274,18 @@ class AcquisitionLedger:
                 self._records[cap].closed = True
             group.closed = True
         except BaseException as primary:
-            self._close_uncertainty(Role.HOST, primary)
+            if type(group.object) is socket.socket:
+                # A failed/identity-mismatched socket close must also neutralize
+                # its live wrapper. Otherwise a later destructor could close a
+                # reused raw number. Detach is NOT confirmation of OS closure;
+                # this group stays attempted, unclosed and permanently in debt.
+                try:
+                    if group.object.fileno() >= 0:
+                        group.object.detach()
+                except BaseException as cleanup:
+                    if isinstance(primary, Exception) and not isinstance(cleanup, Exception):
+                        primary = cleanup
+            self._close_uncertainty(group.actor, primary)
 
     def close_once(self, cap):
         record = self._record(cap)

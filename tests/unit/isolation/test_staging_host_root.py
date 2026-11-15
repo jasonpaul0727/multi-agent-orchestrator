@@ -182,7 +182,7 @@ def test_close_uncertainty_is_once_only_poison_and_retains_tombstone(isolated, m
     assert m._HOST_ROOT is root
 
 
-def test_manifest_contains_implemented_a_sources_only():
+def test_manifest_contains_implemented_a_and_b1_sources_only():
     from orchestrator.isolation._staging_contract import _MANIFEST_SOURCES, _CODE_ROOT
     declared = {path for _, path, _ in _MANIFEST_SOURCES}
     names = ('_staging_a2_contract.py', '_staging_ownership.py', '_staging_native.py',
@@ -192,7 +192,7 @@ def test_manifest_contains_implemented_a_sources_only():
     for role, path, kind in _MANIFEST_SOURCES:
         assert Path(path).exists()
         if role.startswith('code_'):
-            assert not Path(path).name in ('_staging_protocol.py', '_staging_supervisor.py', '_staging_entry.py', '_staging_retention_entry.py', '_staging_release.py')
+            assert not Path(path).name in ('_staging_supervisor.py', '_staging_entry.py', '_staging_retention_entry.py', '_staging_release.py')
 
 def test_interpreter_origin_and_non_main_interpreter_refuse_before_metadata(isolated, monkeypatch):
     m = isolated

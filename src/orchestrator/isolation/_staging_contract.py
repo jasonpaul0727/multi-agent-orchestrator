@@ -505,6 +505,7 @@ _MANIFEST_SOURCES = (
     ('code_reopen', str(_CODE_ROOT / '_staging_reopen.py'), 'file'),
     ('code_audit', str(_CODE_ROOT / '_staging_audit.py'), 'file'),
     ('code_gate', str(_CODE_ROOT / '_staging_gate.py'), 'file'),
+    ('code_protocol', str(_CODE_ROOT / '_staging_protocol.py'), 'file'),
     ('code_landlock', str(_CODE_ROOT / 'landlock.py'), 'file'),
     ('code_capabilities', str(_CODE_ROOT / 'candidate_security.py'), 'file'),
     ('interpreter', '/usr/bin/python3.12', 'file'),
@@ -516,12 +517,13 @@ _MANIFEST_SOURCES = (
     ('native_seccomp', '/usr/lib/x86_64-linux-gnu/libseccomp.so.2', 'file'),
     *((f'stdlib_{name}', f'/usr/lib/python3.12/{name}.py', 'file') for name in
       ('dataclasses', 'enum', 'hashlib', 'json/__init__', 'pathlib', 'struct',
-       'ctypes/__init__', 'ctypes/_endian', 'threading')),
+       'ctypes/__init__', 'ctypes/_endian', 'threading', 'socket', 'selectors')),
     ('stdlib_ctypes_native', '/usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so', 'file'),
     ('stdlib_resource', '/usr/lib/python3.12/lib-dynload/resource.cpython-312-x86_64-linux-gnu.so', 'file'),
     ('stdlib_subinterpreters', '/usr/lib/python3.12/lib-dynload/_xxsubinterpreters.cpython-312-x86_64-linux-gnu.so', 'file'),
-    # fcntl/_thread/os/stat/sys/time are built-in or frozen in the fixed
-    # interpreter for this profile; no invented extension pathname is used.
+    # fcntl/_socket/select/math/_thread/os/stat/sys/time are built-in or frozen in the fixed
+    # interpreter for this profile and bound by its manifested image hash;
+    # no invented extension pathname is used.
 )
 
 
