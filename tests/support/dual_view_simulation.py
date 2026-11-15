@@ -92,6 +92,8 @@ class Outcome(Enum):
     WINNER = auto()
     SUPERSEDED = auto()
     PRECONDITIONS_MET_NON_AUTHORITY = auto()
+    CRASHED = auto()
+    REPLAYED = auto()
 
 
 class Invalidation(Enum):
@@ -104,14 +106,14 @@ class Invalidation(Enum):
     RESERVATION = auto()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Observation:
     outcome: Outcome
     simulation_only: bool = True
     non_authoritative: bool = True
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Eligibility:
     source: Source
     model: Model
@@ -122,7 +124,7 @@ class Eligibility:
     expires: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Envelope:
     source: Source
     request: Request
@@ -139,71 +141,83 @@ class Envelope:
     fixture: Fixture
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RegisterSource:
     source: Source
     history: tuple[Model, ...]
     fixture: Fixture
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SetFacts:
     source: Source
     changes: tuple[tuple[Fact, Value], ...]
     clock: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Propose:
     envelope: Envelope
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PrepareCommit:
     envelope: Envelope
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Commit:
     envelope: Envelope
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CloseGeneration:
     source: Source
     generation: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Invalidate:
     source: Source
     reason: Invalidation
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SimulateDispatchCheck:
     envelope: Envelope
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class Crash:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Replay:
+    events: tuple["Event", ...]
+    anchor: tuple["Event", ...]
+    anchor_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class Reservation:
     envelope: Envelope
     revoked: bool = False
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Winner:
     envelope: Envelope
     reservation: Reservation
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Event:
     ordinal: int
     command: RegisterSource | SetFacts | Propose | Commit | CloseGeneration | Invalidate
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SourceState:
     source: Source
     history: tuple[Model, ...]
@@ -218,7 +232,7 @@ class SourceState:
     invalidations: tuple[Invalidation, ...] = ()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelState:
     sources: tuple[SourceState, ...] = ()
     events: tuple[Event, ...] = ()
@@ -279,6 +293,13 @@ def _command_shape_ok(command):
     return (type(command) is Invalidate and type(command.source) is Source
             and type(command.reason) is Invalidation)
 
+def _event_ok(event, ordinal):
+    # Pending, crash, replay and simulated dispatch are never durable events.
+    return (type(event) is Event and type(event.ordinal) is int and event.ordinal == ordinal
+            and type(event.command) in (RegisterSource, SetFacts, Propose, Commit, CloseGeneration, Invalidate)
+            and _command_shape_ok(event.command))
+
+
 def _state_ok(state):
     if (type(state) is not ModelState or state.simulation_only is not True
             or state.non_authoritative is not True
@@ -291,9 +312,7 @@ def _state_ok(state):
             or type(state.closed_generations) is not tuple or len(state.closed_generations) > 2
             or not _clock_ok(state.clock)):
         return False
-    if not all(type(event) is Event and type(event.ordinal) is int and event.ordinal == i
-               and _command_shape_ok(event.command)
-               for i, event in enumerate(state.events, 1)):
+    if not all(_event_ok(event, i) for i, event in enumerate(state.events, 1)):
         return False
     if not all(type(item) is SourceState and type(item.source) is Source
                and _history_ok(item.history) and type(item.fixture) is Fixture
@@ -401,10 +420,41 @@ def _winner(state, source):
     return next((item for item in state.winners if item.envelope.source is source), None)
 
 
-def step(state: ModelState, command: object) -> tuple[ModelState, Observation]:
+def _replay(state, command):
+    events, anchor, count = command.events, command.anchor, command.anchor_count
+    if (type(events) is not tuple or type(anchor) is not tuple
+            or type(count) is not int or not 0 <= count <= 64
+            or len(events) != count or len(anchor) != count
+            or not all(_event_ok(event, i) for i, event in enumerate(events, 1))
+            or not all(_event_ok(event, i) for i, event in enumerate(anchor, 1))
+            or events != anchor):
+        return _out(state, Outcome.HELD_INVALID)
+    rebuilt = initial_state()
+    for event in events:
+        if type(event.command) is Commit:
+            # Preparation is volatile. Reconstruct its effect locally solely
+            # to reuse the live commit checks; the event does not prove that
+            # preparation occurred. Only durable preconditions can validate it.
+            candidate = replace(rebuilt, pending=(event.command.envelope,))
+        else:
+            candidate = rebuilt
+        after, observation = step(candidate, event.command)
+        if (observation.outcome not in (Outcome.REGISTERED, Outcome.RECORDED,
+                                       Outcome.PROPOSED, Outcome.WINNER)
+                or len(after.events) != event.ordinal or after.events[-1] != event):
+            return _out(state, Outcome.HELD_INVALID)
+        rebuilt = replace(after, pending=())
+    return _out(rebuilt, Outcome.REPLAYED)
+
+
+def _step(state: ModelState, command: object) -> tuple[ModelState, Observation]:
     """Perform one bounded synthetic transition, holding malformed inputs."""
     if not _state_ok(state):
         return _out(state, Outcome.HELD_INVALID)
+    if type(command) is Crash:
+        return _out(replace(state, pending=()), Outcome.CRASHED)
+    if type(command) is Replay:
+        return _replay(state, command)
     if type(command) is RegisterSource:
         if type(command.source) is not Source or type(command.fixture) is not Fixture or not _history_ok(command.history):
             return _out(state, Outcome.HELD_INVALID)
@@ -561,3 +611,58 @@ def step(state: ModelState, command: object) -> tuple[ModelState, Observation]:
                         else item for item in state.winners)
         return _out(_append(state, command, sources=sources, winners=winners), Outcome.RECORDED)
     return _out(state, Outcome.HELD_INVALID)
+
+
+
+def _copy_envelope(envelope):
+    eligibility = envelope.eligibility
+    if eligibility is not None:
+        eligibility = Eligibility(eligibility.source, eligibility.model, eligibility.provider,
+                                  eligibility.evidence, eligibility.policy,
+                                  eligibility.retry_level, eligibility.expires)
+    return Envelope(envelope.source, envelope.request, envelope.version, envelope.entry,
+                    envelope.action, envelope.model, envelope.provider, tuple(envelope.history),
+                    eligibility, envelope.generation, envelope.created, envelope.expires,
+                    envelope.fixture)
+
+
+def _copy_event_command(command):
+    if type(command) is RegisterSource:
+        return RegisterSource(command.source, tuple(command.history), command.fixture)
+    if type(command) is SetFacts:
+        return SetFacts(command.source, tuple((fact, value) for fact, value in command.changes), command.clock)
+    if type(command) is Propose:
+        return Propose(_copy_envelope(command.envelope))
+    if type(command) is Commit:
+        return Commit(_copy_envelope(command.envelope))
+    if type(command) is CloseGeneration:
+        return CloseGeneration(command.source, command.generation)
+    if type(command) is Invalidate:
+        return Invalidate(command.source, command.reason)
+    raise ValueError("invalid synthetic event command")
+
+
+def _copy_state(state):
+    """Detach trusted model values, not a defense against reflective mutation of outputs."""
+    sources = tuple(SourceState(item.source, tuple(item.history), item.fixture, tuple(item.facts),
+                                tuple(item.first_yes), item.budget, item.attempts,
+                                item.max_attempts, item.retry_level, item.max_retries,
+                                tuple(item.invalidations)) for item in state.sources)
+    events = tuple(Event(item.ordinal, _copy_event_command(item.command)) for item in state.events)
+    proposals = tuple(_copy_envelope(item) for item in state.proposals)
+    pending = tuple(_copy_envelope(item) for item in state.pending)
+    winners = tuple(Winner(_copy_envelope(item.envelope),
+                           Reservation(_copy_envelope(item.reservation.envelope),
+                                       item.reservation.revoked)) for item in state.winners)
+    return ModelState(sources=sources, events=events, proposals=proposals, pending=pending,
+                      winners=winners, closed_generations=tuple((source, generation)
+                                                               for source, generation in state.closed_generations),
+                      clock=state.clock)
+
+
+def step(state: ModelState, command: object) -> tuple[ModelState, Observation]:
+    """Return detached synthetic outputs; invalid inputs remain unchanged."""
+    result, observation = _step(state, command)
+    if result is state:
+        return result, observation
+    return _copy_state(result), observation

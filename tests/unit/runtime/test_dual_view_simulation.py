@@ -561,3 +561,380 @@ def test_unproposed_request_must_match_static_source_bindings(sim, unknown, comm
     same, out = sim.step(state, getattr(sim, command_name)(invalid))
     assert same is state and out.outcome is sim.Outcome.HELD_INVALID
     assert state.sources[0].budget == 1 and not state.winners
+
+
+def _committed_with_loser_pending(sim):
+    state, b, old = _pair(sim, True)
+    for envelope in (b, old):
+        state, _ = sim.step(state, sim.Propose(envelope))
+        state, _ = sim.step(state, sim.PrepareCommit(envelope))
+    state, out = sim.step(state, sim.Commit(b))
+    assert out.outcome is sim.Outcome.WINNER
+    assert state.pending == (old,)
+    return state, b, old
+
+
+def test_crash_discards_pending_and_replay_preserves_winner_and_reservation(sim):
+    assert hasattr(sim, "Crash"), "synthetic crash transition is not implemented"
+    state, b, old = _committed_with_loser_pending(sim)
+    events = state.events
+    crashed, out = sim.step(state, sim.Crash())
+    assert out.outcome is sim.Outcome.CRASHED
+    assert crashed.pending == () and crashed.events == events
+    recovered, out = sim.step(crashed, sim.Replay(events, events, len(events)))
+    assert out.outcome is sim.Outcome.REPLAYED
+    assert recovered == crashed
+    assert recovered.pending == () and recovered.sources[0].budget == 0
+    assert recovered.winners[0].reservation.envelope == b
+    same, out = sim.step(recovered, sim.Commit(b))
+    assert same == recovered and out.outcome is sim.Outcome.WINNER
+    same, out = sim.step(recovered, sim.Commit(old))
+    assert same == recovered and out.outcome is sim.Outcome.SUPERSEDED
+    same, out = sim.step(recovered, sim.SimulateDispatchCheck(b))
+    assert same == recovered and out.outcome is sim.Outcome.PRECONDITIONS_MET_NON_AUTHORITY
+
+
+def test_replay_preserves_winner_but_unknown_invalidates_simulated_dispatch(sim):
+    state, b, _ = _committed_with_loser_pending(sim)
+    state, _ = sim.step(state, sim.Invalidate(sim.Source.S0, sim.Invalidation.UNKNOWN))
+    crashed, _ = sim.step(state, sim.Crash())
+    recovered, out = sim.step(crashed, sim.Replay(crashed.events, crashed.events, len(crashed.events)))
+    assert out.outcome is sim.Outcome.REPLAYED and recovered == crashed
+    assert len(recovered.winners) == 1 and recovered.sources[0].budget == 0
+    same, out = sim.step(recovered, sim.SimulateDispatchCheck(b))
+    assert same == recovered and out.outcome is sim.Outcome.RECONCILIATION
+
+
+def test_replay_preserves_revoked_reservation_without_refunding(sim):
+    state, b, _ = _committed_with_loser_pending(sim)
+    state, _ = sim.step(state, sim.Invalidate(sim.Source.S0, sim.Invalidation.RESERVATION))
+    crashed, _ = sim.step(state, sim.Crash())
+    recovered, out = sim.step(crashed, sim.Replay(crashed.events, crashed.events, len(crashed.events)))
+    assert out.outcome is sim.Outcome.REPLAYED and recovered == crashed
+    assert recovered.winners[0].reservation.revoked is True and recovered.sources[0].budget == 0
+    same, out = sim.step(recovered, sim.SimulateDispatchCheck(b))
+    assert same == recovered and out.outcome is sim.Outcome.HELD
+
+
+def test_effect_before_stop_and_repeat_yes_remains_held_after_replay(sim):
+    state = register(sim)
+    for name in (sim.Fact.NO_EFFECT, sim.Fact.CLOSED, sim.Fact.NO_EFFECT, sim.Fact.FAILED,
+                 sim.Fact.LATEST, sim.Fact.INPUT, sim.Fact.POLICY, sim.Fact.HEALTH, sim.Fact.RESOURCE):
+        state, _ = fact(sim, state, name, sim.Value.YES)
+    recovered, out = sim.step(state, sim.Replay(state.events, state.events, len(state.events)))
+    assert out.outcome is sim.Outcome.REPLAYED and recovered == state
+    same, out = sim.step(recovered, proposal(sim, sim.Version.B))
+    assert same == recovered and out.outcome is sim.Outcome.HELD
+
+
+def test_anchor_mismatch_truncation_duplicate_and_reorder_are_atomic(sim):
+    state, _, _ = _committed_with_loser_pending(sim)
+    history = state.events
+    variants = (history[:-1], history[:2] + history[3:], history + (history[-1],),
+                history[:1] + (history[2], history[1]) + history[3:],
+                history[:1] + (replace(history[1], ordinal=True),) + history[2:],
+                list(history), history + (sim.Event(65, sim.Crash()),) * 65)
+    for damaged in variants:
+        same, out = sim.step(state, sim.Replay(damaged, history, len(history)))
+        assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+    for bad_count in (True, len(history) - 1, 65):
+        same, out = sim.step(state, sim.Replay(history, history, bad_count))
+        assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+    same, out = sim.step(state, sim.Replay(history, list(history), len(history)))
+    assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+
+
+def test_synthetic_matching_anchor_does_not_make_illegal_event_order_valid(sim):
+    state, b, old = _committed_with_loser_pending(sim)
+    register = state.events[0]
+    malformed_histories = (
+        (sim.Event(1, state.events[1].command),),
+        (register, sim.Event(2, sim.CloseGeneration(sim.Source.S0, 0))),
+        (register, sim.Event(2, sim.Commit(b))),
+        state.events + (sim.Event(len(state.events) + 1, sim.Commit(b)),),
+        state.events + (sim.Event(len(state.events) + 1, sim.Commit(old)),),
+        state.events + (sim.Event(len(state.events) + 1, sim.PrepareCommit(old)),),
+    )
+    for history in malformed_histories:
+        same, out = sim.step(state, sim.Replay(history, history, len(history)))
+        assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+
+
+def test_empty_replay_requires_empty_anchor_and_zero_count(sim):
+    state = ready(sim)
+    recovered, out = sim.step(state, sim.Replay((), (), 0))
+    assert out.outcome is sim.Outcome.REPLAYED and recovered == sim.initial_state()
+    same, out = sim.step(state, sim.Replay((), state.events, len(state.events)))
+    assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+
+
+@pytest.mark.parametrize("name", ["FAILED", "LATEST", "INPUT", "CLOSED", "NO_EFFECT", "POLICY", "HEALTH", "RESOURCE"])
+@pytest.mark.parametrize("before,after,safety_allowed,dynamic_allowed", [
+    ("UNSET", "YES", True, True), ("UNSET", "NO", True, True), ("UNSET", "UNKNOWN", True, True),
+    ("YES", "YES", True, True), ("YES", "NO", True, True), ("YES", "UNKNOWN", True, True),
+    ("NO", "YES", False, True), ("NO", "NO", True, True), ("NO", "UNKNOWN", False, True),
+    ("UNKNOWN", "YES", False, False), ("UNKNOWN", "NO", False, False), ("UNKNOWN", "UNKNOWN", True, True),
+])
+def test_complete_synthetic_fact_transition_matrix(sim, name, before, after, safety_allowed, dynamic_allowed):
+    state = register(sim)
+    selected = sim.Fact[name]
+    if before != "UNSET":
+        state, out = fact(sim, state, selected, sim.Value[before])
+        assert out.outcome is sim.Outcome.RECORDED
+    changed, out = fact(sim, state, selected, sim.Value[after])
+    allowed = dynamic_allowed if name in {"POLICY", "HEALTH", "RESOURCE"} else safety_allowed
+    assert out.outcome is (sim.Outcome.RECORDED if allowed else sim.Outcome.HELD)
+    if not allowed:
+        assert changed is state
+    recovered, replay = sim.step(changed, sim.Replay(changed.events, changed.events, len(changed.events)))
+    assert replay.outcome is sim.Outcome.REPLAYED and recovered == changed
+
+
+def test_maximum_length_history_replays_and_oversize_is_rejected(sim):
+    state = register(sim)
+    for _ in range(63):
+        state, out = fact(sim, state, sim.Fact.HEALTH, sim.Value.YES)
+        assert out.outcome is sim.Outcome.RECORDED
+    assert len(state.events) == 64
+    recovered, out = sim.step(state, sim.Replay(state.events, state.events, 64))
+    assert out.outcome is sim.Outcome.REPLAYED and recovered == state
+    too_many = state.events + (sim.Event(65, sim.SetFacts(sim.Source.S0, ((sim.Fact.HEALTH, sim.Value.YES),), 0)),)
+    same, out = sim.step(state, sim.Replay(too_many, too_many, 65))
+    assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+    same, out = fact(sim, state, sim.Fact.HEALTH, sim.Value.NO, 1)
+    assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+
+
+def test_matching_synthetic_anchor_cannot_authorize_invalid_fact_payload(sim):
+    state = register(sim)
+    malformed = (state.events[0], sim.Event(2, sim.SetFacts(sim.Source.S0, [(sim.Fact.CLOSED, sim.Value.YES)], 0)))
+    same, out = sim.step(state, sim.Replay(malformed, malformed, 2))
+    assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+
+
+def test_simulation_has_no_runtime_or_external_io_dependencies(sim, monkeypatch):
+    import ast
+    import builtins
+    import os
+    import socket
+    import subprocess
+    from pathlib import Path
+
+    tree = ast.parse(Path(sim.__file__).read_text(encoding="utf-8"))
+    imports = [node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+    assert set(imports) <= {"dataclasses", "enum"}
+    assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
+    assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                   and node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(tree))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("synthetic model crossed an I/O or execution boundary")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(builtins, "open", forbidden)
+        guarded.setattr(os, "open", forbidden)
+        guarded.setattr(socket, "socket", forbidden)
+        guarded.setattr(subprocess, "Popen", forbidden)
+        state, b, _ = _committed_with_loser_pending(sim)
+        state, _ = sim.step(state, sim.Crash())
+        restored, out = sim.step(state, sim.Replay(state.events, state.events, len(state.events)))
+        assert out.outcome is sim.Outcome.REPLAYED and restored == state
+        _, out = sim.step(restored, sim.SimulateDispatchCheck(b))
+        assert out.outcome is sim.Outcome.PRECONDITIONS_MET_NON_AUTHORITY
+
+
+def test_replay_closing_expired_generation_keeps_late_commit_blocked(sim):
+    state, b, _ = _pair(sim, True)
+    b = replace(b, expires=1, eligibility=replace(b.eligibility, expires=1))
+    state, _ = sim.step(state, sim.Propose(b))
+    state, _ = sim.step(state, sim.PrepareCommit(b))
+    state, _ = fact(sim, state, sim.Fact.HEALTH, sim.Value.YES, 2)
+    state, out = sim.step(state, sim.CloseGeneration(sim.Source.S0, 0))
+    assert out.outcome is sim.Outcome.RECORDED
+    state, _ = sim.step(state, sim.Crash())
+    restored, out = sim.step(state, sim.Replay(state.events, state.events, len(state.events)))
+    assert out.outcome is sim.Outcome.REPLAYED and restored == state
+    same, out = sim.step(restored, sim.Commit(b))
+    assert same == restored and out.outcome is sim.Outcome.HELD
+    new = replace(b, request=sim.Request.R1, generation=1, created=2, expires=8,
+                  eligibility=replace(b.eligibility, expires=8))
+    restored, out = sim.step(restored, sim.Propose(new))
+    assert out.outcome is sim.Outcome.PROPOSED
+    restored, out = sim.step(restored, sim.PrepareCommit(new))
+    assert out.outcome is sim.Outcome.PREPARED
+    restored, out = sim.step(restored, sim.Commit(new))
+    assert out.outcome is sim.Outcome.WINNER
+    restored, _ = sim.step(restored, sim.Crash())
+    replayed, out = sim.step(restored, sim.Replay(restored.events, restored.events, len(restored.events)))
+    assert out.outcome is sim.Outcome.REPLAYED and replayed == restored
+    assert replayed.winners[0].envelope == new and replayed.sources[0].budget == 0
+
+
+def test_replay_revalidates_facts_at_winner_event_time(sim):
+    state, b, _ = _committed_with_loser_pending(sim)
+    assert type(state.events[-1].command) is sim.Commit
+    prefix = state.events[:-1]
+    forged = prefix + (sim.Event(len(prefix) + 1, sim.Invalidate(sim.Source.S0, sim.Invalidation.UNKNOWN)),
+                       sim.Event(len(prefix) + 2, sim.Commit(b)))
+    same, out = sim.step(state, sim.Replay(forged, forged, len(forged)))
+    assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+
+
+def test_crash_before_commit_requires_fresh_prepare(sim):
+    state, b, _ = _pair(sim, True)
+    state, _ = sim.step(state, sim.Propose(b))
+    state, _ = sim.step(state, sim.PrepareCommit(b))
+    crashed, out = sim.step(state, sim.Crash())
+    assert out.outcome is sim.Outcome.CRASHED and not crashed.pending
+    restored, out = sim.step(crashed, sim.Replay(crashed.events, crashed.events, len(crashed.events)))
+    assert out.outcome is sim.Outcome.REPLAYED and restored == crashed
+    same, out = sim.step(restored, sim.Commit(b))
+    assert same is restored and out.outcome is sim.Outcome.HELD
+    assert restored.sources[0].budget == 1 and not restored.winners
+
+
+@pytest.mark.parametrize("source", [
+    "import tests.support.dual_view_simulation",
+    "import dual_view_simulation as offline",
+    "from tests.support import dual_view_simulation as offline",
+    "from tests.support.dual_view_simulation import step",
+    "value = tests.support.dual_view_simulation.step",
+    "module = importlib.import_module('tests.support.dual_view_simulation')",
+    "module = __import__('tests.support.dual_' + 'view_simulation')",
+    "module = importlib.import_module(f'tests.support.{\"dual_view_simulation\"}')",
+    "module = getattr(container, 'dual_view_simulation')",
+])
+def test_dependency_guard_detects_synthetic_runtime_references(source):
+    assert _references_offline_model(source)
+
+
+def test_dependency_guard_ignores_comments_and_unrelated_near_names():
+    source = "# import tests.support.dual_view_simulation\nimport pathlib\nname = 'dual_view_simulation_backup'\n"
+    assert not _references_offline_model(source)
+
+
+def test_dependency_guard_rejects_unparseable_source():
+    assert _references_offline_model("from ??? import broken")
+
+
+def test_production_sources_do_not_depend_on_offline_model(sim):
+    from pathlib import Path
+
+    root = Path(sim.__file__).resolve().parents[2] / "src"
+    sources = sorted(root.rglob("*.py"))
+    assert sources, "production source directory is unavailable"
+    violations = [str(path.relative_to(root)) for path in sources
+                  if _references_offline_model(path.read_text(encoding="utf-8"))]
+    assert violations == [], f"production sources refer to the tests-only model: {violations}"
+
+
+def _references_offline_model(source):
+    """Conservative static guard, not an OS or malicious-code boundary."""
+    import ast
+    import re
+
+    def is_reference(value):
+        return re.search(r"(?<![A-Za-z0-9_])dual_view_simulation(?![A-Za-z0-9_])", value) is not None
+
+    def static_string(node, depth=0):
+        if depth > 32:
+            return None
+        if isinstance(node, ast.Constant) and type(node.value) is str:
+            return node.value if len(node.value) <= 4096 else None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = static_string(node.left, depth + 1), static_string(node.right, depth + 1)
+            if left is not None and right is not None and len(left) + len(right) <= 4096:
+                return left + right
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            for value in node.values:
+                piece = static_string(value.value if isinstance(value, ast.FormattedValue) else value, depth + 1)
+                if piece is None:
+                    return None
+                parts.append(piece)
+            result = "".join(parts)
+            return result if len(result) <= 4096 else None
+        return None
+
+    try:
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.alias) and is_reference(node.name):
+                return True
+            if isinstance(node, ast.ImportFrom) and node.module is not None and is_reference(node.module):
+                return True
+            if isinstance(node, ast.Name) and node.id == "dual_view_simulation":
+                return True
+            if isinstance(node, ast.Attribute) and node.attr == "dual_view_simulation":
+                return True
+            value = static_string(node)
+            if value is not None and is_reference(value):
+                return True
+    except (SyntaxError, RecursionError):
+        return True
+    return False
+
+
+def test_unknown_command_fields_cannot_be_added(sim):
+    command = sim.RegisterSource(sim.Source.S0, (sim.Model.M0,), sim.Fixture.NORMAL)
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(command, "unexpected", [])
+
+
+def test_recorded_proposal_detaches_caller_command_envelope_and_eligibility(sim):
+    from copy import deepcopy
+
+    state = ready(sim)
+    envelope = proposal(sim, sim.Version.B).envelope
+    eligibility = envelope.eligibility
+    command = sim.Propose(envelope)
+    state, out = sim.step(state, command)
+    assert out.outcome is sim.Outcome.PROPOSED
+    anchor = deepcopy(state.events)
+    proposals = deepcopy(state.proposals)
+    object.__setattr__(eligibility, "expires", 1)
+    object.__setattr__(envelope, "entry", sim.Entry.IMPORT)
+    object.__setattr__(command, "envelope", replace(envelope, request=sim.Request.R1))
+    assert state.events == anchor
+    assert state.proposals == proposals
+    same, out = sim.step(state, sim.Propose(proposals[0]))
+    assert same is state and out.outcome is sim.Outcome.PROPOSED
+    same, out = sim.step(state, sim.Propose(replace(proposals[0], entry=sim.Entry.IMPORT)))
+    assert same is state and out.outcome is sim.Outcome.CONFLICT
+
+
+def test_recorded_prepare_commit_and_replay_detach_caller_values(sim):
+    from copy import deepcopy
+
+    state, original, _ = _pair(sim, True)
+    state, _ = sim.step(state, sim.Propose(original))
+    prepare_input = deepcopy(original)
+    state, out = sim.step(state, sim.PrepareCommit(prepare_input))
+    assert out.outcome is sim.Outcome.PREPARED
+    pending = deepcopy(state.pending)
+    object.__setattr__(prepare_input, "entry", sim.Entry.IMPORT)
+    assert state.pending == pending
+    commit_input = deepcopy(original)
+    state, out = sim.step(state, sim.Commit(commit_input))
+    assert out.outcome is sim.Outcome.WINNER
+    anchor = deepcopy(state.events)
+    winners = deepcopy(state.winners)
+    object.__setattr__(commit_input.eligibility, "expires", 1)
+    object.__setattr__(commit_input, "entry", sim.Entry.IMPORT)
+    assert state.events == anchor and state.winners == winners
+    recovered, out = sim.step(state, sim.Replay(anchor, deepcopy(anchor), len(anchor)))
+    assert out.outcome is sim.Outcome.REPLAYED
+    restored_history = deepcopy(recovered.events)
+    object.__setattr__(anchor[-1].command.envelope, "entry", sim.Entry.IMPORT)
+    assert recovered.events == restored_history and recovered.winners == winners
+
+
+def test_new_state_detaches_previously_returned_state_events(sim):
+    from copy import deepcopy
+
+    previous = ready(sim)
+    state, out = sim.step(previous, proposal(sim, sim.Version.B))
+    assert out.outcome is sim.Outcome.PROPOSED
+    saved = deepcopy(state.events)
+    object.__setattr__(previous.events[0].command, "history", ())
+    assert state.events == saved
