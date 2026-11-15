@@ -1,6 +1,6 @@
 # Design: exception-safe SandboxSession transport cleanup
 
-Status: Independent design review PASS; implementation not yet started.
+Status: Implemented and independently reviewed; bounded local transport task complete.
 Existing user authorization permits direct development after independent review
 PASS without another approval question.
 
@@ -183,7 +183,7 @@ object alias/FD reuse, selected error chaining/notes, pending result versus rece
 qualification, fast failed/reentrant paths versus cross-thread serialization,
 discard-before-retire dependency and partially applied cleanup. The design fixes
 the exception class/message, priority, latch and ownership decisions; no policy
-choice is intentionally deferred to implementation. Real REDs remain unexecuted.
+choice is intentionally deferred to implementation. RED evidence and final validation are recorded in the implementation plan.
 
 Only this finite local transport contract is corrected. Late to_thread results,
 operation-lease custody, hidden post-Popen sessions, global staging/RSS/FD caps,

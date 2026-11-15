@@ -71,6 +71,18 @@
 
 ## Whole-task acceptance
 
-- [ ] Independent whole-slice review compares final scoped changes against the spec, tests, all note/error/caching/receipt boundaries and real FD-reuse evidence.
-- [ ] One fresh full suite on final reviewed source with explicit isolated PYTHONPATH, persisted JUnit/log in the sole ledger, no concurrent full run or source changes. Inspect all failures and strict expected failure separately; native staging's existing UNSUPPORTED mandatory evidence cannot be hidden or called green.
-- [ ] Record exact source HEAD, three substantive pushes, reviews, targeted/full results and remaining boundaries. Mark this task complete only on its truthful applicable acceptance; keep native Stage 0 and P3 overall incomplete where required evidence is absent. No automatic main merge or P5 transition.
+- [x] Independent whole-slice review compares final scoped changes against the spec, tests, all note/error/caching/receipt boundaries and real FD-reuse evidence.
+- [x] One fresh full suite on final reviewed source with explicit isolated PYTHONPATH, persisted JUnit/log in the sole ledger, no concurrent full run or source changes. Inspect all failures and strict expected failure separately; native staging's existing UNSUPPORTED mandatory evidence cannot be hidden or called green.
+- [x] Record exact source HEAD, three substantive pushes, reviews, targeted/full results and remaining boundaries. Mark this task complete only on its truthful applicable acceptance; keep native Stage 0 and P3 overall incomplete where required evidence is absent. No automatic main merge or P5 transition.
+
+## Validation receipt
+
+Completed as one bounded local transport correction; P3 and the staging native/campaign gates remain incomplete. Design, increments A/B/C and a fresh whole-slice review passed independently. Substantive ordinary feature-branch pushes: 6e4fa49, f3b228d, e030f29. Public v1/receipt/Provider/unknown behavior and staging deletion qualifications were preserved.
+
+Final reviewed source: e030f29d1a216ceac8e002b40b555d4fd8377c71. One fresh full suite completed exit 0: 5197 passed, 1 existing strict xfailed, 28 record_property/xunit2 reporting warnings in 1448.04 seconds. JUnit: 5198 tests, 0 failures, 0 errors, 1 skipped (pytest.xfail). The pre-existing private-connection transaction-monitor bypass remains expected-failing evidence, not a passing security proof. No new coverage percentage was collected.
+
+The affected launcher file passed 278 tests; three directly relevant consumer guards passed. A/B have observed behavioral REDs; C added 24 real FD-reuse/alias/thread/compatibility characterizations already green on B. Initial C fixture allocation failures are not production RED. Explicit close attempts do not prove a failed close completed or a Worker stopped.
+
+Local durable receipts are under .superpowers/sdd/2026-11-07-p3-worker-host-mediation-stop-proof/: session-cleanup-full-e030f29-20261115.log/.xml/.pid and session-cleanup-*-report/review.md. Full exec session 95107 completed; do not repeat it merely to reconstruct history. All active source/tests still match the tested commit; the unrelated snapshot status-only modification was preserved.
+
+The rejected A2 native implementation and its failed one-shot acceptance were preserved in that ledger and withdrawn together before this suite. This green result covers the active reviewed tree; it does not reinterpret that old native failure as accepted, prove host namespace support, release the original UNKNOWN slot or complete P3. The A2 custody addendum remains a separate design review. No main merge, Provider call or deployment occurred.
