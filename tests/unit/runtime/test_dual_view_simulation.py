@@ -938,3 +938,153 @@ def test_new_state_detaches_previously_returned_state_events(sim):
     saved = deepcopy(state.events)
     object.__setattr__(previous.events[0].command, "history", ())
     assert state.events == saved
+
+
+def test_source_and_successor_fence_are_distinct_and_survive_replay(sim):
+    state, b, _ = _pair(sim, True)
+    assert getattr(state.sources[0], "source_fencing_generation", None) == 2
+    assert getattr(b, "source_fencing_generation", None) == 2
+    assert getattr(b.eligibility, "source_fencing_generation", None) == 2
+    state, _ = sim.step(state, sim.Propose(b))
+    state, _ = sim.step(state, sim.PrepareCommit(b))
+    state, out = sim.step(state, sim.Commit(b))
+    assert out.outcome is sim.Outcome.WINNER
+    assert state.winners[0].successor_fencing_generation == 3
+    assert state.winners[0].reservation.successor_fencing_generation == 3
+    assert all(event.source_fencing_generation == 2 for event in state.events)
+    same, out = sim.step(state, sim.Commit(b))
+    assert same is state and out.outcome is sim.Outcome.WINNER
+    assert state.sources[0].budget == 0
+    state, _ = sim.step(state, sim.Crash())
+    restored, out = sim.step(state, sim.Replay(state.events, state.events, len(state.events)))
+    assert out.outcome is sim.Outcome.REPLAYED and restored == state
+    assert restored.sources[0].source_fencing_generation == 2
+    assert restored.winners[0].successor_fencing_generation == 3
+    assert restored.winners[0].reservation.successor_fencing_generation == 3
+
+
+@pytest.mark.parametrize("value", [True, 1, 3])
+def test_wrong_source_fence_in_registration_envelope_and_eligibility_is_invalid(sim, value):
+    empty = sim.initial_state()
+    same, out = sim.step(empty, sim.RegisterSource(sim.Source.S0, (), sim.Fixture.NORMAL,
+                                                   source_fencing_generation=value))
+    assert same is empty and out.outcome is sim.Outcome.HELD_INVALID
+    state, b, _ = _pair(sim, True)
+    for bad in (replace(b, source_fencing_generation=value),
+                replace(b, eligibility=replace(b.eligibility, source_fencing_generation=value))):
+        same, out = sim.step(state, sim.Propose(bad))
+        assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+    assert state.sources[0].budget == 1 and not state.winners
+
+
+@pytest.mark.parametrize("value", [True, 1, 3])
+def test_wrong_source_fence_on_event_rejected_even_with_matching_anchor(sim, value):
+    state = ready(sim)
+    forged = (replace(state.events[0], source_fencing_generation=value),) + state.events[1:]
+    same, out = sim.step(state, sim.Replay(forged, forged, len(forged)))
+    assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+
+
+@pytest.mark.parametrize("value", [True, 2, 4])
+def test_wrong_successor_fence_in_winner_or_reservation_is_invalid(sim, value):
+    state, _, _ = _committed_with_loser_pending(sim)
+    winner = state.winners[0]
+    for bad in (replace(winner, successor_fencing_generation=value),
+                replace(winner, reservation=replace(winner.reservation, successor_fencing_generation=value))):
+        forged = replace(state, winners=(bad,))
+        same, out = sim.step(forged, sim.Crash())
+        assert same is forged and out.outcome is sim.Outcome.HELD_INVALID
+
+
+def test_caller_cannot_clear_unknown_while_retaining_its_event(sim):
+    state, b, _ = _pair(sim, True)
+    state, _ = sim.step(state, sim.Invalidate(sim.Source.S0, sim.Invalidation.UNKNOWN))
+    forged_source = replace(state.sources[0], invalidations=())
+    forged = replace(state, sources=(forged_source,))
+    same, out = sim.step(forged, sim.Propose(b))
+    assert same is forged and out.outcome is sim.Outcome.HELD_INVALID
+    assert forged.sources[0].budget == 1 and not forged.winners
+
+
+@pytest.mark.parametrize("tamper", ["budget", "winner", "first_yes"])
+def test_durable_state_inconsistent_with_events_is_rejected(sim, tamper):
+    state, b, _ = _committed_with_loser_pending(sim)
+    if tamper == "budget":
+        forged = replace(state, sources=(replace(state.sources[0], budget=1),))
+    elif tamper == "winner":
+        forged = replace(state, winners=())
+    else:
+        source = state.sources[0]
+        first = list(source.first_yes)
+        closed = list(sim.Fact).index(sim.Fact.CLOSED)
+        effect = list(sim.Fact).index(sim.Fact.NO_EFFECT)
+        first[closed], first[effect] = first[effect], first[closed]
+        forged = replace(state, sources=(replace(source, first_yes=tuple(first)),))
+    same, out = sim.step(forged, sim.Commit(b))
+    assert same is forged and out.outcome is sim.Outcome.HELD_INVALID
+
+
+def test_stale_but_reachable_pending_survives_consistency_validation(sim):
+    state, b, _ = _pair(sim, True)
+    b = replace(b, expires=1, eligibility=replace(b.eligibility, expires=1))
+    state, _ = sim.step(state, sim.Propose(b))
+    state, _ = sim.step(state, sim.PrepareCommit(b))
+    state, _ = fact(sim, state, sim.Fact.HEALTH, sim.Value.YES, 2)
+    same, out = sim.step(state, sim.Commit(b))
+    assert same is state and out.outcome is sim.Outcome.HELD
+    state, _ = sim.step(state, sim.Invalidate(sim.Source.S0, sim.Invalidation.UNKNOWN))
+    same, out = sim.step(state, sim.Commit(b))
+    assert same is state and out.outcome is sim.Outcome.RECONCILIATION
+
+
+@pytest.mark.parametrize("bad", [True, 2, 4])
+def test_commit_event_binds_successor_fence_and_rejects_tampering(sim, bad):
+    state, b, _ = _pair(sim, True)
+    state, _ = sim.step(state, sim.Propose(b))
+    state, _ = sim.step(state, sim.PrepareCommit(b))
+    same, out = sim.step(state, sim.Commit(b, successor_fencing_generation=bad))
+    assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+    state, out = sim.step(state, sim.Commit(b))
+    assert out.outcome is sim.Outcome.WINNER
+    assert state.events[-1].command.successor_fencing_generation == 3
+    event = replace(state.events[-1], command=replace(state.events[-1].command,
+                                                       successor_fencing_generation=bad))
+    forged = state.events[:-1] + (event,)
+    same, out = sim.step(state, sim.Replay(forged, forged, len(forged)))
+    assert same is state and out.outcome is sim.Outcome.HELD_INVALID
+
+
+def test_pending_without_proposal_or_with_mismatched_binding_is_invalid(sim):
+    state, b, _ = _pair(sim, True)
+    forged = replace(state, pending=(b,))
+    same, out = sim.step(forged, sim.Commit(b))
+    assert same is forged and out.outcome is sim.Outcome.HELD_INVALID
+    state, _ = sim.step(state, sim.Propose(b))
+    state, _ = sim.step(state, sim.PrepareCommit(b))
+    forged = replace(state, pending=(replace(b, entry=sim.Entry.IMPORT),))
+    same, out = sim.step(forged, sim.Crash())
+    assert same is forged and out.outcome is sim.Outcome.HELD_INVALID
+    state, _ = sim.step(state, sim.Invalidate(sim.Source.S0, sim.Invalidation.UNKNOWN))
+    same, out = sim.step(state, sim.Commit(b))
+    assert same is state and out.outcome is sim.Outcome.RECONCILIATION
+
+
+def test_synthetic_pending_requires_trusted_harness_and_is_not_authenticated(sim):
+    """An arbitrary caller can forge this volatile input; never use it as production proof."""
+    state, b, _ = _pair(sim, True)
+    state, out = sim.step(state, sim.Propose(b))
+    assert out.outcome is sim.Outcome.PROPOSED
+    same, out = sim.step(state, sim.Commit(b))
+    assert same is state and out.outcome is sim.Outcome.HELD
+    assert state.sources[0].budget == 1 and not state.winners
+
+    # The proposal is durable in the synthetic history, but PrepareCommit is
+    # not. A caller manufacturing a matching pending tuple can simulate a win.
+    # The trusted harness must pass only pending returned by step; this test is
+    # a limitation disclosure, not an authorization or storage guarantee.
+    forged = replace(state, pending=(b,))
+    won, out = sim.step(forged, sim.Commit(b))
+    assert out.outcome is sim.Outcome.WINNER
+    assert out.simulation_only is True and out.non_authoritative is True
+    assert won.simulation_only is True and won.non_authoritative is True
+    assert won.sources[0].budget == 0 and len(won.winners) == 1

@@ -122,6 +122,7 @@ class Eligibility:
     policy: Policy
     retry_level: int
     expires: int
+    source_fencing_generation: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +140,7 @@ class Envelope:
     created: int
     expires: int
     fixture: Fixture
+    source_fencing_generation: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +148,7 @@ class RegisterSource:
     source: Source
     history: tuple[Model, ...]
     fixture: Fixture
+    source_fencing_generation: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +171,7 @@ class PrepareCommit:
 @dataclass(frozen=True, slots=True)
 class Commit:
     envelope: Envelope
+    successor_fencing_generation: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,18 +207,21 @@ class Replay:
 class Reservation:
     envelope: Envelope
     revoked: bool = False
+    successor_fencing_generation: int = 3
 
 
 @dataclass(frozen=True, slots=True)
 class Winner:
     envelope: Envelope
     reservation: Reservation
+    successor_fencing_generation: int = 3
 
 
 @dataclass(frozen=True, slots=True)
 class Event:
     ordinal: int
     command: RegisterSource | SetFacts | Propose | Commit | CloseGeneration | Invalidate
+    source_fencing_generation: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +237,7 @@ class SourceState:
     retry_level: int
     max_retries: int
     invalidations: tuple[Invalidation, ...] = ()
+    source_fencing_generation: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,7 +285,8 @@ def _clock_ok(clock):
 def _command_shape_ok(command):
     if type(command) is RegisterSource:
         return (type(command.source) is Source and type(command.fixture) is Fixture
-                and _history_ok(command.history))
+                and _history_ok(command.history) and type(command.source_fencing_generation) is int
+                and command.source_fencing_generation == 2)
     if type(command) is SetFacts:
         changes = command.changes
         return (type(command.source) is Source and _clock_ok(command.clock)
@@ -286,7 +295,10 @@ def _command_shape_ok(command):
                         and type(pair[0]) is Fact and type(pair[1]) is Value
                         and pair[1] is not Value.UNSET for pair in changes)
                 and len({pair[0] for pair in changes}) == len(changes))
-    if type(command) in (Propose, PrepareCommit, Commit, SimulateDispatchCheck):
+    if type(command) is Commit:
+        return (_envelope_ok(command.envelope) and type(command.successor_fencing_generation) is int
+                and command.successor_fencing_generation == 3)
+    if type(command) in (Propose, PrepareCommit, SimulateDispatchCheck):
         return _envelope_ok(command.envelope)
     if type(command) is CloseGeneration:
         return type(command.source) is Source and type(command.generation) is int and command.generation == 0
@@ -296,6 +308,7 @@ def _command_shape_ok(command):
 def _event_ok(event, ordinal):
     # Pending, crash, replay and simulated dispatch are never durable events.
     return (type(event) is Event and type(event.ordinal) is int and event.ordinal == ordinal
+            and type(event.source_fencing_generation) is int and event.source_fencing_generation == 2
             and type(event.command) in (RegisterSource, SetFacts, Propose, Commit, CloseGeneration, Invalidate)
             and _command_shape_ok(event.command))
 
@@ -316,6 +329,7 @@ def _state_ok(state):
         return False
     if not all(type(item) is SourceState and type(item.source) is Source
                and _history_ok(item.history) and type(item.fixture) is Fixture
+               and type(item.source_fencing_generation) is int and item.source_fencing_generation == 2
                and type(item.facts) is tuple and len(item.facts) == len(Fact)
                and all(type(value) is Value for value in item.facts)
                and type(item.first_yes) is tuple and len(item.first_yes) == len(Fact)
@@ -338,7 +352,10 @@ def _state_ok(state):
             and all(type(item) is Winner and _envelope_ok(item.envelope)
                     and type(item.reservation) is Reservation
                     and item.reservation.envelope == item.envelope
-                    and type(item.reservation.revoked) is bool for item in state.winners)
+                                        and type(item.reservation.revoked) is bool
+                    and type(item.successor_fencing_generation) is int and item.successor_fencing_generation == 3
+                    and type(item.reservation.successor_fencing_generation) is int
+                    and item.reservation.successor_fencing_generation == 3 for item in state.winners)
             and len({item.envelope.source for item in state.winners}) == len(state.winners)
             and all(type(item) is tuple and len(item) == 2 and type(item[0]) is Source
                     and type(item[1]) is int and item[1] == 0 for item in state.closed_generations)
@@ -362,7 +379,8 @@ def _envelope_ok(envelope):
                         (envelope.provider, Provider), (envelope.fixture, Fixture)):
         if type(value) is not kind:
             return False
-    if not (_history_ok(envelope.history) and type(envelope.generation) is int
+    if not (_history_ok(envelope.history) and type(envelope.source_fencing_generation) is int
+            and envelope.source_fencing_generation == 2 and type(envelope.generation) is int
             and envelope.generation in (0, 1) and _clock_ok(envelope.created)
             and _clock_ok(envelope.expires) and envelope.created <= envelope.expires):
         return False
@@ -373,11 +391,13 @@ def _envelope_ok(envelope):
             and type(eligibility.model) is Model and type(eligibility.provider) is Provider
             and type(eligibility.evidence) is Evidence and type(eligibility.policy) is Policy
             and type(eligibility.retry_level) is int and 0 <= eligibility.retry_level <= 2
-            and _clock_ok(eligibility.expires))
+            and _clock_ok(eligibility.expires) and type(eligibility.source_fencing_generation) is int
+            and eligibility.source_fencing_generation == 2)
 
 
 def _binding_ok(envelope, source):
-    if source.history != envelope.history or source.fixture is not envelope.fixture:
+    if (source.history != envelope.history or source.fixture is not envelope.fixture
+            or envelope.source_fencing_generation != source.source_fencing_generation):
         return False
     source_model, source_provider, evidence = _identity(envelope.source)
     expected_provider = Provider.P0 if envelope.model is Model.M0 else Provider.P1
@@ -388,7 +408,8 @@ def _binding_ok(envelope, source):
         return (eligibility is not None and eligibility.source is envelope.source
                 and eligibility.model is source_model and eligibility.provider is source_provider
                 and eligibility.evidence is evidence and eligibility.policy is Policy.P0
-                and eligibility.retry_level == 2 and eligibility.expires >= envelope.created)
+                and eligibility.retry_level == 2 and eligibility.expires >= envelope.created
+                and eligibility.source_fencing_generation == source.source_fencing_generation)
     return envelope.eligibility is None
 
 
@@ -420,6 +441,44 @@ def _winner(state, source):
     return next((item for item in state.winners if item.envelope.source is source), None)
 
 
+def _rebuild_events(events):
+    """Validate event-time transitions without recursing through public step."""
+    rebuilt = initial_state()
+    for event in events:
+        if type(event.command) is Commit:
+            # Preparation is volatile and is not established by the event.
+            # This temporary value permits only rechecking durable conditions.
+            candidate = replace(rebuilt, pending=(event.command.envelope,))
+        else:
+            candidate = rebuilt
+        after, observation = _step(candidate, event.command)
+        if (observation.outcome not in (Outcome.REGISTERED, Outcome.RECORDED,
+                                       Outcome.PROPOSED, Outcome.WINNER)
+                or len(after.events) != event.ordinal or after.events[-1] != event):
+            return None
+        rebuilt = replace(after, pending=())
+    return rebuilt
+
+
+def _state_consistent(state):
+    """Compare durable state to its own bounded history, not to a trusted anchor."""
+    rebuilt = _rebuild_events(state.events)
+    if rebuilt is None or (state.sources, state.events, state.proposals, state.winners,
+                           state.closed_generations, state.clock) != (rebuilt.sources, rebuilt.events,
+                           rebuilt.proposals, rebuilt.winners, rebuilt.closed_generations, rebuilt.clock):
+        return False
+    for item in state.pending:
+        source = _find(rebuilt, item.source)
+        if source is None or _proposal(rebuilt, item) != item or not _binding_ok(item, source):
+            return False
+        winner = _winner(rebuilt, item.source)
+        if winner is not None and winner.envelope == item:
+            return False
+        if sum(other.source is item.source for other in state.pending) > 2:
+            return False
+    return True
+
+
 def _replay(state, command):
     events, anchor, count = command.events, command.anchor, command.anchor_count
     if (type(events) is not tuple or type(anchor) is not tuple
@@ -429,21 +488,9 @@ def _replay(state, command):
             or not all(_event_ok(event, i) for i, event in enumerate(anchor, 1))
             or events != anchor):
         return _out(state, Outcome.HELD_INVALID)
-    rebuilt = initial_state()
-    for event in events:
-        if type(event.command) is Commit:
-            # Preparation is volatile. Reconstruct its effect locally solely
-            # to reuse the live commit checks; the event does not prove that
-            # preparation occurred. Only durable preconditions can validate it.
-            candidate = replace(rebuilt, pending=(event.command.envelope,))
-        else:
-            candidate = rebuilt
-        after, observation = step(candidate, event.command)
-        if (observation.outcome not in (Outcome.REGISTERED, Outcome.RECORDED,
-                                       Outcome.PROPOSED, Outcome.WINNER)
-                or len(after.events) != event.ordinal or after.events[-1] != event):
-            return _out(state, Outcome.HELD_INVALID)
-        rebuilt = replace(after, pending=())
+    rebuilt = _rebuild_events(events)
+    if rebuilt is None:
+        return _out(state, Outcome.HELD_INVALID)
     return _out(rebuilt, Outcome.REPLAYED)
 
 
@@ -456,7 +503,7 @@ def _step(state: ModelState, command: object) -> tuple[ModelState, Observation]:
     if type(command) is Replay:
         return _replay(state, command)
     if type(command) is RegisterSource:
-        if type(command.source) is not Source or type(command.fixture) is not Fixture or not _history_ok(command.history):
+        if not _command_shape_ok(command):
             return _out(state, Outcome.HELD_INVALID)
         found = _find(state, command.source)
         if found is not None:
@@ -570,7 +617,8 @@ def _step(state: ModelState, command: object) -> tuple[ModelState, Observation]:
         updated = replace(source, budget=source.budget - 1, attempts=source.attempts + 1,
                           retry_level=source.retry_level + 1)
         sources = tuple(updated if item.source is envelope.source else item for item in state.sources)
-        winner = Winner(envelope, Reservation(envelope))
+        winner = Winner(envelope, Reservation(envelope, False, command.successor_fencing_generation),
+                        command.successor_fencing_generation)
         pending = tuple(item for item in state.pending if item != envelope)
         return _out(_append(state, command, sources=sources, pending=pending,
                             winners=state.winners + (winner,)), Outcome.WINNER)
@@ -619,22 +667,24 @@ def _copy_envelope(envelope):
     if eligibility is not None:
         eligibility = Eligibility(eligibility.source, eligibility.model, eligibility.provider,
                                   eligibility.evidence, eligibility.policy,
-                                  eligibility.retry_level, eligibility.expires)
+                                  eligibility.retry_level, eligibility.expires,
+                                  eligibility.source_fencing_generation)
     return Envelope(envelope.source, envelope.request, envelope.version, envelope.entry,
                     envelope.action, envelope.model, envelope.provider, tuple(envelope.history),
                     eligibility, envelope.generation, envelope.created, envelope.expires,
-                    envelope.fixture)
+                    envelope.fixture, envelope.source_fencing_generation)
 
 
 def _copy_event_command(command):
     if type(command) is RegisterSource:
-        return RegisterSource(command.source, tuple(command.history), command.fixture)
+        return RegisterSource(command.source, tuple(command.history), command.fixture,
+                              command.source_fencing_generation)
     if type(command) is SetFacts:
         return SetFacts(command.source, tuple((fact, value) for fact, value in command.changes), command.clock)
     if type(command) is Propose:
         return Propose(_copy_envelope(command.envelope))
     if type(command) is Commit:
-        return Commit(_copy_envelope(command.envelope))
+        return Commit(_copy_envelope(command.envelope), command.successor_fencing_generation)
     if type(command) is CloseGeneration:
         return CloseGeneration(command.source, command.generation)
     if type(command) is Invalidate:
@@ -647,13 +697,16 @@ def _copy_state(state):
     sources = tuple(SourceState(item.source, tuple(item.history), item.fixture, tuple(item.facts),
                                 tuple(item.first_yes), item.budget, item.attempts,
                                 item.max_attempts, item.retry_level, item.max_retries,
-                                tuple(item.invalidations)) for item in state.sources)
-    events = tuple(Event(item.ordinal, _copy_event_command(item.command)) for item in state.events)
+                                tuple(item.invalidations), item.source_fencing_generation) for item in state.sources)
+    events = tuple(Event(item.ordinal, _copy_event_command(item.command), item.source_fencing_generation)
+                   for item in state.events)
     proposals = tuple(_copy_envelope(item) for item in state.proposals)
     pending = tuple(_copy_envelope(item) for item in state.pending)
     winners = tuple(Winner(_copy_envelope(item.envelope),
                            Reservation(_copy_envelope(item.reservation.envelope),
-                                       item.reservation.revoked)) for item in state.winners)
+                                       item.reservation.revoked,
+                                       item.reservation.successor_fencing_generation),
+                           item.successor_fencing_generation) for item in state.winners)
     return ModelState(sources=sources, events=events, proposals=proposals, pending=pending,
                       winners=winners, closed_generations=tuple((source, generation)
                                                                for source, generation in state.closed_generations),
@@ -662,6 +715,8 @@ def _copy_state(state):
 
 def step(state: ModelState, command: object) -> tuple[ModelState, Observation]:
     """Return detached synthetic outputs; invalid inputs remain unchanged."""
+    if not _state_ok(state) or not _state_consistent(state):
+        return _out(state, Outcome.HELD_INVALID)
     result, observation = _step(state, command)
     if result is state:
         return result, observation
