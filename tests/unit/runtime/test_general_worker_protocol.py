@@ -533,3 +533,170 @@ def test_completion_rejects_exact_utf8_overflow_and_short_surrogates(limit, resp
     # Strings within the character cap still require a strict exact UTF-8 byte check.
     rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("complete", LAUNCH,
         task(limit), response)))
+
+
+# Handwritten v1 bytes; the commitment below was calculated independently from these bytes.
+GOLDEN_TASK = (
+    b'{"context":{"agent_instance_id":"agent-1","attempt_id":"attempt-1",'
+    b'"effective_config_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    b'"fencing_generation":18446744073709551616,"graph_version":18446744073709551616,'
+    b'"input_manifest_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    b'"node_id":"node-1",'
+    b'"planning_contract_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    b'"policy_manifest_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    b'"registry_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    b'"routing_decision_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    b'"run_id":"run-1"},"input_artifacts":[{"artifact_type":"text",'
+    b'"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+    b'"media_type":"text/plain","size_bytes":18446744073709551616}],'
+    b'"output_byte_limit":3,"role":"coder","task_text":"\xc3\xa9\\r\\n",'
+    b'"tool_capabilities":[{"grant_id":"grant-a",'
+    b'"scope_hash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+    b'"tool_id":"tool"},{"grant_id":"grant-z",'
+    b'"scope_hash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+    b'"tool_id":"tool"}]}'
+)
+
+
+@pytest.mark.parametrize("collection", [list, tuple])
+@pytest.mark.parametrize("phase, response, prefix", [
+    ("request", None, b'{"launch_id":"4dc48974-60de-476b-8828-e6d979729813",'
+        b'"phase":"request","response_text":null,"schema":"maestro.general-worker-turn.v1","task":'),
+    ("complete", "é", b'{"launch_id":"4dc48974-60de-476b-8828-e6d979729813",'
+        b'"phase":"complete","response_text":"\xc3\xa9","schema":"maestro.general-worker-turn.v1","task":'),
+], ids=["request", "complete"])
+def test_v1_literal_canonical_bytes_and_commitment_survive_collection_shape_and_wide_integers(
+    collection, phase, response, prefix,
+):
+    # Capping any formerly unbounded integer or changing v1 bytes/ordering breaks this fixture.
+    context = task().context.model_copy(update={"fencing_generation": 18_446_744_073_709_551_616,
+        "graph_version": 18_446_744_073_709_551_616})
+    artifact = ArtifactRef(digest="sha256:" + "b" * 64, size_bytes=18_446_744_073_709_551_616,
+        artifact_type="text", media_type="text/plain")
+    refs = [ToolCapabilityRef(grant_id=name, tool_id="tool", scope_hash="sha256:" + "c" * 64)
+        for name in ("grant-a", "grant-z")]
+    model = task(3).model_copy(update={"context": context, "task_text": "é\r\n",
+        "input_artifacts": collection([artifact]), "tool_capabilities": collection(refs)})
+    turn = GeneralWorkerTurn(phase, LAUNCH, model, response)
+    payload = encode_general_worker_turn(turn)
+    assert payload == prefix + GOLDEN_TASK + b"}"
+    assert encode_general_worker_turn(decode_general_worker_turn(payload)) == payload
+    result = child(payload)
+    assert (result.returncode, result.stderr) == (0, b"")
+    proposal = decode_general_worker_proposal(result.stdout, turn)
+    if phase == "request":
+        assert proposal.input_commitment == "sha256:652fd807a87bf53ec9495c3c4ed5e7e4ea9568fe83ef57eeb888b12c6f261aac"
+    else:
+        assert proposal.blobs[0].content == b"\xc3\xa9"
+
+
+@pytest.mark.parametrize("contract, field, valid, invalid", [
+    pytest.param(WorkerTask, "role", "x" * 64, "x" * 65, id="role-length"),
+    pytest.param(WorkerTask, "task_text", "x" * 100_000, "x" * 100_001, id="task-length"),
+    pytest.param(WorkerTask, "output_byte_limit", 1, 0, id="output-minimum"),
+    pytest.param(WorkerTask, "output_byte_limit", 1_073_741_824, 1_073_741_825, id="output-maximum"),
+    *[pytest.param(AttemptContext, name, "x" * 128, "x" * 129, id=name + "-length")
+        for name in ("run_id", "node_id", "attempt_id", "agent_instance_id")],
+    *[pytest.param(AttemptContext, name, "sha256:" + "a" * 64, "sha256:" + "a" * 65,
+        id=name + "-length") for name in ("input_manifest_hash", "effective_config_hash",
+        "registry_hash", "policy_manifest_hash", "routing_decision_hash", "planning_contract_hash")],
+    pytest.param(AttemptContext, "fencing_generation", 1, 0, id="fencing-minimum"),
+    pytest.param(AttemptContext, "graph_version", 0, -1, id="graph-minimum"),
+    pytest.param(ArtifactRef, "digest", "sha256:" + "b" * 64, "sha256:" + "b" * 65, id="digest-length"),
+    pytest.param(ArtifactRef, "size_bytes", 0, -1, id="artifact-size-minimum"),
+    pytest.param(ArtifactRef, "artifact_type", "x" * 64, "x" * 65, id="artifact-type-length"),
+    pytest.param(ArtifactRef, "media_type", "x" * 128, "x" * 129, id="media-length"),
+    pytest.param(ToolCapabilityRef, "grant_id", "x" * 128, "x" * 129, id="grant-length"),
+    pytest.param(ToolCapabilityRef, "tool_id", "x" * 128, "x" * 129, id="tool-length"),
+    pytest.param(ToolCapabilityRef, "scope_hash", "sha256:" + "c" * 64, "sha256:" + "c" * 65,
+        id="scope-length"),
+])
+def test_existing_scalar_boundaries_accept_edge_and_reject_first_invalid_value(
+    contract, field, valid, invalid,
+):
+    # Every pair protects an existing admission boundary when model validation is bypassed.
+    h = "sha256:" + "a" * 64
+    if contract is WorkerTask:
+        base, target = task(), None
+    elif contract is AttemptContext:
+        base, target = task().context, "context"
+    elif contract is ArtifactRef:
+        base = ArtifactRef(digest=h, size_bytes=0, artifact_type="text", media_type="text/plain")
+        target = "input_artifacts"
+    else:
+        base = ToolCapabilityRef(grant_id="grant", tool_id="tool", scope_hash=h)
+        target = "tool_capabilities"
+    for scalar, accepted in ((valid, True), (invalid, False)):
+        model = base.model_copy(update={field: scalar})
+        if target is not None:
+            model = task().model_copy(update={target: model if target == "context" else (model,)})
+        turn = GeneralWorkerTurn("request", LAUNCH, model)
+        if accepted:
+            assert decode_general_worker_turn(encode_general_worker_turn(turn)).task == model
+        else:
+            rejected(lambda: encode_general_worker_turn(turn))
+
+
+@pytest.mark.parametrize("field, count", [("input_artifacts", 128), ("tool_capabilities", 64)])
+@pytest.mark.parametrize("collection", [list, tuple])
+def test_existing_collection_count_boundary_remains_accepted(field, count, collection):
+    # Enforcing the cap before copying must preserve the exact allowed maximum.
+    h = "sha256:" + "a" * 64
+    if field == "input_artifacts":
+        refs = [ArtifactRef(digest=f"sha256:{index:064x}", size_bytes=0,
+            artifact_type="text", media_type="text/plain") for index in range(count)]
+    else:
+        refs = [ToolCapabilityRef(grant_id=f"grant-{index:03}", tool_id="tool", scope_hash=h)
+            for index in range(count)]
+    model = task().model_copy(update={field: collection(refs)})
+    payload = encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, model))
+    assert len(json.loads(payload)["task"][field]) == count
+    assert len(getattr(decode_general_worker_turn(payload).task, field)) == count
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt("private-control"),
+    SystemExit("private-control"), GeneratorExit("private-control")],
+    ids=["keyboard-interrupt", "system-exit", "generator-exit"])
+def test_encoding_preserves_baseexception_control_identity(monkeypatch, control):
+    # Wrapping BaseException as a protocol error would swallow a host control signal.
+    def interrupt(value):
+        raise control
+
+    monkeypatch.setattr(protocol, "_canonical", interrupt)
+    with pytest.raises(type(control)) as caught:
+        encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, task()))
+    assert caught.value is control
+
+
+@pytest.mark.parametrize("launch_id", [LAUNCH.upper(), "4dc48974-60de-576b-8828-e6d979729813",
+    "urn:uuid:" + LAUNCH, "{" + LAUNCH + "}", LAUNCH.replace("-", "")],
+    ids=["uppercase", "version-five", "urn", "braces", "compact"])
+def test_launch_identity_requires_exact_canonical_uuid_four(launch_id):
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", launch_id, task())))
+
+
+@pytest.mark.parametrize("field", ["input_artifacts", "tool_capabilities"])
+def test_constructor_bypass_cannot_admit_duplicate_artifact_or_grant_identity(field):
+    h = "sha256:" + "a" * 64
+    if field == "input_artifacts":
+        ref = ArtifactRef(digest=h, size_bytes=0, artifact_type="text", media_type="text/plain")
+    else:
+        ref = ToolCapabilityRef(grant_id="grant", tool_id="tool", scope_hash=h)
+    model = task().model_copy(update={field: (ref, ref)})
+    rejected(lambda: encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, model)))
+
+
+def test_artifact_input_order_is_preserved_in_wire_bytes():
+    refs = tuple(ArtifactRef(digest="sha256:" + digit * 64, size_bytes=0,
+        artifact_type="text", media_type="text/plain") for digit in ("b", "a"))
+    model = task().model_copy(update={"input_artifacts": refs})
+    payload = encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, model))
+    assert [ref["digest"] for ref in json.loads(payload)["task"]["input_artifacts"]] == [
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+
+
+def test_turn_schema_version_remains_exact_on_decode():
+    value = json.loads(encode_general_worker_turn(GeneralWorkerTurn("request", LAUNCH, task())))
+    value["schema"] = "maestro.general-worker-turn.v2"
+    rejected(lambda: decode_general_worker_turn(wire(value)))

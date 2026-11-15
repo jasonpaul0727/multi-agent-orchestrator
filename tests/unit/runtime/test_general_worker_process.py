@@ -1,6 +1,7 @@
 """Supervision must bind launch observation and exact whole-unit stop."""
 
 from dataclasses import replace
+import json
 from pathlib import Path
 import subprocess
 import threading
@@ -11,7 +12,8 @@ from orchestrator.isolation import (
     IsolationNotStarted, IsolationStartUnknown, IsolationStopUnknown,
     PreparedSandboxLaunch, SandboxLaunchReceipt, SandboxLimits, SandboxResult, SandboxTerminationReceipt,
 )
-from orchestrator.runtime.contracts import AttemptContext, WorkerTask
+from orchestrator.runtime import general_worker_protocol as protocol
+from orchestrator.runtime.contracts import ArtifactRef, AttemptContext, ToolCapabilityRef, WorkerTask
 from orchestrator.runtime.general_worker_process import GeneralWorkerProcess
 from orchestrator.runtime.general_worker_protocol import (
     GeneralWorkerTurn, encode_general_worker_turn, _proposal_bytes,
@@ -256,3 +258,107 @@ def test_hostile_ack_identity_rejected_before_comparison_callback(tmp_path, fiel
     detached(IsolationStartUnknown, lambda: GeneralWorkerProcess(launcher=Launcher(Session(receipt=receipt))).start_turn(
         tmp_path, turn(), prepared_launch=prepared()))
     assert calls == []
+
+
+@pytest.mark.parametrize("case", ["task-scalar", "context-scalar", "task-text-oversize",
+    "artifact-count", "capability-count", "response-character-cap", "response-byte-cap",
+    "response-surrogate", "frame-oversize", "artifact-grow", "artifact-shrink",
+    "capability-grow", "capability-shrink"])
+def test_invalid_turn_preflight_reaches_no_launcher_with_positive_control(tmp_path, monkeypatch, case):
+    # Exercise real start_turn; the same prepared fixture demonstrably permits a valid launch.
+    class OwnedLauncher(Launcher):
+        def prepare_launch(self):
+            return prepared()
+
+    launcher = OwnedLauncher()
+    worker = GeneralWorkerProcess(launcher=launcher)
+    intent = worker.prepare_launch()
+    session = worker.start_turn(tmp_path, turn(), prepared_launch=intent)
+    assert session.launch_receipt == ack() and len(launcher.calls) == 1
+    launcher.calls.clear()
+    candidate = turn()
+    h = "sha256:" + "a" * 64
+    if case == "task-scalar":
+        candidate = replace(candidate, task=candidate.task.model_copy(
+            update={"task_text": ["private-task-sentinel"]}))
+    elif case == "context-scalar":
+        context = candidate.task.context.model_copy(update={"graph_version": True})
+        candidate = replace(candidate, task=candidate.task.model_copy(update={"context": context}))
+    elif case == "task-text-oversize":
+        candidate = replace(candidate, task=candidate.task.model_copy(update={"task_text": "x" * 100_001}))
+    elif case == "response-character-cap":
+        candidate = replace(candidate, response_text="x" * 16_385)
+    elif case == "response-byte-cap":
+        candidate = replace(candidate, response_text="é" * 8_192 + "x")
+    elif case == "response-surrogate":
+        candidate = replace(candidate, response_text="\ud800")
+    elif case == "frame-oversize":
+        # Valid field values alone contribute at least 1,054,144 UTF-8 bytes,
+        # before JSON punctuation, exceeding the unchanged 1,048,576-byte frame cap.
+        refs = tuple(ArtifactRef(digest=f"sha256:{index:064x}", size_bytes=10 ** 4_299,
+            artifact_type="a" * 64, media_type="\U0001f642" * 128) for index in range(128))
+        grants = tuple(ToolCapabilityRef(grant_id=f"{index:03}" + "g" * 125,
+            tool_id="t" * 128, scope_hash=h) for index in range(64))
+        model = WorkerTask(context=candidate.task.context, role="coder",
+            task_text="\U0001f642" * 100_000, input_artifacts=refs, tool_capabilities=grants,
+            output_byte_limit=16_384)
+        task_bytes = json.dumps(model.model_dump(mode="json"), ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8")
+        assert len(task_bytes) > 1_048_576
+        candidate = replace(candidate, task=model)
+    else:
+        artifact_case = case.startswith("artifact")
+        contract = ArtifactRef if artifact_case else ToolCapabilityRef
+        field = "input_artifacts" if artifact_case else "tool_capabilities"
+
+        def reference(index):
+            if artifact_case:
+                return ArtifactRef(digest=f"sha256:{index:064x}", size_bytes=0,
+                    artifact_type="text", media_type="text/plain")
+            return ToolCapabilityRef(grant_id=f"grant-{index:03}", tool_id="tool", scope_hash=h)
+
+        count = (129 if artifact_case else 65) if case.endswith("count") else 2
+        source = [reference(index) for index in range(count)]
+        candidate = replace(candidate, task=candidate.task.model_copy(update={field: source}))
+        if case.endswith(("grow", "shrink")):
+            original = protocol._model_fields
+            changed = []
+
+            def mutate_fields(model, expected):
+                snapshot = original(model, expected)
+                if expected is contract and not changed:
+                    changed.append(True)
+                    if case.endswith("grow"):
+                        source.append(reference(2))
+                    else:
+                        source.pop()
+                return snapshot
+
+            monkeypatch.setattr(protocol, "_model_fields", mutate_fields)
+    with pytest.raises(IsolationNotStarted) as caught:
+        worker.start_turn(tmp_path, candidate, prepared_launch=intent)
+    error = caught.value
+    assert str(error) == "general_worker_not_started"
+    assert error.__cause__ is None and error.__context__ is None
+    assert "private-" not in str(error) + repr(error) + repr(error.__dict__)
+    assert len(launcher.calls) == 0
+    if case.endswith(("grow", "shrink")):
+        assert len(source) == (3 if case.endswith("grow") else 1)
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt("private-control"),
+    SystemExit("private-control"), GeneratorExit("private-control")],
+    ids=["keyboard-interrupt", "system-exit", "generator-exit"])
+def test_start_turn_preserves_encoding_baseexception_without_launch(tmp_path, monkeypatch, control):
+    # A prelaunch host control signal must propagate unchanged rather than becoming start-unknown.
+    launcher = Launcher()
+    worker = GeneralWorkerProcess(launcher=launcher)
+
+    def interrupt(value):
+        raise control
+
+    monkeypatch.setattr(protocol, "_canonical", interrupt)
+    with pytest.raises(type(control)) as caught:
+        worker.start_turn(tmp_path, turn(), prepared_launch=prepared())
+    assert caught.value is control
+    assert len(launcher.calls) == 0
