@@ -33,7 +33,7 @@ Preserve existing pure model and production code. Full v1/unknown reconciliation
 
 ### Stage B: One-transaction events, winner and resources
 
-**Interfaces:** `apply(command)->(ModelState,Observation)` accepts only fixed persistent commands; `commit(envelope,*,hook=None)->(ModelState,Observation)`, owns local Prepare+Commit; `read()` always fully verifies.
+**Interfaces:** `apply(command,*,hook=None)->(ModelState,Observation)` accepts only fixed persistent commands; `commit(envelope,*,hook=None)->(ModelState,Observation)`, owns local Prepare+Commit; `read()` always fully verifies.
 
 - [ ] RED: source registered, separate stop/effect YES facts, v1 history unchanged, B proposal/commit produces one winner/reservation and debit; exact repeat unchanged; altered envelope conflicts; other version/entry superseded according to model.
 - [ ] RED: unknown/closed generation/stale source/expiry/limits block; winner retained after unknown but no new winner; wrong source/fences invalid; all event/projection/index rows match replay.

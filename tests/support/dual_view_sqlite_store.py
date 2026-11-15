@@ -4,6 +4,7 @@ This database has no production adapter, authority, or provider side effects.
 Its trusted parent directory and SQLite/VFS semantics are test assumptions.
 """
 
+from dataclasses import replace
 import os
 from pathlib import Path
 import sqlite3
@@ -47,9 +48,12 @@ def _rollback_preserving_error(connection):
     try:
         if connection.in_transaction:
             connection.rollback()
+        return True
     except BaseException:
-        # The active validation/control-flow error remains the primary error.
-        pass
+        # A failed rollback must not leave an owned writer lock available for reuse.
+        # Closing also attempts SQLite's implicit rollback; preserve the first error.
+        _close_preserving_error(connection)
+        return False
 
 
 def _close_preserving_error(connection):
@@ -217,5 +221,75 @@ class SqliteDualViewStore:
             connection.commit()
             return state
         except BaseException:
-            _rollback_preserving_error(connection)
+            if not _rollback_preserving_error(connection):
+                self._connection = None
             raise
+
+
+    def apply(self, command, *, hook=None) -> tuple[sim.ModelState, sim.Observation]:
+        """Apply only fixed persistent commands under this store's write lock."""
+        return self._write(command, is_commit=False, hook=hook)
+
+    def commit(self, envelope, *, hook=None) -> tuple[sim.ModelState, sim.Observation]:
+        """Prepare and commit locally; no caller-owned pending value is trusted."""
+        return self._write(envelope, is_commit=True, hook=hook)
+
+    def _write(self, value, *, is_commit, hook):
+        connection = self._connection
+        if connection is None:
+            raise ValueError("private prototype store is closed")
+
+        def phase(name):
+            if hook is not None:
+                hook(name)
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            phase("after_begin")
+            before = _read_state(connection)
+            if is_commit:
+                if type(value) is not sim.Envelope:
+                    raise ValueError("private prototype requires an exact finite envelope")
+                after, observation = sim.step(before, sim.PrepareCommit(value))
+                if observation.outcome is sim.Outcome.PREPARED:
+                    after, observation = sim.step(after, sim.Commit(value))
+            else:
+                if type(value) not in (sim.RegisterSource, sim.SetFacts, sim.Propose,
+                                       sim.CloseGeneration, sim.Invalidate):
+                    raise ValueError("private prototype requires a fixed persistent command")
+                after, observation = sim.step(before, value)
+            # Preparation is volatile even when Commit fails at the event cap.
+            after = replace(after, pending=())
+            changed = after != before
+            if changed and (len(after.events) <= len(before.events)
+                            or after.events[:len(before.events)] != before.events):
+                raise ValueError("invalid private prototype persistent transition")
+            if changed:
+                for event in after.events[len(before.events):]:
+                    payload = encode(event)
+                    if len(payload.encode("utf-8")) > _EVENT_BYTES:
+                        raise ValueError("private prototype event is too large")
+                    connection.execute("INSERT INTO events(sequence,payload) VALUES(?,?)",
+                                       (event.ordinal, payload))
+            phase("after_events")
+            if changed:
+                connection.execute("UPDATE projection SET payload=? WHERE singleton=1",
+                                   (encode(after),))
+            phase("after_projection")
+            if changed:
+                connection.execute("DELETE FROM winners")
+                connection.executemany("INSERT INTO winners(source,payload) VALUES(?,?)",
+                    ((winner.envelope.source.name, encode(winner)) for winner in after.winners))
+                connection.execute("DELETE FROM resources")
+                connection.executemany("INSERT INTO resources(source,payload) VALUES(?,?)",
+                    ((source.source.name, encode(source)) for source in after.sources))
+            phase("after_indexes")
+            phase("before_commit")
+            connection.commit()
+        except BaseException:
+            if not _rollback_preserving_error(connection):
+                self._connection = None
+            raise
+        # A hook failure here is a lost local response, never a rollback claim.
+        phase("after_commit")
+        return after, observation

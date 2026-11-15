@@ -11,7 +11,7 @@ Existing Scheduler and append_checked use the same connection/BEGIN IMMEDIATE fo
 ## Files and interfaces
 
 - `tests/support/dual_view_sqlite_codec.py`: exact whitelist canonical JSON encoding/decoding of existing model enums and frozen dataclasses; no production-compatible authorization format.
-- `tests/support/dual_view_sqlite_store.py`: `create_store(path: Path) -> None`; `SqliteDualViewStore(path)` context manager for an existing store; `apply(command) -> (ModelState, Observation)`; `commit(envelope, *, hook=None) -> (ModelState, Observation)`; `read() -> ModelState`.
+- `tests/support/dual_view_sqlite_store.py`: `create_store(path: Path) -> None`; `SqliteDualViewStore(path)` context manager for an existing store; `apply(command, *, hook=None) -> (ModelState, Observation)`; `commit(envelope, *, hook=None) -> (ModelState, Observation)`; `read() -> ModelState`.
 - `tests/unit/runtime/test_dual_view_sqlite_store.py`: codec, lifecycle, transactions, idempotency, strict replay/projection rejection.
 - `tests/integration/test_dual_view_sqlite_processes.py`: real process races, controlled SIGKILL and fresh-process recovery. A separate tests/support harness is allowed if needed.
 
@@ -64,3 +64,5 @@ Keep full v1 verification; no schema epoch bypass, production event acceptance, 
 ## Independent review clarification
 
 Design review PASS. Rollback-on-error applies only before COMMIT has succeeded; after_commit errors preserve the committed database and represent lost local response. Regardless of any failed model Prepare/Commit intermediate result (including the 64-event cap), all persisted projections and public returned ModelState values must have pending=(). The database never stores a volatile pending or treats it as independent permission. Full source keys are the fixed schema-domain mapping of S0/S1 to their synthetic run/node/attempt/fence/decision identities; version, entry and plan generation never extend the winner primary key.
+
+The same optional phase hook is available on apply and commit so controlled independent processes can demonstrate unknown/generation writers actually holding the write lock before a competing commit. This is test orchestration only and introduces no automatic retry or production endpoint.
