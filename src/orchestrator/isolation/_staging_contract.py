@@ -499,6 +499,12 @@ _CODE_ROOT = Path(__file__).absolute().parent
 _MANIFEST_SOURCES = (
     ('code_contract', str(_CODE_ROOT / '_staging_contract.py'), 'file'),
     ('code_arena', str(_CODE_ROOT / '_staging_arena.py'), 'file'),
+    ('code_a2_contract', str(_CODE_ROOT / '_staging_a2_contract.py'), 'file'),
+    ('code_ownership', str(_CODE_ROOT / '_staging_ownership.py'), 'file'),
+    ('code_native', str(_CODE_ROOT / '_staging_native.py'), 'file'),
+    ('code_reopen', str(_CODE_ROOT / '_staging_reopen.py'), 'file'),
+    ('code_audit', str(_CODE_ROOT / '_staging_audit.py'), 'file'),
+    ('code_gate', str(_CODE_ROOT / '_staging_gate.py'), 'file'),
     ('code_landlock', str(_CODE_ROOT / 'landlock.py'), 'file'),
     ('code_capabilities', str(_CODE_ROOT / 'candidate_security.py'), 'file'),
     ('interpreter', '/usr/bin/python3.12', 'file'),
@@ -509,7 +515,11 @@ _MANIFEST_SOURCES = (
     ('native_libc', '/usr/lib/x86_64-linux-gnu/libc.so.6', 'file'),
     ('native_seccomp', '/usr/lib/x86_64-linux-gnu/libseccomp.so.2', 'file'),
     *((f'stdlib_{name}', f'/usr/lib/python3.12/{name}.py', 'file') for name in
-      ('dataclasses', 'enum', 'hashlib', 'json/__init__', 'pathlib', 'struct')),
+      ('dataclasses', 'enum', 'hashlib', 'json/__init__', 'pathlib', 'struct',
+       'ctypes/__init__', 'ctypes/_endian', 'threading')),
+    ('stdlib_ctypes_native', '/usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so', 'file'),
+    ('stdlib_resource', '/usr/lib/python3.12/lib-dynload/resource.cpython-312-x86_64-linux-gnu.so', 'file'),
+    ('stdlib_subinterpreters', '/usr/lib/python3.12/lib-dynload/_xxsubinterpreters.cpython-312-x86_64-linux-gnu.so', 'file'),
     # fcntl/_thread/os/stat/sys/time are built-in or frozen in the fixed
     # interpreter for this profile; no invented extension pathname is used.
 )
