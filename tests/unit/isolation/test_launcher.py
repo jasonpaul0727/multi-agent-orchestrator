@@ -335,6 +335,407 @@ def test_collector_deduplicates_owned_objects_and_preserves_stdin_eligibility(co
     assert rig.pipes["stdin"].close_calls == rig.pipes["stderr"].close_calls == 0
 
 
+@pytest.fixture
+def wait_rig(monkeypatch):
+    from types import SimpleNamespace
+
+    unit, cgroup = _attempt_identity()
+    rig = SimpleNamespace(errors={}, fail_at={}, callbacks={}, counts={}, events=[], cgroup=cgroup)
+
+    def step(name):
+        rig.events.append(name)
+        rig.counts[name] = rig.counts.get(name, 0) + 1
+        callback = rig.callbacks.get(name)
+        if callback is not None:
+            callback()
+        if name in rig.errors and rig.counts[name] == rig.fail_at.get(name, rig.counts[name]):
+            raise rig.errors[name]
+
+    class Transport:
+        returncode = 0
+
+        def poll(self):
+            step("poll")
+            return rig.poll_result
+
+        def wait(self, *, timeout):
+            assert timeout == 2.0
+            step("wait")
+            return 0
+
+    rig.poll_result = 0
+    rig.staging = SimpleNamespace(cleanup=lambda: step("cleanup"), discard=lambda: step("discard"))
+    rig.session = SandboxSession(process=Transport(), unit_name=unit, systemctl="unused",
+        client_env={}, output_limit=1024, timeout_seconds=10, staging=rig.staging)
+    rig.result = launcher_module.SandboxResult(unit, 0, b"stdout", b"stderr", 0.25, None,
+        False, False, False, True)
+    rig.receipt = launcher_module.SandboxTerminationReceipt(unit,
+        "/" + cgroup.relative_to("/sys/fs/cgroup").as_posix(), "inactive", True)
+
+    def collect(**_private):
+        step("collect")
+        return rig.result
+
+    def read_receipt(**_arguments):
+        step("receipt")
+        return rig.receipt
+
+    def binding(*_arguments):
+        step("binding")
+        return "stopped"
+
+    owner = SimpleNamespace(_retire_session=lambda session: step("retire"))
+
+    def owner_ref():
+        step("owner")
+        return owner
+
+    rig.session._owner_ref = owner_ref
+    monkeypatch.setattr(rig.session, "_collect", collect)
+    monkeypatch.setattr(rig.session, "cancel", lambda: step("cancel"))
+    monkeypatch.setattr(launcher_module, "_read_termination_receipt", read_receipt)
+    monkeypatch.setattr(launcher_module, "_observe_prepared_binding", binding)
+    return rig
+
+
+def _assert_wait_failure_replay_is_detached_and_inert(rig):
+    counts = dict(rig.counts)
+    failures = []
+    for _ in range(2):
+        # A caller may replay while already handling an unrelated exception.
+        try:
+            raise RuntimeError("private unrelated caller context")
+        except RuntimeError:
+            with pytest.raises(IsolationUnavailable) as caught:
+                rig.session.wait()
+        assert type(caught.value) is IsolationUnavailable
+        assert caught.value.args == ("sandbox_session_wait_failed",)
+        assert caught.value.__cause__ is caught.value.__context__ is None
+        failures.append(caught.value)
+    assert failures[0] is not failures[1]
+    assert rig.counts == counts
+    assert rig.session._result is None
+    assert getattr(rig.session, "_wait_failed", False) is True
+    assert getattr(rig.session, "_wait_owner_thread", None) is None
+    assert not any(isinstance(value, BaseException) or value is rig.result
+        for value in vars(rig.session).values())
+
+
+@pytest.mark.parametrize("boundary", ["cancel", "wait", "wait-timeout", "poll", "cleanup"])
+def test_wait_primary_failure_survives_outer_cleanup_and_replay_is_inert(wait_rig, boundary):
+    rig = wait_rig
+    primary = OSError("primary collection failure")
+    rig.errors["collect"] = primary
+    phase = "wait" if boundary == "wait-timeout" else boundary
+    rig.errors[phase] = (subprocess.TimeoutExpired("private wait sentinel", 2)
+        if boundary == "wait-timeout" else OSError("private cleanup sentinel"))
+    latch_observations = []
+    for name in ("cancel", "wait", "poll", "cleanup"):
+        rig.callbacks[name] = lambda: latch_observations.append(getattr(rig.session, "_wait_failed", False))
+    with pytest.raises(OSError) as caught:
+        rig.session.wait()
+    assert caught.value is primary
+    assert rig.counts["cancel"] == rig.counts["wait"] == rig.counts["poll"] == 1
+    assert rig.counts.get("cleanup", 0) == (0 if phase == "poll" else 1)
+    assert latch_observations and all(latch_observations)
+    assert len(primary.__notes__) == len(set(primary.__notes__))
+    import traceback
+    assert "private" not in "".join(traceback.format_exception(primary))
+    _assert_wait_failure_replay_is_detached_and_inert(rig)
+
+
+@pytest.mark.parametrize("primary_control", [False, True])
+@pytest.mark.parametrize("first_control_phase", ["cancel", "wait"])
+def test_wait_preserves_primary_control_or_first_outer_cleanup_control(wait_rig, primary_control, first_control_phase):
+    rig = wait_rig
+    primary = _CollectorControl("primary control") if primary_control else OSError("primary")
+    first = _CollectorControl("first cleanup control")
+    rig.errors.update(collect=primary, cancel=OSError("private cancel"),
+        wait=_CollectorControl("private later wait"), poll=_CollectorControl("private later poll"))
+    rig.errors[first_control_phase] = first
+    with pytest.raises(BaseException) as caught:
+        rig.session.wait()
+    assert caught.value is (primary if primary_control else first)
+    assert rig.counts == {"collect": 1, "cancel": 1, "wait": 1, "poll": 1}
+    notes = caught.value.__notes__
+    assert len(notes) == len(set(notes))
+    assert set(notes) == {"sandbox_session_cancel_cleanup_failed", "sandbox_session_wait_cleanup_failed",
+        "sandbox_session_poll_cleanup_failed", "sandbox_session_secondary_failure"} | (
+        set() if primary_control else {"sandbox_session_primary_superseded"})
+    _assert_wait_failure_replay_is_detached_and_inert(rig)
+
+
+@pytest.mark.parametrize("boundary", ["poll-final", "cleanup", "discard", "owner", "retire", "receipt", "receipt-poll", "binding"])
+def test_wait_pending_result_is_not_cached_after_teardown_or_receipt_failure(wait_rig, boundary):
+    rig = wait_rig
+    primary = OSError("pending result failure")
+    scoped = boundary not in {"cleanup", "poll-final"}
+    if scoped:
+        rig.session._scope_cgroup = rig.cgroup
+    phase = "poll" if boundary in {"poll-final", "receipt-poll"} else boundary
+    rig.errors[phase] = primary
+    if boundary == "receipt-poll":
+        rig.fail_at["poll"] = 1
+    if boundary == "binding":
+        rig.session._launch_receipt = launcher_module.SandboxLaunchReceipt(
+            "f" * 32, rig.session.unit_name, rig.receipt.control_group, "a" * 32, "b" * 64)
+    unpublished = []
+    for name in ("receipt", "binding", "cleanup", "discard", "owner", "retire"):
+        rig.callbacks[name] = lambda: unpublished.append(rig.session._result is None)
+    with pytest.raises(OSError) as caught:
+        rig.session.wait()
+    assert caught.value is primary
+    assert rig.session._result is None
+    assert all(unpublished)
+    if boundary in {"discard", "poll-final", "receipt-poll", "receipt", "binding"}:
+        assert rig.counts.get("retire", 0) == 0
+    if boundary in {"poll-final", "receipt-poll"}:
+        assert rig.counts.get("cleanup", 0) == rig.counts.get("discard", 0) == 0
+    assert rig.counts.get("cancel", 0) == rig.counts.get("wait", 0) == (
+        1 if boundary in {"receipt", "receipt-poll", "binding"} else 0)
+    _assert_wait_failure_replay_is_detached_and_inert(rig)
+
+
+@pytest.mark.parametrize("cleanup_enabled", [False, True])
+def test_wait_publishes_after_qualified_cleanup_and_replays_same_object(wait_rig, cleanup_enabled):
+    rig = wait_rig
+    rig.session._scope_cgroup = rig.cgroup
+    rig.session._cleanup_on_termination = cleanup_enabled
+    unpublished = []
+    for name in ("discard", "owner", "retire"):
+        rig.callbacks[name] = lambda: unpublished.append(rig.session._result is None)
+    result = rig.session.wait()
+    assert result.termination_receipt is rig.receipt
+    assert all(unpublished)
+    assert rig.counts.get("discard", 0) == int(cleanup_enabled)
+    assert rig.counts["retire"] == 1
+    assert rig.counts.get("cleanup", 0) == rig.counts.get("cancel", 0) == rig.counts.get("wait", 0) == 0
+    if cleanup_enabled:
+        assert rig.events.index("discard") < rig.events.index("owner") < rig.events.index("retire")
+    counts = dict(rig.counts)
+    assert rig.session.wait() is result
+    assert rig.counts == counts
+    assert getattr(rig.session, "_wait_owner_thread", None) is None
+
+
+def test_wait_fresh_poll_failure_never_uses_earlier_exit_to_delete_or_retire(wait_rig):
+    rig = wait_rig
+    rig.session._scope_cgroup = rig.cgroup
+    rig.errors["poll"] = OSError("fresh final poll")
+    rig.fail_at["poll"] = 2
+    with pytest.raises(OSError):
+        rig.session.wait()
+    assert rig.counts["receipt"] == 1
+    assert rig.counts.get("discard", 0) == rig.counts.get("owner", 0) == rig.counts.get("retire", 0) == 0
+    _assert_wait_failure_replay_is_detached_and_inert(rig)
+
+
+class _FiniteReentryLock:
+    """Make the unfixed recursive-acquire bug fail promptly rather than hang."""
+
+    def __init__(self, on_acquire=lambda: None):
+        self.real = threading.Lock()
+        self.acquisitions = 0
+        self.on_acquire = on_acquire
+
+    def __enter__(self):
+        self.acquisitions += 1
+        if not self.real.acquire(timeout=0.1):
+            raise RuntimeError("recursive wait tried to acquire its owned lock")
+        self.on_acquire()
+        return self
+
+    def __exit__(self, *_error):
+        self.real.release()
+
+
+@pytest.mark.parametrize("boundary", ["collect", "cleanup", "cancel"])
+def test_wait_reentry_refuses_before_lock_without_poisoning_caught_outer_call(wait_rig, boundary):
+    rig = wait_rig
+    lock = _FiniteReentryLock()
+    rig.session._wait_lock = lock
+    nested_errors = []
+
+    def nested():
+        with pytest.raises(IsolationUnavailable) as caught:
+            rig.session.wait()
+        assert caught.value.args == ("sandbox_session_wait_failed",)
+        assert caught.value.__context__ is caught.value.__cause__ is None
+        nested_errors.append(caught.value)
+
+    rig.callbacks[boundary] = nested
+    if boundary == "cancel":
+        primary = OSError("outer collection")
+        rig.errors["collect"] = primary
+        with pytest.raises(OSError) as caught:
+            rig.session.wait()
+        assert caught.value is primary
+        _assert_wait_failure_replay_is_detached_and_inert(rig)
+    else:
+        assert rig.session.wait() is rig.result
+        assert not getattr(rig.session, "_wait_failed", False)
+    assert len(nested_errors) == lock.acquisitions == 1
+    assert getattr(rig.session, "_wait_owner_thread", None) is None
+
+
+def test_wait_escaping_reentry_becomes_primary_failure_and_latches(wait_rig):
+    rig = wait_rig
+    rig.session._wait_lock = _FiniteReentryLock()
+    rig.callbacks["collect"] = lambda: rig.session.wait()
+    with pytest.raises(IsolationUnavailable) as caught:
+        rig.session.wait()
+    assert caught.value.args == ("sandbox_session_wait_failed",)
+    assert rig.counts["collect"] == rig.counts["cancel"] == rig.counts["wait"] == 1
+    _assert_wait_failure_replay_is_detached_and_inert(rig)
+
+
+def test_wait_checks_failure_latch_again_after_acquiring_lock(wait_rig):
+    rig = wait_rig
+    rig.session._wait_lock = _FiniteReentryLock(lambda: setattr(rig.session, "_wait_failed", True))
+    with pytest.raises(IsolationUnavailable, match="sandbox_session_wait_failed"):
+        rig.session.wait()
+    assert rig.counts == {}
+
+
+@pytest.mark.parametrize("selected_phase", ["body", "collector-cleanup", "outer-cleanup"])
+def test_wait_collector_and_outer_cleanup_share_fixed_notes_and_control_priority(collector_rig, monkeypatch, selected_phase):
+    rig = collector_rig
+    body = _CollectorControl("selected body") if selected_phase == "body" else OSError("body")
+    selector = _CollectorControl("selected collector cleanup") if selected_phase == "collector-cleanup" else OSError("private selector")
+    outer = _CollectorControl("selected outer cleanup")
+    rig.select_error = body
+    rig.selector_close_error = selector
+    rig.pipes["stdout"].close_error = OSError("private pipe")
+    counts = []
+
+    def cleanup_failure(name, error):
+        counts.append(name)
+        raise error
+
+    monkeypatch.setattr(rig.session, "cancel", lambda: cleanup_failure("cancel", outer))
+    monkeypatch.setattr(rig.process, "wait", lambda **_options: cleanup_failure("wait", _CollectorControl("private wait")))
+    monkeypatch.setattr(rig.process, "poll", lambda: 0)
+    monkeypatch.setattr(rig.session._staging, "cleanup", lambda: cleanup_failure("staging", OSError("private staging")))
+    with pytest.raises(BaseException) as caught:
+        rig.session.wait()
+    assert caught.value is {"body": body, "collector-cleanup": selector, "outer-cleanup": outer}[selected_phase]
+    assert counts == ["cancel", "wait", "staging"]
+    _assert_collector_closed_once(rig)
+    notes = caught.value.__notes__
+    assert len(notes) == len(set(notes))
+    assert set(notes) == {"sandbox_session_selector_close_failed", "sandbox_session_pipe_close_failed",
+        "sandbox_session_cancel_cleanup_failed", "sandbox_session_wait_cleanup_failed",
+        "sandbox_session_staging_cleanup_failed", "sandbox_session_secondary_failure"} | (
+        set() if selected_phase == "body" else {"sandbox_session_primary_superseded"})
+    import traceback
+    assert "private" not in "".join(traceback.format_exception(caught.value))
+
+
+@pytest.mark.parametrize("reject_notes", [False, True])
+def test_wait_unbound_notes_and_insertion_failure_do_not_replace_primary(wait_rig, reject_notes):
+    class Primary(OSError):
+        def add_note(self, _note):
+            pytest.fail("bound add_note must not be invoked")
+
+        def __setattr__(self, name, value):
+            if name == "__notes__" and reject_notes:
+                raise _CollectorControl("private insertion failure")
+            return super().__setattr__(name, value)
+
+    rig = wait_rig
+    primary = Primary("primary")
+    rig.errors.update(collect=primary, cancel=OSError("private cancel"), wait=OSError("private wait"))
+    with pytest.raises(Primary) as caught:
+        rig.session.wait()
+    assert caught.value is primary
+    if not reject_notes:
+        assert set(primary.__notes__) == {"sandbox_session_cancel_cleanup_failed",
+            "sandbox_session_wait_cleanup_failed", "sandbox_session_secondary_failure"}
+    _assert_wait_failure_replay_is_detached_and_inert(rig)
+
+
+def test_wait_deduplicates_own_notes_without_traversing_foreign_notes(wait_rig):
+    class ForeignNotes(list):
+        def __iter__(self):
+            pytest.fail("must not traverse pre-existing notes")
+
+        def __contains__(self, _value):
+            pytest.fail("must not search pre-existing notes")
+
+    rig = wait_rig
+    primary = OSError("primary")
+    primary.__notes__ = ForeignNotes(["foreign note"])
+    rig.errors.update(collect=primary, cancel=OSError("private cancel"), wait=OSError("private wait"))
+    with pytest.raises(OSError) as caught:
+        rig.session.wait()
+    assert caught.value is primary
+    assert list.count(primary.__notes__, "foreign note") == 1
+    assert list.count(primary.__notes__, "sandbox_session_secondary_failure") == 1
+
+
+@pytest.mark.parametrize(("collector_rig", "boundary"), [
+    (False, "body"), (True, "selector-close"), (True, "pipe-close")], indirect=["collector_rig"])
+def test_wait_latches_at_first_collector_failure_before_remaining_closes(collector_rig, monkeypatch, boundary):
+    rig = collector_rig
+    failure = OSError("first collector failure")
+    if boundary == "body":
+        rig.select_error = failure
+    else:
+        rig.session._stop_grace_seconds = 0.001
+        rig.session._cancel_requested.set()
+        if boundary == "selector-close":
+            rig.selector_close_error = failure
+        else:
+            rig.pipes["stdout"].close_error = failure
+    observations = []
+    for name in ("stdout", "stderr"):
+        original = rig.pipes[name].close
+
+        def observing_close(name=name, original=original):
+            observations.append((name, getattr(rig.session, "_wait_failed", False)))
+            original()
+
+        monkeypatch.setattr(rig.pipes[name], "close", observing_close)
+    monkeypatch.setattr(rig.session, "cancel", lambda: False)
+    monkeypatch.setattr(rig.process, "wait", lambda **_options: 0)
+    monkeypatch.setattr(rig.session._staging, "cleanup", lambda: None)
+    with pytest.raises(OSError) as caught:
+        rig.session.wait()
+    assert caught.value is failure
+    assert observations == [("stdout", boundary != "pipe-close"), ("stderr", True)]
+    _assert_collector_closed_once(rig)
+
+
+def test_wait_refuses_after_direct_collector_failure_without_repeating_pipe_actions(collector_rig, monkeypatch):
+    rig = collector_rig
+    rig.constructor_error = OSError("collector setup")
+    with pytest.raises(OSError):
+        rig.session._collect()
+    _assert_collector_closed_once(rig)
+    monkeypatch.setattr(rig.session, "cancel", lambda: pytest.fail("failed replay must not cancel"))
+    with pytest.raises(IsolationUnavailable, match="sandbox_session_wait_failed"):
+        rig.session.wait()
+    _assert_collector_closed_once(rig)
+
+
+def test_wait_refuses_after_direct_collector_result_conversion_failure(collector_rig, monkeypatch):
+    rig = collector_rig
+    failure = OSError("transport returncode inspection")
+
+    def fail_returncode(_process):
+        raise failure
+
+    monkeypatch.setattr(type(rig.process), "returncode", property(fail_returncode))
+    with pytest.raises(OSError) as caught:
+        rig.session._collect()
+    assert caught.value is failure
+    _assert_collector_closed_once(rig)
+    assert getattr(rig.session, "_wait_failed", False) is True
+    with pytest.raises(IsolationUnavailable, match="sandbox_session_wait_failed"):
+        rig.session.wait()
+    _assert_collector_closed_once(rig)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -399,7 +800,7 @@ def test_collection_error_cleanup_wait_is_bounded_by_default(monkeypatch):
         process=Transport(), unit_name="unit.service", systemctl="ctl", client_env={},
         output_limit=1024, timeout_seconds=1, staging=type("Stage", (), {"cleanup": lambda _s: None})(),
     )
-    monkeypatch.setattr(session, "_collect", lambda: (_ for _ in ()).throw(OSError("collector failed")))
+    monkeypatch.setattr(session, "_collect", lambda *, _cleanup_notes=None: (_ for _ in ()).throw(OSError("collector failed")))
     monkeypatch.setattr(subprocess, "run", lambda args, **_kw: subprocess.CompletedProcess(args, 1))
     with pytest.raises(OSError, match="collector failed"):
         session.wait()

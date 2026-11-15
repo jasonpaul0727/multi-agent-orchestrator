@@ -39,11 +39,11 @@
 **Consumes:** Existing stdout/stderr and existing input-owned stdin, existing selector loop, `_wait_lock` serialization.
 **Produces:** Same `SandboxResult` or the spec-selected original exception after all finite close attempts. Small private helpers may be reused by B; no general cleanup framework or public API.
 
-- [ ] Write behavioral REDs using own real pipes for selector construction/registration/set_blocking failure, empty-input/EOF close failure, body error plus selector/pipe close failures; distinguish missing-interface/setup errors from behavioral RED.
-- [ ] Verify exact once per object, remaining eligible attempts, actual owned FD closure where close succeeds, selected object identity and finite notes. Constructor failure does not claim closure of hidden unreturned handles.
-- [ ] Implement close records before setup and before every close, optional owned selector, unified local priority and best-effort fixed notes. Keep the existing loop's limits and cancellation flow.
-- [ ] Run focused tests with explicit worktree PYTHONPATH and existing venv: `python -m pytest -o addopts= -p no:cacheprovider tests/unit/isolation/test_launcher.py -q`. No actual systemd/native/Provider calls from new tests.
-- [ ] Self-review, write `session-cleanup-a-report.md` in the sole ledger, stop writes for independent spec/quality review. Parent records real commit and ordinary feature push, then immediately checks quota. A is a partial milestone, not a completed public wait fix.
+- [x] Write behavioral REDs using own real pipes for selector construction/registration/set_blocking failure, empty-input/EOF close failure, body error plus selector/pipe close failures; distinguish missing-interface/setup errors from behavioral RED.
+- [x] Verify exact once per object, remaining eligible attempts, actual owned FD closure where close succeeds, selected object identity and finite notes. Constructor failure does not claim closure of hidden unreturned handles.
+- [x] Implement close records before setup and before every close, optional owned selector, unified local priority and best-effort fixed notes. Keep the existing loop's limits and cancellation flow.
+- [x] Run focused tests with explicit worktree PYTHONPATH and existing venv: `python -m pytest -o addopts= -p no:cacheprovider tests/unit/isolation/test_launcher.py -q`. No actual systemd/native/Provider calls from new tests.
+- [x] Self-review, write `session-cleanup-a-report.md` in the sole ledger, stop writes for independent spec/quality review. Parent records real commit and ordinary feature push, then immediately checks quota. A is a partial milestone, not a completed public wait fix.
 
 ### Increment B: Public wait failure and cache discipline
 
@@ -52,11 +52,11 @@
 **Consumes:** A's finite close/error machinery and existing receipt/cleanup conditions.
 **Produces:** Healthy identical-object result replay, delayed result publication, finite failure latch and local same-thread reentry protection; no retained exception/traceback in session state.
 
-- [ ] Write/run genuine REDs for outer cancel/process-wait/poll/staging/owner failures and post-result cleanup then repeated wait; require zero repeated side effects and no fabricated receipt.
-- [ ] Implement primary-versus-secondary rule across both methods, deduplicate fixed note categories without traversing arbitrary existing notes; preserve exact first selected control object, including custom direct BaseException. Test unbound-note insertion failure.
-- [ ] Keep independent cancellation and bounded process-wait attempts after body failure, with existing TimeoutExpired semantics. Preserve fresh poll and discard-before-retire dependencies, including `cleanup_on_termination=False`.
-- [ ] Publish pending result only after eligible teardown succeeds; latch failure before error cleanup, fail repeated calls before resource actions and under the wait lock, reject only same-thread active reentry while healthy other threads serialize. Do not cache the original error or pending result.
-- [ ] Run focused affected launcher tests and concrete consumer regressions warranted by changed wait behavior. Write `session-cleanup-b-report.md`, independent review/fixes, then parent commit/push/quota.
+- [x] Write/run genuine REDs for outer cancel/process-wait/poll/staging/owner failures and post-result cleanup then repeated wait; require zero repeated side effects and no fabricated receipt.
+- [x] Implement primary-versus-secondary rule across both methods, deduplicate fixed note categories without traversing arbitrary existing notes; preserve exact first selected control object, including custom direct BaseException. Test unbound-note insertion failure.
+- [x] Keep independent cancellation and bounded process-wait attempts after body failure, with existing TimeoutExpired semantics. Preserve fresh poll and discard-before-retire dependencies, including `cleanup_on_termination=False`.
+- [x] Publish pending result only after eligible teardown succeeds; latch failure before error cleanup, fail repeated calls before resource actions and under the wait lock, reject only same-thread active reentry while healthy other threads serialize. Do not cache the original error or pending result.
+- [x] Run focused affected launcher tests and concrete consumer regressions warranted by changed wait behavior. Write `session-cleanup-b-report.md`, independent review/fixes, then parent commit/push/quota.
 
 ### Increment C: Real FD-reuse and compatibility evidence
 

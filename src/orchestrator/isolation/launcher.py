@@ -543,48 +543,92 @@ class SandboxSession:
     def wait(self) -> SandboxResult:
         """Drain capped output until exit, runtime deadline, or cancellation."""
 
+        owner_thread = threading.get_ident()
+        if (getattr(self, "_wait_failed", False)
+            or getattr(self, "_wait_owner_thread", None) == owner_thread):
+            _raise_session_wait_failed()
         with self._wait_lock:
+            if getattr(self, "_wait_failed", False):
+                _raise_session_wait_failed()
             if self._result is not None:
                 return self._result
-            try:
-                result = self._collect()
-                # An absent unit is not a stop witness while systemd-run can
-                # still submit it. Retain staging and withhold proof until the
-                # owning host launch/transport operation has ended.
-                if self._scope_cgroup is not None and self._process.poll() is not None:
-                    receipt = _read_termination_receipt(
-                        unit_name=self.unit_name,
-                        expected_cgroup=self._scope_cgroup,
-                        client_env=self._client_env,
-                        systemctl=self._systemctl,
-                    )
-                    if receipt is not None and self._launch_receipt is not None:
-                        prepared = PreparedSandboxLaunch(self._launch_receipt.launch_id, self.unit_name)
-                        if _observe_prepared_binding(prepared, self._launch_receipt,
-                            self._systemctl, self._client_env) != "stopped":
-                            receipt = None
-                    result = replace(result, termination_receipt=receipt)
-                self._result = result
-                return self._result
-            except BaseException:
-                self.cancel()
-                try:
-                    self._process.wait(timeout=self._stop_grace_seconds)
-                except subprocess.TimeoutExpired:
-                    pass  # Caller must retain staging when scope stop is unconfirmed.
-                raise
-            finally:
-                if self._process.poll() is not None:
-                    if self._scope_cgroup is None:
-                        self._staging.cleanup()
-                    elif self._result is not None and self._result.termination_confirmed:
-                        if self._cleanup_on_termination:
-                            _discard_staging(self._staging)
-                        owner = self._owner_ref() if self._owner_ref is not None else None
-                        if owner is not None:
-                            owner._retire_session(self)
+            self._wait_owner_thread = owner_thread
+            primary = None
+            result = None
+            cleanup_failures = []
+            notes: list[str] = []
 
-    def _collect(self) -> SandboxResult:
+            def cleanup_failed(error, note):
+                self._wait_failed = True
+                cleanup_failures.append((error, note))
+
+            try:
+                try:
+                    result = self._collect(_cleanup_notes=notes)
+                    # An absent unit is not a stop witness while systemd-run
+                    # can still submit it. Keep the existing observation gate.
+                    if self._scope_cgroup is not None and self._process.poll() is not None:
+                        receipt = _read_termination_receipt(
+                            unit_name=self.unit_name,
+                            expected_cgroup=self._scope_cgroup,
+                            client_env=self._client_env,
+                            systemctl=self._systemctl,
+                        )
+                        if receipt is not None and self._launch_receipt is not None:
+                            prepared = PreparedSandboxLaunch(self._launch_receipt.launch_id, self.unit_name)
+                            if _observe_prepared_binding(prepared, self._launch_receipt,
+                                self._systemctl, self._client_env) != "stopped":
+                                receipt = None
+                        result = replace(result, termination_receipt=receipt)
+                except BaseException as error:
+                    primary = error
+                    self._wait_failed = True
+                    try:
+                        self.cancel()
+                    except BaseException as error:
+                        cleanup_failed(error, "sandbox_session_cancel_cleanup_failed")
+                    try:
+                        self._process.wait(timeout=self._stop_grace_seconds)
+                    except BaseException as error:
+                        # TimeoutExpired remains secondary to the primary.
+                        cleanup_failed(error, "sandbox_session_wait_cleanup_failed")
+                exited = False
+                try:
+                    exited = self._process.poll() is not None
+                except BaseException as error:
+                    cleanup_failed(error, "sandbox_session_poll_cleanup_failed")
+                if exited:
+                    if self._scope_cgroup is None:
+                        try:
+                            self._staging.cleanup()
+                        except BaseException as error:
+                            cleanup_failed(error, "sandbox_session_staging_cleanup_failed")
+                    elif result is not None and result.termination_confirmed:
+                        try:
+                            if self._cleanup_on_termination:
+                                _discard_staging(self._staging)
+                        except BaseException as error:
+                            cleanup_failed(error, "sandbox_session_staging_cleanup_failed")
+                        else:
+                            # A failed discard must retain owner custody.
+                            try:
+                                owner = self._owner_ref() if self._owner_ref is not None else None
+                                if owner is not None:
+                                    owner._retire_session(self)
+                            except BaseException as error:
+                                cleanup_failed(error, "sandbox_session_retirement_failed")
+                selected = _select_session_cleanup_failure(primary, cleanup_failures, _notes=notes)
+                if selected is not None:
+                    self._wait_failed = True
+                    _add_session_cleanup_notes(selected, notes)
+                    raise selected from None
+                assert result is not None
+                self._result = result
+                return result
+            finally:
+                self._wait_owner_thread = None
+
+    def _collect(self, *, _cleanup_notes: list[str] | None = None) -> SandboxResult:
         stdout, stderr = self._process.stdout, self._process.stderr
         input_stream = self._process.stdin if self._input_bytes is not None else None
         pipes = []
@@ -678,47 +722,56 @@ class SandboxSession:
                 self._process.wait(timeout=self._stop_grace_seconds)
         except BaseException as error:
             primary = error
+            self._wait_failed = True
         finally:
             if selector is not None:
                 try:
                     close_once(selector)
                 except BaseException as error:
+                    self._wait_failed = True
                     cleanup_failures.append((error, "sandbox_session_selector_close_failed"))
             for stream in pipes:
                 try:
                     close_once(stream)
                 except BaseException as error:
+                    self._wait_failed = True
                     cleanup_failures.append((error, "sandbox_session_pipe_close_failed"))
-        selected = _select_session_cleanup_failure(primary, cleanup_failures)
+        selected = _select_session_cleanup_failure(primary, cleanup_failures, _notes=_cleanup_notes)
         if selected is not None:
             raise selected from None
-        elapsed = max(0.0, time.monotonic() - self._started)
-        returncode = int(self._process.returncode) if self._process.returncode is not None else 125
-        if (
-            not self._cancel_requested.is_set()
-            and not output_limited
-            and elapsed >= self._timeout_seconds
-        ):
-            timed_out = True
-        with self._cancel_lock:
-            cancel_signal_accepted = self._cancel_signal_accepted
-        return SandboxResult(
-            unit_name=self.unit_name,
-            returncode=returncode,
-            stdout=bytes(streams[stdout]),
-            stderr=bytes(streams[stderr]),
-            elapsed_seconds=elapsed,
-            termination_receipt=None,
-            cancelled=cancel_signal_accepted and not timed_out and not output_limited,
-            timed_out=timed_out,
-            output_limited=output_limited,
-            input_written=self._input_bytes is None or input_offset == len(self._input_bytes),
-        )
+        try:
+            elapsed = max(0.0, time.monotonic() - self._started)
+            returncode = int(self._process.returncode) if self._process.returncode is not None else 125
+            if (
+                not self._cancel_requested.is_set()
+                and not output_limited
+                and elapsed >= self._timeout_seconds
+            ):
+                timed_out = True
+            with self._cancel_lock:
+                cancel_signal_accepted = self._cancel_signal_accepted
+            return SandboxResult(
+                unit_name=self.unit_name,
+                returncode=returncode,
+                stdout=bytes(streams[stdout]),
+                stderr=bytes(streams[stderr]),
+                elapsed_seconds=elapsed,
+                termination_receipt=None,
+                cancelled=cancel_signal_accepted and not timed_out and not output_limited,
+                timed_out=timed_out,
+                output_limited=output_limited,
+                input_written=self._input_bytes is None or input_offset == len(self._input_bytes),
+            )
+        except BaseException:
+            self._wait_failed = True
+            raise
 
 
 def _select_session_cleanup_failure(
     primary: BaseException | None,
     cleanup_failures: list[tuple[BaseException, str]],
+    *,
+    _notes: list[str] | None = None,
 ) -> BaseException | None:
     """Choose the session failure without exposing secondary error details."""
     if primary is not None and not isinstance(primary, Exception):
@@ -731,21 +784,36 @@ def _select_session_cleanup_failure(
                 cleanup_failures[0][0] if cleanup_failures else None)
     if selected is None:
         return None
-    notes = []
+    notes = [] if _notes is None else _notes
     for _error, note in cleanup_failures:
         if note not in notes:
             notes.append(note)
-    if primary is not None and selected is not primary:
+    if primary is not None and selected is not primary and "sandbox_session_primary_superseded" not in notes:
         notes.append("sandbox_session_primary_superseded")
     if (primary is not None and primary is not selected
-        or any(error is not selected for error, _note in cleanup_failures)):
+        or any(error is not selected for error, _note in cleanup_failures)
+    ) and "sandbox_session_secondary_failure" not in notes:
         notes.append("sandbox_session_secondary_failure")
+    if _notes is None:
+        _add_session_cleanup_notes(selected, notes)
+    return selected
+
+
+def _add_session_cleanup_notes(selected: BaseException, notes: list[str]) -> None:
     for note in notes:
         try:
             BaseException.add_note(selected, note)
         except BaseException:
             pass  # Diagnostics must never replace the chosen failure.
-    return selected
+
+
+def _raise_session_wait_failed() -> None:
+    error = IsolationUnavailable("sandbox_session_wait_failed")
+    try:
+        raise error from None
+    finally:
+        # Refusal can occur inside the caller's active exception handler.
+        error.__context__ = None
 
 
 def _validate_command(command: Sequence[str]) -> None:
